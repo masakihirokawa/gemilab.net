@@ -32,8 +32,8 @@ export default async function LocaleLayout({
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
         {/* Google Analytics */}
-        <script async src="https://www.googletagmanager.com/gtag/js?id=G-XXXXXXXXXX" />
-        <script dangerouslySetInnerHTML={{ __html: `window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-XXXXXXXXXX');` }} />
+        <script async src="https://www.googletagmanager.com/gtag/js?id=G-CJWM68JK57" />
+        <script dangerouslySetInnerHTML={{ __html: `window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-CJWM68JK57');` }} />
         <link rel="alternate" type="application/rss+xml" title="Gemini Lab RSS" href={locale === "ja" ? "/feed.xml" : "/en/feed.xml"} />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
