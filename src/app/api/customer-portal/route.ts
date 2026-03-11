@@ -29,7 +29,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ url: portalSession.url });
   } catch (error) {
-    console.error("Customer portal error:", error);
+    // Customer portal error - log would happen in platform logs
     return NextResponse.json(
       { error: "Failed to create portal session" },
       { status: 500 }
