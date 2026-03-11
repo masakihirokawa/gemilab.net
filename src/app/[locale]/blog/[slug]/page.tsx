@@ -18,7 +18,15 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       description: post.meta.description,
       type: "article",
       publishedTime: post.meta.date,
+    
+    alternates: {
+      canonical: locale === "ja" ? `https://gemilab.net/blog/${slug}` : `https://gemilab.net/en/blog/${slug}`,
+      languages: {
+        ja: `https://gemilab.net/blog/${slug}`,
+        en: `https://gemilab.net/en/blog/${slug}`,
+      },
     },
+  },
   };
 }
 

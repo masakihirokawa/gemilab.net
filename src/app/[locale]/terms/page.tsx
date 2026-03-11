@@ -7,7 +7,14 @@ interface Props {
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale } = await params;
   const title = locale === "ja" ? "利用規約" : "Terms of Use";
-  return { title, openGraph: { title } };
+  return { title, openGraph: { title }     alternates: {
+      canonical: locale === "ja" ? "https://gemilab.net/terms" : `https://gemilab.net/en/terms`,
+      languages: {
+        ja: "https://gemilab.net/terms",
+        en: "https://gemilab.net/en/terms",
+      },
+    },
+  };
 }
 
 export default async function TermsPage({ params }: Props) {
