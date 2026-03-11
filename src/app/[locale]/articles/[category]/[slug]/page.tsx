@@ -165,7 +165,7 @@ export default async function ArticlePage({ params }: Props) {
             letterSpacing: "0.06em",
           }}
         >
-          {category}
+          {CATEGORY_LABELS[locale]?.[category] || category}
         </span>
       </div>
 
