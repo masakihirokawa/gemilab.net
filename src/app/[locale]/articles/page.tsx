@@ -54,8 +54,8 @@ export default async function ArticlesPage({ params, searchParams }: Props) {
     CATEGORIES.find((c) => c.id === id)?.icon || "";
 
   const CATEGORY_LABELS: Record<string, Record<string, string>> = {
-    ja: { "gemini-basics": "Gemini AI", "gemini-dev": "Gemini Code", "gemini-api": "Cowork", "gemini-advanced": "API & SDK" },
-    en: { "gemini-basics": "Gemini AI", "gemini-dev": "Gemini Code", "gemini-api": "Cowork", "gemini-advanced": "API & SDK" },
+    ja: { "gemini-basics": "Gemini 入門", "gemini-dev": "開発ツール", "gemini-api": "API & SDK", "gemini-advanced": "高度な活用" },
+    en: { "gemini-basics": "Gemini Basics", "gemini-dev": "Dev Tools", "gemini-api": "API & SDK", "gemini-advanced": "Advanced" },
   };
 
   const prefix = locale === "ja" ? "" : `/${locale}`;
@@ -141,7 +141,7 @@ export default async function ArticlesPage({ params, searchParams }: Props) {
             >
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
                 <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em" }}>
-                  {catIcon(article.category)} {article.category}
+                  {catIcon(article.category)} {CATEGORY_LABELS[locale]?.[article.category] || article.category}
                 </span>
                 <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
                 <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
