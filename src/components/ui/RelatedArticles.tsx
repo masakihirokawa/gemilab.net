@@ -1,5 +1,11 @@
 import { getArticles, CATEGORIES, type ArticleMeta } from "@/lib/content";
 
+
+const CATEGORY_LABELS: Record<string, Record<string, string>> = {
+  ja: {"gemini-basics": "Gemini 入門", "gemini-dev": "開発ツール", "gemini-api": "API / SDK", "gemini-advanced": "高度な活用"},
+  en: {"gemini-basics": "Gemini Basics", "gemini-dev": "Dev Tools", "gemini-api": "API / SDK", "gemini-advanced": "Advanced"},
+};
+
 interface RelatedArticlesProps {
   locale: string;
   currentSlug: string;
@@ -72,7 +78,7 @@ export function RelatedArticles({
                     fontFamily: "'DM Mono', monospace",
                   }}
                 >
-                  {aCat?.icon} {article.category}
+                  {aCat?.icon} {CATEGORY_LABELS[locale]?.[article.category] || article.category}
                 </span>
                 <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{article.date?.split("T")[0]}</span>
               </div>
