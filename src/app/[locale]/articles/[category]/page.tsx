@@ -17,7 +17,7 @@ const CAT_TITLES: Record<string, Record<string, string>> = {
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale, category } = await params;
   const title = CAT_TITLES[category]?.[locale] || CAT_TITLES[category]?.en || category;
-  return { title, openGraph: { title 
+  return { title, openGraph: { title },
     alternates: {
       canonical: locale === "ja" ? `https://gemilab.net/articles/${category}` : `https://gemilab.net/en/articles/${category}`,
       languages: {
@@ -25,7 +25,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
         en: `https://gemilab.net/en/articles/${category}`,
       },
     },
-  } };
+  };
 }
 
 const LEVEL_LABELS: Record<string, Record<string, string>> = {

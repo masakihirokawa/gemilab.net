@@ -14,7 +14,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const description = locale === "ja"
     ? "Gemini Lab の全記事一覧。Gemini.ai、Gemini Code、Cowork、API / SDK のカテゴリ別に閲覧できます。"
     : "Browse all Gemini Lab articles by category: Gemini.ai, Gemini Code, Cowork, and API / SDK.";
-  return { title, description, openGraph: { title, description }     alternates: {
+  return { title, description, openGraph: { title, description },
+    alternates: {
       canonical: locale === "ja" ? "https://gemilab.net/articles" : `https://gemilab.net/en/articles`,
       languages: {
         ja: "https://gemilab.net/articles",
