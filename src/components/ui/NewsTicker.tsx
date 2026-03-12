@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "NEW — Gemini が Firefox の脆弱性を22件発見、うち14件が高重大度",
-    "Enterprise — セルフサーブ購入が可能に、営業不要で即日導入",
-    "Gemini in Excel — Opus 4.6 対応、ピボットテーブル・条件付き書式をネイティブサポート",
-    "Sonnet 4.6 — コーディング・長文推論・エージェント計画が大幅強化、100万トークン対応",
-    "Cowork — macOS デスクトッププレビュー公開、ローカルVM でエージェント作業",
-    "Gemini Lab — 初級〜上級の日英ナレッジベース 40+ 記事公開中",
+    "NEW — メモリインポート機能が全ユーザーに公開、ChatGPT・Geminiからの移行も対応",
+    "UPDATE — Claude Opus 4.6 リリース、100万トークンコンテキストウィンドウ（ベータ）対応",
+    "NEW — Agent Teams 発表、複数AIエージェントが並列でタスクを分担・協調",
+    "Cowork — macOS デスクトップ版が Pro プランで利用可能に、ローカルVM搭載",
+    "API — ウェブ検索ツールが正式GA、動的フィルタリングでトークンコスト削減",
+    "Claude Code — /loop コマンド追加、音声入力が10言語に拡大",
   ],
   en: [
-    "NEW — Gemini discovers 22 Firefox vulnerabilities, 14 high-severity",
-    "Enterprise — Self-serve purchase now available, no sales call needed",
-    "Gemini in Excel — Opus 4.6 powered, native pivot table & conditional formatting",
-    "Sonnet 4.6 — Major upgrades in coding, long-context reasoning & agent planning, 1M tokens",
-    "Cowork — macOS desktop preview launched with local VM agentic capabilities",
-    "Gemini Lab — 40+ articles in Japanese & English, beginner to advanced",
+    "NEW — Memory import now available to all users, migrate from ChatGPT & Gemini",
+    "UPDATE — Claude Opus 4.6 released with 1M token context window (beta)",
+    "NEW — Agent Teams launched, multiple AI agents collaborate on tasks in parallel",
+    "Cowork — macOS desktop available for Pro plan users with local VM support",
+    "API — Web search tool now GA with dynamic filtering for lower token costs",
+    "Claude Code — New /loop command added, voice STT expanded to 10 languages",
   ],
 };
 
