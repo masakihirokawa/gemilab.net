@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "NEW — メモリインポート機能が全ユーザーに公開、ChatGPT・Geminiからの移行も対応",
-    "UPDATE — Claude Opus 4.6 リリース、100万トークンコンテキストウィンドウ（ベータ）対応",
-    "NEW — Agent Teams 発表、複数AIエージェントが並列でタスクを分担・協調",
-    "Cowork — macOS デスクトップ版が Pro プランで利用可能に、ローカルVM搭載",
-    "API — ウェブ検索ツールが正式GA、動的フィルタリングでトークンコスト削減",
-    "Claude Code — /loop コマンド追加、音声入力が10言語に拡大",
+    "NEW — Gemini、Google Docs/Sheets/Drive を横断した質問応答・文書生成が可能に",
+    "UPDATE — Sheets「Fill with Gemini」、既存セルやGoogle検索からデータを自動予測・補完",
+    "Pixel — 3月アップデートでエージェントAIタスク・Circle to Search強化・Now Playingアプリ追加",
+    "UPDATE — Google Home、Gemini音声の途切れ問題を大幅改善、会話の自然な切り替えを実現",
+    "API — gemini-2.5-flash-lite-preview が3/31廃止、Gemini 3.1 Proへの移行を推奨",
+    "NEW — Gemini in Drive、複数ドキュメント横断の質問応答がAI Pro/UltraでBeta公開",
   ],
   en: [
-    "NEW — Memory import now available to all users, migrate from ChatGPT & Gemini",
-    "UPDATE — Claude Opus 4.6 released with 1M token context window (beta)",
-    "NEW — Agent Teams launched, multiple AI agents collaborate on tasks in parallel",
-    "Cowork — macOS desktop available for Pro plan users with local VM support",
-    "API — Web search tool now GA with dynamic filtering for lower token costs",
-    "Claude Code — New /loop command added, voice STT expanded to 10 languages",
+    "NEW — Gemini now synthesizes info across Docs, Sheets & Drive for cross-file Q&A",
+    "UPDATE — Sheets 'Fill with Gemini' predicts & fills data from existing cells or Google Search",
+    "Pixel — March drop adds agentic AI tasks, smarter Circle to Search, standalone Now Playing app",
+    "UPDATE — Google Home significantly reduces Gemini voice cutoffs for smoother conversations",
+    "API — gemini-2.5-flash-lite-preview retiring 3/31, migrate to Gemini 3.1 Pro now",
+    "NEW — Gemini in Drive multi-doc Q&A now in beta for Google AI Pro & Ultra subscribers",
   ],
 };
 
