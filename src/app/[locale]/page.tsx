@@ -39,6 +39,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       languages: {
         ja: "https://gemilab.net",
         en: "https://gemilab.net/en",
+        "x-default": "https://gemilab.net/en",
       },
     },
   };
