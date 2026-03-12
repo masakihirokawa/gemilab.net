@@ -74,6 +74,22 @@ const CATEGORY_LABELS: Record<string, Record<string, string>> = {
   en: { "gemini-basics": "Gemini Basics", "gemini-dev": "Dev Tools", "gemini-api": "API / SDK", "gemini-advanced": "Advanced" },
 };
 
+
+// Extract headings from compiled HTML for SSR-safe TableOfContents (no CLS)
+function extractTocItems(html: string): { id: string; text: string; level: number }[] {
+  const items: { id: string; text: string; level: number }[] = [];
+  const regex = /<h([23])[^>]*>([\s\S]*?)<\/h[23]>/gi;
+  let i = 0;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(html)) !== null) {
+    items.push({
+      id: `section-${i++}`,
+      text: match[2].replace(/<[^>]+>/g, "").trim(),
+      level: parseInt(match[1]),
+    });
+  }
+  return items;
+}
 export default async function ArticlePage({ params }: Props) {
   const { locale, category, slug } = await params;
   const article = getArticle(locale, category, slug);
@@ -233,7 +249,7 @@ export default async function ArticlePage({ params }: Props) {
       <hr style={{ border: "none", borderTop: "1px solid var(--border-subtle)", marginBottom: 40 }} />
 
       {/* Table of Contents */}
-      <TableOfContents locale={locale} />
+      <TableOfContents locale={locale} initialItems={extractTocItems(article.content)} />
 
       {/* Article Content (pre-compiled HTML) */}
       {article.meta.premium ? (
