@@ -1,108 +1,84 @@
-# Claude Lab コンテンツ管理ログ
+# Gemini Lab コンテンツ管理ログ
 
 重複防止のため、すべての記事・ブログ投稿をカテゴリ別に記録しています。
 新しい記事を追加する際は、このログを参照して既存トピックとの重複を確認してください。
 
 ---
 
-## Articles（解説記事）— 計 52本 × 2言語
+## Articles（解説記事）— 計 27本 × 2言語
 
-### Claude AI（claude-ai）— 11本
+### Gemini 基本（gemini-basics）— 7本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
-| getting-started | Claude.ai はじめての使い方ガイド | beginner | 2026-03-06 |
-| prompt-engineering | プロンプトエンジニアリング実践ガイド | intermediate | 2026-03-08 |
-| projects-and-memory | Projects とメモリ機能の活用法 | intermediate | 2026-03-08 |
-| model-comparison | Claude モデル比較ガイド — Opus・Sonnet・Haiku の選び方 | beginner | 2026-03-08 |
-| artifacts-guide | Claude Artifacts 完全ガイド | intermediate | 2026-03-08 |
-| extended-thinking | Extended Thinking 解説 — Claude の思考過程を活用する | advanced | 2026-03-08 |
-| vision-guide | Claude Vision（画像認識）機能ガイド | intermediate | 2026-03-09 |
-| plan-comparison | Claude プラン比較ガイド | beginner | 2026-03-09 |
-| claude-for-education | Claude × 教育活用ガイド | beginner | 2026-03-09 |
-| recommended-books | Claude・AI 関連おすすめ書籍ガイド | beginner | 2026-03-09 |
-| gemini-claude-comparison | Gemini × Claude 使い分けガイド | intermediate | 2026-03-09 |
+| what-is-gemini | Google Geminiとは？基本機能と始め方を徹底解説 | beginner | 2026-03-11 |
+| gemini-25-pro-vs-flash | Gemini 2.5 Pro と 2.5 Flash の違い — 用途別モデル選択ガイド | beginner | 2026-03-11 |
+| gemini-for-business | ビジネスで使うGemini — 業務効率化の実践テクニック | intermediate | 2026-03-11 |
+| gemini-31-pro-guide | Gemini 3.1 Pro 徹底解説：3段階思考システムで複雑なタスクを攻略する | beginner | 2026-03-12 |
+| gemini-3-flash-guide | Gemini 3 Flash 完全ガイド — フロンティアAIを高速・低コストで活用する | beginner | 2026-03-13 |
+| gemini-3-pro-guide | Gemini 3 Pro 完全ガイド — Google 最高峰モデルの使いどころ | beginner | 2026-03-13 |
+| gemini-31-flash-lite-guide | Gemini 3.1 Flash Lite 完全ガイド — 最速・最コスト効率モデルの使い方 | beginner | 2026-03-13 |
 
-### Claude Code（claude-code）— 15本
+### Gemini API（gemini-api）— 9本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
-| setup-guide | Claude Code セットアップガイド | beginner | 2026-03-06 |
-| cli-commands | Claude Code CLI コマンド一覧 | intermediate | 2026-03-06 |
-| plugins-guide | Claude Code プラグイン開発入門 | advanced | 2026-03-06 |
-| hooks-and-automation | Hooks と自動化ガイド | intermediate | 2026-03-08 |
-| git-integration | Claude Code × Git 連携ガイド | intermediate | 2026-03-08 |
-| mcp-servers | MCP サーバー入門 | advanced | 2026-03-08 |
-| claude-md-memory | CLAUDE.md と Auto Memory | beginner | 2026-03-08 |
-| ci-cd-integration | Claude Code CI/CD 統合ガイド — GitHub Actions | advanced | 2026-03-09 |
-| ide-integration | Claude Code IDE 統合ガイド — VS Code・JetBrains | intermediate | 2026-03-09 |
-| cloudflare-pages-deploy | Claude Code × Cloudflare Pages デプロイガイド | intermediate | 2026-03-09 |
-| cursor-integration | Claude × Cursor エディタ統合ガイド | intermediate | 2026-03-09 |
-| agent-teams | Claude Code エージェントチーム入門 | advanced | 2026-03-09 |
-| practical-workflows | Claude Code 実践ワークフロー集 | intermediate | 2026-03-09 |
-| skills-marketplace | Claude Code スキル＆マーケットプレイス入門 | intermediate | 2026-03-09 |
-| figma-mcp-integration | Figma × Claude Code 連携ガイド — MCP でデザインとコードを双方向に橋渡し | intermediate | 2026-03-09 |
+| gemini-api-quickstart | Gemini API クイックスタート — Python/TypeScriptで始める | intermediate | 2026-03-11 |
+| multimodal-api-guide | Gemini マルチモーダルAPI完全ガイド — 画像・動画・音声を扱う | intermediate | 2026-03-11 |
+| streaming-and-chat | Gemini APIでストリーミング応答とマルチターン会話を実装する | intermediate | 2026-03-11 |
+| gemini-25-flash-guide | Gemini 2.5 Flash 完全ガイド — 速度と推論を両立するハイブリッドモデル | intermediate | 2026-03-12 |
+| gemini-api-logging-datasets | Gemini API のログ＆データセットツール活用ガイド | intermediate | 2026-03-12 |
+| gemini-live-api-guide | Gemini Live API 完全ガイド：リアルタイム音声・動画会話を構築する方法 | intermediate | 2026-03-13 |
+| context-caching-guide | Gemini API コンテキストキャッシュ完全ガイド — 大規模処理のコストを90%削減する | intermediate | 2026-03-13 |
+| json-mode-structured-output | Gemini API の JSON Mode と構造化出力 — 確実に JSON を受け取る方法 | beginner | 2026-03-13 |
+| embeddings-api-guide | Gemini Embeddings API ガイド — テキスト検索・類似度計算・RAG を実装する | intermediate | 2026-03-13 |
 
-### Cowork（cowork）— 15本
+### 高度機能（gemini-advanced）— 6本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
-| task-automation | Cowork タスク自動化入門 | beginner | 2026-03-06 |
-| file-management | Cowork ファイル管理ガイド | beginner | 2026-03-08 |
-| browser-automation | Cowork ブラウザ自動化ガイド | intermediate | 2026-03-08 |
-| scheduled-tasks | Cowork スケジュールタスク入門 | beginner | 2026-03-08 |
-| connectors-guide | Cowork コネクタ＆MCP 活用ガイド | intermediate | 2026-03-09 |
-| excel-powerpoint-integration | Cowork × Excel・PowerPoint 自動化ガイド | intermediate | 2026-03-09 |
-| google-stitch-integration | Google Stitch × Claude 統合ガイド | intermediate | 2026-03-09 |
-| skills-and-plugins | Cowork スキル＆プラグイン入門 | beginner | 2026-03-09 |
-| whats-new-2026 | Cowork 2026年の新機能まとめ | beginner | 2026-03-09 |
-| rork-app-development | Rork × Claude Code モバイルアプリ開発ガイド | intermediate | 2026-03-09 |
-| rork-max-guide | Rork Max 完全ガイド — ネイティブ Swift アプリ開発 | intermediate | 2026-03-09 |
-| aqua-voice-guide | Aqua Voice × Claude 音声入力ガイド | beginner | 2026-03-09 |
-| canva-claude-integration | Canva × Claude MCP コネクタ連携ガイド | intermediate | 2026-03-09 |
-| suno-ai-music-guide | Suno AI × Claude 活用ガイド — AI で作詞・作曲ワークフローを構築する | intermediate | 2026-03-09 |
-| pollo-ai-video-guide | Pollo AI × Claude 活用ガイド — AI 動画制作ワークフローを構築する | intermediate | 2026-03-10 |
+| function-calling-guide | Gemini Function Calling完全ガイド — 外部API連携の実装 | advanced | 2026-03-11 |
+| grounding-and-search | Grounding with Google Search — Geminiの検索連携で回答精度を上げる | advanced | 2026-03-11 |
+| deep-research-agent-guide | Gemini Deep Research Agent ガイド — Interactions API で自律リサーチを構築する | intermediate | 2026-03-12 |
+| computer-use-guide | Gemini 3 の Computer Use ツール入門 — AI がブラウザを自律操作する | advanced | 2026-03-12 |
+| gemini-25-pro-tts | Gemini 2.5 Pro TTS — AI音声合成の新時代が始まる | intermediate | 2026-03-12 |
+| video-understanding-guide | Gemini で動画を分析する — Video Understanding API 実践ガイド | intermediate | 2026-03-13 |
 
-### API / SDK（api-sdk）— 11本
+### 開発ツール（gemini-dev）— 5本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
-| api-quickstart | Claude API クイックスタート | beginner | 2026-03-06 |
-| tool-use-guide | Tool Use（関数呼び出し）ガイド | intermediate | 2026-03-08 |
-| streaming-responses | ストリーミングレスポンスガイド | intermediate | 2026-03-08 |
-| batch-processing | Claude API バッチ処理ガイド | advanced | 2026-03-08 |
-| prompt-caching | プロンプトキャッシング入門 | intermediate | 2026-03-08 |
-| error-handling | Claude API エラーハンドリングとリトライ戦略 | intermediate | 2026-03-09 |
-| rate-limits-best-practices | Claude API レート制限ベストプラクティス | intermediate | 2026-03-09 |
-| agent-sdk-guide | Claude Agent SDK 入門 — AI エージェントをプログラムで構築する | intermediate | 2026-03-10 |
-| multimodal-input-guide | マルチモーダル入力ガイド — Claude API で画像・PDF を活用する | intermediate | 2026-03-10 |
-| build-mcp-server | MCP サーバー自作ガイド — TypeScript・Python で独自ツールを構築する | intermediate | 2026-03-10 |
-| data-analysis-guide | Claude API データ分析入門 — コード実行と構造化出力で始める実践ガイド | intermediate | 2026-03-10 |
+| google-ai-studio-guide | Google AI Studio入門 — 無料でGemini APIを試す方法 | beginner | 2026-03-11 |
+| gemini-cli-guide | Gemini CLI入門 — ターミナルからGeminiを使いこなす | intermediate | 2026-03-11 |
+| gemini-extensions-guide | Gemini Extensions 活用ガイド — 外部ツールとの連携 | intermediate | 2026-03-11 |
+| gemini-webdev-arena-guide | Gemini 2.5 Pro で Webアプリを作る — WebDev Arena 1位の実力を試す | beginner | 2026-03-12 |
+| vertex-ai-quickstart | Vertex AI で Gemini を使う — エンタープライズ向けクイックスタート | intermediate | 2026-03-13 |
 
 ---
 
-## Blog（ニュース・アップデート）— 計 3本 × 2言語
+## Blog（ニュース・アップデート）— 計 4本 × 2言語
 
 | Slug | Title (JA) | Date |
 |------|------------|------|
-| claude-opus-4-6-release | Claude Opus 4.6 リリース | 2026-03-01 |
-| claude-code-desktop-app | Claude Code デスクトップアプリ登場 | 2026-02-20 |
-| claude-haiku-3-deprecation | Claude Haiku 3 の廃止予告 | 2026-03-05 |
+| gemini-lab-launch | Gemini Lab をオープンしました | 2026-03-12 |
+| gemini-31-pro-release | Gemini 3.1 Pro が登場 — 何が変わったのか | 2026-03-12 |
+| tech-stack-behind-gemini-lab | Gemini Lab を支える技術スタック | 2026-03-12 |
+| gemini-function-calling-agent | Gemini 3 Flash の Function Calling で自律エージェントを作った話 | 2026-03-13 |
 
 ---
 
 ## 未着手トピック候補（今後追加予定）
 
 ### Articles
-- Claude AI: システムプロンプト設計のベストプラクティス
-- Claude AI: Claude でのデータ分析入門
-- Claude Code: ワークスペースとマルチエージェント
-- Cowork: ドキュメント作成自動化
-- ~~API/SDK: Claude API でのデータ分析入門~~ → 完了 (2026-03-10)
+- gemini-basics: Gemini for Kids / 教育活用ガイド
+- gemini-api: Batch Processing API ガイド
+- gemini-api: Files API でPDF・音声を処理する
+- gemini-advanced: Long Context 100万トークン活用術
+- gemini-advanced: Code Execution ツール活用ガイド
+- gemini-dev: Gemini Nano（オンデバイス）入門
+- gemini-dev: Firebase Genkit × Gemini 統合ガイド
 
 ### Blog
-- Claude Sonnet 4.6 の特徴まとめ
-- Claude Code の Slack 連携が開始
-- Claude Code Web版の使い方
-- MCP エコシステムの拡大
-- Claude のプライバシーとセキュリティ
+- Gemini 3.2 リリース情報
+- Google I/O 2026 Gemini 発表まとめ
+- Gemini × Android Studio 連携の最新動向
 
 ---
 
-*最終更新: 2026-03-10*
+*最終更新: 2026-03-13*
