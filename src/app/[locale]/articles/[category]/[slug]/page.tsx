@@ -170,7 +170,7 @@ export default async function ArticlePage({ params }: Props) {
             letterSpacing: "0.06em",
           }}
         >
-          Articles
+          {locale === "ja" ? "記事一覧" : "Articles"}
         </a>
         <span style={{ fontSize: 12, color: "var(--text-faint)" }}>/</span>
         <span
