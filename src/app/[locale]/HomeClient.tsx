@@ -125,8 +125,8 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               className="hero-cta"
               style={{
                 display: "inline-flex", alignItems: "center", gap: 8, padding: "14px 32px",
-                border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
-                borderRadius: 6, background: "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
+                border: "1px solid color-mix(in srgb, var(--accent-coral) 45%, transparent)",
+                borderRadius: 6, background: "color-mix(in srgb, var(--accent-coral) 13%, transparent)",
                 color: "var(--accent-coral)", fontSize: 14, cursor: "pointer",
                 textDecoration: "none", letterSpacing: "0.04em",
               }}
