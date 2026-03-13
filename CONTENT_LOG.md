@@ -52,7 +52,7 @@
 
 ---
 
-## Blog（ニュース・アップデート）— 計 4本 × 2言語
+## Blog（ニュース・アップデート）— 計 5本 × 2言語
 
 | Slug | Title (JA) | Date |
 |------|------------|------|
@@ -60,6 +60,7 @@
 | gemini-31-pro-release | Gemini 3.1 Pro が登場 — 何が変わったのか | 2026-03-12 |
 | tech-stack-behind-gemini-lab | Gemini Lab を支える技術スタック | 2026-03-12 |
 | gemini-function-calling-agent | Gemini 3 Flash の Function Calling で自律エージェントを作った話 | 2026-03-13 |
+| gemini-android-studio-update | Gemini × Android Studio 連携 — 2026年最新動向まとめ | 2026-03-13 |
 
 ---
 
@@ -77,8 +78,8 @@
 ### Blog
 - Gemini 3.2 リリース情報
 - Google I/O 2026 Gemini 発表まとめ
-- Gemini × Android Studio 連携の最新動向
+~~- Gemini × Android Studio 連携の最新動向~~ ✅ 2026-03-13 追加済み
 
 ---
 
-*最終更新: 2026-03-13*
+*最終更新: 2026-03-13 (blog: +1, 計5本)*
