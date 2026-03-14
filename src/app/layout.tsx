@@ -26,10 +26,10 @@ export const metadata: Metadata = {
     description:
       "Google Gemini・Gemini API・Google AI Studio の初心者から上級者までを対象にした日本語ナレッジベース",
     url: "https://gemilab.net",
-    images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 630, alt: "Gemini Lab" }],
+    images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 1200, alt: "Gemini Lab" }],
   },
   twitter: {
-    card: "summary_large_image",
+    card: "summary",
     site: "@dolice",
     creator: "@dolice",
   },
