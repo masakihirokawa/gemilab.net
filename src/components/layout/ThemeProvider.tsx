@@ -10,6 +10,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       defaultTheme="dark"
       enableSystem={false}
       storageKey="gemilab-theme"
+      disableTransitionOnChange
     >
       {children}
     </NextThemesProvider>

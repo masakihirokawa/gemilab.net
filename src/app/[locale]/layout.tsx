@@ -9,7 +9,7 @@ import { NewsTicker } from "@/components/ui/NewsTicker";
 import { ScrollToTop } from "@/components/ui/ScrollToTop";
 
 // Blocking script to prevent FOUC (Flash of Unstyled Content) on theme change
-const themeScript = `(function(){try{var t=localStorage.getItem('gemilab-theme');if(t){document.documentElement.setAttribute('data-theme',t)}}catch(e){}})()`;
+const themeScript = `(function(){try{var t=localStorage.getItem('gemilab-theme');document.documentElement.setAttribute('data-theme',t||'dark')}catch(e){}})()`;
 
 
 export default async function LocaleLayout({
