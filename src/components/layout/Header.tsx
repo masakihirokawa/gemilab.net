@@ -98,6 +98,7 @@ export function Header() {
   const navItems = [
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
     { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
+    { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
     { key: "geminiBasics", label: t("nav.geminiBasics"), href: `${prefix}/articles/gemini-basics` },
     { key: "geminiDev", label: t("nav.geminiDev"), href: `${prefix}/articles/gemini-dev` },
     { key: "geminiApi", label: t("nav.geminiApi"), href: `${prefix}/articles/gemini-api` },
