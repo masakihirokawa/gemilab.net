@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "NEW — Gemini、Google Docs/Sheets/Drive を横断した質問応答・文書生成が可能に",
-    "UPDATE — Sheets「Fill with Gemini」、既存セルやGoogle検索からデータを自動予測・補完",
-    "Pixel — 3月アップデートでエージェントAIタスク・Circle to Search強化・Now Playingアプリ追加",
-    "UPDATE — Google Home、Gemini音声の途切れ問題を大幅改善、会話の自然な切り替えを実現",
-    "API — gemini-2.5-flash-lite-preview が3/31廃止、Gemini 3.1 Proへの移行を推奨",
-    "NEW — Gemini in Drive、複数ドキュメント横断の質問応答がAI Pro/UltraでBeta公開",
+    "NEW — Gemini、Docs/Sheets/Drive/Gmail を横断した複数文書 Q&A・文書生成が正式公開（3/10）",
+    "UPDATE — Sheets「Fill with Gemini」、既存セルや Google 検索からデータを自動予測・補完",
+    "API — gemini-3-pro-preview が 3/9 廃止、Gemini 3.1 Pro Preview への移行が必須",
+    "Pixel — 3月 Drop：食料品注文・レストラン検索などエージェント AI タスクが Pixel で可能に",
+    "UPDATE — Computer Use ツールが gemini-3-pro-preview と flash-preview に正式対応",
+    "Workspace — Gemini が複雑なスプレッドシートタスクで 70.48% の成功率を達成（新ベンチマーク）",
   ],
   en: [
-    "NEW — Gemini now synthesizes info across Docs, Sheets & Drive for cross-file Q&A",
-    "UPDATE — Sheets 'Fill with Gemini' predicts & fills data from existing cells or Google Search",
-    "Pixel — March drop adds agentic AI tasks, smarter Circle to Search, standalone Now Playing app",
-    "UPDATE — Google Home significantly reduces Gemini voice cutoffs for smoother conversations",
-    "API — gemini-2.5-flash-lite-preview retiring 3/31, migrate to Gemini 3.1 Pro now",
-    "NEW — Gemini in Drive multi-doc Q&A now in beta for Google AI Pro & Ultra subscribers",
+    "NEW — Gemini synthesizes info across Docs, Sheets, Drive & Gmail for multi-doc Q&A (3/10)",
+    "UPDATE — Sheets 'Fill with Gemini' predicts & auto-fills data from existing cells or Search",
+    "API — Gemini 3 Pro Preview discontinued 3/9; migrate to Gemini 3.1 Pro Preview now",
+    "Pixel — March Drop: Gemini handles agentic tasks like ordering groceries & finding restaurants",
+    "UPDATE — Computer Use tool now supported in gemini-3-pro-preview and flash-preview",
+    "Workspace — Gemini achieves 70.48% success rate on complex real-world spreadsheet tasks",
   ],
 };
 
