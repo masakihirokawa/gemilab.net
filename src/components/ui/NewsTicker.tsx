@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "NEW — Gemini、Docs/Sheets/Drive/Gmail を横断した複数文書 Q&A・文書生成が正式公開（3/10）",
-    "UPDATE — Sheets「Fill with Gemini」、既存セルや Google 検索からデータを自動予測・補完",
-    "API — gemini-3-pro-preview が 3/9 廃止、Gemini 3.1 Pro Preview への移行が必須",
-    "Pixel — 3月 Drop：食料品注文・レストラン検索などエージェント AI タスクが Pixel で可能に",
-    "UPDATE — Computer Use ツールが gemini-3-pro-preview と flash-preview に正式対応",
-    "Workspace — Gemini が複雑なスプレッドシートタスクで 70.48% の成功率を達成（新ベンチマーク）",
+    "3.1 Pro — Gemini 3.1 Pro がリリース、ARC-AGI-2 で 77.1% を記録し推論能力が大幅向上",
+    "API — thinking_level パラメータ・Thought Signatures・Interactions API（Beta）が追加",
+    "Flash-Lite — Gemini 3.1 Flash-Lite が Preview 公開、コスト効率重視の軽量モデル（3/3）",
+    "Workspace — Docs/Sheets/Drive/Gmail を横断する複数文書 Q&A が AI Ultra/Pro ユーザーに提供開始",
+    "ADK — Agent Development Kit × Live API Toolkit で双方向音声 AI エージェント開発が可能に",
+    "Personal AI — Gemini アプリの無料ユーザーにも Personal Intelligence が拡大（3/17）",
   ],
   en: [
-    "NEW — Gemini synthesizes info across Docs, Sheets, Drive & Gmail for multi-doc Q&A (3/10)",
-    "UPDATE — Sheets 'Fill with Gemini' predicts & auto-fills data from existing cells or Search",
-    "API — Gemini 3 Pro Preview discontinued 3/9; migrate to Gemini 3.1 Pro Preview now",
-    "Pixel — March Drop: Gemini handles agentic tasks like ordering groceries & finding restaurants",
-    "UPDATE — Computer Use tool now supported in gemini-3-pro-preview and flash-preview",
-    "Workspace — Gemini achieves 70.48% success rate on complex real-world spreadsheet tasks",
+    "3.1 Pro — Gemini 3.1 Pro released with 77.1% on ARC-AGI-2, major reasoning improvements",
+    "API — New thinking_level parameter, Thought Signatures & Interactions API (Beta) added",
+    "Flash-Lite — Gemini 3.1 Flash-Lite now in Preview; cost-efficient lightweight model (3/3)",
+    "Workspace — Multi-doc Q&A across Docs, Sheets, Drive & Gmail now live for AI Ultra/Pro users",
+    "ADK — Agent Development Kit × Live API Toolkit enables bidirectional voice AI agent dev",
+    "Personal AI — Personal Intelligence expands to free-tier Gemini app users (3/17)",
   ],
 };
 
