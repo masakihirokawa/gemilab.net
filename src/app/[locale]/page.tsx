@@ -32,6 +32,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       title: m.title,
       description: m.description,
       url,
+      type: "website",
+      siteName: "Gemini Lab",
       locale: locale === "ja" ? "ja_JP" : "en_US",
       images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 630, alt: "Gemini Lab" }],
     },
