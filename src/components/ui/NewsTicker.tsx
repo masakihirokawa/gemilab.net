@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "3.1 Pro — Gemini 3.1 Pro がリリース、ARC-AGI-2 で 77.1% を記録し推論能力が大幅向上",
-    "API — thinking_level パラメータ・Thought Signatures・Interactions API（Beta）が追加",
-    "Flash-Lite — Gemini 3.1 Flash-Lite が Preview 公開、コスト効率重視の軽量モデル（3/3）",
-    "Workspace — Docs/Sheets/Drive/Gmail を横断する複数文書 Q&A が AI Ultra/Pro ユーザーに提供開始",
-    "ADK — Agent Development Kit × Live API Toolkit で双方向音声 AI エージェント開発が可能に",
-    "Personal AI — Gemini アプリの無料ユーザーにも Personal Intelligence が拡大（3/17）",
+    "Gemini — Gemini 3 Pro Preview リリース：高度な推論・マルチモーダル・エージェント対応モデル",
+    "NEW — Gemini 3 Flash Preview 公開：大規模モデル級の性能を低コストで実現",
+    "API — Computer Use ツールが Gemini 3 Pro / Flash Preview で利用可能に",
+    "Pixel — Gemini スクリーン自動化を Pixel 10 に展開：アプリ操作をAIが代行（3月 Feature Drop）",
+    "Smart Home — Gemini for Home が 40% 高速化：カナダ・欧州・アジアなどへ展開拡大",
+    "Workspace — Docs/Sheets/Slides の AI 自動化ベータ開始：AI Ultra/Pro ユーザーが先行利用",
   ],
   en: [
-    "3.1 Pro — Gemini 3.1 Pro released with 77.1% on ARC-AGI-2, major reasoning improvements",
-    "API — New thinking_level parameter, Thought Signatures & Interactions API (Beta) added",
-    "Flash-Lite — Gemini 3.1 Flash-Lite now in Preview; cost-efficient lightweight model (3/3)",
-    "Workspace — Multi-doc Q&A across Docs, Sheets, Drive & Gmail now live for AI Ultra/Pro users",
-    "ADK — Agent Development Kit × Live API Toolkit enables bidirectional voice AI agent dev",
-    "Personal AI — Personal Intelligence expands to free-tier Gemini app users (3/17)",
+    "Gemini — Gemini 3 Pro Preview released: Advanced reasoning, multimodal & agentic capabilities",
+    "NEW — Gemini 3 Flash Preview: Frontier-class performance at a fraction of larger model costs",
+    "API — Computer Use tool now available in Gemini 3 Pro Preview and Gemini 3 Flash Preview",
+    "Pixel — Gemini screen automation rolls out to Pixel 10: AI handles in-app tasks on command",
+    "Smart Home — Gemini for Home 40% faster; expanding to Canada, Europe & Asia",
+    "Workspace — Gemini automates Docs, Sheets & Slides in beta for AI Ultra/Pro subscribers",
   ],
 };
 
