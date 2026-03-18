@@ -5,9 +5,9 @@
 
 ---
 
-## Articles（解説記事）— 計 27本 × 2言語
+## Articles（解説記事）— 計 30本 × 2言語
 
-### Gemini 基本（gemini-basics）— 7本
+### Gemini 基本（gemini-basics）— 8本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | what-is-gemini | Google Geminiとは？基本機能と始め方を徹底解説 | beginner | 2026-03-11 |
@@ -17,8 +17,9 @@
 | gemini-3-flash-guide | Gemini 3 Flash 完全ガイド — フロンティアAIを高速・低コストで活用する | beginner | 2026-03-13 |
 | gemini-3-pro-guide | Gemini 3 Pro 完全ガイド — Google 最高峰モデルの使いどころ | beginner | 2026-03-13 |
 | gemini-31-flash-lite-guide | Gemini 3.1 Flash Lite 完全ガイド — 最速・最コスト効率モデルの使い方 | beginner | 2026-03-13 |
+| google-ai-pro-ultra-subscription-guide | Google AI Pro・Ultra プラン徹底比較 — Gemini Advanced の新料金体系と選び方ガイド | beginner | 2026-03-19 |
 
-### Gemini API（gemini-api）— 9本
+### Gemini API（gemini-api）— 10本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | gemini-api-quickstart | Gemini API クイックスタート — Python/TypeScriptで始める | intermediate | 2026-03-11 |
@@ -30,8 +31,9 @@
 | context-caching-guide | Gemini API コンテキストキャッシュ完全ガイド — 大規模処理のコストを90%削減する | intermediate | 2026-03-13 |
 | json-mode-structured-output | Gemini API の JSON Mode と構造化出力 — 確実に JSON を受け取る方法 | beginner | 2026-03-13 |
 | embeddings-api-guide | Gemini Embeddings API ガイド — テキスト検索・類似度計算・RAG を実装する | intermediate | 2026-03-13 |
+| gemini-personal-intelligence-api-guide | Google Personal Intelligence × Gemini API — パーソナライズされた AI 体験を構築する | advanced | 2026-03-19 |
 
-### 高度機能（gemini-advanced）— 6本
+### 高度機能（gemini-advanced）— 7本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | function-calling-guide | Gemini Function Calling完全ガイド — 外部API連携の実装 | advanced | 2026-03-11 |
@@ -40,6 +42,7 @@
 | computer-use-guide | Gemini 3 の Computer Use ツール入門 — AI がブラウザを自律操作する | advanced | 2026-03-12 |
 | gemini-25-pro-tts | Gemini 2.5 Pro TTS — AI音声合成の新時代が始まる | intermediate | 2026-03-12 |
 | video-understanding-guide | Gemini で動画を分析する — Video Understanding API 実践ガイド | intermediate | 2026-03-13 |
+| gemini-31-pro-agentic-coding-deep-dive | Gemini 3.1 Pro のエージェンティック・コーディングを徹底解剖 | advanced | 2026-03-19 |
 
 ### 開発ツール（gemini-dev）— 5本
 | Slug | Title (JA) | Level | Date |
@@ -82,4 +85,4 @@
 
 ---
 
-*最終更新: 2026-03-13 (blog: +1, 計5本)*
+*最終更新: 2026-03-19 (articles: +3, 計30本)*
