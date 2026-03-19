@@ -24,11 +24,11 @@
 
 ---
 
-## サイト規模（2026-03-19 現在）
+## サイト規模（2026-03-20 現在）
 
-- 記事: 122本 × 2言語 = 244エントリ
-- ブログ: 8本 × 2言語 = 16エントリ
-- カテゴリ: gemini-api (45), gemini-basics (27), gemini-advanced (25), gemini-dev (24), gemini-updates (1)
+- 記事: JA 134本 / EN 109本 = 243エントリ（うちプレミアム JA 32本 / EN 21本）
+- ブログ: JA 8本 / EN 7本 = 15エントリ
+- カテゴリ: gemini-api (49), gemini-advanced (29), gemini-basics (28), gemini-dev (26), gemini-workspace (1), gemini-updates (1)
 
 ---
 

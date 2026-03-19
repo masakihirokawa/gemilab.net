@@ -5,9 +5,9 @@
 
 ---
 
-## Articles（解説記事）— 計 30本 × 2言語
+## Articles（解説記事）— 計 JA 134本 / EN 109本
 
-### Gemini 基本（gemini-basics）— 8本
+### Gemini 基本（gemini-basics）— JA 28本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | what-is-gemini | Google Geminiとは？基本機能と始め方を徹底解説 | beginner | 2026-03-11 |
@@ -19,7 +19,7 @@
 | gemini-31-flash-lite-guide | Gemini 3.1 Flash Lite 完全ガイド — 最速・最コスト効率モデルの使い方 | beginner | 2026-03-13 |
 | google-ai-pro-ultra-subscription-guide | Google AI Pro・Ultra プラン徹底比較 — Gemini Advanced の新料金体系と選び方ガイド | beginner | 2026-03-19 |
 
-### Gemini API（gemini-api）— 10本
+### Gemini API（gemini-api）— JA 49本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | gemini-api-quickstart | Gemini API クイックスタート — Python/TypeScriptで始める | intermediate | 2026-03-11 |
@@ -33,7 +33,7 @@
 | embeddings-api-guide | Gemini Embeddings API ガイド — テキスト検索・類似度計算・RAG を実装する | intermediate | 2026-03-13 |
 | gemini-personal-intelligence-api-guide | Google Personal Intelligence × Gemini API — パーソナライズされた AI 体験を構築する | advanced | 2026-03-19 |
 
-### 高度機能（gemini-advanced）— 7本
+### 高度機能（gemini-advanced）— JA 29本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | function-calling-guide | Gemini Function Calling完全ガイド — 外部API連携の実装 | advanced | 2026-03-11 |
@@ -43,8 +43,9 @@
 | gemini-25-pro-tts | Gemini 2.5 Pro TTS — AI音声合成の新時代が始まる | intermediate | 2026-03-12 |
 | video-understanding-guide | Gemini で動画を分析する — Video Understanding API 実践ガイド | intermediate | 2026-03-13 |
 | gemini-31-pro-agentic-coding-deep-dive | Gemini 3.1 Pro のエージェンティック・コーディングを徹底解剖 | advanced | 2026-03-19 |
+| gemini-premium-best-practices-collection | Gemini 開発ベストプラクティス総集編 — 28本のプレミアム記事から厳選した実践テクニック集 | intermediate-advanced | 2026-03-20 |
 
-### 開発ツール（gemini-dev）— 5本
+### 開発ツール（gemini-dev）— JA 26本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | google-ai-studio-guide | Google AI Studio入門 — 無料でGemini APIを試す方法 | beginner | 2026-03-11 |
