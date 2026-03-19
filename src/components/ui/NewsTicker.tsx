@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "Gemini — Gemini 3 Pro Preview リリース：高度な推論・マルチモーダル・エージェント対応モデル",
-    "NEW — Gemini 3 Flash Preview 公開：大規模モデル級の性能を低コストで実現",
-    "API — Computer Use ツールが Gemini 3 Pro / Flash Preview で利用可能に",
-    "Pixel — Gemini スクリーン自動化を Pixel 10 に展開：アプリ操作をAIが代行（3月 Feature Drop）",
-    "Smart Home — Gemini for Home が 40% 高速化：カナダ・欧州・アジアなどへ展開拡大",
-    "Workspace — Docs/Sheets/Slides の AI 自動化ベータ開始：AI Ultra/Pro ユーザーが先行利用",
+    "Workspace — Gemini が Docs/Sheets/Slides/Drive に深く統合、パーソナライズ文書作成に対応（3月）",
+    "Pixel Drop — 3月の Pixel アップデート：Gemini によるエージェント型タスク実行・Magic Cue 追加",
+    "Smart Home — Gemini for Home が応答速度 40% 向上、スマートオートメーション機能を強化",
+    "Sheets — Gemini の Sheets タスク処理が成功率 70.48% に到達、複雑な実務処理に対応",
+    "Chrome — Gemini in Chrome がカナダ・NZ・インドに展開、50以上の新言語をサポート",
+    "OpenClaw — NVIDIA NemoClaw 発表：OpenClaw をエンタープライズ対応に（GTC 2026）",
   ],
   en: [
-    "Gemini — Gemini 3 Pro Preview released: Advanced reasoning, multimodal & agentic capabilities",
-    "NEW — Gemini 3 Flash Preview: Frontier-class performance at a fraction of larger model costs",
-    "API — Computer Use tool now available in Gemini 3 Pro Preview and Gemini 3 Flash Preview",
-    "Pixel — Gemini screen automation rolls out to Pixel 10: AI handles in-app tasks on command",
-    "Smart Home — Gemini for Home 40% faster; expanding to Canada, Europe & Asia",
-    "Workspace — Gemini automates Docs, Sheets & Slides in beta for AI Ultra/Pro subscribers",
+    "Workspace — Gemini deeply integrated into Docs, Sheets, Slides & Drive with personalized docs (Mar)",
+    "Pixel Drop — March Pixel update: Agentic AI tasks in Gemini, Magic Cue suggestions in chats",
+    "Smart Home — Gemini for Home gets 40% faster response time, smarter automation features",
+    "Sheets — Gemini achieves 70.48% success rate on complex real-world spreadsheet tasks",
+    "Chrome — Gemini in Chrome rolls out to Canada, NZ, India with 50+ new languages",
+    "OpenClaw — NVIDIA announces NemoClaw: enterprise-grade AI agents at GTC 2026",
   ],
 };
 
