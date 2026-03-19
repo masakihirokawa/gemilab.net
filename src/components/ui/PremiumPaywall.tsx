@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 
 interface PremiumPaywallProps {
   locale: string;
@@ -8,23 +8,17 @@ interface PremiumPaywallProps {
 
 const PLANS: Record<string, { pro: { priceId: string; label: string }; premium: { priceId: string; label: string } }> = {
   ja: {
-    pro: { priceId: "price_1TCQykEGB5g6A54oRZa4faF7", label: "Pro — ¥380/月" },
-    premium: { priceId: "price_1TCQyxEGB5g6A54o56MtETkI", label: "Premium — ¥1,480（永久）" },
+    pro: { priceId: "price_1T9XgTEGB5g6A54ojl6Yp2lw", label: "Pro — ¥500/月" },
+    premium: { priceId: "price_1T9XfZEGB5g6A54olbkcLGTs", label: "Premium — ¥2,980（永久）" },
   },
   en: {
-    pro: { priceId: "price_1TCQymEGB5g6A54oyBTnCcRh", label: "Pro — $3/mo" },
-    premium: { priceId: "price_1TCQyzEGB5g6A54odkusafTp", label: "Premium — $10 (lifetime)" },
+    pro: { priceId: "price_1TALKEEGB5g6A54o5JKqn7TL", label: "Pro — $5/mo" },
+    premium: { priceId: "price_1TALKGEGB5g6A54oUIZaioUu", label: "Premium — $19 (lifetime)" },
   },
 };
 
 export function PremiumPaywall({ locale }: PremiumPaywallProps) {
   const [loading, setLoading] = useState<string | null>(null);
-  const [isPremium, setIsPremium] = useState(false);
-
-  useEffect(() => {
-    const hasPremium = document.cookie.split(";").some((c) => c.trim().startsWith("premium_token="));
-    setIsPremium(hasPremium);
-  }, []);
   const plans = PLANS[locale] || PLANS.en;
 
   const handleCheckout = async (priceId: string, mode: string, plan: string) => {
@@ -45,8 +39,6 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
       setLoading(null);
     }
   };
-
-  if (isPremium) return null;
 
   return (
     <div
@@ -78,7 +70,7 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
             marginBottom: 8,
           }}
         >
-          {locale === "ja" ? "続きを読むには" : "Continue Reading"}
+          {locale === "ja" ? "ここまでお読みいただきありがとうございます" : "Thank you for reading this far"}
         </h3>
         <p
           style={{
@@ -89,8 +81,8 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
           }}
         >
           {locale === "ja"
-            ? "この記事の続きは Claude Lab メンバー限定です。すべてのプレミアム記事にアクセスできます。"
-            : "The rest of this article is for Claude Lab members. Get access to all premium articles."}
+            ? "この先には、実装コードやベンチマーク結果など、より実践的な内容をご用意しています。メンバーシップで続きをお読みいただけます。"
+            : "What follows includes implementation code, benchmarks, and more hands-on content. Membership unlocks the full article."}
         </p>
 
         {/* Pro button */}
