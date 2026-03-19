@@ -9,11 +9,11 @@ interface Props {
 const META: Record<string, { title: string; description: string }> = {
   ja: {
     title: "メンバーシップ & サポート — Gemini Lab",
-    description: "Gemini Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。月額 ¥500 または永久アクセス ¥2,980。",
+    description: "Gemini Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。月額 ¥380 または永久アクセス ¥1,480。",
   },
   en: {
     title: "Membership & Support — Gemini Lab",
-    description: "Get full access to all premium articles with Gemini Lab Pro / Premium. $5/month or $19 lifetime.",
+    description: "Get full access to all premium articles with Gemini Lab Pro / Premium. $3/month or $10 lifetime.",
   },
 };
 
