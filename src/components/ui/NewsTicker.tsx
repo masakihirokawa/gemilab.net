@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "Workspace — Gemini が Docs/Sheets/Slides/Drive に深く統合、パーソナライズ文書作成に対応（3月）",
-    "Pixel Drop — 3月の Pixel アップデート：Gemini によるエージェント型タスク実行・Magic Cue 追加",
-    "Smart Home — Gemini for Home が応答速度 40% 向上、スマートオートメーション機能を強化",
-    "Sheets — Gemini の Sheets タスク処理が成功率 70.48% に到達、複雑な実務処理に対応",
-    "Chrome — Gemini in Chrome がカナダ・NZ・インドに展開、50以上の新言語をサポート",
-    "OpenClaw — NVIDIA NemoClaw 発表：OpenClaw をエンタープライズ対応に（GTC 2026）",
+    "Gemini 3.1 — Gemini 3.1 Pro Preview リリース：推論・マルチモーダル・エージェント性能が大幅向上",
+    "Workspace — Gemini が Docs/Sheets/Slides/Drive を横断して AI 文書作成を自動化（3月更新）",
+    "API — Gemini API が 2026年1月に 850億リクエスト突破、前年比 142% 成長",
+    "Home — Gemini for Home が応答速度 40% 改善、カナダ・欧州・アジアに展開拡大",
+    "BILLING — Gemini API に課金上限制度を 4月導入、プロジェクト単位で月額制御が可能に",
+    "TOOLS — Gemini 3 で Computer Use・Maps 対応、関数呼び出しとの同時利用が可能に",
   ],
   en: [
-    "Workspace — Gemini deeply integrated into Docs, Sheets, Slides & Drive with personalized docs (Mar)",
-    "Pixel Drop — March Pixel update: Agentic AI tasks in Gemini, Magic Cue suggestions in chats",
-    "Smart Home — Gemini for Home gets 40% faster response time, smarter automation features",
-    "Sheets — Gemini achieves 70.48% success rate on complex real-world spreadsheet tasks",
-    "Chrome — Gemini in Chrome rolls out to Canada, NZ, India with 50+ new languages",
-    "OpenClaw — NVIDIA announces NemoClaw: enterprise-grade AI agents at GTC 2026",
+    "Gemini 3.1 — Gemini 3.1 Pro Preview released: major reasoning, multimodal & agent upgrades",
+    "Workspace — Gemini automates AI document creation across Docs, Sheets, Slides & Drive (Mar)",
+    "API — Gemini API hits 85B requests in Jan 2026, up 142% year-over-year growth",
+    "Home — Gemini for Home gets 40% faster responses, expanding to Canada, Europe & Asia",
+    "BILLING — Gemini API introducing billing caps in April, per-project monthly spend control",
+    "TOOLS — Gemini 3 adds Computer Use & Maps tools, combinable with function calling",
   ],
 };
 
