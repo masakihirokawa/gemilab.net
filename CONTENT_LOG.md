@@ -5,7 +5,7 @@
 
 ---
 
-## Articles（解説記事）— 計 JA 134本 / EN 109本
+## Articles（解説記事）— 計 JA 139本 / EN 114本
 
 ### Gemini 基本（gemini-basics）— JA 28本
 | Slug | Title (JA) | Level | Date |
@@ -18,6 +18,9 @@
 | gemini-3-pro-guide | Gemini 3 Pro 完全ガイド — Google 最高峰モデルの使いどころ | beginner | 2026-03-13 |
 | gemini-31-flash-lite-guide | Gemini 3.1 Flash Lite 完全ガイド — 最速・最コスト効率モデルの使い方 | beginner | 2026-03-13 |
 | google-ai-pro-ultra-subscription-guide | Google AI Pro・Ultra プラン徹底比較 — Gemini Advanced の新料金体系と選び方ガイド | beginner | 2026-03-19 |
+| gemini-complete-guide-2026 | Gemini 完全ガイド 2026年版 | beginner | 2026-03-20 |
+| gemini-practical-techniques-part1 | Gemini 実践テクニック パート1 | intermediate | 2026-03-20 |
+| ai-tools-directory-2026-part1 | AI ツールディレクトリ 2026年版 パート1 | beginner | 2026-03-20 |
 
 ### Gemini API（gemini-api）— JA 49本
 | Slug | Title (JA) | Level | Date |
@@ -44,6 +47,8 @@
 | video-understanding-guide | Gemini で動画を分析する — Video Understanding API 実践ガイド | intermediate | 2026-03-13 |
 | gemini-31-pro-agentic-coding-deep-dive | Gemini 3.1 Pro のエージェンティック・コーディングを徹底解剖 | advanced | 2026-03-19 |
 | gemini-premium-best-practices-collection | Gemini 開発ベストプラクティス総集編 — 28本のプレミアム記事から厳選した実践テクニック集 | intermediate-advanced | 2026-03-20 |
+| gemini-practical-techniques-part2 | Gemini 実践テクニック パート2【プレミアム】 | advanced | 2026-03-20 |
+| ai-tools-directory-2026-part2 | AI ツールディレクトリ 2026年版 パート2【プレミアム】 | intermediate-advanced | 2026-03-20 |
 
 ### 開発ツール（gemini-dev）— JA 26本
 | Slug | Title (JA) | Level | Date |
@@ -86,4 +91,4 @@
 
 ---
 
-*最終更新: 2026-03-19 (articles: +3, 計30本)*
+*最終更新: 2026-03-20 (articles: +5, 計35本)*
