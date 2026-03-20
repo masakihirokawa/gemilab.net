@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "Gemini 3.1 — Gemini 3.1 Pro Preview リリース：推論・マルチモーダル・エージェント性能が大幅向上",
-    "Workspace — Gemini が Docs/Sheets/Slides/Drive を横断して AI 文書作成を自動化（3月更新）",
-    "API — Gemini API が 2026年1月に 850億リクエスト突破、前年比 142% 成長",
-    "Home — Gemini for Home が応答速度 40% 改善、カナダ・欧州・アジアに展開拡大",
-    "BILLING — Gemini API に課金上限制度を 4月導入、プロジェクト単位で月額制御が可能に",
-    "TOOLS — Gemini 3 で Computer Use・Maps 対応、関数呼び出しとの同時利用が可能に",
+    "MODEL — Gemini 3.1 Flash-Lite Preview・Nano Banana 2 が登場（3/19）",
+    "WORKSPACE — Gemini が Docs・Sheets・Slides・Drive に拡張、AI Overview 追加（3/17）",
+    "CHROME — Gemini in Chrome がカナダ・NZ・インドに展開、50+ 言語対応（3/15）",
+    "PIXEL — March Pixel Drop：Gemini で食料品注文・レストラン検索が可能に（3/13）",
+    "HOME — Gemini for Home：音声コマンドの認識精度と機器制御が向上（3/10）",
+    "PLAN — Google AI Pro $19.99/月 & Ultra プランで新機能にアーリーアクセス（3/8）",
   ],
   en: [
-    "Gemini 3.1 — Gemini 3.1 Pro Preview released: major reasoning, multimodal & agent upgrades",
-    "Workspace — Gemini automates AI document creation across Docs, Sheets, Slides & Drive (Mar)",
-    "API — Gemini API hits 85B requests in Jan 2026, up 142% year-over-year growth",
-    "Home — Gemini for Home gets 40% faster responses, expanding to Canada, Europe & Asia",
-    "BILLING — Gemini API introducing billing caps in April, per-project monthly spend control",
-    "TOOLS — Gemini 3 adds Computer Use & Maps tools, combinable with function calling",
+    "MODEL — Gemini 3.1 Flash-Lite Preview and Nano Banana 2 arrive (3/19)",
+    "WORKSPACE — Gemini expands to Docs, Sheets, Slides & Drive with AI Overview (3/17)",
+    "CHROME — Gemini in Chrome launches in Canada, NZ & India with 50+ languages (3/15)",
+    "PIXEL — March Pixel Drop: grocery ordering and restaurant search via Gemini (3/13)",
+    "HOME — Gemini for Home: improved voice recognition accuracy and device control (3/10)",
+    "PLAN — Google AI Pro $19.99/month & Ultra plan with early feature access (3/8)",
   ],
 };
 
