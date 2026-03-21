@@ -25,7 +25,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   return {
     title: m.title,
     description: m.description,
-    openGraph: { title: m.title, description: m.description },
+    openGraph: { title: m.title, description: m.description, images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 630, alt: "Gemini Lab", type: "image/png" }] },
     alternates: {
       canonical:
         locale === "ja"

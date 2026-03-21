@@ -23,7 +23,7 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
   const metadata: Metadata = {
     title,
     description,
-    openGraph: { title, description },
+    openGraph: { title, description, images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 630, alt: "Gemini Lab", type: "image/png" }] },
     alternates: {
       canonical: canonicalUrl,
       languages: {
