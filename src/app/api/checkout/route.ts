@@ -9,8 +9,12 @@ function getStripe() {
 }
 
 const PLAN_NAMES: Record<string, string> = {
+  // JA
+  "price_1TCQyPEGB5g6A54oqVrc9ron": "Gemini Lab チップ（¥150）",
   "price_1TCQykEGB5g6A54oRZa4faF7": "Gemini Lab Pro（月額プラン）",
   "price_1TCQyxEGB5g6A54o56MtETkI": "Gemini Lab Premium（永久アクセス）",
+  // EN
+  "price_1TCQyXEGB5g6A54okNKaZiad": "Gemini Lab Tip ($1.50)",
   "price_1TCQymEGB5g6A54oyBTnCcRh": "Gemini Lab Pro (Monthly)",
   "price_1TCQyzEGB5g6A54odkusafTp": "Gemini Lab Premium (Lifetime)",
 };
