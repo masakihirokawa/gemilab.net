@@ -7,12 +7,15 @@ interface Props {
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale } = await params;
   const title = locale === "ja" ? "プライバシーポリシー" : "Privacy Policy";
-  return { title, openGraph: { title },
+  return {
+    title,
+    openGraph: { title },
     alternates: {
       canonical: locale === "ja" ? "https://gemilab.net/privacy" : `https://gemilab.net/en/privacy`,
       languages: {
         ja: "https://gemilab.net/privacy",
         en: "https://gemilab.net/en/privacy",
+        "x-default": "https://gemilab.net/en/privacy",
       },
     },
   };

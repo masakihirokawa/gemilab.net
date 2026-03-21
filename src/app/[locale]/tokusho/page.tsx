@@ -7,12 +7,15 @@ interface Props {
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale } = await params;
   const title = locale === "ja" ? "特定商取引法に基づく表記" : "Legal Notice";
-  return { title, openGraph: { title },
+  return {
+    title,
+    openGraph: { title },
     alternates: {
       canonical: locale === "ja" ? "https://gemilab.net/tokusho" : `https://gemilab.net/en/tokusho`,
       languages: {
         ja: "https://gemilab.net/tokusho",
         en: "https://gemilab.net/en/tokusho",
+        "x-default": "https://gemilab.net/en/tokusho",
       },
     },
   };

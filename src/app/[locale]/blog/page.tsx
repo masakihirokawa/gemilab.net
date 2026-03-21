@@ -11,12 +11,16 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const description = locale === "ja"
     ? "Gemini Lab の開発ブログ。サイト運営の裏側や技術的なトピックを発信します。"
     : "Gemini Lab development blog. Behind-the-scenes insights and technical topics.";
-  return { title, description, openGraph: { title, description },
+  return {
+    title,
+    description,
+    openGraph: { title, description },
     alternates: {
       canonical: locale === "ja" ? "https://gemilab.net/blog" : `https://gemilab.net/en/blog`,
       languages: {
         ja: "https://gemilab.net/blog",
         en: "https://gemilab.net/en/blog",
+        "x-default": "https://gemilab.net/en/blog",
       },
     },
   };

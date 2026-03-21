@@ -26,6 +26,11 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     description: m.description,
     alternates: {
       canonical: `https://gemilab.net${prefix}/support`,
+      languages: {
+        ja: "https://gemilab.net/support",
+        en: "https://gemilab.net/en/support",
+        "x-default": "https://gemilab.net/en/support",
+      },
     },
   };
 }

@@ -8,21 +8,40 @@ interface Props {
   searchParams: Promise<{ page?: string; category?: string }>;
 }
 
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
+export async function generateMetadata({ params, searchParams }: Props): Promise<Metadata> {
   const { locale } = await params;
+  const sp = await searchParams;
+  const currentPage = Math.max(1, parseInt(sp.page || "1", 10) || 1);
+
   const title = locale === "ja" ? "すべての記事" : "All Articles";
   const description = locale === "ja"
     ? "Gemini Lab の全記事一覧。Gemini.ai、Gemini Code、Cowork、API / SDK のカテゴリ別に閲覧できます。"
     : "Browse all Gemini Lab articles by category: Gemini.ai, Gemini Code, Cowork, and API / SDK.";
-  return { title, description, openGraph: { title, description },
+
+  const canonicalUrl = locale === "ja" ? "https://gemilab.net/articles" : `https://gemilab.net/en/articles`;
+
+  const metadata: Metadata = {
+    title,
+    description,
+    openGraph: { title, description },
     alternates: {
-      canonical: locale === "ja" ? "https://gemilab.net/articles" : `https://gemilab.net/en/articles`,
+      canonical: canonicalUrl,
       languages: {
         ja: "https://gemilab.net/articles",
         en: "https://gemilab.net/en/articles",
+        "x-default": "https://gemilab.net/en/articles",
       },
     },
   };
+
+  // Add noindex for paginated pages (page > 1)
+  if (currentPage > 1) {
+    metadata.robots = {
+      index: false,
+    };
+  }
+
+  return metadata;
 }
 
 const LEVEL_LABELS: Record<string, Record<string, string>> = {

@@ -17,12 +17,18 @@ const CAT_TITLES: Record<string, Record<string, string>> = {
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale, category } = await params;
   const title = CAT_TITLES[category]?.[locale] || CAT_TITLES[category]?.en || category;
-  return { title, openGraph: { title },
+  const description = CATEGORY_DESC[category]?.[locale] || "";
+
+  return {
+    title,
+    description,
+    openGraph: { title, description },
     alternates: {
       canonical: locale === "ja" ? `https://gemilab.net/articles/${category}` : `https://gemilab.net/en/articles/${category}`,
       languages: {
         ja: `https://gemilab.net/articles/${category}`,
         en: `https://gemilab.net/en/articles/${category}`,
+        "x-default": `https://gemilab.net/en/articles/${category}`,
       },
     },
   };
