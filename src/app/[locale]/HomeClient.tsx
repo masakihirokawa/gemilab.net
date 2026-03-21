@@ -25,16 +25,16 @@ const GUIDES_LIGHT = {
   red: "linear-gradient(135deg, #f7eef0 0%, #f0dde2 55%, #e8d0d7 100%)",
 };
 
-const GUIDES: Record<string, { title: string; desc: string; articles: number; level: string; colorKey: keyof typeof GUIDES_DARK; href: string }[]> = {
+const GUIDES: Record<string, { title: string; desc: string; categories: string[]; level: string; colorKey: keyof typeof GUIDES_DARK; href: string }[]> = {
   ja: [
-    { title: "Gemini 入門ガイド", desc: "Geminiの基本から始めよう", articles: 12, level: "beginner", colorKey: "purple", href: "/articles/gemini-basics" },
-    { title: "Gemini API クイックスタート", desc: "APIを使ったアプリ開発の第一歩", articles: 18, level: "intermediate-advanced", colorKey: "green", href: "/articles/gemini-api" },
-    { title: "Google AI Studio 活用法", desc: "無料で始めるプロンプトデザイン", articles: 15, level: "intermediate", colorKey: "red", href: "/articles/gemini-dev" },
+    { title: "Gemini 入門ガイド", desc: "Geminiの基本から始めよう", categories: ["gemini-basics"], level: "beginner", colorKey: "purple", href: "/articles/gemini-basics" },
+    { title: "Gemini API クイックスタート", desc: "APIを使ったアプリ開発の第一歩", categories: ["gemini-api"], level: "intermediate-advanced", colorKey: "green", href: "/articles/gemini-api" },
+    { title: "Google AI Studio 活用法", desc: "無料で始めるプロンプトデザイン", categories: ["gemini-dev"], level: "intermediate", colorKey: "red", href: "/articles/gemini-dev" },
   ],
   en: [
-    { title: "Gemini Getting Started", desc: "Start with the basics of Gemini", articles: 12, level: "beginner", colorKey: "purple", href: "/en/articles/gemini-basics" },
-    { title: "Gemini API Quickstart", desc: "Build your first app with the API", articles: 18, level: "intermediate-advanced", colorKey: "green", href: "/en/articles/gemini-api" },
-    { title: "Google AI Studio Guide", desc: "Free prompt design and testing", articles: 15, level: "intermediate", colorKey: "red", href: "/en/articles/gemini-dev" },
+    { title: "Gemini Getting Started", desc: "Start with the basics of Gemini", categories: ["gemini-basics"], level: "beginner", colorKey: "purple", href: "/en/articles/gemini-basics" },
+    { title: "Gemini API Quickstart", desc: "Build your first app with the API", categories: ["gemini-api"], level: "intermediate-advanced", colorKey: "green", href: "/en/articles/gemini-api" },
+    { title: "Google AI Studio Guide", desc: "Free prompt design and testing", categories: ["gemini-dev"], level: "intermediate", colorKey: "red", href: "/en/articles/gemini-dev" },
   ],
 };
 
@@ -297,33 +297,38 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16 }}>
-          {(GUIDES[locale] || GUIDES.ja).map((guide, i) => (
-            <a
-              key={i}
-              href={guide.href}
-              className={`guide-card${mounted && !skipAnim ? " animate-fade-up" : ""}`}
-              style={{
-                display: "block", padding: "32px 28px", borderRadius: 8,
-                background: isDark ? GUIDES_DARK[guide.colorKey] : GUIDES_LIGHT[guide.colorKey], border: "1px solid var(--border-subtle)",
-                cursor: "pointer",
-                animationDelay: `${0.5 + i * 0.1}s`,
-                textDecoration: "none",
-              }}
-            >
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
-                <LevelBadge level={guide.level} label={t(`levels.${guide.level}`)} />
-                <span style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
-                  {t("articles.count", { count: guide.articles })}
-                </span>
-              </div>
-              <h3 style={{ fontSize: 18, fontWeight: 500, color: "var(--text-primary)", marginBottom: 8, letterSpacing: "0.01em" }}>
-                {guide.title}
-              </h3>
-              <p style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.6 }}>
-                {guide.desc}
-              </p>
-            </a>
-          ))}
+          {(GUIDES[locale] || GUIDES.ja).map((guide, i) => {
+            const count = guide.categories.length > 0
+              ? articles.filter((a) => guide.categories.includes(a.category)).length
+              : articles.length;
+            return (
+              <a
+                key={i}
+                href={guide.href}
+                className={`guide-card${mounted && !skipAnim ? " animate-fade-up" : ""}`}
+                style={{
+                  display: "block", padding: "32px 28px", borderRadius: 8,
+                  background: isDark ? GUIDES_DARK[guide.colorKey] : GUIDES_LIGHT[guide.colorKey], border: "1px solid var(--border-subtle)",
+                  cursor: "pointer",
+                  animationDelay: `${0.5 + i * 0.1}s`,
+                  textDecoration: "none",
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+                  <LevelBadge level={guide.level} label={t(`levels.${guide.level}`)} />
+                  <span style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
+                    {t("articles.count", { count })}
+                  </span>
+                </div>
+                <h3 style={{ fontSize: 18, fontWeight: 500, color: "var(--text-primary)", marginBottom: 8, letterSpacing: "0.01em" }}>
+                  {guide.title}
+                </h3>
+                <p style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.6 }}>
+                  {guide.desc}
+                </p>
+              </a>
+            );
+          })}
         </div>
       </section>
 
