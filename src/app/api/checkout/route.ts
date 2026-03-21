@@ -8,6 +8,13 @@ function getStripe() {
   });
 }
 
+const PLAN_NAMES: Record<string, string> = {
+  "price_1TCQykEGB5g6A54oRZa4faF7": "Gemini Lab Pro（月額プラン）",
+  "price_1TCQyxEGB5g6A54o56MtETkI": "Gemini Lab Premium（永久アクセス）",
+  "price_1TCQymEGB5g6A54oyBTnCcRh": "Gemini Lab Pro (Monthly)",
+  "price_1TCQyzEGB5g6A54odkusafTp": "Gemini Lab Premium (Lifetime)",
+};
+
 export async function POST(request: NextRequest) {
   try {
     const stripe = getStripe();
@@ -15,6 +22,7 @@ export async function POST(request: NextRequest) {
     const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://gemilab.net";
     const prefix = locale === "en" ? "en/" : "";
     const fallbackCancel = `${baseUrl}/${prefix}support`;
+    const planName = PLAN_NAMES[priceId] || "Gemini Lab Membership";
 
     const session = await stripe.checkout.sessions.create({
       mode: mode || "payment",
@@ -26,7 +34,10 @@ export async function POST(request: NextRequest) {
       ],
       // Pro（月額）のみ初月無料トライアルを付与
       ...(mode === "subscription" && {
-        subscription_data: { trial_period_days: 30 },
+        subscription_data: { trial_period_days: 30, description: planName },
+      }),
+      ...(mode === "payment" && {
+        payment_intent_data: { description: planName },
       }),
       success_url: `${baseUrl}/${prefix}api/verify-session?session_id={CHECKOUT_SESSION_ID}&locale=${locale}`,
       cancel_url: cancelUrl || fallbackCancel,
