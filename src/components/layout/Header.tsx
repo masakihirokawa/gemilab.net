@@ -98,12 +98,12 @@ export function Header() {
   const scrolled = scrollY > 50;
   const navItems = [
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
-    { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
     { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
     { key: "geminiBasics", label: t("nav.geminiBasics"), href: `${prefix}/articles/gemini-basics` },
     { key: "geminiDev", label: t("nav.geminiDev"), href: `${prefix}/articles/gemini-dev` },
     { key: "geminiApi", label: t("nav.geminiApi"), href: `${prefix}/articles/gemini-api` },
     { key: "geminiAdvanced", label: t("nav.geminiAdvanced"), href: `${prefix}/articles/gemini-advanced` },
+    { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
     { key: "tags", label: t("nav.tags"), href: `${prefix}/tags` },
   ];
 

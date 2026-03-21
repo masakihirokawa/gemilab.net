@@ -24,11 +24,11 @@
 
 ---
 
-## サイト規模（2026-03-20 現在）
+## サイト規模（2026-03-21 現在）
 
-- 記事: JA 139本 / EN 114本 = 253エントリ（うちプレミアム JA 34本 / EN 23本）
-- ブログ: JA 8本 / EN 7本 = 15エントリ
-- カテゴリ: gemini-api (49), gemini-advanced (29), gemini-basics (28), gemini-dev (26), gemini-workspace (1), gemini-updates (1)
+- 記事: JA 156本 / EN 131本 = 287エントリ（うちプレミアム JA 38本 / EN 27本）
+- ブログ: JA 9本 / EN 9本 = 18エントリ
+- カテゴリ: gemini-api (57), gemini-basics (38), gemini-dev (30), gemini-advanced (29), gemini-workspace (1), gemini-updates (1)
 
 ---
 
