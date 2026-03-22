@@ -325,8 +325,8 @@ export function Header() {
             flexDirection: "column",
             alignItems: "center",
             justifyContent: "flex-start",
-            paddingTop: 80,
-            gap: 24,
+            paddingTop: 56,
+            gap: 14,
             overflowY: "auto",
             WebkitOverflowScrolling: "touch",
           }}
@@ -348,16 +348,16 @@ export function Header() {
             ×
           </button>
           {/* Level links in mobile — top position */}
-          <div style={{ width: "100%", maxWidth: 280, margin: "0 auto", paddingBottom: 8 }}>
-            <span style={{ display: "block", textAlign: "center", fontSize: 10, fontFamily: "'DM Mono', monospace", color: "var(--text-dim)", letterSpacing: "0.15em", marginBottom: 12 }}>
+          <div style={{ width: "100%", maxWidth: 280, margin: "0 auto", paddingBottom: 4 }}>
+            <span style={{ display: "block", textAlign: "center", fontSize: 9, fontFamily: "'DM Mono', monospace", color: "var(--text-dim)", letterSpacing: "0.15em", marginBottom: 8 }}>
               LEVEL
             </span>
-            <div style={{ display: "flex", justifyContent: "center", gap: 12 }}>
+            <div style={{ display: "flex", justifyContent: "center", gap: 10 }}>
               {levelItems.map(({ key, label, href, icon, color }) => (
                 <a key={key} href={href} onClick={() => setMobileOpen(false)}
-                  style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, textDecoration: "none", fontSize: 12, color: "var(--text-secondary)", padding: "8px 14px", borderRadius: 8, border: "1px solid var(--border-subtle)", transition: "border-color 0.2s" }}
+                  style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, textDecoration: "none", fontSize: 11, color: "var(--text-secondary)", padding: "6px 12px", borderRadius: 6, border: "1px solid var(--border-subtle)", transition: "border-color 0.2s" }}
                 >
-                  <span style={{ color, fontSize: 16 }}>{icon}</span>
+                  <span style={{ color, fontSize: 14 }}>{icon}</span>
                   <span style={{ letterSpacing: "0.04em" }}>{label}</span>
                 </a>
               ))}
@@ -372,9 +372,9 @@ export function Header() {
               style={{
                 color: "var(--text-secondary)",
                 textDecoration: "none",
-                fontSize: 18,
-                letterSpacing: "0.08em",
-                fontWeight: 300,
+                fontSize: 14,
+                letterSpacing: "0.06em",
+                fontWeight: 400,
               }}
             >
               {label}
@@ -386,8 +386,8 @@ export function Header() {
             style={{
               color: "var(--text-dim)",
               textDecoration: "none",
-              fontSize: 22,
-              marginTop: 8,
+              fontSize: 16,
+              marginTop: 4,
               paddingBottom: 40,
               transition: "color 0.3s",
             }}
