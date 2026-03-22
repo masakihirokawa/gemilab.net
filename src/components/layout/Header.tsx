@@ -102,6 +102,8 @@ export function Header() {
     { key: "geminiDev", label: t("nav.geminiDev"), href: `${prefix}/articles/gemini-dev` },
     { key: "geminiApi", label: t("nav.geminiApi"), href: `${prefix}/articles/gemini-api` },
     { key: "geminiAdvanced", label: t("nav.geminiAdvanced"), href: `${prefix}/articles/gemini-advanced` },
+    { key: "geminiUpdates", label: t("nav.geminiUpdates"), href: `${prefix}/articles/gemini-updates` },
+    { key: "geminiWorkspace", label: t("nav.geminiWorkspace"), href: `${prefix}/articles/gemini-workspace` },
     { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
     { key: "tags", label: t("nav.tags"), href: `${prefix}/tags` },
     { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
