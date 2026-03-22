@@ -98,13 +98,13 @@ export function Header() {
   const scrolled = scrollY > 50;
   const navItems = [
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
-    { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
     { key: "geminiBasics", label: t("nav.geminiBasics"), href: `${prefix}/articles/gemini-basics` },
     { key: "geminiDev", label: t("nav.geminiDev"), href: `${prefix}/articles/gemini-dev` },
     { key: "geminiApi", label: t("nav.geminiApi"), href: `${prefix}/articles/gemini-api` },
     { key: "geminiAdvanced", label: t("nav.geminiAdvanced"), href: `${prefix}/articles/gemini-advanced` },
     { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
     { key: "tags", label: t("nav.tags"), href: `${prefix}/tags` },
+    { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
   ];
 
   const levelItems = [
@@ -149,24 +149,6 @@ export function Header() {
         {/* Desktop Nav */}
         {!isMobile && (
           <nav style={{ display: "flex", gap: 24, alignItems: "center" }}>
-            {navItems.map(({ key, label, href }) => (
-              <a
-                key={key}
-                href={href}
-                style={{
-                  color: "var(--text-muted)",
-                  textDecoration: "none",
-                  fontSize: 13,
-                  letterSpacing: "0.06em",
-                  transition: "color 0.3s",
-                  whiteSpace: "nowrap",
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-primary)")}
-                onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
-              >
-                {label}
-              </a>
-            ))}
             {/* Level Dropdown */}
             <div
               style={{ position: "relative" }}
@@ -213,6 +195,24 @@ export function Header() {
                 </div>
               )}
             </div>
+            {navItems.map(({ key, label, href }) => (
+              <a
+                key={key}
+                href={href}
+                style={{
+                  color: "var(--text-muted)",
+                  textDecoration: "none",
+                  fontSize: 13,
+                  letterSpacing: "0.06em",
+                  transition: "color 0.3s",
+                  whiteSpace: "nowrap",
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-primary)")}
+                onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
+              >
+                {label}
+              </a>
+            ))}
             <a
               href={`${prefix}/support`}
               aria-label="Support us"
@@ -345,6 +345,23 @@ export function Header() {
           >
             ×
           </button>
+          {/* Level links in mobile — top position */}
+          <div style={{ width: "100%", maxWidth: 280, margin: "0 auto", paddingBottom: 8 }}>
+            <span style={{ display: "block", textAlign: "center", fontSize: 10, fontFamily: "'DM Mono', monospace", color: "var(--text-dim)", letterSpacing: "0.15em", marginBottom: 12 }}>
+              LEVEL
+            </span>
+            <div style={{ display: "flex", justifyContent: "center", gap: 12 }}>
+              {levelItems.map(({ key, label, href, icon, color }) => (
+                <a key={key} href={href} onClick={() => setMobileOpen(false)}
+                  style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, textDecoration: "none", fontSize: 12, color: "var(--text-secondary)", padding: "8px 14px", borderRadius: 8, border: "1px solid var(--border-subtle)", transition: "border-color 0.2s" }}
+                >
+                  <span style={{ color, fontSize: 16 }}>{icon}</span>
+                  <span style={{ letterSpacing: "0.04em" }}>{label}</span>
+                </a>
+              ))}
+            </div>
+          </div>
+          <div style={{ width: "100%", maxWidth: 280, borderTop: "1px solid var(--border-subtle)", margin: "0 auto" }} />
           {navItems.map(({ key, label, href }) => (
             <a
               key={key}
@@ -361,22 +378,6 @@ export function Header() {
               {label}
             </a>
           ))}
-          {/* Level links in mobile */}
-          <div style={{ width: "100%", maxWidth: 280, margin: "8px auto", borderTop: "1px solid var(--border-subtle)", paddingTop: 16 }}>
-            <span style={{ display: "block", textAlign: "center", fontSize: 10, fontFamily: "'DM Mono', monospace", color: "var(--text-dim)", letterSpacing: "0.15em", marginBottom: 12 }}>
-              LEVEL
-            </span>
-            <div style={{ display: "flex", justifyContent: "center", gap: 12 }}>
-              {levelItems.map(({ key, label, href, icon, color }) => (
-                <a key={key} href={href} onClick={() => setMobileOpen(false)}
-                  style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, textDecoration: "none", fontSize: 12, color: "var(--text-secondary)", padding: "8px 14px", borderRadius: 8, border: "1px solid var(--border-subtle)", transition: "border-color 0.2s" }}
-                >
-                  <span style={{ color, fontSize: 16 }}>{icon}</span>
-                  <span style={{ letterSpacing: "0.04em" }}>{label}</span>
-                </a>
-              ))}
-            </div>
-          </div>
           <a
             href={`${prefix}/support`}
             onClick={() => setMobileOpen(false)}
