@@ -4,21 +4,7 @@ import { routing } from "@/i18n/routing";
 import { ThemeProvider } from "@/components/layout/ThemeProvider";
 import { Header } from "@/components/layout/Header";
 import { Footer } from "@/components/layout/Footer";
-import dynamic from "next/dynamic";
-
-// Dynamic imports for non-critical components (reduces initial JS bundle)
-const NewsTicker = dynamic(
-  () => import("@/components/ui/NewsTicker").then((m) => ({ default: m.NewsTicker })),
-  { ssr: false }
-);
-const ScrollToTop = dynamic(
-  () => import("@/components/ui/ScrollToTop").then((m) => ({ default: m.ScrollToTop })),
-  { ssr: false }
-);
-const CookieBanner = dynamic(
-  () => import("@/components/layout/CookieBanner").then((m) => ({ default: m.CookieBanner })),
-  { ssr: false }
-);
+import { DynamicNewsTicker, DynamicScrollToTop, DynamicCookieBanner } from "@/components/layout/DynamicComponents";
 
 // Blocking script to prevent FOUC (Flash of Unstyled Content) on theme change
 const themeScript = `(function(){try{var t=localStorage.getItem('gemilab-theme');document.documentElement.setAttribute('data-theme',t||'dark')}catch(e){}})()`;
@@ -65,11 +51,11 @@ export default async function LocaleLayout({
           <NextIntlClientProvider locale={locale} messages={messages}>
             {/* GrainOverlay moved to CSS (see globals.css ::after on body) */}
             <Header />
-            <NewsTicker />
+            <DynamicNewsTicker />
             <main style={{ paddingTop: 99 }}>{children}</main>
             <Footer />
-            <ScrollToTop />
-            <CookieBanner
+            <DynamicScrollToTop />
+            <DynamicCookieBanner
               gaId="G-CJWM68JK57"
               privacyHref={locale === "ja" ? "/privacy" : "/en/privacy"}
               locale={locale}
