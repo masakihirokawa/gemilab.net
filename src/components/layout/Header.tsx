@@ -326,7 +326,7 @@ export function Header() {
             alignItems: "center",
             justifyContent: "flex-start",
             paddingTop: 56,
-            gap: 14,
+            gap: 20,
             overflowY: "auto",
             WebkitOverflowScrolling: "touch",
           }}
@@ -372,9 +372,10 @@ export function Header() {
               style={{
                 color: "var(--text-secondary)",
                 textDecoration: "none",
-                fontSize: 14,
+                fontSize: 15,
                 letterSpacing: "0.06em",
                 fontWeight: 400,
+                padding: "4px 0",
               }}
             >
               {label}
@@ -387,7 +388,7 @@ export function Header() {
               color: "var(--text-dim)",
               textDecoration: "none",
               fontSize: 16,
-              marginTop: 4,
+              marginTop: 2,
               paddingBottom: 40,
               transition: "color 0.3s",
             }}
