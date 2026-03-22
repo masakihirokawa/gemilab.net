@@ -266,7 +266,7 @@ export function Header() {
 
         {/* Mobile controls — all icons 32×32 square, uniform styling */}
         {isMobile && (
-          <div style={{ display: "flex", alignItems: "center", gap: 7, flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 9, flexShrink: 0 }}>
             <a
               href={`${prefix}/support`}
               aria-label="Support us"
