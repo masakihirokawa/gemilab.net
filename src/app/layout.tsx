@@ -70,27 +70,5 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
-  return (
-    <html>
-      <head>
-        <link rel="alternate" type="application/json+oembed" href="https://gemilab.net/api/oembed?url=https://gemilab.net" title="Gemini Lab" />
-        <script
-          type="application/ld+json"
-          dangerouslySetInnerHTML={{
-            __html: JSON.stringify({
-              "@context": "https://schema.org",
-              "@type": "Organization",
-              name: "Gemini Lab",
-              url: "https://gemilab.net",
-              logo: "https://gemilab.net/icon-512.png",
-              description: "Google Gemini の実践ガイド＆ナレッジベース",
-              founder: { "@type": "Person", name: "Masaki Hirokawa", url: "https://dolice.design" },
-              sameAs: ["https://dolice.design", "https://dolice.net"],
-            }),
-          }}
-        />
-      </head>
-      {children}
-    </html>
-  );
+  return children;
 }
