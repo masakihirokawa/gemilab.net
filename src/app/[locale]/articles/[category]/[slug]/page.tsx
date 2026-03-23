@@ -159,7 +159,6 @@ export default async function ArticlePage({ params }: Props) {
 
   return (
     <>
-    <link rel="alternate" type="application/json+oembed" href={`https://gemilab.net/api/oembed?url=${encodeURIComponent(articleUrl)}`} title="Gemini Lab" />
     <script
       type="application/ld+json"
       dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
