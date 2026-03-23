@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "CANVAS — Gemini Canvas が Google Search AI Mode に統合、対話型ワークスペースに進化（3/24）",
+    "PERSONAL — Personal Intelligence が全米展開、Gmail・Photos 連携で文脈理解が向上（3/22）",
     "MODEL — Gemini 3.1 Pro / Flash が正式 GA：Computer Use ツールも対応（3/20）",
     "STUDIO — Google AI Studio 大幅刷新：統合 Playground で Veo 3.1・TTS も利用可能に（3/19）",
+    "750M — Gemini 月間アクティブユーザー7.5億人突破、API リクエスト月850億件達成（3/18）",
     "HOME — Gemini for Home：応答速度 40% 向上＆カナダ（フランス語含む）に拡大（3/17）",
-    "WORKSPACE — Gemini が Sheets タスクを成功率 70% 超で自動処理、Drive 検索も強化（3/15）",
-    "COST — Gemini API にプロジェクトごとの月額上限設定＆新 Usage Tier が追加（3/12）",
-    "PIXEL — March Pixel Drop：Gemini エージェントタスク＆Magic Cue 搭載（3/10）",
   ],
   en: [
+    "CANVAS — Gemini Canvas integrated into Google Search AI Mode as interactive workspace (3/24)",
+    "PERSONAL — Personal Intelligence rolls out to all US users with Gmail & Photos context (3/22)",
     "MODEL — Gemini 3.1 Pro / Flash now generally available with Computer Use tool (3/20)",
     "STUDIO — Google AI Studio overhaul: unified Playground with Veo 3.1 & TTS support (3/19)",
+    "750M — Gemini surpasses 750M monthly active users, 85B API requests per month (3/18)",
     "HOME — Gemini for Home: 40% faster responses & expansion to Canada incl. French (3/17)",
-    "WORKSPACE — Gemini automates Sheets tasks at 70%+ success rate, enhanced Drive search (3/15)",
-    "COST — Gemini API adds per-project monthly spend caps & revamped Usage Tiers (3/12)",
-    "PIXEL — March Pixel Drop: Gemini agentic tasks & Magic Cue integration (3/10)",
   ],
 };
 
