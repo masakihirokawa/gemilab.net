@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MODEL — Gemini 3.1 Flash-Lite Preview・Nano Banana 2 が登場（3/19）",
-    "WORKSPACE — Gemini が Docs・Sheets・Slides・Drive に拡張、AI Overview 追加（3/17）",
-    "CHROME — Gemini in Chrome がカナダ・NZ・インドに展開、50+ 言語対応（3/15）",
-    "PIXEL — March Pixel Drop：Gemini で食料品注文・レストラン検索が可能に（3/13）",
-    "HOME — Gemini for Home：音声コマンドの認識精度と機器制御が向上（3/10）",
-    "PLAN — Google AI Pro $19.99/月 & Ultra プランで新機能にアーリーアクセス（3/8）",
+    "MODEL — Gemini 3.1 Pro / Flash が正式 GA：Computer Use ツールも対応（3/20）",
+    "STUDIO — Google AI Studio 大幅刷新：統合 Playground で Veo 3.1・TTS も利用可能に（3/19）",
+    "HOME — Gemini for Home：応答速度 40% 向上＆カナダ（フランス語含む）に拡大（3/17）",
+    "WORKSPACE — Gemini が Sheets タスクを成功率 70% 超で自動処理、Drive 検索も強化（3/15）",
+    "COST — Gemini API にプロジェクトごとの月額上限設定＆新 Usage Tier が追加（3/12）",
+    "PIXEL — March Pixel Drop：Gemini エージェントタスク＆Magic Cue 搭載（3/10）",
   ],
   en: [
-    "MODEL — Gemini 3.1 Flash-Lite Preview and Nano Banana 2 arrive (3/19)",
-    "WORKSPACE — Gemini expands to Docs, Sheets, Slides & Drive with AI Overview (3/17)",
-    "CHROME — Gemini in Chrome launches in Canada, NZ & India with 50+ languages (3/15)",
-    "PIXEL — March Pixel Drop: grocery ordering and restaurant search via Gemini (3/13)",
-    "HOME — Gemini for Home: improved voice recognition accuracy and device control (3/10)",
-    "PLAN — Google AI Pro $19.99/month & Ultra plan with early feature access (3/8)",
+    "MODEL — Gemini 3.1 Pro / Flash now generally available with Computer Use tool (3/20)",
+    "STUDIO — Google AI Studio overhaul: unified Playground with Veo 3.1 & TTS support (3/19)",
+    "HOME — Gemini for Home: 40% faster responses & expansion to Canada incl. French (3/17)",
+    "WORKSPACE — Gemini automates Sheets tasks at 70%+ success rate, enhanced Drive search (3/15)",
+    "COST — Gemini API adds per-project monthly spend caps & revamped Usage Tiers (3/12)",
+    "PIXEL — March Pixel Drop: Gemini agentic tasks & Magic Cue integration (3/10)",
   ],
 };
 
