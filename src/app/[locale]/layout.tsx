@@ -31,7 +31,6 @@ export default async function LocaleLayout({
   return (
     <html lang={locale} suppressHydrationWarning>
       <head>
-        <link rel="alternate" type="application/json+oembed" href="https://gemilab.net/api/oembed?url=https://gemilab.net" title="Gemini Lab" />
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{
