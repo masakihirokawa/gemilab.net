@@ -9,6 +9,20 @@ import { DynamicNewsTicker, DynamicScrollToTop, DynamicCookieBanner } from "@/co
 // Blocking script to prevent FOUC (Flash of Unstyled Content) on theme change
 const themeScript = `(function(){try{var t=localStorage.getItem('gemilab-theme');document.documentElement.setAttribute('data-theme',t||'dark')}catch(e){}})()`;
 
+// Speculation Rules API: prefetch pages on hover for instant navigation
+const speculationScript = JSON.stringify({
+  prefetch: [{
+    where: {
+      and: [
+        { href_matches: "/*" },
+        { not: { href_matches: "/api/*" } },
+        { not: { href_matches: "/feed.xml" } },
+      ],
+    },
+    eagerness: "moderate",
+  }],
+});
+
 // Non-blocking Google Fonts loader
 const fontUrl = "https://fonts.googleapis.com/css2?family=DM+Mono:wght@400&family=DM+Sans:wght@300;400;500&family=Noto+Sans+JP:wght@300;400;500;700&display=swap";
 const fontScript = `(function(){var l=document.createElement('link');l.rel='stylesheet';l.href='${fontUrl}';document.head.appendChild(l)})()`;
@@ -47,6 +61,8 @@ export default async function LocaleLayout({
           }}
         />
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+        {/* Speculation Rules API: prefetch pages on hover for faster navigation */}
+        <script type="speculationrules" dangerouslySetInnerHTML={{ __html: speculationScript }} />
         {/* Google Analytics is loaded via CookieBanner after consent */}
         <link rel="alternate" type="application/rss+xml" title="Gemini Lab RSS" href={locale === "ja" ? "/feed.xml" : "/en/feed.xml"} />
         {/* Font loading: preconnect + async load (non-render-blocking) */}
