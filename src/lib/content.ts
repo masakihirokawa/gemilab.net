@@ -63,7 +63,7 @@ export function getArticle(
       tags: entry.tags || [],
       premium: entry.premium || false,
     },
-    content: entry.content || "",
+    content: "",
   };
 }
 
@@ -131,6 +131,49 @@ export function getBlogPost(locale: string, slug: string): BlogPost | null {
       description: entry.description || "",
       tags: entry.tags || [],
     },
-    content: entry.content || "",
+    content: "",
   };
+}
+
+/**
+ * Fetch article HTML content from static assets (async).
+ * Content is stored as individual HTML files in public/content/articles/
+ * and served by Cloudflare CDN — NOT bundled into the worker.
+ */
+export async function getArticleContent(
+  locale: string,
+  category: string,
+  slug: string
+): Promise<string> {
+  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://gemilab.net";
+  try {
+    const res = await fetch(
+      `${siteUrl}/content/articles/${locale}/${category}/${slug}.html`,
+      { cache: "force-cache" }
+    );
+    if (!res.ok) return "";
+    return await res.text();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Fetch blog post HTML content from static assets (async).
+ */
+export async function getBlogContent(
+  locale: string,
+  slug: string
+): Promise<string> {
+  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://gemilab.net";
+  try {
+    const res = await fetch(
+      `${siteUrl}/content/blog/${locale}/${slug}.html`,
+      { cache: "force-cache" }
+    );
+    if (!res.ok) return "";
+    return await res.text();
+  } catch {
+    return "";
+  }
 }

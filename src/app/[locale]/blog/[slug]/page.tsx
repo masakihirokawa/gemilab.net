@@ -1,4 +1,4 @@
-import { getBlogPost, getBlogPosts } from "@/lib/content";
+import { getBlogPost, getBlogPosts, getBlogContent } from "@/lib/content";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 
@@ -46,6 +46,9 @@ export default async function BlogPostPage({ params }: Props) {
   const { locale, slug } = await params;
   const post = getBlogPost(locale, slug);
   if (!post) notFound();
+
+  // Fetch blog content from static assets
+  const content = await getBlogContent(locale, slug);
 
   const isJa = locale === "ja";
   const prefix = locale === "ja" ? "" : `/${locale}`;
@@ -123,7 +126,7 @@ export default async function BlogPostPage({ params }: Props) {
       {/* Content */}
       <div
         className="article-content"
-        dangerouslySetInnerHTML={{ __html: post.content }}
+        dangerouslySetInnerHTML={{ __html: content }}
       />
 
       {/* JSON-LD */}
