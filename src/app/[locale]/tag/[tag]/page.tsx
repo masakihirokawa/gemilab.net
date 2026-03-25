@@ -13,8 +13,8 @@ const LEVEL_LABELS: Record<string, Record<string, string>> = {
 };
 
 const CATEGORY_LABELS: Record<string, Record<string, string>> = {
-  ja: { "gemini-basics": "Gemini 基礎", "gemini-dev": "Gemini 開発", "gemini-api": "Gemini API", "gemini-advanced": "Gemini 応用" },
-  en: { "gemini-basics": "Gemini Basics", "gemini-dev": "Gemini Dev", "gemini-api": "Gemini API", "gemini-advanced": "Gemini Advanced" },
+  ja: { "gemini-basics": "Gemini 基礎", "gemini-dev": "Gemini 開発", "gemini-api": "Gemini API", "gemini-advanced": "Gemini 応用", "gemini-workspace": "Workspace 連携", "gemini-updates": "最新情報" },
+  en: { "gemini-basics": "Gemini Basics", "gemini-dev": "Gemini Dev", "gemini-api": "Gemini API", "gemini-advanced": "Gemini Advanced", "gemini-workspace": "Workspace", "gemini-updates": "Updates" },
 };
 
 /* ── Props ── */

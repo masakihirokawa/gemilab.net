@@ -12,6 +12,8 @@ const CAT_TITLES: Record<string, Record<string, string>> = {
   "gemini-dev": { ja: "開発ツールの記事一覧", en: "Dev Tools Articles" },
   "gemini-api": { ja: "API / SDK の記事一覧", en: "API / SDK Articles" },
   "gemini-advanced": { ja: "高度な活用の記事一覧", en: "Advanced Articles" },
+  "gemini-workspace": { ja: "Workspace 連携の記事一覧", en: "Workspace Articles" },
+  "gemini-updates": { ja: "最新情報の記事一覧", en: "Updates Articles" },
 };
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
@@ -44,6 +46,8 @@ const CATEGORY_NAMES: Record<string, Record<string, string>> = {
   "gemini-dev": { ja: "開発ツール", en: "Dev Tools" },
   "gemini-api": { ja: "API / SDK", en: "API / SDK" },
   "gemini-advanced": { ja: "高度な活用", en: "Advanced" },
+  "gemini-workspace": { ja: "Workspace 連携", en: "Workspace" },
+  "gemini-updates": { ja: "最新情報", en: "Updates" },
 };
 
 const CATEGORY_DESC: Record<string, Record<string, string>> = {
@@ -62,6 +66,14 @@ const CATEGORY_DESC: Record<string, Record<string, string>> = {
   "gemini-advanced": {
     ja: "エージェント・高度な活用法",
     en: "Agents and advanced usage",
+  },
+  "gemini-workspace": {
+    ja: "Google Workspace との統合・自動化",
+    en: "Google Workspace integration and automation",
+  },
+  "gemini-updates": {
+    ja: "Gemini の新機能・アップデート情報",
+    en: "Latest Gemini features and news",
   },
 };
 

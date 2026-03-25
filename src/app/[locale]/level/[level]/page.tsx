@@ -81,8 +81,8 @@ const LEVEL_LABELS: Record<string, Record<string, string>> = {
 };
 
 const CATEGORY_LABELS: Record<string, Record<string, string>> = {
-  ja: { "gemini-basics": "Gemini 入門", "gemini-dev": "開発ツール", "gemini-api": "API / SDK", "gemini-advanced": "高度な活用" },
-  en: { "gemini-basics": "Gemini Basics", "gemini-dev": "Dev Tools", "gemini-api": "API / SDK", "gemini-advanced": "Advanced" },
+  ja: { "gemini-basics": "Gemini 入門", "gemini-dev": "開発ツール", "gemini-api": "API / SDK", "gemini-advanced": "高度な活用", "gemini-workspace": "Workspace 連携", "gemini-updates": "最新情報" },
+  en: { "gemini-basics": "Gemini Basics", "gemini-dev": "Dev Tools", "gemini-api": "API / SDK", "gemini-advanced": "Advanced", "gemini-workspace": "Workspace", "gemini-updates": "Updates" },
 };
 
 /* ── Page ── */
