@@ -97,8 +97,8 @@ export function Header() {
   const prefix = localePrefix(locale);
   const scrolled = scrollY > 50;
   const navItems = [
-    { key: "premium", label: t("nav.premium"), href: `${prefix}/membership` },
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
+    { key: "premium", label: t("nav.premium"), href: `${prefix}/membership` },
     { key: "geminiBasics", label: t("nav.geminiBasics"), href: `${prefix}/articles/gemini-basics` },
     { key: "geminiDev", label: t("nav.geminiDev"), href: `${prefix}/articles/gemini-dev` },
     { key: "geminiApi", label: t("nav.geminiApi"), href: `${prefix}/articles/gemini-api` },
