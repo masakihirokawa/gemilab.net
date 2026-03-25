@@ -97,6 +97,7 @@ export function Header() {
   const prefix = localePrefix(locale);
   const scrolled = scrollY > 50;
   const navItems = [
+    { key: "premium", label: t("nav.premium"), href: `${prefix}/membership` },
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
     { key: "geminiBasics", label: t("nav.geminiBasics"), href: `${prefix}/articles/gemini-basics` },
     { key: "geminiDev", label: t("nav.geminiDev"), href: `${prefix}/articles/gemini-dev` },
@@ -106,7 +107,6 @@ export function Header() {
     { key: "geminiWorkspace", label: t("nav.geminiWorkspace"), href: `${prefix}/articles/gemini-workspace` },
     { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
     { key: "tags", label: t("nav.tags"), href: `${prefix}/tags` },
-    { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
   ];
 
   const levelItems = [
