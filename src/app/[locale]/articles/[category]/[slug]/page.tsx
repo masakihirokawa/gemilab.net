@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { getArticle, getAllArticleSlugs, CATEGORIES } from "@/lib/content";
+import { getArticle, getAllArticleSlugs, CATEGORIES, getArticleContent } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { BookRecommendation } from "@/components/ui/BookRecommendation";
 import { ShareButtons } from "@/components/ui/ShareButtons";
@@ -104,6 +104,9 @@ export default async function ArticlePage({ params }: Props) {
   if (!article) {
     notFound();
   }
+
+  // Fetch article content from static assets
+  const content = await getArticleContent(locale, category, slug);
 
   const catInfo = CATEGORIES.find((c) => c.id === category);
   const prefix = locale === "ja" ? "" : `/${locale}`;
@@ -259,7 +262,7 @@ export default async function ArticlePage({ params }: Props) {
       <hr style={{ border: "none", borderTop: "1px solid var(--border-subtle)", marginBottom: 40 }} />
 
       {/* Table of Contents */}
-      <TableOfContents locale={locale} initialItems={extractTocItems(article.content)} />
+      <TableOfContents locale={locale} initialItems={extractTocItems(content)} />
 
       {/* Premium badge */}
       {article.meta.premium && (
@@ -273,14 +276,14 @@ export default async function ArticlePage({ params }: Props) {
         <>
           <div
             className="article-content"
-            dangerouslySetInnerHTML={{ __html: article.content.slice(0, 10000) }}
+            dangerouslySetInnerHTML={{ __html: content.slice(0, 10000) }}
           />
           <PremiumPaywall locale={locale} />
         </>
       ) : (
         <div
           className="article-content"
-          dangerouslySetInnerHTML={{ __html: article.content }}
+          dangerouslySetInnerHTML={{ __html: content }}
         />
       )}
 
@@ -290,13 +293,13 @@ export default async function ArticlePage({ params }: Props) {
         url={`https://gemilab.net${prefix}/articles/${category}/${slug}`}
       />
 
-      {/* Membership CTA — shown only for non-members on free articles */}
+      {/* Membership CTA — shown for non-members on free articles */}
       {!canViewPremium && !article.meta.premium && (
         <MembershipCTA locale={locale} />
       )}
 
-      {/* Tip CTA — shown on free articles for all readers */}
-      {!article.meta.premium && <TipCTA locale={locale} />}
+      {/* Tip CTA — shown when full article content is visible */}
+      {(!article.meta.premium || canViewPremium) && <TipCTA locale={locale} />}
 
       {/* Related Articles */}
       <RelatedArticles
