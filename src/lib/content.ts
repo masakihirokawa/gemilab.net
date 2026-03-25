@@ -83,6 +83,8 @@ export const CATEGORIES = [
   { id: "gemini-dev", icon: "⟐", color: "var(--accent-blue)" },
   { id: "gemini-api", icon: "◈", color: "var(--accent-green)" },
   { id: "gemini-advanced", icon: "⬡", color: "var(--accent-gold)" },
+  { id: "gemini-workspace", icon: "◧", color: "var(--accent-blue)" },
+  { id: "gemini-updates", icon: "◎", color: "var(--accent-green)" },
 ] as const;
 
 // ── Blog ──
