@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "APPLE — Apple と Google の AI 提携の詳細判明：Gemini モデルからオンデバイス小型モデルを蒸留可能に（3/25）",
+    "IMPORT — Gemini がチャット履歴インポート機能を公式追加：ChatGPT・Claude から ZIP で移行可能に（3/26）",
+    "DARKWEB — Gemini エージェントがダークウェブ監視に進出、1日1,000万件を98%精度で分析（3/26）",
+    "APPLE — Apple と Google の AI 提携の詳細判明：Gemini からオンデバイス小型モデルを蒸留可能に（3/25）",
     "PIXEL — March Pixel Drop：Gemini App Actions で自然言語操作＆Circle to Search 強化（3/25）",
-    "TV — Google TV に Gemini 搭載：ビジュアル応答・Deep Dives・Sports Briefs の3機能追加（3/24）",
-    "CANVAS — Gemini Canvas が Google Search AI Mode に統合、対話型ワークスペースに進化（3/24）",
-    "GA — Gemini 3.1 Pro / Flash が正式 GA：customtools エンドポイントも新設（3/20）",
-    "STUDIO — Google AI Studio 大幅刷新：統合 Playground で Veo 3.1・TTS・Live モデル対応（3/19）",
+    "TV — Google TV に Gemini 新機能：ビジュアル応答・Deep Dives・Sports Briefs が展開中（3/24）",
+    "CANVAS — Gemini Canvas が Google Search AI Mode で全米展開、対話型ワークスペースに進化（3/24）",
   ],
   en: [
+    "IMPORT — Gemini adds official chat history import: migrate from ChatGPT & Claude via ZIP upload (3/26)",
+    "DARKWEB — Gemini agents now monitor the dark web, analyzing 10M+ posts daily at 98% accuracy (3/26)",
     "APPLE — Apple-Google AI deal details revealed: Apple can distill on-device models from Gemini (3/25)",
     "PIXEL — March Pixel Drop: Gemini App Actions for natural language control & smarter Circle to Search (3/25)",
-    "TV — Google TV gets Gemini: visual responses, Deep Dives & Sports Briefs added (3/24)",
-    "CANVAS — Gemini Canvas integrated into Google Search AI Mode as interactive workspace (3/24)",
-    "GA — Gemini 3.1 Pro / Flash now generally available with new customtools endpoint (3/20)",
-    "STUDIO — Google AI Studio overhaul: unified Playground with Veo 3.1, TTS & Live models (3/19)",
+    "TV — Google TV gets new Gemini features: visual responses, Deep Dives & Sports Briefs rolling out (3/24)",
+    "CANVAS — Gemini Canvas now available to all US users in Google Search AI Mode (3/24)",
   ],
 };
 
