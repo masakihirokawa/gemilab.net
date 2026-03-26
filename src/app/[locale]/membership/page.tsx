@@ -53,15 +53,15 @@ const CATEGORY_LABELS: Record<string, Record<string, string>> = {
 
 const PAGE_TEXT = {
   ja: {
-    badge: "MEMBERSHIP",
-    heading: "メンバーシップ",
-    subheading: "プレミアム限定の上級ガイドとチュートリアル",
+    badge: "PREMIUM",
+    heading: "Premium",
+    subheading: "実装コード付きの上級ガイドが読み放題",
     description:
-      "Gemini Lab メンバーシップでは、毎週追加されるプレミアム記事にアクセスできます。Gemini API の高度な活用、エージェント構築、ドキュメント処理などの実践ガイドをお届けします。",
+      "コピー&ペーストで使える実装コード、ベンチマーク結果、本番設計パターンを含む上級ガイドを毎週追加しています。無料記事で基礎を学んだ後の「次の一歩」として、実務ですぐに活用できる内容です。",
     features: [
       "すべてのプレミアム記事が読み放題",
-      "毎週追加される限定コンテンツ",
-      "上級テクニック・実践ガイド",
+      "毎週追加される実装コード付き上級ガイド",
+      "本番環境で使える設計パターン・ベストプラクティス",
     ],
     pro: "Pro プラン",
     proPrice: "¥380/月",
@@ -77,15 +77,15 @@ const PAGE_TEXT = {
     locked: "PREMIUM",
   },
   en: {
-    badge: "MEMBERSHIP",
-    heading: "Membership",
-    subheading: "Exclusive premium guides and tutorials",
+    badge: "PREMIUM",
+    heading: "Premium",
+    subheading: "Advanced guides with production-ready code",
     description:
-      "Gemini Lab Membership gives you access to premium articles added every week. Master advanced Gemini API usage, agent development, document processing, and more.",
+      "Copy-paste ready implementation code, benchmark results, and production design patterns — published weekly. The practical next step after our free articles, built for real-world use.",
     features: [
       "Unlimited access to all premium articles",
-      "New exclusive content added every week",
-      "Advanced techniques & hands-on guides",
+      "New advanced guides with code published every week",
+      "Production-ready design patterns \& best practices",
     ],
     pro: "Pro Plan",
     proPrice: "$3/mo",
