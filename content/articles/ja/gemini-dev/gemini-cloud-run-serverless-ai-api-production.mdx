@@ -1,0 +1,510 @@
+---
+title: "Gemini 3.1 Pro × Cloud Run：サーバーレスAI APIの本番構築完全ガイド"
+slug: "gemini-cloud-run-serverless-ai-api-production"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-03-27T11:00"
+author: "Gemini Lab"
+description: "Gemini 3.1 ProをCloud Runにデプロイし、SSEストリーミング・オートスケール・コールドスタート最適化・本番監視まで網羅するサーバーレスAI API構築の決定版ガイド。"
+tags: ["gemini-api", "cloud-run", "serverless", "production", "streaming", "deploy", "google-cloud"]
+highlights:
+  - "Cloud Run上でGemini APIのSSEストリーミングを安定稼働させる実装パターンを習得できる"
+  - "コールドスタート最適化・最小インスタンス設定など本番運用に必須のチューニング手法がわかる"
+  - "Cloud Logging・Error Reporting・コストアラートを組み合わせた本番監視体制の構築方法を理解できる"
+---
+
+## はじめに
+
+Gemini 3.1 Pro は、100万トークンのコンテキストウィンドウと毎秒114トークンの出力速度を備えた、Google の最新フラグシップモデルです。このモデルをプロダクション環境で安定的に提供するには、適切なインフラ設計が不可欠です。
+
+Google Cloud Run は、コンテナベースのサーバーレスプラットフォームとして、AI APIのホスティングに最適な選択肢のひとつです。リクエストがないときはゼロスケールでコストを抑え、トラフィック急増時には自動でスケールアウトしてくれます。
+
+この記事では、Gemini 3.1 Pro を Cloud Run にデプロイし、SSEストリーミング対応・コールドスタート最適化・本番監視まで含めた**プロダクション品質のAI API**を構築する方法を、実際のコードとともに解説します。
+
+### この記事の対象読者
+
+- Gemini API を使ったサービスを本番リリースしたい開発者
+- Cloud Run でのAIサービスデプロイに興味があるバックエンドエンジニア
+- コスト効率とスケーラビリティを両立したい個人開発者・スタートアップ
+
+### 前提知識
+
+- Google Cloud プロジェクトの基本操作
+- Docker / コンテナの基礎知識
+- Python（FastAPI）または Node.js の基本
+
+## Cloud Run × Gemini API のアーキテクチャ設計
+
+Cloud Run で Gemini API を提供する場合、以下のアーキテクチャが推奨されます。
+
+```
+クライアント → Cloud Load Balancer → Cloud Run サービス → Gemini API
+                                          ↓
+                                   Cloud Logging / Monitoring
+                                          ↓
+                                   Secret Manager（APIキー）
+```
+
+### なぜ Cloud Run なのか
+
+Cloud Run を選ぶ理由は3つあります。
+
+**1. ゼロスケール**: リクエストがない時間帯のコストがゼロになります。個人開発やスタートアップにとって、固定費ゼロは大きなメリットです。
+
+**2. 自動スケール**: 同時リクエスト数に応じてインスタンスが自動的に増減します。バイラルで急にトラフィックが増えても、設定ひとつで対応できます。
+
+**3. マネージドSSL/ドメイン**: カスタムドメインとSSL証明書が標準で提供され、インフラ管理の負担が最小限になります。
+
+## プロジェクトのセットアップ
+
+まず、Cloud Run にデプロイするFastAPIアプリケーションの基本構成を作ります。
+
+```python
+# requirements.txt
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+google-genai==1.14.0
+sse-starlette==2.2.1
+google-cloud-logging==3.11.0
+google-cloud-secret-manager==2.21.0
+```
+
+```python
+# main.py
+import os
+import json
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
+from google import genai
+
+# --- ロギング設定 ---
+if os.getenv("K_SERVICE"):  # Cloud Run 環境判定
+    import google.cloud.logging
+    client = google.cloud.logging.Client()
+    client.setup_logging()
+
+logger = logging.getLogger(__name__)
+
+# --- Gemini クライアント初期化（起動時に1回だけ） ---
+gemini_client = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """アプリケーション起動時にGeminiクライアントを初期化"""
+    global gemini_client
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    gemini_client = genai.Client(api_key=api_key)
+    logger.info("Gemini client initialized successfully")
+    yield
+    logger.info("Application shutting down")
+
+app = FastAPI(title="Gemini AI API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 本番では適切に制限する
+    allow_methods=["POST"],
+    allow_headers=["*"],
+)
+```
+
+ここでのポイントは、`lifespan` イベントで Gemini クライアントを1回だけ初期化していることです。リクエストごとに初期化すると、接続のオーバーヘッドが積み重なり、レイテンシが増加します。
+
+## SSEストリーミングの実装
+
+Cloud Run でのSSEストリーミングは、レスポンスが途中で切断されないよう注意が必要です。
+
+```python
+# main.py（続き）
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=30000)
+    model: str = Field(default="gemini-3.1-pro-preview")
+    max_tokens: Optional[int] = Field(default=8192, ge=1, le=65000)
+    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
+    stream: bool = Field(default=True)
+
+@app.post("/v1/generate")
+async def generate(req: GenerateRequest):
+    """Gemini APIを呼び出し、SSEストリーミングでレスポンスを返す"""
+    if req.stream:
+        return EventSourceResponse(
+            stream_generate(req),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # Nginx バッファリング無効化
+            },
+        )
+    else:
+        return await batch_generate(req)
+
+
+async def stream_generate(req: GenerateRequest):
+    """SSEストリーミングジェネレーター"""
+    try:
+        response = gemini_client.models.generate_content_stream(
+            model=req.model,
+            contents=req.prompt,
+            config=genai.types.GenerateContentConfig(
+                max_output_tokens=req.max_tokens,
+                temperature=req.temperature,
+            ),
+        )
+
+        total_tokens = 0
+        for chunk in response:
+            if chunk.text:
+                total_tokens += len(chunk.text.split())
+                yield {
+                    "event": "chunk",
+                    "data": json.dumps({
+                        "text": chunk.text,
+                        "done": False,
+                    }),
+                }
+
+        # 完了シグナル
+        yield {
+            "event": "done",
+            "data": json.dumps({
+                "text": "",
+                "done": True,
+                "usage": {"approximate_tokens": total_tokens},
+            }),
+        }
+
+    except Exception as e:
+        logger.error(f"Stream generation failed: {e}", exc_info=True)
+        yield {
+            "event": "error",
+            "data": json.dumps({"error": str(e)}),
+        }
+
+
+async def batch_generate(req: GenerateRequest):
+    """非ストリーミング（バッチ）レスポンス"""
+    try:
+        response = gemini_client.models.generate_content(
+            model=req.model,
+            contents=req.prompt,
+            config=genai.types.GenerateContentConfig(
+                max_output_tokens=req.max_tokens,
+                temperature=req.temperature,
+            ),
+        )
+        return {
+            "text": response.text,
+            "usage": {
+                "prompt_tokens": response.usage_metadata.prompt_token_count,
+                "output_tokens": response.usage_metadata.candidates_token_count,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Batch generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+```
+
+### SSEストリーミングの注意点
+
+Cloud Run でSSEを使う際に最も重要なのは、**レスポンスバッファリングの無効化**です。`X-Accel-Buffering: no` ヘッダーを設定しないと、Cloud Run のリバースプロキシがレスポンスをバッファリングし、チャンクがまとめて送信されてしまいます。
+
+また、Cloud Run のリクエストタイムアウト（デフォルト300秒）に注意してください。長文生成の場合、65,000トークンの出力には数分かかることがあります。タイムアウトは最大3,600秒まで延長可能です。
+
+## Dockerfile とコールドスタート最適化
+
+コールドスタートの速度は、ユーザー体験に直結します。以下のDockerfileでは、マルチステージビルドと依存関係の事前インストールで起動時間を最適化しています。
+
+```dockerfile
+# ---- ビルドステージ ----
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir --target=/build/deps -r requirements.txt
+
+# ---- 実行ステージ ----
+FROM python:3.12-slim
+
+# セキュリティ: 非rootユーザーで実行
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+WORKDIR /app
+COPY --from=builder /build/deps /usr/local/lib/python3.12/site-packages/
+COPY main.py .
+
+# Cloud Run は PORT 環境変数を自動設定
+ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
+
+# ヘルスチェックエンドポイント
+HEALTHCHECK --interval=30s --timeout=5s \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
+
+USER appuser
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+```
+
+### コールドスタートを速くするための3つの戦略
+
+**1. 最小インスタンス数の設定**: トラフィックが予測できるサービスでは、最小インスタンスを1以上に設定します。常時稼働のコストは発生しますが、コールドスタートを完全に回避できます。
+
+```bash
+gcloud run deploy gemini-api \
+  --min-instances=1 \
+  --max-instances=10 \
+  --concurrency=80 \
+  --cpu=2 \
+  --memory=1Gi \
+  --timeout=600
+```
+
+**2. CPU ブースト**: Cloud Run の「startup CPU boost」を有効にすると、起動時に一時的にCPU割り当てが増加し、起動時間が短縮されます。
+
+```bash
+gcloud run deploy gemini-api \
+  --cpu-boost
+```
+
+**3. イメージサイズの最小化**: 上記の `python:3.12-slim` ベースイメージに加え、不要なパッケージを含めないことで、pull時間を短縮します。最終イメージサイズは200MB以下を目標にしてください。
+
+## Secret Manager によるAPIキー管理
+
+Gemini API キーをコンテナイメージやソースコードに含めてはいけません。Cloud Run では Secret Manager との統合が標準で提供されています。
+
+```bash
+# シークレットの作成
+echo -n "YOUR_GEMINI_API_KEY" | \
+  gcloud secrets create gemini-api-key --data-file=-
+
+# Cloud Run サービスにマウント
+gcloud run deploy gemini-api \
+  --set-secrets="GEMINI_API_KEY=gemini-api-key:latest"
+```
+
+これにより、`GEMINI_API_KEY` 環境変数が自動的に最新のシークレット値で設定されます。キーのローテーション時もシークレットのバージョンを更新するだけで、再デプロイは不要です。
+
+セキュリティの詳細については [Gemini API 本番環境セキュリティ完全ガイド](/articles/gemini-api/gemini-api-production-security-guide) も参考にしてください。
+
+## 本番監視体制の構築
+
+### Cloud Logging によるリクエストログ
+
+Cloud Run は標準出力へのログを自動的に Cloud Logging に転送します。先ほどのコードで設定した `google-cloud-logging` により、構造化ログが記録されます。
+
+```python
+# main.py に追加するミドルウェア
+import time
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
+
+    logger.info(
+        "API request completed",
+        extra={
+            "json_fields": {
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "duration_ms": round(duration * 1000, 2),
+                "model": request.state.model if hasattr(request.state, "model") else "unknown",
+            }
+        },
+    )
+    return response
+```
+
+### Error Reporting の活用
+
+Cloud Run で発生した例外は、Cloud Error Reporting に自動的に集約されます。追加設定なしで、エラーのグルーピング・通知・トレンド分析が利用可能です。
+
+ただし、Gemini API のレート制限エラー（429）は想定内のエラーです。これを Error Reporting のノイズにしないために、以下のようにハンドリングします。
+
+```python
+from google.api_core.exceptions import ResourceExhausted
+
+async def stream_generate_with_retry(req: GenerateRequest, max_retries: int = 3):
+    """指数バックオフ付きリトライ"""
+    for attempt in range(max_retries):
+        try:
+            async for chunk in stream_generate(req):
+                yield chunk
+            return
+        except ResourceExhausted:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.warning(f"Rate limited, retrying in {wait}s (attempt {attempt + 1})")
+                await asyncio.sleep(wait)
+            else:
+                yield {
+                    "event": "error",
+                    "data": json.dumps({"error": "Rate limit exceeded. Please try again later."}),
+                }
+```
+
+エラーハンドリングの詳細なパターンについては [Gemini API エラーハンドリング＆リトライ完全ガイド](/articles/gemini-api/gemini-api-error-handling-retry-patterns) を参照してください。
+
+### コストアラートの設定
+
+Cloud Run の課金は「リクエスト処理時間 × CPU/メモリ」で計算されます。Gemini API の課金と合わせて、予期しないコスト増を防ぐためにアラートを設定しましょう。
+
+```bash
+# 予算アラートの作成（月額$50を超えたら通知）
+gcloud billing budgets create \
+  --billing-account=YOUR_BILLING_ACCOUNT \
+  --display-name="Gemini API Cloud Run Budget" \
+  --budget-amount=50USD \
+  --threshold-rule=percent=80 \
+  --threshold-rule=percent=100
+```
+
+## パフォーマンスチューニング
+
+### 同時実行数の最適化
+
+Cloud Run の `concurrency` 設定は、1つのインスタンスが同時に処理するリクエスト数を決めます。Gemini API 呼び出しは I/O バウンドなので、比較的高い値（50〜100）を設定できます。
+
+```bash
+# 推奨設定
+gcloud run deploy gemini-api \
+  --concurrency=80 \
+  --cpu=2 \
+  --memory=1Gi
+```
+
+ただし、ストリーミングリクエストは接続を長時間保持するため、同時接続数が多いとインスタンスあたりのメモリ消費が増加します。負荷テストで最適値を見つけてください。
+
+### レスポンスキャッシュ
+
+同一プロンプトへの応答をキャッシュすることで、APIコストとレイテンシを大幅に削減できます。
+
+```python
+from functools import lru_cache
+import hashlib
+
+# インメモリキャッシュ（非ストリーミングのみ）
+_cache = {}
+
+def get_cache_key(prompt: str, model: str, temperature: float) -> str:
+    """プロンプトのハッシュをキーにする"""
+    content = f"{model}:{temperature}:{prompt}"
+    return hashlib.sha256(content.encode()).hexdigest()
+
+async def cached_generate(req: GenerateRequest):
+    """キャッシュ付き生成（temperature=0の場合のみ）"""
+    if req.temperature == 0:
+        key = get_cache_key(req.prompt, req.model, req.temperature)
+        if key in _cache:
+            logger.info("Cache hit")
+            return _cache[key]
+
+    result = await batch_generate(req)
+
+    if req.temperature == 0:
+        _cache[key] = result
+
+    return result
+```
+
+本番環境では、Redis（Cloud Memorystore）をキャッシュバックエンドとして使うことを推奨します。インスタンス間でキャッシュを共有でき、TTLによる自動失効も可能です。
+
+## CI/CD パイプラインの構築
+
+Cloud Build を使って、GitHub への push をトリガーに自動デプロイします。
+
+```yaml
+# cloudbuild.yaml
+steps:
+  # テスト実行
+  - name: 'python:3.12-slim'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install -r requirements.txt
+        pip install pytest httpx
+        pytest tests/ -v
+
+  # Docker イメージのビルド & プッシュ
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/gemini-api:$SHORT_SHA', '.']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/gemini-api:$SHORT_SHA']
+
+  # Cloud Run へデプロイ
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'gemini-api'
+      - '--image=gcr.io/$PROJECT_ID/gemini-api:$SHORT_SHA'
+      - '--region=asia-northeast1'
+      - '--platform=managed'
+      - '--min-instances=1'
+      - '--max-instances=10'
+      - '--concurrency=80'
+      - '--cpu=2'
+      - '--memory=1Gi'
+      - '--timeout=600'
+      - '--cpu-boost'
+      - '--set-secrets=GEMINI_API_KEY=gemini-api-key:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+```
+
+### ブルーグリーンデプロイ
+
+Cloud Run はリビジョンベースのデプロイをサポートしています。新しいリビジョンにトラフィックを段階的に移行することで、リスクを最小化できます。
+
+```bash
+# 新リビジョンをデプロイ（トラフィックは既存リビジョンのまま）
+gcloud run deploy gemini-api \
+  --image=gcr.io/PROJECT_ID/gemini-api:v2 \
+  --no-traffic
+
+# 10% のトラフィックを新リビジョンに振り分け
+gcloud run services update-traffic gemini-api \
+  --to-revisions=gemini-api-v2=10
+
+# 問題なければ100%に移行
+gcloud run services update-traffic gemini-api \
+  --to-latest
+```
+
+## よくある質問（FAQ）
+
+### Q: Cloud Run と Cloud Functions、どちらを選ぶべきですか？
+
+SSEストリーミングが必要な場合は Cloud Run 一択です。Cloud Functions（第2世代）もコンテナベースですが、レスポンスストリーミングのサポートは限定的です。また、Cloud Run はコンテナのカスタマイズ自由度が高く、Uvicorn のワーカー設定やヘルスチェックなどを細かく制御できます。
+
+### Q: コールドスタートはどれくらいの時間がかかりますか？
+
+Python + FastAPI の構成で、イメージサイズ200MB程度の場合、コールドスタートは通常2〜5秒です。最小インスタンスを1に設定すれば、ほとんどのリクエストでコールドスタートは発生しません。月額のコスト増は CPU 2コア・1GBメモリの場合で約$10〜15程度です。
+
+### Q: Gemini API のレート制限にどう対処すべきですか？
+
+指数バックオフ付きリトライが基本戦略です。Google AI Studio の Usage Tiers を確認し、必要に応じてティアを上げてください。また、Cloud Run の同時実行数を調整し、バーストリクエストを抑制することも有効です。詳細は [Gemini API エラーハンドリング完全ガイド](/articles/gemini-api/gemini-api-error-handling-troubleshooting) で解説しています。
+
+### Q: Vertex AI と Google AI Studio、どちらのAPIを使うべきですか？
+
+エンタープライズ用途で VPC Service Controls、IAM ベースのアクセス制御、SLA が必要な場合は Vertex AI を選択してください。個人開発やスタートアップで、シンプルなAPIキー認証で十分な場合は Google AI Studio が手軽です。本記事のコードは Google AI Studio（google-genai SDK）ベースですが、Vertex AI への移行も容易です。Vertex AI での本番デプロイについては [Vertex AI Gemini プロダクション完全ガイド](/articles/gemini-dev/vertex-ai-gemini-production) を参照してください。
+
+## まとめ
+
+Cloud Run × Gemini 3.1 Pro の組み合わせは、コスト効率とスケーラビリティを両立するサーバーレスAI APIの構築に最適な選択肢です。この記事で紹介したSSEストリーミング・コールドスタート最適化・Secret Manager連携・本番監視・CI/CDパイプラインのパターンを組み合わせることで、個人開発からエンタープライズまで対応できる堅牢なAI APIを構築できます。
+
+本記事のテーマをさらに深めたい方には「[Google Cloudではじめる実践データエンジニアリング入門](https://www.amazon.co.jp/dp/4297138581/?tag=pinocchio-22)」（下田倫大 著）がおすすめです。
