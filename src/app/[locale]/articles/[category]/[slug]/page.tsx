@@ -291,6 +291,8 @@ export default async function ArticlePage({ params }: Props) {
       <ShareButtons
         title={article.meta.title}
         url={`https://gemilab.net${prefix}/articles/${category}/${slug}`}
+        tags={article.meta.tags}
+        siteName="GeminiLab"
       />
 
       {/* Membership CTA — shown for non-members on free articles */}
