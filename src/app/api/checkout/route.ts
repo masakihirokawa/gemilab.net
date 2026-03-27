@@ -13,10 +13,12 @@ const PLAN_NAMES: Record<string, string> = {
   "price_1TCQyPEGB5g6A54oqVrc9ron": "Gemini Lab チップ（¥150）",
   "price_1TCQykEGB5g6A54oRZa4faF7": "Gemini Lab Pro（月額プラン）",
   "price_1TCQyxEGB5g6A54o56MtETkI": "Gemini Lab Premium（永久アクセス）",
+  "price_1TFRyMEGB5g6A54o4j3brkd6": "Gemini Lab Premium（感謝価格 ¥980）",
   // EN
   "price_1TCQyXEGB5g6A54okNKaZiad": "Gemini Lab Tip ($1.50)",
   "price_1TCQymEGB5g6A54oyBTnCcRh": "Gemini Lab Pro (Monthly)",
   "price_1TCQyzEGB5g6A54odkusafTp": "Gemini Lab Premium (Lifetime)",
+  "price_1TFRyMEGB5g6A54ocVmrC9gS": "Gemini Lab Premium (Thank You Price $7)",
 };
 
 // Tip price IDs — these should NOT grant premium access
