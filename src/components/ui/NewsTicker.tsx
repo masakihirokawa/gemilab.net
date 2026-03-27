@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "IMPORT — Gemini がチャット履歴インポート機能を公式追加：ChatGPT・Claude から ZIP で移行可能に（3/26）",
-    "DARKWEB — Gemini エージェントがダークウェブ監視に進出、1日1,000万件を98%精度で分析（3/26）",
-    "APPLE — Apple と Google の AI 提携の詳細判明：Gemini からオンデバイス小型モデルを蒸留可能に（3/25）",
-    "PIXEL — March Pixel Drop：Gemini App Actions で自然言語操作＆Circle to Search 強化（3/25）",
-    "TV — Google TV に Gemini 新機能：ビジュアル応答・Deep Dives・Sports Briefs が展開中（3/24）",
-    "CANVAS — Gemini Canvas が Google Search AI Mode で全米展開、対話型ワークスペースに進化（3/24）",
+    "LYRIA — Lyria 3 Pro で最大 3 分の楽曲生成が可能に：イントロ・ヴァース・コーラスを指定可能（3/25）",
+    "DROPS — Gemini Drops 3 月：Personal Intelligence 全米無料化＆チャット履歴インポート追加（3/26）",
+    "DARKWEB — Gemini エージェントがダークウェブ監視に進出、1 日 1,000 万件を 98% 精度で分析（3/26）",
+    "LIVE — Gemini Live 3.1 に大幅アップグレード：応答速度向上＆コンテキスト保持量が 2 倍に（3/25）",
+    "PIXEL — March Pixel Drop：Magic Cue がレストラン提案＆Circle to Search がマルチアイテム対応（3/25）",
+    "APPLE — Apple が Gemini から小型オンデバイスモデルを蒸留可能に、AI 提携の詳細が判明（3/25）",
   ],
   en: [
-    "IMPORT — Gemini adds official chat history import: migrate from ChatGPT & Claude via ZIP upload (3/26)",
-    "DARKWEB — Gemini agents now monitor the dark web, analyzing 10M+ posts daily at 98% accuracy (3/26)",
-    "APPLE — Apple-Google AI deal details revealed: Apple can distill on-device models from Gemini (3/25)",
-    "PIXEL — March Pixel Drop: Gemini App Actions for natural language control & smarter Circle to Search (3/25)",
-    "TV — Google TV gets new Gemini features: visual responses, Deep Dives & Sports Briefs rolling out (3/24)",
-    "CANVAS — Gemini Canvas now available to all US users in Google Search AI Mode (3/24)",
+    "LYRIA — Lyria 3 Pro enables up to 3-minute tracks with intro, verse & chorus control (3/25)",
+    "DROPS — March Gemini Drop: Personal Intelligence free for all US users & chat history import (3/26)",
+    "DARKWEB — Gemini agents enter dark web monitoring, analyzing 10M+ posts daily at 98% accuracy (3/26)",
+    "LIVE — Gemini Live 3.1 gets major upgrade: faster responses and doubled context retention (3/25)",
+    "PIXEL — March Pixel Drop: Magic Cue suggests restaurants & Circle to Search goes multi-item (3/25)",
+    "APPLE — Apple can distill on-device AI models from Gemini, deal details revealed (3/25)",
   ],
 };
 
