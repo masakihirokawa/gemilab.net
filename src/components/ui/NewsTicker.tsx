@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "LYRIA — Lyria 3 Pro で最大 3 分の楽曲生成が可能に：イントロ・ヴァース・コーラスを指定可能（3/25）",
-    "DROPS — Gemini Drops 3 月：Personal Intelligence 全米無料化＆チャット履歴インポート追加（3/26）",
-    "DARKWEB — Gemini エージェントがダークウェブ監視に進出、1 日 1,000 万件を 98% 精度で分析（3/26）",
-    "LIVE — Gemini Live 3.1 に大幅アップグレード：応答速度向上＆コンテキスト保持量が 2 倍に（3/25）",
-    "PIXEL — March Pixel Drop：Magic Cue がレストラン提案＆Circle to Search がマルチアイテム対応（3/25）",
-    "APPLE — Apple が Gemini から小型オンデバイスモデルを蒸留可能に、AI 提携の詳細が判明（3/25）",
+    "DROPS — Gemini Drop 3 月まとめ：5 大機能を一挙公開、AI プラットフォーム最速成長を維持（3/27）",
+    "IMPORT — Import Memory to Gemini：ChatGPT・Claude からのチャット履歴移行がワンクリックで可能に（3/26）",
+    "FREE — Personal Intelligence が全米で無料化、Gmail・Photos・YouTube と連携した個人 AI アシスタント（3/27）",
+    "LYRIA — Lyria 3 Pro で最大 3 分の本格楽曲生成、写真からの音楽生成にも対応（3/25）",
+    "LIVE — Gemini 3.1 Flash Live：応答速度が大幅向上、コンテキスト保持量 2 倍で自然な対話を実現（3/27）",
+    "750M — Gemini が月間 7.5 億アクティブユーザー突破、API は月間 850 億リクエストを処理（3/28）",
   ],
   en: [
-    "LYRIA — Lyria 3 Pro enables up to 3-minute tracks with intro, verse & chorus control (3/25)",
-    "DROPS — March Gemini Drop: Personal Intelligence free for all US users & chat history import (3/26)",
-    "DARKWEB — Gemini agents enter dark web monitoring, analyzing 10M+ posts daily at 98% accuracy (3/26)",
-    "LIVE — Gemini Live 3.1 gets major upgrade: faster responses and doubled context retention (3/25)",
-    "PIXEL — March Pixel Drop: Magic Cue suggests restaurants & Circle to Search goes multi-item (3/25)",
-    "APPLE — Apple can distill on-device AI models from Gemini, deal details revealed (3/25)",
+    "DROPS — March Gemini Drop recap: 5 major features released, cementing fastest-growing AI platform (3/27)",
+    "IMPORT — Import Memory to Gemini: one-click chat history migration from ChatGPT & Claude (3/26)",
+    "FREE — Personal Intelligence now free for all US users, connecting Gmail, Photos & YouTube (3/27)",
+    "LYRIA — Lyria 3 Pro enables 3-minute tracks with lyrics, plus photo-to-music generation (3/25)",
+    "LIVE — Gemini 3.1 Flash Live: faster responses and doubled context retention for natural conversations (3/27)",
+    "750M — Gemini surpasses 750M monthly active users, API processing 85B+ requests per month (3/28)",
   ],
 };
 
