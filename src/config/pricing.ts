@@ -19,12 +19,12 @@
 export const STRIPE_PRICE_IDS = {
   ja: {
     tip: "price_1TCQyPEGB5g6A54oqVrc9ron",
-    pro: "price_1TCQykEGB5g6A54oRZa4faF7",
+    pro: "price_1TGSqVEGB5g6A54o54sFGJa7",
     premium: "price_1TCQyxEGB5g6A54o56MtETkI",
   },
   en: {
     tip: "price_1TCQyXEGB5g6A54okNKaZiad",
-    pro: "price_1TCQymEGB5g6A54oyBTnCcRh",
+    pro: "price_1TGSqWEGB5g6A54oZ0MDW2uK",
     premium: "price_1TCQyzEGB5g6A54odkusafTp",
   },
 } as const;
@@ -34,12 +34,12 @@ export const STRIPE_PRICE_IDS = {
 export const PRICES = {
   ja: {
     tip: "¥150",
-    pro: "¥380/月",
+    pro: "¥280/月",
     premium: "¥1,480",
   },
   en: {
     tip: "$1.50",
-    pro: "$3/mo",
+    pro: "$2/mo",
     premium: "$10",
   },
 } as const;
@@ -49,21 +49,21 @@ export const PRICES = {
 export const PLAN_LABELS = {
   ja: {
     tipButton: "¥150 チップを送る",
-    tipDescription: "チップ（¥150）で応援いただけると今後の執筆の励みになります",
-    proButton: "Pro — ¥380/月",
-    proLong: "月額プラン — ¥380/月",
+    tipDescription: "もしお役に立ちましたら、チップ（¥150）で応援いただけると大変励みになります",
+    proButton: "Pro — ¥280/月",
+    proLong: "月額プラン — ¥280/月",
     premiumButton: "Premium — ¥1,480（おすすめ）",
     premiumLong: "永久アクセス — ¥1,480（おすすめ）",
-    proFeature: "¥380/月 または ¥1,480 の永久アクセス",
+    proFeature: "¥280/月 または ¥1,480 の永久アクセス",
   },
   en: {
     tipButton: "Send $1.50 Tip",
-    tipDescription: "A small tip ($1.50) would really encourage us to keep writing",
-    proButton: "Pro — $3/mo",
-    proLong: "Monthly — $3/mo",
+    tipDescription: "If you found this helpful, a small tip ($1.50) would mean a lot to us",
+    proButton: "Pro — $2/mo",
+    proLong: "Monthly — $2/mo",
     premiumButton: "Premium — $10 (Recommended)",
     premiumLong: "Lifetime Access — $10 (Recommended)",
-    proFeature: "$3/mo or $10 for lifetime access",
+    proFeature: "$2/mo or $10 for lifetime access",
   },
 } as const;
 
@@ -99,12 +99,12 @@ export const CAMPAIGN = {
     ja: {
       premiumButton: "Premium — ¥980（感謝価格）",
       premiumLong: "永久アクセス — ¥980（感謝価格）",
-      proFeature: "¥380/月 または ¥980 の永久アクセス",
+      proFeature: "¥280/月 または ¥980 の永久アクセス",
     },
     en: {
       premiumButton: "Premium — $7 (Thank You Price)",
       premiumLong: "Lifetime Access — $7 (Thank You Price)",
-      proFeature: "$3/mo or $7 for lifetime access",
+      proFeature: "$2/mo or $7 for lifetime access",
     },
   },
 } as const;

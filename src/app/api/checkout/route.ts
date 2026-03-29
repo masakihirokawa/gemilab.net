@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
-import { STRIPE_PRICE_IDS, CAMPAIGN } from "@/config/pricing";
 
 function getStripe() {
   return new Stripe(process.env.STRIPE_SECRET_KEY!, {
@@ -11,15 +10,15 @@ function getStripe() {
 
 const PLAN_NAMES: Record<string, string> = {
   // JA
-  "price_1TCQyPEGB5g6A54oqVrc9ron": "Gemini Lab チップ（¥150）",
-  "price_1TCQykEGB5g6A54oRZa4faF7": "Gemini Lab Pro（月額プラン）",
-  "price_1TCQyxEGB5g6A54o56MtETkI": "Gemini Lab Premium（永久アクセス）",
-  "price_1TFRyMEGB5g6A54o4j3brkd6": "Gemini Lab Premium（感謝価格 ¥980）",
+  "price_1TCQyPEGB5g6A54oqVrc9ron": "Gemini Lab — チップ（¥150）ご支援ありがとうございます",
+  "price_1TGSqVEGB5g6A54o54sFGJa7": "Gemini Lab メンバーシップ — Pro（月額プラン）",
+  "price_1TCQyxEGB5g6A54o56MtETkI": "Gemini Lab メンバーシップ — Premium（永久アクセス）",
+  "price_1TFRyMEGB5g6A54o4j3brkd6": "Gemini Lab メンバーシップ — Premium（感謝価格 ¥980）",
   // EN
-  "price_1TCQyXEGB5g6A54okNKaZiad": "Gemini Lab Tip ($1.50)",
-  "price_1TCQymEGB5g6A54oyBTnCcRh": "Gemini Lab Pro (Monthly)",
-  "price_1TCQyzEGB5g6A54odkusafTp": "Gemini Lab Premium (Lifetime)",
-  "price_1TFRyMEGB5g6A54ocVmrC9gS": "Gemini Lab Premium (Thank You Price $7)",
+  "price_1TCQyXEGB5g6A54okNKaZiad": "Gemini Lab — Tip ($1.50) Thank you for your support",
+  "price_1TGSqWEGB5g6A54oZ0MDW2uK": "Gemini Lab Membership — Pro (Monthly)",
+  "price_1TCQyzEGB5g6A54odkusafTp": "Gemini Lab Membership — Premium (Lifetime Access)",
+  "price_1TFRyMEGB5g6A54ocVmrC9gS": "Gemini Lab Membership — Premium (Thank You Price $7)",
 };
 
 // Tip price IDs — these should NOT grant premium access
@@ -28,36 +27,6 @@ const TIP_PRICE_IDS = new Set([
   "price_1TCQyXEGB5g6A54okNKaZiad", // $1.50 USD
 ]);
 
-// ── Locale-aware product names for Stripe Checkout ─────────────
-const PRODUCT_NAMES: Record<string, Record<string, { name: string; description: string }>> = {
-  tip: {
-    ja: { name: "Gemini Lab チップ", description: "運営へのサポート。ありがとうございます！" },
-    en: { name: "Gemini Lab Tip", description: "Support for site operations. Thank you!" },
-  },
-  pro: {
-    ja: { name: "Gemini Lab Pro（月額プラン）", description: "月額制で全プレミアム記事にアクセス。いつでもキャンセル可能。" },
-    en: { name: "Gemini Lab Pro (Monthly)", description: "Monthly access to all premium articles. Cancel anytime." },
-  },
-  premium: {
-    ja: { name: "Gemini Lab プレミアム（永久アクセス）", description: "一括払いで全プレミアム記事に永久アクセス。実装コード付きの上級ガイドが読み放題。" },
-    en: { name: "Gemini Lab Premium (Lifetime)", description: "One-time payment for lifetime access to all premium articles with production-ready code." },
-  },
-};
-
-// Map priceId → { amount, currency, recurring? } for price_data
-const PRICE_CONFIG: Record<string, { amount: number; currency: string; recurring?: { interval: "month" } }> = {
-  [STRIPE_PRICE_IDS.ja.tip]: { amount: 150, currency: "jpy" },
-  [STRIPE_PRICE_IDS.ja.pro]: { amount: 380, currency: "jpy", recurring: { interval: "month" } },
-  [STRIPE_PRICE_IDS.ja.premium]: { amount: 1480, currency: "jpy" },
-  [STRIPE_PRICE_IDS.en.tip]: { amount: 150, currency: "usd" },
-  [STRIPE_PRICE_IDS.en.pro]: { amount: 300, currency: "usd", recurring: { interval: "month" } },
-  [STRIPE_PRICE_IDS.en.premium]: { amount: 1000, currency: "usd" },
-  ...(CAMPAIGN.enabled ? {
-    [CAMPAIGN.priceIds.ja]: { amount: 980, currency: "jpy" },
-    [CAMPAIGN.priceIds.en]: { amount: 700, currency: "usd" },
-  } : {}),
-};
-
 export async function POST(request: NextRequest) {
   try {
     const stripe = getStripe();
@@ -65,7 +34,7 @@ export async function POST(request: NextRequest) {
     const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://gemilab.net";
     const prefix = locale === "en" ? "en/" : "";
     const fallbackCancel = `${baseUrl}/${prefix}support`;
-    const planName = PLAN_NAMES[priceId] || "Gemini Lab Membership";
+    const planName = PLAN_NAMES[priceId] || locale === "ja" ? "Gemini Lab メンバーシップ" : "Gemini Lab Membership";
 
     // Determine plan type for verify-session to handle correctly
     const planType = mode === "subscription" ? "pro" : TIP_PRICE_IDS.has(priceId) ? "tip" : "premium";
@@ -73,21 +42,10 @@ export async function POST(request: NextRequest) {
     const session = await stripe.checkout.sessions.create({
       mode: mode || "payment",
       line_items: [
-        PRICE_CONFIG[priceId]
-          ? {
-              price_data: {
-                currency: PRICE_CONFIG[priceId].currency,
-                product_data: {
-                  name: PRODUCT_NAMES[planType]?.[locale]?.name || PRODUCT_NAMES[planType]?.en?.name || planName,
-                  description: PRODUCT_NAMES[planType]?.[locale]?.description || PRODUCT_NAMES[planType]?.en?.description || "",
-                  images: [`${baseUrl}/images/stripe-product.png`],
-                },
-                unit_amount: PRICE_CONFIG[priceId].amount,
-                ...(PRICE_CONFIG[priceId].recurring && { recurring: PRICE_CONFIG[priceId].recurring }),
-              },
-              quantity: 1,
-            }
-          : { price: priceId, quantity: 1 },
+        {
+          price: priceId || process.env.STRIPE_TIP_PRICE_ID!,
+          quantity: 1,
+        },
       ],
       metadata: { plan_type: planType, ...(returnUrl && { return_url: returnUrl }) },
       // Pro（月額）のみ初月無料トライアルを付与

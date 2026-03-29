@@ -10,11 +10,11 @@ interface Props {
 const META: Record<string, { title: string; description: string }> = {
   ja: {
     title: "メンバーシップ & サポート — Gemini Lab",
-    description: `Gemini Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。月額 ${PRICES.ja.pro.replace("/月", "")} または永久アクセス ${PRICES.ja.premium}。`,
+    description: `Gemini Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。広告なしで公開しており、皆さまのサポートが運営を支えています。月額 ${PRICES.ja.pro.replace("/月", "")} または永久アクセス ${PRICES.ja.premium}。`,
   },
   en: {
     title: "Membership & Support — Gemini Lab",
-    description: `Get full access to all premium articles with Gemini Lab Pro / Premium. ${PRICES.en.pro.replace("/mo", "")}/month or ${PRICES.en.premium} lifetime.`,
+    description: `Get full access to all premium articles with Gemini Lab Pro / Premium. Ad-free and community-supported. ${PRICES.en.pro.replace("/mo", "")}/month or ${PRICES.en.premium} lifetime.`,
   },
 };
 
@@ -61,9 +61,9 @@ const CONTENT: Record<string, {
   }[];
 }> = {
   ja: {
-    heading: "Premium & サポート",
+    heading: "メンバーシップ & サポート",
     sub: "Gemini Lab をご覧いただきありがとうございます。広告なし・無料で公開しており、皆さまのサポートがドメイン・サーバー代などの運営費を支えています。",
-    membershipHeading: "Gemini Lab Premium",
+    membershipHeading: "Gemini Lab メンバーシップ",
     membershipSub: "実装コード付きの上級ガイドが読み放題",
     features: [
       "コピー&ペーストで使える実装コード付き",
@@ -75,7 +75,7 @@ const CONTENT: Record<string, {
     proLabel: `月額プラン — ${PRICES.ja.pro}`,
     premiumLabel: CAMPAIGN.enabled ? `永久アクセス — ${CAMPAIGN.prices.ja}` : `永久アクセス — ${PRICES.ja.premium}（おすすめ）`,
     tipHeading: "チップで応援する",
-    note: "※ いただいたご支援はサーバー費用・コンテンツ制作に使わせていただきます。",
+    note: "※ いただいたご支援はすべて、サーバー費用・ドメイン代・コンテンツ制作に大切に使わせていただきます。",
     tipLabel: `${PRICES.ja.tip} チップを送る`,
     tipSub: "Stripe 決済（クレジットカード対応）",
     methods: [
@@ -87,9 +87,9 @@ const CONTENT: Record<string, {
     ],
   },
   en: {
-    heading: "Premium & Support",
-    sub: "Thank you for visiting Gemini Lab. Ad-free and free to read — your support covers hosting and domain costs.",
-    membershipHeading: "Gemini Lab Premium",
+    heading: "Membership & Support",
+    sub: "Thank you for visiting Gemini Lab. We keep this site completely ad-free and free to read. Server, hosting, and domain costs are entirely covered by your generous support — and we're truly grateful for it.",
+    membershipHeading: "Gemini Lab Membership",
     membershipSub: "Advanced guides with production-ready code",
     features: [
       "Copy-paste ready implementation code",
@@ -101,7 +101,7 @@ const CONTENT: Record<string, {
     proLabel: `Monthly — ${PRICES.en.pro}`,
     premiumLabel: CAMPAIGN.enabled ? `Lifetime Access — ${CAMPAIGN.prices.en}` : `Lifetime Access — ${PRICES.en.premium} (Recommended)`,
     tipHeading: "Leave a Tip",
-    note: "* All contributions go toward server costs and content creation.",
+    note: "* Every contribution goes directly toward server costs, hosting, and content creation. Thank you for your support.",
     tipLabel: `Send ${PRICES.en.tip} Tip`,
     tipSub: "Stripe checkout (credit card)",
     methods: [
