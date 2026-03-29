@@ -11,9 +11,9 @@ function getStripe() {
 const PLAN_NAMES: Record<string, string> = {
   // JA
   "price_1TCQyPEGB5g6A54oqVrc9ron": "Gemini Lab — チップ（¥150）ご支援ありがとうございます",
-  "price_1TGSqVEGB5g6A54o54sFGJa7": "Gemini Lab メンバーシップ — Pro（月額プラン）",
-  "price_1TCQyxEGB5g6A54o56MtETkI": "Gemini Lab メンバーシップ — Premium（永久アクセス）",
-  "price_1TFRyMEGB5g6A54o4j3brkd6": "Gemini Lab メンバーシップ — Premium（感謝価格 ¥980）",
+  "price_1TGSqVEGB5g6A54o54sFGJa7": "Gemini Lab メンバーシップ — プロ（月額プラン）",
+  "price_1TCQyxEGB5g6A54o56MtETkI": "Gemini Lab メンバーシップ — プレミアム（永久アクセス）",
+  "price_1TFRyMEGB5g6A54o4j3brkd6": "Gemini Lab メンバーシップ — プレミアム（感謝価格 ¥980）",
   // EN
   "price_1TCQyXEGB5g6A54okNKaZiad": "Gemini Lab — Tip ($1.50) Thank you for your support",
   "price_1TGSqWEGB5g6A54oZ0MDW2uK": "Gemini Lab Membership — Pro (Monthly)",
@@ -34,7 +34,7 @@ export async function POST(request: NextRequest) {
     const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://gemilab.net";
     const prefix = locale === "en" ? "en/" : "";
     const fallbackCancel = `${baseUrl}/${prefix}support`;
-    const planName = PLAN_NAMES[priceId] || locale === "ja" ? "Gemini Lab メンバーシップ" : "Gemini Lab Membership";
+    const planName = PLAN_NAMES[priceId] || (locale === "en" ? "Gemini Lab Membership" : "Gemini Lab メンバーシップ");
 
     // Determine plan type for verify-session to handle correctly
     const planType = mode === "subscription" ? "pro" : TIP_PRICE_IDS.has(priceId) ? "tip" : "premium";
