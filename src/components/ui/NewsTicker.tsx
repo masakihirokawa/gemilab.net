@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DROPS — Gemini Drop 3 月まとめ：5 大機能を一挙公開、AI プラットフォーム最速成長を維持（3/27）",
-    "IMPORT — Import Memory to Gemini：ChatGPT・Claude からのチャット履歴移行がワンクリックで可能に（3/26）",
+    "IMPORT — Gemini にチャット履歴インポート機能が登場、ChatGPT・Claude からワンクリックで移行可能に（3/26）",
     "FREE — Personal Intelligence が全米で無料化、Gmail・Photos・YouTube と連携した個人 AI アシスタント（3/27）",
-    "LYRIA — Lyria 3 Pro で最大 3 分の本格楽曲生成、写真からの音楽生成にも対応（3/25）",
-    "LIVE — Gemini 3.1 Flash Live：応答速度が大幅向上、コンテキスト保持量 2 倍で自然な対話を実現（3/27）",
-    "750M — Gemini が月間 7.5 億アクティブユーザー突破、API は月間 850 億リクエストを処理（3/28）",
+    "WORKSPACE — Gemini in Docs・Sheets・Slides が強化、Drive 検索に AI Overview が追加（3/27）",
+    "3.1 PRO — Gemini 3.1 Pro Preview が正式公開、complex tasks 向け推論能力が大幅向上（3/30）",
+    "PIXEL — Pixel Drop 3 月版：Gemini App Actions でエージェント操作が日常に（食料品注文・配車・スマートホーム）（3/26）",
+    "750M — Gemini が月間 7.5 億ユーザー突破、API リクエスト月 850 億件で AI 最速成長を維持（3/28）",
   ],
   en: [
-    "DROPS — March Gemini Drop recap: 5 major features released, cementing fastest-growing AI platform (3/27)",
-    "IMPORT — Import Memory to Gemini: one-click chat history migration from ChatGPT & Claude (3/26)",
+    "IMPORT — Gemini adds chat history import: migrate from ChatGPT & Claude in one click (3/26)",
     "FREE — Personal Intelligence now free for all US users, connecting Gmail, Photos & YouTube (3/27)",
-    "LYRIA — Lyria 3 Pro enables 3-minute tracks with lyrics, plus photo-to-music generation (3/25)",
-    "LIVE — Gemini 3.1 Flash Live: faster responses and doubled context retention for natural conversations (3/27)",
-    "750M — Gemini surpasses 750M monthly active users, API processing 85B+ requests per month (3/28)",
+    "WORKSPACE — Gemini in Docs, Sheets & Slides enhanced; Drive search gains AI Overview (3/27)",
+    "3.1 PRO — Gemini 3.1 Pro Preview launches with major reasoning improvements for complex tasks (3/30)",
+    "PIXEL — March Pixel Drop: Gemini App Actions bring agentic control to daily tasks (3/26)",
+    "750M — Gemini hits 750M monthly active users, API processing 85B+ requests per month (3/28)",
   ],
 };
 
