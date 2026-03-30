@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { CAMPAIGN } from "@/config/pricing";
 
 interface PaymentMethod {
   name: string;
@@ -17,6 +18,7 @@ interface Plan {
   priceId: string;
   label: string;
   price: string;
+  originalPrice?: string;
 }
 
 interface SupportContent {
@@ -140,6 +142,7 @@ export function SupportClient({
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [isMobile, setIsMobile] = useState(false);
+  const [thanksTip, setThanksTip] = useState(false);
 
   // Restore access state
   const [showRestore, setShowRestore] = useState(false);
@@ -150,11 +153,31 @@ export function SupportClient({
   const rt = RESTORE_TEXT[locale] || RESTORE_TEXT.en;
   const faq = FAQ_TEXT[locale] || FAQ_TEXT.en;
 
+  // Reset loading state when returning from Stripe via browser back button (bfcache)
+  useEffect(() => {
+    const handlePageShow = (e: PageTransitionEvent) => {
+      if (e.persisted) {
+        setLoading(null);
+        setError("");
+      }
+    };
+    window.addEventListener("pageshow", handlePageShow);
+    return () => window.removeEventListener("pageshow", handlePageShow);
+  }, []);
+
   useEffect(() => {
     const check = () => setIsMobile(window.innerWidth < 768 || "ontouchstart" in window);
     check();
     window.addEventListener("resize", check);
     return () => window.removeEventListener("resize", check);
+  }, []);
+
+  // Detect ?thanks=tip in URL
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("thanks") === "tip") {
+      setThanksTip(true);
+    }
   }, []);
 
   const handleCheckout = async (priceId: string, mode: "payment" | "subscription", key: string) => {
@@ -239,6 +262,26 @@ export function SupportClient({
         </p>
       </div>
 
+      {/* Tip Thank You Banner */}
+      {thanksTip && (
+        <div
+          style={{
+            marginBottom: 24,
+            padding: "20px 24px",
+            borderRadius: 12,
+            border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
+            background: "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
+            textAlign: "center",
+          }}
+        >
+          <p style={{ fontSize: 15, color: "var(--text-primary)", lineHeight: 1.7, margin: 0 }}>
+            {locale === "ja"
+              ? "チップをお送りいただきありがとうございます！いただいたご支援は、サーバー費用やコンテンツ制作に大切に使わせていただきます。"
+              : "Thank you so much for your tip! Your support goes directly toward server costs and content creation."}
+          </p>
+        </div>
+      )}
+
       {/* Membership */}
       <div
         id="membership"
@@ -274,36 +317,8 @@ export function SupportClient({
                 </li>
               ))}
             </ul>
-            <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-              <button
-                onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
-                disabled={!!loading}
-                style={{
-                  width: "100%",
-                  padding: "14px 24px",
-                  borderRadius: 8,
-                  border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
-                  background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
-                  color: "var(--accent-coral)",
-                  fontSize: 14,
-                  fontWeight: 600,
-                  cursor: loading ? "wait" : "pointer",
-                  opacity: loading ? 0.7 : 1,
-                  transition: "all 0.25s",
-                }}
-                onMouseEnter={(e) => {
-                  if (!loading) {
-                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
-                    e.currentTarget.style.transform = "translateY(-1px)";
-                  }
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
-                  e.currentTarget.style.transform = "translateY(0)";
-                }}
-              >
-                {loading === "pro" ? "..." : `${plans.pro.label} — ${plans.pro.price}`}
-              </button>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {/* Premium — primary CTA */}
               <button
                 onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
                 disabled={!!loading}
@@ -311,27 +326,93 @@ export function SupportClient({
                   width: "100%",
                   padding: "14px 24px",
                   borderRadius: 8,
-                  border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
-                  background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+                  border: CAMPAIGN.enabled
+                    ? "1px solid color-mix(in srgb, #daa520 50%, transparent)"
+                    : "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
+                  background: CAMPAIGN.enabled
+                    ? "color-mix(in srgb, #daa520 12%, transparent)"
+                    : "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+                  color: CAMPAIGN.enabled ? "#daa520" : "var(--accent-coral)",
+                  fontSize: 14,
+                  fontWeight: 700,
+                  cursor: loading ? "wait" : "pointer",
+                  opacity: loading ? 0.7 : 1,
+                  transition: "all 0.25s",
+                  letterSpacing: "-0.01em",
+                  position: "relative" as const,
+                  overflow: "visible",
+                }}
+                onMouseEnter={(e) => {
+                  if (!loading) {
+                    const c = CAMPAIGN.enabled ? "#daa520" : "var(--accent-coral)";
+                    e.currentTarget.style.background = `color-mix(in srgb, ${c} 18%, transparent)`;
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  const c = CAMPAIGN.enabled ? "#daa520" : "var(--accent-coral)";
+                  e.currentTarget.style.background = `color-mix(in srgb, ${c} 12%, transparent)`;
+                  e.currentTarget.style.transform = "translateY(0)";
+                }}
+              >
+                {CAMPAIGN.enabled && (
+                  <span style={{
+                    position: "absolute" as const,
+                    top: -10,
+                    right: 12,
+                    padding: "3px 9px 1px",
+                    borderRadius: 4,
+                    background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
+                    fontSize: 10,
+                    fontFamily: "'DM Mono', monospace",
+                    fontWeight: 700,
+                    letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
+                    color: "#fff",
+                    whiteSpace: "nowrap" as const,
+                  }}>
+                    {CAMPAIGN.name[locale as "ja" | "en"] || CAMPAIGN.name.en}
+                  </span>
+                )}
+                {loading === "premium" ? "..." : (
+                  CAMPAIGN.enabled && plans.premium.originalPrice ? (
+                    <>
+                      <span style={{ textDecoration: "line-through", opacity: 0.5, fontWeight: 400, marginRight: 6 }}>
+                        {plans.premium.originalPrice}
+                      </span>
+                      {content.premiumLabel}
+                    </>
+                  ) : content.premiumLabel
+                )}
+              </button>
+              {/* Pro — secondary CTA */}
+              <button
+                onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
+                disabled={!!loading}
+                style={{
+                  width: "100%",
+                  padding: "14px 24px",
+                  borderRadius: 8,
+                  border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
+                  background: "transparent",
                   color: "var(--accent-coral)",
                   fontSize: 14,
-                  fontWeight: 600,
+                  fontWeight: 500,
                   cursor: loading ? "wait" : "pointer",
                   opacity: loading ? 0.7 : 1,
                   transition: "all 0.25s",
                 }}
                 onMouseEnter={(e) => {
                   if (!loading) {
-                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
+                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 8%, transparent)";
                     e.currentTarget.style.transform = "translateY(-1px)";
                   }
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
+                  e.currentTarget.style.background = "transparent";
                   e.currentTarget.style.transform = "translateY(0)";
                 }}
               >
-                {loading === "premium" ? "..." : `${plans.premium.label} — ${plans.premium.price}`}
+                {loading === "pro" ? "..." : content.proLabel}
               </button>
             </div>
           </>

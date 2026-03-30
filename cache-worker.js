@@ -1,76 +1,164 @@
 /**
  * Cache wrapper for OpenNext Cloudflare Worker
- * Uses Cloudflare Workers Cache API to cache HTML responses at the edge.
- * Reduces TTFB from ~3-5s (full SSR) to ~50ms (edge cache hit).
- *
- * This file is bundled by wrangler (esbuild) at deploy time,
- * NOT by Next.js, so it must stay outside the TS compilation.
+ * ─────────────────────────────────────────────
+ * - HTMLRewriter: injects __name polyfill before any Next.js script
+ * - Edge cache:   caches 200 HTML for CACHE_TTL (Workers Cache API)
+ * - Version gate:  DEPLOY_VERSION invalidates stale cache entries
+ * - Browser:       max-age=0, must-revalidate (edge is authoritative)
+ * - Error safety:  never caches non-200; try-catch around all cache ops
  */
 import nextHandler from "./.open-next/worker";
 
-const CACHE_TTL = 14400; // 4 hours
+// ── Config ──────────────────────────────────────────────────────
+const DEPLOY_VERSION = "2026-03-27-campaign";
+const CACHE_TTL = 14400; // 4 hours (edge only)
 
+// ── __name polyfill (Turbopack / esbuild compat) ────────────────
+const NAME_POLYFILL =
+  '<script>if(typeof __name==="undefined"){var __name=function(fn,name){Object.defineProperty(fn,"name",{value:name,configurable:true});return fn}}</script>';
+
+class HeadHandler {
+  element(element) {
+    element.prepend(NAME_POLYFILL, { html: true });
+  }
+}
+
+function injectPolyfill(response) {
+  return new HTMLRewriter().on("head", new HeadHandler()).transform(response);
+}
+
+// ── Helpers ─────────────────────────────────────────────────────
+function shouldSkipCache(url, request) {
+  if (request.method !== "GET") return true;
+  const p = url.pathname;
+  if (p.startsWith("/api/") || p === "/feed.xml" || p.startsWith("/_next/")) return true;
+  if (p.includes(".") && !p.endsWith("/")) return true;
+  if (request.headers.get("rsc")) return true;
+  return false;
+}
+
+function makeBrowserHeaders(srcHeaders) {
+  const h = new Headers(srcHeaders);
+  h.set("Cache-Control", "public, max-age=0, must-revalidate");
+  h.delete("set-cookie");
+  return h;
+}
+
+// ── Main handler ────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
-    // Only cache GET requests
-    if (request.method !== "GET") {
-      return nextHandler.fetch(request, env, ctx);
-    }
-
     const url = new URL(request.url);
 
-    // Skip caching for API routes, feeds, and file-like paths (static assets)
-    if (
-      url.pathname.startsWith("/api/") ||
-      url.pathname === "/feed.xml" ||
-      url.pathname.startsWith("/_next/") ||
-      (url.pathname.includes(".") && !url.pathname.endsWith("/"))
-    ) {
-      return nextHandler.fetch(request, env, ctx);
+    // ── Manual cache purge ────────────────────────────────────
+    if (url.pathname === "/api/purge-cache") {
+      const cache = caches.default;
+      const paths = ["/", "/ja", "/en",
+                     "/articles", "/ja/articles", "/en/articles",
+                     "/membership", "/ja/membership", "/en/membership",
+                     "/blog", "/ja/blog", "/en/blog",
+                     "/tags", "/ja/tags", "/en/tags",
+                     "/guides", "/ja/guides", "/en/guides",
+                     "/support", "/ja/support", "/en/support",
+                     "/level/beginner", "/level/intermediate", "/level/advanced",
+                     "/ja/level/beginner", "/ja/level/intermediate", "/ja/level/advanced",
+                     "/en/level/beginner", "/en/level/intermediate", "/en/level/advanced"];
+      const purged = [];
+      for (const p of paths) {
+        const key = new Request(new URL(p, url.origin).toString(), { method: "GET" });
+        const deleted = await cache.delete(key);
+        if (deleted) purged.push(p);
+      }
+      return new Response(
+        JSON.stringify({ ok: true, version: DEPLOY_VERSION, purged }),
+        { headers: { "Content-Type": "application/json" } }
+      );
     }
 
-    // Skip caching for RSC (React Server Component) prefetch requests
-    const rscHeader = request.headers.get("rsc");
-    if (rscHeader) {
-      return nextHandler.fetch(request, env, ctx);
+    // ── Diagnostic endpoint ───────────────────────────────────
+    if (url.pathname === "/api/cache-status") {
+      return new Response(
+        JSON.stringify({ version: DEPLOY_VERSION, cacheTTL: CACHE_TTL, ts: new Date().toISOString() }),
+        { headers: { "Content-Type": "application/json" } }
+      );
     }
 
+    // ── Non-cacheable requests: pass through ──────────────────
+    if (shouldSkipCache(url, request)) {
+      const resp = await nextHandler.fetch(request, env, ctx);
+      const ct = resp.headers.get("content-type") || "";
+      return ct.includes("text/html") ? injectPolyfill(resp) : resp;
+    }
+
+    // ── Edge cache lookup ─────────────────────────────────────
     const cache = caches.default;
     const cacheKey = new Request(url.toString(), { method: "GET" });
 
-    // Check edge cache
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const resp = new Response(cached.body, cached);
-      resp.headers.set("X-Cache", "HIT");
-      return resp;
+    try {
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        const ver = cached.headers.get("X-Deploy-Version");
+        if (ver === DEPLOY_VERSION) {
+          const hit = new Response(cached.body, cached);
+          hit.headers.set("X-Cache", "HIT");
+          hit.headers.set("Cache-Control", "public, max-age=0, must-revalidate");
+          return injectPolyfill(hit);
+        }
+        // Stale version — purge and fall through
+        ctx.waitUntil(cache.delete(cacheKey));
+      }
+    } catch (_) {
+      // Cache read failure — fall through to SSR
     }
 
-    // Cache miss — run SSR via OpenNext
+    // ── SSR via OpenNext ──────────────────────────────────────
     const response = await nextHandler.fetch(request, env, ctx);
 
-    // Only cache successful HTML responses (not redirects, errors, etc.)
     if (response.status === 200) {
-      const contentType = response.headers.get("content-type") || "";
-      if (contentType.includes("text/html")) {
-        const body = await response.arrayBuffer();
-        const headers = new Headers(response.headers);
-        headers.set(
-          "Cache-Control",
-          `public, s-maxage=${CACHE_TTL}, stale-while-revalidate=86400`
-        );
-        headers.set("X-Cache", "MISS");
-        headers.delete("set-cookie");
+      const ct = response.headers.get("content-type") || "";
+      if (ct.includes("text/html")) {
+        try {
+          // Clone BEFORE consuming body to guarantee fallback
+          const forCache = response.clone();
 
-        const toCache = new Response(body, { status: 200, headers });
+          // Browser response — return immediately
+          const browserHeaders = makeBrowserHeaders(response.headers);
+          browserHeaders.set("X-Cache", "MISS");
+          browserHeaders.set("X-Deploy-Version", DEPLOY_VERSION);
+          const browserResp = new Response(response.body, {
+            status: 200,
+            headers: browserHeaders,
+          });
 
-        // Store in edge cache (non-blocking)
-        ctx.waitUntil(cache.put(cacheKey, toCache.clone()));
+          // Edge cache storage — async, non-blocking
+          ctx.waitUntil(
+            (async () => {
+              try {
+                const body = await forCache.arrayBuffer();
+                const h = new Headers(forCache.headers);
+                h.set("Cache-Control", `public, s-maxage=${CACHE_TTL}, stale-while-revalidate=86400`);
+                h.set("X-Cache", "MISS");
+                h.set("X-Deploy-Version", DEPLOY_VERSION);
+                h.delete("set-cookie");
+                await cache.put(cacheKey, new Response(body, { status: 200, headers: h }));
+              } catch (_) {
+                // Cache write failure — silently ignore
+              }
+            })()
+          );
 
-        return toCache;
+          return injectPolyfill(browserResp);
+        } catch (_) {
+          // Body handling failure — return original with polyfill
+          return injectPolyfill(response);
+        }
       }
     }
 
+    // ── Non-200 / non-HTML passthrough ────────────────────────
+    const ct = response.headers.get("content-type") || "";
+    if (ct.includes("text/html")) {
+      return injectPolyfill(response);
+    }
     return response;
   },
 };

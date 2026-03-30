@@ -1,39 +1,41 @@
 import { localePrefix } from "@/lib/locale";
+import type { ArticleMeta } from "@/lib/content";
+import { CAMPAIGN, PLAN_LABELS } from "@/config/pricing";
 
 interface MembershipCTAProps {
   locale: string;
+  relatedPremiumArticles?: ArticleMeta[];
 }
+
+const proFeatureJa = CAMPAIGN.enabled ? CAMPAIGN.labels.ja.proFeature : PLAN_LABELS.ja.proFeature;
+const proFeatureEn = CAMPAIGN.enabled ? CAMPAIGN.labels.en.proFeature : PLAN_LABELS.en.proFeature;
 
 const CONTENT = {
   ja: {
     heading: "お読みいただきありがとうございます",
     description:
-      "最後までお読みくださり、ありがとうございます。Gemini Lab では、この記事の続きとなる上級実装ガイドや、完全なコード例を含むプレミアム記事もご用意しています。",
+      "Gemini Lab では、実装コード・ベンチマーク・本番設計パターンなど、実務ですぐにお役立ていただけるプレミアム記事をご用意しています。もしご興味がありましたら、ぜひご覧ください。",
     features: [
-      "実践的なコード例・ベンチマーク付き上級ガイド",
-      "毎週追加される限定コンテンツ",
-      "無料記事の「続き」をすべて読める",
+      "コピー&ペーストで使える実装コード付き",
+      "毎日新しい上級ガイドを追加",
+      proFeatureJa,
     ],
-    pro: "Pro プラン — ¥380/月（初月無料）",
-    premium: "Premium プラン — ¥1,480（永久アクセス）",
     link: "メンバーシップを見る →",
   },
   en: {
     heading: "Thank You for Reading",
     description:
-      "Thank you for reading to the end. Gemini Lab offers premium articles with advanced implementation guides, complete code examples, and benchmarks that go deeper into the topics covered here.",
+      "Gemini Lab offers premium articles with implementation code, benchmarks, and production-ready design patterns — practical content we hope you'll find useful.",
     features: [
-      "Advanced guides with working code & benchmarks",
-      "New exclusive content added every week",
-      "Full access to all premium \"deep dive\" articles",
+      "Copy-paste ready implementation code",
+      "New advanced guides published daily",
+      proFeatureEn,
     ],
-    pro: "Pro Plan — $3/mo (first month free)",
-    premium: "Premium Plan — $10 (lifetime access)",
     link: "View Membership →",
   },
 };
 
-export function MembershipCTA({ locale }: MembershipCTAProps) {
+export function MembershipCTA({ locale, relatedPremiumArticles }: MembershipCTAProps) {
   const t = CONTENT[locale as keyof typeof CONTENT] || CONTENT.en;
   const prefix = localePrefix(locale);
 
@@ -101,21 +103,35 @@ export function MembershipCTA({ locale }: MembershipCTAProps) {
           </li>
         ))}
       </ul>
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          gap: 8,
-          fontSize: 12,
-          color: "var(--text-faint)",
-          marginBottom: 16,
-        }}
-      >
-        <span>{t.pro}</span>
-        <span>{t.premium}</span>
-      </div>
+      {relatedPremiumArticles && relatedPremiumArticles.length > 0 && (
+        <div style={{ marginBottom: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+          {relatedPremiumArticles.map((a) => (
+            <a
+              key={`${a.category}/${a.slug}`}
+              href={`${prefix}/articles/${a.category}/${a.slug}`}
+              style={{
+                display: "block",
+                fontSize: 13,
+                color: "var(--text-secondary)",
+                textDecoration: "none",
+                padding: "10px 14px",
+                borderRadius: 8,
+                border: "1px solid var(--border-subtle)",
+                background: "var(--bg-primary)",
+                transition: "border-color 0.2s",
+                lineHeight: 1.5,
+              }}
+            >
+              <span style={{ fontSize: 10, color: "var(--accent-coral)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.08em", marginRight: 8 }}>
+                PREMIUM
+              </span>
+              {a.title}
+            </a>
+          ))}
+        </div>
+      )}
       <a
-        href={`${prefix}/support`}
+        href={`${prefix}/membership`}
         style={{
           display: "inline-block",
           fontSize: 13,

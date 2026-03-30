@@ -1,21 +1,12 @@
 "use client";
 
 import { useState } from "react";
+import { getPriceIds, getLabels, getCampaign } from "@/config/pricing";
 
 interface PremiumPaywallProps {
   locale: string;
+  highlights?: string[];
 }
-
-const PLANS: Record<string, { pro: { priceId: string; label: string }; premium: { priceId: string; label: string } }> = {
-  ja: {
-    pro: { priceId: "price_1TCQykEGB5g6A54oRZa4faF7", label: "Pro — ¥380/月" },
-    premium: { priceId: "price_1TCQyxEGB5g6A54o56MtETkI", label: "Premium — ¥1,480（永久）" },
-  },
-  en: {
-    pro: { priceId: "price_1TCQymEGB5g6A54oyBTnCcRh", label: "Pro — $3/mo" },
-    premium: { priceId: "price_1TCQyzEGB5g6A54odkusafTp", label: "Premium — $10 (lifetime)" },
-  },
-};
 
 const RESTORE_TEXT: Record<string, {
   sectionLabel: string;
@@ -58,13 +49,15 @@ const RESTORE_TEXT: Record<string, {
   },
 };
 
-export function PremiumPaywall({ locale }: PremiumPaywallProps) {
+export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
   const [loading, setLoading] = useState<string | null>(null);
   const [showRestore, setShowRestore] = useState(false);
   const [restoreEmail, setRestoreEmail] = useState("");
   const [restoreLoading, setRestoreLoading] = useState(false);
   const [restoreResult, setRestoreResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
-  const plans = PLANS[locale] || PLANS.en;
+  const priceIds = getPriceIds(locale);
+  const labels = getLabels(locale);
+  const campaign = getCampaign(locale);
   const rt = RESTORE_TEXT[locale] || RESTORE_TEXT.en;
 
   const handleRestore = async () => {
@@ -139,6 +132,18 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
         }}
       >
         <div style={{ fontSize: 28, marginBottom: 12 }}>✦</div>
+        <p
+          style={{
+            fontSize: 13,
+            color: "var(--text-dim)",
+            lineHeight: 1.7,
+            marginBottom: 12,
+          }}
+        >
+          {locale === "ja"
+            ? "ここまでお読みいただきありがとうございます。"
+            : "Thank you for reading this far."}
+        </p>
         <h3
           style={{
             fontSize: 18,
@@ -147,91 +152,138 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
             marginBottom: 8,
           }}
         >
-          {locale === "ja" ? "ここまでお読みいただきありがとうございます" : "Thank you for reading this far"}
+          {locale === "ja" ? "この記事の続きを読む" : "Continue Reading"}
         </h3>
         <p
           style={{
             fontSize: 14,
             color: "var(--text-muted)",
             lineHeight: 1.7,
-            marginBottom: 28,
+            marginBottom: highlights && highlights.length > 0 ? 16 : 28,
           }}
         >
           {locale === "ja"
-            ? "この先には、実装コードやベンチマーク結果など、より実践的な内容をご用意しています。メンバーシップで続きをお読みいただけます。"
-            : "What follows includes implementation code, benchmarks, and more hands-on content. Membership unlocks the full article."}
+            ? "この先には、実装コードやベンチマーク結果など、実務でお役に立てる内容をご用意しています。もしよろしければ、メンバーシップでご覧いただけますと幸いです。"
+            : "What follows includes implementation code, benchmarks, and practical content we hope you'll find useful. We'd be grateful if you'd consider joining our membership."}
         </p>
+        {highlights && highlights.length > 0 && (
+          <div style={{ textAlign: "left", marginBottom: 28, padding: "12px 16px", borderRadius: 8, background: "color-mix(in srgb, var(--accent-coral) 2%, var(--bg-primary))" }}>
+            <div style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", letterSpacing: "0.12em", color: "var(--accent-coral)", marginBottom: 8 }}>
+              {locale === "ja" ? "この記事で得られること" : "WHAT YOU'LL LEARN"}
+            </div>
+            {highlights.map((h, i) => (
+              <div key={i} style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.6, paddingLeft: 16, position: "relative", marginBottom: i < highlights.length - 1 ? 4 : 0 }}>
+                <span style={{ position: "absolute", left: 0, color: "var(--accent-coral)", fontSize: 11 }}>✦</span>
+                {h}
+              </div>
+            ))}
+          </div>
+        )}
 
-        {/* Pro button */}
+        {/* Premium — primary CTA */}
         <button
-          onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
+          onClick={() => handleCheckout(priceIds.premium, "payment", "premium")}
           disabled={!!loading}
           style={{
             display: "block",
             width: "100%",
             maxWidth: 320,
-            margin: "0 auto 12px",
-            padding: "12px 24px",
+            margin: "0 auto 10px",
+            padding: "14px 24px",
             borderRadius: 8,
-            border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
-            background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
-            color: "var(--accent-coral)",
+            border: campaign.enabled
+              ? "1px solid color-mix(in srgb, #daa520 50%, transparent)"
+              : "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
+            background: campaign.enabled
+              ? "color-mix(in srgb, #daa520 12%, transparent)"
+              : "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+            color: campaign.enabled ? "#daa520" : "var(--accent-coral)",
             fontSize: 14,
-            fontWeight: 600,
+            fontWeight: 700,
             cursor: loading ? "wait" : "pointer",
-            opacity: loading === "pro" ? 0.7 : 1,
+            opacity: loading === "premium" ? 0.7 : 1,
             transition: "all 0.25s",
+            letterSpacing: "-0.01em",
+            position: "relative" as const,
+            overflow: "visible",
           }}
           onMouseEnter={(e) => {
             if (!loading) {
-              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
+              const c = campaign.enabled ? "#daa520" : "var(--accent-coral)";
+              e.currentTarget.style.background = `color-mix(in srgb, ${c} 20%, transparent)`;
               e.currentTarget.style.transform = "translateY(-1px)";
             }
           }}
           onMouseLeave={(e) => {
-            e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
+            const c = campaign.enabled ? "#daa520" : "var(--accent-coral)";
+            e.currentTarget.style.background = `color-mix(in srgb, ${c} 12%, transparent)`;
             e.currentTarget.style.transform = "translateY(0)";
           }}
         >
-          {loading === "pro"
+          {campaign.enabled && (
+            <span style={{
+              position: "absolute" as const,
+              top: -10,
+              right: 12,
+              padding: "3px 9px 1px",
+              borderRadius: 4,
+              background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
+              fontSize: 10,
+              fontFamily: "'DM Mono', monospace",
+              fontWeight: 700,
+              letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
+              color: "#fff",
+              whiteSpace: "nowrap" as const,
+            }}>
+              {campaign.name}
+            </span>
+          )}
+          {loading === "premium"
             ? locale === "ja" ? "処理中..." : "Loading..."
-            : plans.pro.label}
+            : campaign.enabled
+              ? <>
+                  <span style={{ textDecoration: "line-through", opacity: 0.5, fontWeight: 400, marginRight: 6 }}>
+                    {campaign.originalPrice}
+                  </span>
+                  {`Premium — ${campaign.price}`}
+                </>
+              : labels.premiumButton}
         </button>
 
-        {/* Premium button */}
+        {/* Pro — secondary */}
         <button
-          onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
+          onClick={() => handleCheckout(priceIds.pro, "subscription", "pro")}
           disabled={!!loading}
           style={{
             display: "block",
             width: "100%",
             maxWidth: 320,
             margin: "0 auto",
-            padding: "12px 24px",
+            padding: "14px 24px",
             borderRadius: 8,
-            border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
-            background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+            border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
+            background: "transparent",
             color: "var(--accent-coral)",
             fontSize: 14,
-            fontWeight: 600,
+            fontWeight: 500,
             cursor: loading ? "wait" : "pointer",
-            opacity: loading === "premium" ? 0.7 : 1,
+            opacity: loading === "pro" ? 0.7 : 1,
             transition: "all 0.25s",
           }}
           onMouseEnter={(e) => {
             if (!loading) {
-              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
+              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 8%, transparent)";
               e.currentTarget.style.transform = "translateY(-1px)";
             }
           }}
           onMouseLeave={(e) => {
-            e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
+            e.currentTarget.style.background = "transparent";
             e.currentTarget.style.transform = "translateY(0)";
           }}
         >
-          {loading === "premium"
+          {loading === "pro"
             ? locale === "ja" ? "処理中..." : "Loading..."
-            : plans.premium.label}
+            : labels.proButton}
         </button>
 
         <div

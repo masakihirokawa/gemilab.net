@@ -1,5 +1,25 @@
 import articlesData from "@/generated/articles.json";
 import blogData from "@/generated/blog.json";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+
+/**
+ * Read a static asset from Cloudflare Workers ASSETS binding.
+ * This avoids self-fetch (which Cloudflare blocks) by using the
+ * internal binding directly.
+ */
+async function readStaticAsset(path: string): Promise<string> {
+  try {
+    const { env } = getCloudflareContext();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const assets = (env as any).ASSETS;
+    if (!assets?.fetch) return "";
+    const res = await assets.fetch(new URL(path, "https://assets.local"));
+    if (!res.ok) return "";
+    return await res.text();
+  } catch {
+    return "";
+  }
+}
 
 export interface ArticleMeta {
   title: string;
@@ -12,6 +32,7 @@ export interface ArticleMeta {
   description: string;
   tags: string[];
   premium?: boolean;
+  highlights?: string[];
 }
 
 export interface Article {
@@ -63,7 +84,7 @@ export function getArticle(
       tags: entry.tags || [],
       premium: entry.premium || false,
     },
-    content: entry.content || "",
+    content: "",
   };
 }
 
@@ -83,6 +104,8 @@ export const CATEGORIES = [
   { id: "gemini-dev", icon: "⟐", color: "var(--accent-blue)" },
   { id: "gemini-api", icon: "◈", color: "var(--accent-green)" },
   { id: "gemini-advanced", icon: "⬡", color: "var(--accent-gold)" },
+  { id: "gemini-workspace", icon: "◧", color: "var(--accent-blue)" },
+  { id: "gemini-updates", icon: "◎", color: "var(--accent-green)" },
 ] as const;
 
 // ── Blog ──
@@ -129,6 +152,21 @@ export function getBlogPost(locale: string, slug: string): BlogPost | null {
       description: entry.description || "",
       tags: entry.tags || [],
     },
-    content: entry.content || "",
+    content: "",
   };
+}
+
+export async function getArticleContent(
+  locale: string,
+  category: string,
+  slug: string
+): Promise<string> {
+  return readStaticAsset(`/content/articles/${locale}/${category}/${slug}.html`);
+}
+
+export async function getBlogContent(
+  locale: string,
+  slug: string
+): Promise<string> {
+  return readStaticAsset(`/content/blog/${locale}/${slug}.html`);
 }

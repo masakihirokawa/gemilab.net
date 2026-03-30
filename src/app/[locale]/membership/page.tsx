@@ -1,6 +1,9 @@
 import type { Metadata } from "next";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
+import { MembershipPlans } from "@/components/ui/MembershipPlans";
+import { PRICES, STRIPE_PRICE_IDS, CAMPAIGN } from "@/config/pricing";
+import { getPremiumAccess } from "@/lib/premium";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -8,14 +11,14 @@ interface Props {
 
 const META = {
   ja: {
-    title: "メンバーシップ",
+    title: "メンバーシップ — Gemini Lab",
     description:
-      "Gemini Lab メンバーシップで、プレミアム限定の上級ガイドやチュートリアルにアクセス。Pro プラン（¥380/月）と Premium プラン（¥1,480 永久アクセス）をご用意しています。",
+      `Gemini Lab メンバーシップで、プレミアム限定の上級ガイドやチュートリアルにアクセス。Pro プラン（${PRICES.ja.pro.replace("/月", "")}/月）と Premium プラン（${PRICES.ja.premium} 永久アクセス）をご用意しています。`,
   },
   en: {
-    title: "Membership",
+    title: "Membership — Gemini Lab",
     description:
-      "Access exclusive premium guides and advanced tutorials with Gemini Lab Membership. Choose from Pro ($3/mo) or Premium ($10 lifetime).",
+      `Access exclusive premium guides and advanced tutorials with Gemini Lab Membership. Choose from Pro (${PRICES.en.pro.replace("/mo", "")}/mo) or Premium (${PRICES.en.premium} lifetime).`,
   },
 };
 
@@ -54,19 +57,19 @@ const PAGE_TEXT = {
   ja: {
     badge: "MEMBERSHIP",
     heading: "メンバーシップ",
-    subheading: "プレミアム限定の上級ガイドとチュートリアル",
+    subheading: "実装コード付きの上級ガイドが読み放題",
     description:
-      "Gemini Lab メンバーシップでは、毎週追加されるプレミアム記事にアクセスできます。Gemini API の高度な活用、エージェント構築、ドキュメント処理などの実践ガイドをお届けします。",
+      "Gemini Lab をご覧いただきありがとうございます。コピー&ペーストで使える実装コード、ベンチマーク結果、本番設計パターンを含む上級ガイドを毎日追加しています。無料記事で基礎を学んだ後の「次の一歩」として、お役に立てれば幸いです。",
     features: [
       "すべてのプレミアム記事が読み放題",
-      "毎週追加される限定コンテンツ",
-      "上級テクニック・実践ガイド",
+      "毎日追加される実装コード付き上級ガイド",
+      "本番環境で使える設計パターン・ベストプラクティス",
     ],
     pro: "Pro プラン",
-    proPrice: "¥380/月",
+    proPrice: `${PRICES.ja.pro}`,
     proDesc: "月額制で全プレミアム記事にアクセス",
     premium: "Premium プラン",
-    premiumPrice: "¥1,480",
+    premiumPrice: `${PRICES.ja.premium}`,
     premiumDesc: "一括払いで永久アクセス",
     recommended: "おすすめ",
     cta: "メンバーシップに登録する →",
@@ -74,23 +77,24 @@ const PAGE_TEXT = {
     premiumCount: (n: number) => `${n} 本の限定記事`,
     noArticles: "プレミアム記事は準備中です。",
     locked: "PREMIUM",
+    thankYou: (plan: string) => `いつもご利用いただきありがとうございます。${plan} メンバーとして、すべてのプレミアム記事をお楽しみいただけます。`,
   },
   en: {
     badge: "MEMBERSHIP",
     heading: "Membership",
-    subheading: "Exclusive premium guides and tutorials",
+    subheading: "Advanced guides with production-ready code",
     description:
-      "Gemini Lab Membership gives you access to premium articles added every week. Master advanced Gemini API usage, agent development, document processing, and more.",
+      "Thank you for visiting Gemini Lab. We publish advanced guides daily with copy-paste ready code, benchmarks, and production design patterns — practical content we hope you'll find useful as the next step after our free articles.",
     features: [
       "Unlimited access to all premium articles",
-      "New exclusive content added every week",
-      "Advanced techniques & hands-on guides",
+      "New advanced guides with code published daily",
+      "Production-ready design patterns & best practices",
     ],
     pro: "Pro Plan",
-    proPrice: "$3/mo",
+    proPrice: `${PRICES.en.pro}`,
     proDesc: "Monthly access to all premium articles",
     premium: "Premium Plan",
-    premiumPrice: "$10",
+    premiumPrice: `${PRICES.en.premium}`,
     premiumDesc: "One-time payment for lifetime access",
     recommended: "RECOMMENDED",
     cta: "Join Membership →",
@@ -98,6 +102,7 @@ const PAGE_TEXT = {
     premiumCount: (n: number) => `${n} exclusive article${n !== 1 ? "s" : ""}`,
     noArticles: "Premium articles coming soon.",
     locked: "PREMIUM",
+    thankYou: (plan: string) => `Thank you for being a valued ${plan} member. You have full access to all premium articles.`,
   },
 };
 
@@ -105,6 +110,8 @@ export default async function MembershipPage({ params }: Props) {
   const { locale } = await params;
   const t = PAGE_TEXT[locale as keyof typeof PAGE_TEXT] || PAGE_TEXT.en;
   const prefix = locale === "ja" ? "" : `/${locale}`;
+
+  const premiumAccess = await getPremiumAccess();
 
   const allArticles = getArticles(locale);
   const premiumArticles = allArticles.filter((a) => a.premium);
@@ -142,85 +149,35 @@ export default async function MembershipPage({ params }: Props) {
           {t.description}
         </p>
 
-        <ul style={{ listStyle: "none", padding: 0, margin: "0 0 32px 0", display: "flex", flexDirection: "column", gap: 8 }}>
-          {t.features.map((f) => (
-            <li key={f} style={{ fontSize: 13, color: "var(--text-muted)", paddingLeft: 20, position: "relative" }}>
-              <span style={{ position: "absolute", left: 0, color: "var(--accent-coral)" }}>✦</span>
-              {f}
-            </li>
-          ))}
-        </ul>
+        {premiumAccess ? (
+          <div style={{ textAlign: "center", padding: "20px 0" }}>
+            <p style={{ fontSize: 15, color: "var(--text-primary)", lineHeight: 1.7 }}>
+              {t.thankYou(premiumAccess === "pro" ? "Pro" : "Premium")}
+            </p>
+          </div>
+        ) : (
+          <>
+            <ul style={{ listStyle: "none", padding: 0, margin: "0 0 32px 0", display: "flex", flexDirection: "column", gap: 8 }}>
+              {t.features.map((f) => (
+                <li key={f} style={{ fontSize: 13, color: "var(--text-muted)", paddingLeft: 20, position: "relative" }}>
+                  <span style={{ position: "absolute", left: 0, color: "var(--accent-coral)" }}>✦</span>
+                  {f}
+                </li>
+              ))}
+            </ul>
 
-        {/* Plans */}
-        <div style={{ display: "flex", gap: 20, marginBottom: 32, flexWrap: "wrap" }}>
-          {/* Pro — Recommended */}
-          <a
-            href={`${prefix}/support#membership`}
-            className="plan-card"
-            style={{
-              display: "block",
-              padding: "16px 24px",
-              borderRadius: 10,
-              border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
-              background: "color-mix(in srgb, var(--accent-coral) 4%, var(--bg-primary))",
-              minWidth: 200,
-              textDecoration: "none",
-              position: "relative",
-              transition: "all 0.25s",
-            }}
-          >
-            <span style={{
-              position: "absolute", top: -9, right: 12,
-              fontSize: 9, fontFamily: "'DM Mono', monospace", letterSpacing: "0.12em",
-              padding: "3px 8px 1px", borderRadius: 4,
-              background: "var(--accent-coral)", color: "var(--bg-primary)",
-              fontWeight: 700,
-            }}>
-              {t.recommended}
-            </span>
-            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>{t.pro}</div>
-            <div style={{ fontSize: 22, fontWeight: 300, color: "var(--accent-coral)", marginBottom: 4 }}>{t.proPrice}</div>
-            <div style={{ fontSize: 12, color: "var(--text-dim)" }}>{t.proDesc}</div>
-          </a>
-          {/* Premium */}
-          <a
-            href={`${prefix}/support#membership`}
-            className="plan-card"
-            style={{
-              display: "block",
-              padding: "16px 24px",
-              borderRadius: 10,
-              border: "1px solid var(--border-subtle)",
-              background: "var(--bg-primary)",
-              minWidth: 200,
-              textDecoration: "none",
-              transition: "all 0.25s",
-            }}
-          >
-            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>{t.premium}</div>
-            <div style={{ fontSize: 22, fontWeight: 300, color: "var(--accent-coral)", marginBottom: 4 }}>{t.premiumPrice}</div>
-            <div style={{ fontSize: 12, color: "var(--text-dim)" }}>{t.premiumDesc}</div>
-          </a>
-        </div>
-
-        <a
-          href={`${prefix}/support`}
-          className="membership-cta"
-          style={{
-            display: "inline-block",
-            fontSize: 14,
-            fontWeight: 600,
-            color: "var(--accent-coral)",
-            textDecoration: "none",
-            padding: "12px 28px",
-            borderRadius: 8,
-            border: "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
-            background: "color-mix(in srgb, var(--accent-coral) 8%, transparent)",
-            transition: "all 0.25s",
-          }}
-        >
-          {t.cta}
-        </a>
+            {/* Plans + CTA (Client Component with Stripe Checkout) */}
+            <MembershipPlans
+              locale={locale}
+              stripeConfig={{
+                pro: { priceId: STRIPE_PRICE_IDS[locale as keyof typeof STRIPE_PRICE_IDS].pro },
+                premium: { priceId: CAMPAIGN.enabled
+                  ? (locale === "ja" ? CAMPAIGN.priceIds.ja : CAMPAIGN.priceIds.en)
+                  : (locale === "ja" ? STRIPE_PRICE_IDS.ja.premium : STRIPE_PRICE_IDS.en.premium) },
+              }}
+            />
+          </>
+        )}
       </section>
 
       {/* Premium Articles Section */}

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { SupportClient } from "./SupportClient";
 import { getPremiumAccess } from "@/lib/premium";
+import { STRIPE_PRICE_IDS, PRICES, CAMPAIGN, getPriceIds } from "@/config/pricing";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -9,11 +10,11 @@ interface Props {
 const META: Record<string, { title: string; description: string }> = {
   ja: {
     title: "メンバーシップ & サポート — Gemini Lab",
-    description: "Gemini Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。月額 ¥380 または永久アクセス ¥1,480。",
+    description: `Gemini Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。広告なしで公開しており、皆さまのサポートが運営を支えています。月額 ${PRICES.ja.pro.replace("/月", "")} または永久アクセス ${PRICES.ja.premium}。`,
   },
   en: {
     title: "Membership & Support — Gemini Lab",
-    description: "Get full access to all premium articles with Gemini Lab Pro / Premium. $3/month or $10 lifetime.",
+    description: `Get full access to all premium articles with Gemini Lab Pro / Premium. Ad-free and community-supported. ${PRICES.en.pro.replace("/mo", "")}/month or ${PRICES.en.premium} lifetime.`,
   },
 };
 
@@ -35,21 +36,6 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   };
 }
 
-const STRIPE_TIP: Record<string, { priceId: string }> = {
-  ja: { priceId: "price_1TCQyPEGB5g6A54oqVrc9ron" },
-  en: { priceId: "price_1TCQyXEGB5g6A54okNKaZiad" },
-};
-
-const STRIPE_PLANS: Record<string, { pro: { priceId: string; label: string; price: string }; premium: { priceId: string; label: string; price: string } }> = {
-  ja: {
-    pro: { priceId: "price_1TCQykEGB5g6A54oRZa4faF7", label: "Pro — 月額プラン", price: "¥380/月" },
-    premium: { priceId: "price_1TCQyxEGB5g6A54o56MtETkI", label: "Premium — 永久アクセス", price: "¥1,480" },
-  },
-  en: {
-    pro: { priceId: "price_1TCQymEGB5g6A54oyBTnCcRh", label: "Pro — Monthly", price: "$3/mo" },
-    premium: { priceId: "price_1TCQyzEGB5g6A54odkusafTp", label: "Premium — Lifetime", price: "$10" },
-  },
-};
 
 const CONTENT: Record<string, {
   heading: string;
@@ -77,20 +63,19 @@ const CONTENT: Record<string, {
   ja: {
     heading: "メンバーシップ & サポート",
     sub: "Gemini Lab をご覧いただきありがとうございます。広告なし・無料で公開しており、皆さまのサポートがドメイン・サーバー代などの運営費を支えています。",
-    membershipHeading: "Gemini Lab Pro / Premium",
-    membershipSub: "すべてのプレミアム記事にアクセス",
+    membershipHeading: "Gemini Lab メンバーシップ",
+    membershipSub: "実装コード付きの上級ガイドが読み放題",
     features: [
-      "初月無料（Proプランのみ）",
-      "プレミアム記事が読み放題（週2本追加）",
-      "深掘り技術チュートリアル & 実践コード",
-      "広告なしの快適な閲覧体験",
+      "コピー&ペーストで使える実装コード付き",
+      "毎日追加される上級ガイド",
+      "本番環境で使える設計パターン",
       "いつでもキャンセル可能",
     ],
-    proLabel: "月額プランで始める（初月無料）",
-    premiumLabel: "永久アクセスを購入",
+    proLabel: `月額プラン — ${PRICES.ja.pro}`,
+    premiumLabel: CAMPAIGN.enabled ? `永久アクセス — ${CAMPAIGN.prices.ja}` : `永久アクセス — ${PRICES.ja.premium}（おすすめ）`,
     tipHeading: "チップで応援する",
-    note: "※ いただいたご支援はサーバー費用・コンテンツ制作に使わせていただきます。",
-    tipLabel: "¥150 チップを送る",
+    note: "※ いただいたご支援はすべて、サーバー費用・ドメイン代・コンテンツ制作に大切に使わせていただきます。",
+    tipLabel: `${PRICES.ja.tip} チップを送る`,
     tipSub: "Stripe 決済（クレジットカード対応）",
     methods: [
       { name: "Ko-fi", icon: "☕", label: "Ko-fi でサポート", sub: "ko-fi.com/dolice", url: "https://ko-fi.com/dolice", color: "#29ABE0", global: true },
@@ -102,21 +87,20 @@ const CONTENT: Record<string, {
   },
   en: {
     heading: "Membership & Support",
-    sub: "Thank you for visiting Gemini Lab. Ad-free and free to read — your support covers hosting and domain costs.",
-    membershipHeading: "Gemini Lab Pro / Premium",
-    membershipSub: "Full access to all premium articles",
+    sub: "Thank you for visiting Gemini Lab. We keep this site completely ad-free and free to read. Server, hosting, and domain costs are entirely covered by your generous support — and we're truly grateful for it.",
+    membershipHeading: "Gemini Lab Membership",
+    membershipSub: "Advanced guides with production-ready code",
     features: [
-      "First month free (Pro plan only)",
-      "Unlimited access to premium articles (2 new per week)",
-      "In-depth technical tutorials & working code",
-      "Ad-free reading experience",
+      "Copy-paste ready implementation code",
+      "New advanced guides published daily",
+      "Production-ready design patterns",
       "Cancel anytime",
     ],
-    proLabel: "Start Monthly Plan (First Month Free)",
-    premiumLabel: "Buy Lifetime Access",
+    proLabel: `Monthly — ${PRICES.en.pro}`,
+    premiumLabel: CAMPAIGN.enabled ? `Lifetime Access — ${CAMPAIGN.prices.en}` : `Lifetime Access — ${PRICES.en.premium} (Recommended)`,
     tipHeading: "Leave a Tip",
-    note: "* All contributions go toward server costs and content creation.",
-    tipLabel: "Send $1.50 Tip",
+    note: "* Every contribution goes directly toward server costs, hosting, and content creation. Thank you for your support.",
+    tipLabel: `Send ${PRICES.en.tip} Tip`,
     tipSub: "Stripe checkout (credit card)",
     methods: [
       { name: "Ko-fi", icon: "☕", label: "Support on Ko-fi", sub: "ko-fi.com/dolice", url: "https://ko-fi.com/dolice", color: "#29ABE0", global: true },
@@ -124,6 +108,32 @@ const CONTENT: Record<string, {
       { name: "Wise", icon: "🌍", label: "Send via Wise", sub: "wise.com/pay/me/masakih65", url: "https://wise.com/pay/me/masakih65", color: "#9FE870", global: true },
       { name: "Revolut", icon: "⚡", label: "Send via Revolut", sub: "@masakihirokawa", url: "https://revolut.me/masakihirokawa", color: "#191C1F", global: true },
     ],
+  },
+};
+
+const STRIPE_TIP: Record<string, { priceId: string }> = {
+  ja: { priceId: STRIPE_PRICE_IDS.ja.tip },
+  en: { priceId: STRIPE_PRICE_IDS.en.tip },
+};
+
+const STRIPE_PLANS: Record<string, { pro: { priceId: string; label: string; price: string }; premium: { priceId: string; label: string; price: string; originalPrice?: string } }> = {
+  ja: {
+    pro: { priceId: STRIPE_PRICE_IDS.ja.pro, label: "Pro — 月額プラン", price: PRICES.ja.pro },
+    premium: {
+      priceId: CAMPAIGN.enabled ? CAMPAIGN.priceIds.ja : STRIPE_PRICE_IDS.ja.premium,
+      label: CAMPAIGN.enabled ? `永久アクセス — ${CAMPAIGN.prices.ja}（${CAMPAIGN.name.ja}）` : "Premium — 永久アクセス",
+      price: CAMPAIGN.enabled ? CAMPAIGN.prices.ja : PRICES.ja.premium,
+      ...(CAMPAIGN.enabled && { originalPrice: PRICES.ja.premium }),
+    },
+  },
+  en: {
+    pro: { priceId: STRIPE_PRICE_IDS.en.pro, label: "Pro — Monthly", price: PRICES.en.pro },
+    premium: {
+      priceId: CAMPAIGN.enabled ? CAMPAIGN.priceIds.en : STRIPE_PRICE_IDS.en.premium,
+      label: CAMPAIGN.enabled ? `Lifetime Access — ${CAMPAIGN.prices.en} (${CAMPAIGN.name.en})` : "Premium — Lifetime",
+      price: CAMPAIGN.enabled ? CAMPAIGN.prices.en : PRICES.en.premium,
+      ...(CAMPAIGN.enabled && { originalPrice: PRICES.en.premium }),
+    },
   },
 };
 

@@ -18,6 +18,7 @@ import rehypePrettyCode from "rehype-pretty-code";
 
 const CONTENT_DIR = path.join(process.cwd(), "content");
 const OUTPUT_DIR = path.join(process.cwd(), "src", "generated");
+const CONTENT_HTML_DIR = path.join(process.cwd(), "public", "content");
 
 /**
  * Single shared processor — created once so shiki is initialized only once.
@@ -122,6 +123,13 @@ async function generateArticleIndex() {
           console.warn(`  ⚠ WARNING: ${locale}/${category}/${file}: hardcoded locale-prefixed article link found. Fix: use /articles/... (JA) or /en/articles/... (EN)`);
         }
 
+        // Write HTML content to individual file
+        const htmlDir = path.join(CONTENT_HTML_DIR, "articles", locale, category);
+        if (!fs.existsSync(htmlDir)) {
+          fs.mkdirSync(htmlDir, { recursive: true });
+        }
+        fs.writeFileSync(path.join(htmlDir, `${slug}.html`), html, "utf-8");
+
         result[locale].push({
           title: data.title || "",
           slug,
@@ -133,19 +141,22 @@ async function generateArticleIndex() {
           description: data.description || "",
           tags: data.tags || [],
           premium: data.premium || false,
-          content: html,
+          ...(data.highlights ? { highlights: data.highlights } : {}),
+          highlights: data.highlights || null,
         });
       }
     }
 
-    // Sort: by updated time (newest first), then by date, then by title.
+    // Sort: by creation date (newest first).
+    // Same date-time: non-premium articles first so premium doesn't always top the list.
     result[locale].sort((a, b) => {
-      const aUpdated = a.updated || a.date || "";
-      const bUpdated = b.updated || b.date || "";
-      if (aUpdated !== bUpdated) return aUpdated > bUpdated ? -1 : 1;
       const aDate = a.date || "";
       const bDate = b.date || "";
       if (aDate !== bDate) return aDate > bDate ? -1 : 1;
+      // Same creation date: non-premium before premium
+      const aPrem = a.premium ? 1 : 0;
+      const bPrem = b.premium ? 1 : 0;
+      if (aPrem !== bPrem) return aPrem - bPrem;
       return a.title.localeCompare(b.title);
     });
   }
@@ -201,6 +212,13 @@ async function generateBlogIndex() {
 
       const html = await compileMarkdown(cleanedContent);
 
+      // Write HTML content to individual file
+      const htmlDir = path.join(CONTENT_HTML_DIR, "blog", locale);
+      if (!fs.existsSync(htmlDir)) {
+        fs.mkdirSync(htmlDir, { recursive: true });
+      }
+      fs.writeFileSync(path.join(htmlDir, `${slug}.html`), html, "utf-8");
+
       result[locale].push({
         title: data.title || "",
         slug,
@@ -208,7 +226,6 @@ async function generateBlogIndex() {
         author: data.author || "Gemini Lab",
         description: data.description || "",
         tags: data.tags || [],
-        content: html,
       });
     }
 

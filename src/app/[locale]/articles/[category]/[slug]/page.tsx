@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { getArticle, getAllArticleSlugs, CATEGORIES } from "@/lib/content";
+import { getArticle, getAllArticleSlugs, CATEGORIES, getArticleContent } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { BookRecommendation } from "@/components/ui/BookRecommendation";
 import { ShareButtons } from "@/components/ui/ShareButtons";
@@ -77,8 +77,8 @@ const LEVEL_LABELS: Record<string, Record<string, string>> = {
 };
 
 const CATEGORY_LABELS: Record<string, Record<string, string>> = {
-  ja: { "gemini-basics": "Gemini 入門", "gemini-dev": "開発ツール", "gemini-api": "API / SDK", "gemini-advanced": "高度な活用" },
-  en: { "gemini-basics": "Gemini Basics", "gemini-dev": "Dev Tools", "gemini-api": "API / SDK", "gemini-advanced": "Advanced" },
+  ja: { "gemini-basics": "Gemini 入門", "gemini-dev": "開発ツール", "gemini-api": "API / SDK", "gemini-advanced": "高度な活用", "gemini-workspace": "Workspace 連携", "gemini-updates": "最新情報" },
+  en: { "gemini-basics": "Gemini Basics", "gemini-dev": "Dev Tools", "gemini-api": "API / SDK", "gemini-advanced": "Advanced", "gemini-workspace": "Workspace", "gemini-updates": "Updates" },
 };
 
 
@@ -104,6 +104,9 @@ export default async function ArticlePage({ params }: Props) {
   if (!article) {
     notFound();
   }
+
+  // Fetch article content from static assets
+  const content = await getArticleContent(locale, category, slug);
 
   const catInfo = CATEGORIES.find((c) => c.id === category);
   const prefix = locale === "ja" ? "" : `/${locale}`;
@@ -259,7 +262,7 @@ export default async function ArticlePage({ params }: Props) {
       <hr style={{ border: "none", borderTop: "1px solid var(--border-subtle)", marginBottom: 40 }} />
 
       {/* Table of Contents */}
-      <TableOfContents locale={locale} initialItems={extractTocItems(article.content)} />
+      <TableOfContents locale={locale} initialItems={extractTocItems(content)} />
 
       {/* Premium badge */}
       {article.meta.premium && (
@@ -273,14 +276,14 @@ export default async function ArticlePage({ params }: Props) {
         <>
           <div
             className="article-content"
-            dangerouslySetInnerHTML={{ __html: article.content.slice(0, 10000) }}
+            dangerouslySetInnerHTML={{ __html: content.slice(0, 10000) }}
           />
-          <PremiumPaywall locale={locale} />
+          <PremiumPaywall locale={locale} highlights={article.meta.highlights} />
         </>
       ) : (
         <div
           className="article-content"
-          dangerouslySetInnerHTML={{ __html: article.content }}
+          dangerouslySetInnerHTML={{ __html: content }}
         />
       )}
 
@@ -288,15 +291,17 @@ export default async function ArticlePage({ params }: Props) {
       <ShareButtons
         title={article.meta.title}
         url={`https://gemilab.net${prefix}/articles/${category}/${slug}`}
+        tags={article.meta.tags}
+        siteName="GeminiLab"
       />
 
-      {/* Membership CTA — shown only for non-members on free articles */}
+      {/* Membership CTA — shown for non-members on free articles */}
       {!canViewPremium && !article.meta.premium && (
         <MembershipCTA locale={locale} />
       )}
 
-      {/* Tip CTA — shown on free articles for all readers */}
-      {!article.meta.premium && <TipCTA locale={locale} />}
+      {/* Tip CTA — shown when full article content is visible */}
+      {(!article.meta.premium || canViewPremium) && <TipCTA locale={locale} />}
 
       {/* Related Articles */}
       <RelatedArticles
@@ -307,7 +312,7 @@ export default async function ArticlePage({ params }: Props) {
       />
 
       {/* Book Recommendations */}
-      <BookRecommendation locale={locale} />
+      <BookRecommendation locale={locale} category={category} />
     </article>
     </>
   );
