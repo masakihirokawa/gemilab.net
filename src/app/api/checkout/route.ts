@@ -11,20 +11,20 @@ function getStripe() {
 const PLAN_NAMES: Record<string, string> = {
   // JA
   "price_1TCQyPEGB5g6A54oqVrc9ron": "Gemini Lab — チップ（¥150）ご支援ありがとうございます",
-  "price_1TGSqVEGB5g6A54o54sFGJa7": "Gemini Lab メンバーシップ — プロ（月額プラン）",
-  "price_1TCQyxEGB5g6A54o56MtETkI": "Gemini Lab メンバーシップ — プレミアム（永久アクセス）",
-  "price_1TFRyMEGB5g6A54o4j3brkd6": "Gemini Lab メンバーシップ — プレミアム（感謝価格 ¥980）",
+  "price_1TGSqVEGB5g6A54o54sFGJa7": "Gemini Lab メンバーシップ — Pro（月額プラン）",
+  "price_1TCQyxEGB5g6A54o56MtETkI": "Gemini Lab メンバーシップ — Premium（永久アクセス）",
+  "price_1TFRyMEGB5g6A54o4j3brkd6": "Gemini Lab メンバーシップ — Premium（感謝価格 ¥980）",
   // EN
-  "price_1TCQyXEGB5g6A54okNKaZiad": "Gemini Lab — Tip ($1.50) Thank you for your support",
-  "price_1TGSqWEGB5g6A54oZ0MDW2uK": "Gemini Lab Membership — Pro (Monthly)",
-  "price_1TCQyzEGB5g6A54odkusafTp": "Gemini Lab Membership — Premium (Lifetime Access)",
-  "price_1TFRyMEGB5g6A54ocVmrC9gS": "Gemini Lab Membership — Premium (Thank You Price $7)",
+  "price_1TGTQNEGB5g6A54otffwJLGB": "Gemini Lab — Tip ($1.50) Thank you for your support",
+  "price_1TGTQOEGB5g6A54oiLbNR1xV": "Gemini Lab Membership — Pro (Monthly)",
+  "price_1TGTQOEGB5g6A54oWHbKx4ab": "Gemini Lab Membership — Premium (Lifetime Access)",
+  "price_1TGTQOEGB5g6A54on5ljuNBC": "Gemini Lab Membership — Premium (Thank You Price $7)",
 };
 
 // Tip price IDs — these should NOT grant premium access
 const TIP_PRICE_IDS = new Set([
   "price_1TCQyPEGB5g6A54oqVrc9ron", // ¥150 JPY
-  "price_1TCQyXEGB5g6A54okNKaZiad", // $1.50 USD
+  "price_1TGTQNEGB5g6A54otffwJLGB", // $1.50 USD
 ]);
 
 export async function POST(request: NextRequest) {
