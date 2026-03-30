@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "IMPORT — Gemini にチャット履歴インポート機能が登場、ChatGPT・Claude からワンクリックで移行可能に（3/26）",
-    "FREE — Personal Intelligence が全米で無料化、Gmail・Photos・YouTube と連携した個人 AI アシスタント（3/27）",
-    "WORKSPACE — Gemini in Docs・Sheets・Slides が強化、Drive 検索に AI Overview が追加（3/27）",
-    "3.1 PRO — Gemini 3.1 Pro Preview が正式公開、complex tasks 向け推論能力が大幅向上（3/30）",
-    "PIXEL — Pixel Drop 3 月版：Gemini App Actions でエージェント操作が日常に（食料品注文・配車・スマートホーム）（3/26）",
-    "750M — Gemini が月間 7.5 億ユーザー突破、API リクエスト月 850 億件で AI 最速成長を維持（3/28）",
+    "FLASH — Gemini 2.5 Flash-Lite Preview が本日 (3/31) で終了、3.1 Flash-Lite Preview への移行を推奨（3/31）",
+    "IMPORT — Gemini にチャット履歴＆メモリーインポート機能が追加、ChatGPT からワンクリック移行が可能に（3/28）",
+    "FREE — Personal Intelligence が全米で無料化、Gmail・Photos・YouTube 横断の個人 AI アシスタント（3/27）",
+    "LIVE — Gemini Live 3.1 が応答速度向上＋コンテキスト保持量 2 倍、より自然な対話体験へ（3/27）",
+    "HOME — Gemini for Home のレスポンスが 40% 高速化、スマートホーム操作がさらに快適に（3/28）",
+    "CODE — Gemini Code Assist が個人開発者向けに完全無料化、AI コーディング支援がゼロコストで利用可能（3/31）",
   ],
   en: [
-    "IMPORT — Gemini adds chat history import: migrate from ChatGPT & Claude in one click (3/26)",
-    "FREE — Personal Intelligence now free for all US users, connecting Gmail, Photos & YouTube (3/27)",
-    "WORKSPACE — Gemini in Docs, Sheets & Slides enhanced; Drive search gains AI Overview (3/27)",
-    "3.1 PRO — Gemini 3.1 Pro Preview launches with major reasoning improvements for complex tasks (3/30)",
-    "PIXEL — March Pixel Drop: Gemini App Actions bring agentic control to daily tasks (3/26)",
-    "750M — Gemini hits 750M monthly active users, API processing 85B+ requests per month (3/28)",
+    "FLASH — Gemini 2.5 Flash-Lite Preview sunsets today (3/31), migrate to 3.1 Flash-Lite Preview now (3/31)",
+    "IMPORT — Gemini adds chat history & memory import, one-click migration from ChatGPT now available (3/28)",
+    "FREE — Personal Intelligence now free for all US users, spanning Gmail, Photos & YouTube (3/27)",
+    "LIVE — Gemini Live 3.1 delivers faster responses with 2x longer context retention (3/27)",
+    "HOME — Gemini for Home gets 40% faster response time in March update (3/28)",
+    "CODE — Gemini Code Assist goes completely free for individual developers (3/31)",
   ],
 };
 
