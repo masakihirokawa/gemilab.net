@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH — Gemini 2.5 Flash-Lite Preview が本日 (3/31) で終了、3.1 Flash-Lite Preview への移行を推奨（3/31）",
-    "IMPORT — Gemini にチャット履歴＆メモリーインポート機能が追加、ChatGPT からワンクリック移行が可能に（3/28）",
-    "FREE — Personal Intelligence が全米で無料化、Gmail・Photos・YouTube 横断の個人 AI アシスタント（3/27）",
-    "LIVE — Gemini Live 3.1 が応答速度向上＋コンテキスト保持量 2 倍、より自然な対話体験へ（3/27）",
-    "HOME — Gemini for Home のレスポンスが 40% 高速化、スマートホーム操作がさらに快適に（3/28）",
-    "CODE — Gemini Code Assist が個人開発者向けに完全無料化、AI コーディング支援がゼロコストで利用可能（3/31）",
+    "GMAIL — Gmail が Gemini 3 時代に突入、AIスレッド要約・Help Me Write・校正機能が全ユーザーに展開（4/1）",
+    "INBOX — Gmail 新 AI Inbox でメール自動フィルタリング、重要なメールだけを最優先表示（1月〜順次展開）",
+    "IMPORT — Gemini にチャット履歴インポート機能、ChatGPT・Claude からワンクリック移行が公式サポートに（3/28）",
+    "FREE — Personal Intelligence が全米無料化、Gmail・Photos・YouTube 横断の個人 AI アシスタントをゼロコストで（3/27）",
+    "STUDIO — Google AI Studio に Antigravity full-stack 統合、Firebase + Next.js 対応でリアルタイムアプリが即構築可能（3月）",
+    "GROWTH — Gemini が 7.5 億 MAU を達成、API リクエストは月 850 億件と最速成長の AI プラットフォームに（2026 Q1）",
   ],
   en: [
-    "FLASH — Gemini 2.5 Flash-Lite Preview sunsets today (3/31), migrate to 3.1 Flash-Lite Preview now (3/31)",
-    "IMPORT — Gemini adds chat history & memory import, one-click migration from ChatGPT now available (3/28)",
-    "FREE — Personal Intelligence now free for all US users, spanning Gmail, Photos & YouTube (3/27)",
-    "LIVE — Gemini Live 3.1 delivers faster responses with 2x longer context retention (3/27)",
-    "HOME — Gemini for Home gets 40% faster response time in March update (3/28)",
-    "CODE — Gemini Code Assist goes completely free for individual developers (3/31)",
+    "GMAIL — Gmail enters the Gemini 3 era: AI thread summaries, Help Me Write, and Proofread rolling out to all users (4/1)",
+    "INBOX — Gmail's new AI Inbox filters clutter automatically, surfacing only the most important messages first (rolling out)",
+    "IMPORT — Gemini officially supports chat history import from ChatGPT and Claude with one-click migration (3/28)",
+    "FREE — Personal Intelligence now free for all US users, connecting Gemini across Gmail, Photos & YouTube (3/27)",
+    "STUDIO — Google AI Studio integrates Antigravity full-stack with Firebase and Next.js for real-time app building (March)",
+    "GROWTH — Gemini hits 750M MAU with 85B monthly API requests, making it the fastest-growing AI platform in Q1 2026 (2026 Q1)",
   ],
 };
 
