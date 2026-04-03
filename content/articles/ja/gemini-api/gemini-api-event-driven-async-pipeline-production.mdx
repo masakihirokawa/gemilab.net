@@ -1,0 +1,880 @@
+---
+title: "Gemini APIで構築するイベント駆動型非同期AIパイプライン — Pub/Sub・Webhook・キュー統合の本番設計パターン"
+slug: "gemini-api-event-driven-async-pipeline-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-03T19:45"
+author: "Gemini Lab"
+description: "Gemini APIとGoogle Cloud Pub/Sub・Webhook・Redisキューを組み合わせたイベント駆動型非同期AIパイプラインの設計・実装パターンを詳解。本番環境でのスケーリング・エラーハンドリング・コスト最適化まで網羅。"
+tags: ["gemini-api", "event-driven", "pub-sub", "webhook", "async", "pipeline", "python", "fastapi", "redis"]
+highlights:
+  - "Google Cloud Pub/Sub + Gemini APIで大量リクエストを安定処理する非同期パイプラインを実装できる"
+  - "WebhookコールバックとRedisキューを組み合わせたスケーラブルなバックグラウンド処理設計を習得できる"
+  - "デッドレターキュー・リトライ戦略・分散トレーシングによる本番グレードのエラー管理手法を理解できる"
+---
+
+## なぜイベント駆動型AIパイプラインが必要なのか
+
+Gemini APIを使った同期型のリクエスト/レスポンスモデルは、小規模な用途では問題なく機能します。しかし、大量のドキュメント処理、リアルタイムデータの分析、複数ユーザーからの並行リクエストが発生するプロダクション環境では、同期処理の限界がすぐに顕在化します。
+
+代表的な課題としては以下のものが挙げられます。
+
+- **タイムアウト問題**: 大規模なPDFや動画を処理する際、HTTP接続がタイムアウトする
+- **スループット制限**: APIのレート制限により、同期処理では秒間リクエスト数に上限がある
+- **ユーザー体験の劣化**: 処理が完了するまでフロントエンドをブロックしてしまう
+- **障害時の脆弱性**: 一時的なAPIエラーで処理が完全に失敗し、リトライが困難になる
+
+イベント駆動型アーキテクチャ（EDA: Event-Driven Architecture）は、これらの課題をエレガントに解決します。処理を非同期化することで、ユーザーへの即時レスポンスを維持しながら、バックグラウンドでGemini APIの呼び出しを最適なタイミングで実行できます。
+
+本記事では、Google Cloud Pub/Sub、FastAPI Webhook、Redisキューという3つの主要パターンを詳しく解説し、プロダクション環境で実際に使える設計パターンを提供します。
+
+---
+
+## イベント駆動アーキテクチャの基本概念
+
+### コアコンポーネント
+
+イベント駆動型AIパイプラインは、以下のコンポーネントで構成されます。
+
+**プロデューサー（Producer）**
+イベントを発生させる主体です。ユーザーのアップロード操作、スケジューラー、外部Webhookなどがプロデューサーになります。
+
+**メッセージブローカー（Message Broker）**
+プロデューサーとコンシューマーを疎結合にする中間レイヤーです。Google Cloud Pub/Sub、Redis Streams、Amazon SQSなどが代表例です。
+
+**コンシューマー（Consumer）**
+メッセージブローカーからイベントを受け取り、実際のGemini API呼び出しを行うワーカーです。
+
+**コールバック機構**
+処理完了後に結果を返す仕組みです。Webhookコールバック、WebSocket通知、ポーリングエンドポイントなどがあります。
+
+### 同期 vs 非同期の設計判断
+
+同期処理が適しているケースとイベント駆動型が適しているケースは明確に分かれています。
+
+同期処理に向いているのは、**レスポンス時間が3秒以内に収まるリアルタイムチャット**、**ユーザーが結果を即時確認したい単純なQ&A**、**短文の翻訳や変換**などです。
+
+一方、イベント駆動型が適しているのは、**大量ドキュメントの一括処理**、**動画・音声ファイルの解析**、**バッチでのコンテンツ生成**、**複数ステップのエージェントワークフロー**などで、レスポンスまでの待ち時間が長くなるユースケースです。
+
+---
+
+## パターン1: Google Cloud Pub/Sub + Gemini APIの統合
+
+### アーキテクチャ概要
+
+最も堅牢なパターンはGoogle Cloud Pub/Subを使ったものです。フルマネージドなメッセージングサービスであり、数百万件/秒のスループット、少なくとも1回の配信保証、メッセージの自動リトライ機能を持ちます。
+
+```
+[ユーザーリクエスト]
+       ↓
+[FastAPI Publisher]
+       ↓
+[Pub/Sub Topic: gemini-tasks]
+       ↓ (サブスクリプション)
+[Gemini Worker × N台]
+       ↓
+[Pub/Sub Topic: gemini-results]
+       ↓
+[Result Handler]
+       ↓
+[Cloud Firestore / PostgreSQL]
+```
+
+### 実装: Publisherサービス
+
+```python
+# publisher.py
+import json
+import uuid
+from datetime import datetime
+from fastapi import FastAPI, BackgroundTasks
+from google.cloud import pubsub_v1
+from pydantic import BaseModel
+
+app = FastAPI()
+publisher = pubsub_v1.PublisherClient()
+
+PROJECT_ID = "your-project-id"
+TOPIC_ID = "gemini-tasks"
+topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
+
+
+class ProcessRequest(BaseModel):
+    content: str
+    task_type: str  # "summarize" / "classify" / "analyze"
+    user_id: str
+    callback_url: str | None = None
+
+
+@app.post("/process")
+async def submit_processing_task(request: ProcessRequest):
+    """
+    非同期処理タスクをPub/Subに送信する
+    即座にtask_idを返し、処理はバックグラウンドで実行される
+    """
+    task_id = str(uuid.uuid4())
+
+    message_data = {
+        "task_id": task_id,
+        "content": request.content,
+        "task_type": request.task_type,
+        "user_id": request.user_id,
+        "callback_url": request.callback_url,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    # Pub/Subにメッセージを発行
+    future = publisher.publish(
+        topic_path,
+        data=json.dumps(message_data).encode("utf-8"),
+        # 属性でフィルタリング可能（サブスクリプションフィルターに使用）
+        task_type=request.task_type,
+        user_id=request.user_id,
+    )
+
+    # 発行確認（非ブロッキング）
+    future.add_done_callback(
+        lambda f: print(f"Published: {f.result()}")
+    )
+
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "estimated_completion": "30-120 seconds",
+        "status_url": f"/tasks/{task_id}/status",
+    }
+
+
+@app.get("/tasks/{task_id}/status")
+async def get_task_status(task_id: str):
+    """タスクの処理状況をポーリングで確認する"""
+    # Firestoreやデータベースから状態を取得
+    result = await fetch_task_result(task_id)  # 実装は下記参照
+    return result
+```
+
+### 実装: Gemini Workerサービス
+
+```python
+# worker.py
+import json
+import time
+import httpx
+from google.cloud import pubsub_v1, firestore
+import google.generativeai as genai
+
+# Gemini API初期化
+genai.configure(api_key="YOUR_GEMINI_API_KEY")
+model = genai.GenerativeModel("gemini-2.5-pro")
+
+subscriber = pubsub_v1.SubscriberClient()
+db = firestore.Client()
+
+PROJECT_ID = "your-project-id"
+SUBSCRIPTION_ID = "gemini-tasks-sub"
+subscription_path = subscriber.subscription_path(PROJECT_ID, SUBSCRIPTION_ID)
+
+
+def build_prompt(task_type: str, content: str) -> str:
+    """タスクタイプに応じたプロンプトを構築する"""
+    prompts = {
+        "summarize": f"""以下のコンテンツを日本語で簡潔に要約してください。
+要点を3〜5つの箇条書きで示し、最後に1段落のまとめを付けてください。
+
+コンテンツ:
+{content}""",
+        "classify": f"""以下のテキストを次のカテゴリに分類してください:
+[技術, ビジネス, エンタメ, スポーツ, 政治, その他]
+
+必ずJSON形式で回答してください:
+{{"category": "カテゴリ名", "confidence": 0.0~1.0, "reason": "理由"}}
+
+テキスト:
+{content}""",
+        "analyze": f"""以下のコンテンツについて詳細な分析を行ってください:
+1. 主要テーマの特定
+2. センチメント分析（ポジティブ/ネガティブ/ニュートラル）
+3. キーワードの抽出（上位10個）
+4. 改善提案（もし文章であれば）
+
+コンテンツ:
+{content}""",
+    }
+    return prompts.get(task_type, f"以下を処理してください:\n{content}")
+
+
+def process_message(message: pubsub_v1.subscriber.message.Message) -> None:
+    """
+    Pub/Subメッセージを受信し、Gemini APIで処理する
+    """
+    try:
+        data = json.loads(message.data.decode("utf-8"))
+        task_id = data["task_id"]
+
+        print(f"Processing task: {task_id}, type: {data['task_type']}")
+
+        # Firestoreにステータスを更新
+        task_ref = db.collection("tasks").document(task_id)
+        task_ref.set({
+            "status": "processing",
+            "started_at": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+
+        # Gemini APIを呼び出す
+        prompt = build_prompt(data["task_type"], data["content"])
+
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.3,
+                "max_output_tokens": 2048,
+            }
+        )
+
+        result_text = response.text
+
+        # 結果をFirestoreに保存
+        task_ref.set({
+            "status": "completed",
+            "result": result_text,
+            "completed_at": firestore.SERVER_TIMESTAMP,
+            "model": "gemini-2.5-pro",
+        }, merge=True)
+
+        # Webhookコールバックがある場合は通知
+        if data.get("callback_url"):
+            send_webhook_callback(
+                data["callback_url"],
+                task_id,
+                result_text
+            )
+
+        # メッセージを正常完了としてack
+        message.ack()
+        print(f"Task {task_id} completed successfully")
+
+    except Exception as e:
+        print(f"Error processing task: {e}")
+
+        # エラー情報をFirestoreに記録
+        if "task_id" in data:
+            task_ref = db.collection("tasks").document(data["task_id"])
+            task_ref.set({
+                "status": "failed",
+                "error": str(e),
+                "failed_at": firestore.SERVER_TIMESTAMP,
+            }, merge=True)
+
+        # nackすることでPub/Subが自動リトライ
+        message.nack()
+
+
+def send_webhook_callback(url: str, task_id: str, result: str) -> None:
+    """処理完了をWebhookで通知する"""
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            client.post(url, json={
+                "task_id": task_id,
+                "status": "completed",
+                "result": result,
+            })
+    except Exception as e:
+        print(f"Webhook callback failed: {e}")
+
+
+# サブスクライバーの起動
+streaming_pull_future = subscriber.subscribe(
+    subscription_path,
+    callback=process_message,
+    # 同時処理数の制御
+    flow_control=pubsub_v1.types.FlowControl(max_messages=10),
+)
+
+print(f"Listening for messages on {subscription_path}")
+with subscriber:
+    try:
+        streaming_pull_future.result(timeout=None)
+    except KeyboardInterrupt:
+        streaming_pull_future.cancel()
+```
+
+### 期待する動作（例）
+
+```
+# 期待する出力（ターミナル）
+Listening for messages on projects/your-project-id/subscriptions/gemini-tasks-sub
+Processing task: a1b2c3d4-..., type: summarize
+Task a1b2c3d4-... completed successfully
+Processing task: e5f6g7h8-..., type: classify
+Task e5f6g7h8-... completed successfully
+```
+
+---
+
+## パターン2: FastAPI + Webhookによる双方向非同期通信
+
+### 設計思想
+
+Webhookパターンは、クライアントが処理完了の通知を「受け取る」側に回るモデルです。ポーリング不要でリアルタイムな通知が可能になるため、処理完了時に即座にアクションを取りたいシステムに向いています。
+
+### 実装: Webhook受信エンドポイント
+
+```python
+# webhook_receiver.py
+import hmac
+import hashlib
+import json
+from fastapi import FastAPI, Request, HTTPException, Header
+from typing import Annotated
+
+app = FastAPI()
+
+WEBHOOK_SECRET = "your-webhook-secret-key"
+
+
+def verify_webhook_signature(payload: bytes, signature: str) -> bool:
+    """
+    Webhookの署名を検証してなりすましを防ぐ
+    HMAC-SHA256を使用した一般的な検証パターン
+    """
+    expected = hmac.new(
+        WEBHOOK_SECRET.encode(),
+        payload,
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature)
+
+
+@app.post("/webhook/gemini-result")
+async def receive_gemini_result(
+    request: Request,
+    x_signature: Annotated[str | None, Header()] = None,
+):
+    """
+    Gemini処理完了のWebhook通知を受信する
+    """
+    payload = await request.body()
+
+    # 署名検証（セキュリティ必須）
+    if x_signature and not verify_webhook_signature(payload, x_signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    data = json.loads(payload)
+    task_id = data.get("task_id")
+    status = data.get("status")
+    result = data.get("result")
+
+    if status == "completed":
+        # 後続処理をトリガー（例: データベース更新、メール通知など）
+        await handle_completed_result(task_id, result)
+
+    elif status == "failed":
+        # エラーハンドリング（例: アラート、代替処理など）
+        await handle_failed_task(task_id, data.get("error"))
+
+    # 即座に200を返す（Webhookの鉄則）
+    return {"received": True}
+
+
+async def handle_completed_result(task_id: str, result: str):
+    """処理完了後のビジネスロジック"""
+    # データベース更新
+    # 通知送信（Slack, メールなど）
+    # 後続ワークフローの開始
+    print(f"Task {task_id} completed. Result length: {len(result)}")
+```
+
+---
+
+## パターン3: Redisキューを使ったバックグラウンド処理
+
+### ARQによる高速ジョブキュー
+
+Pub/Subほど大規模でなく、よりシンプルなセットアップで済む場合は、Redis + ARQ（Async Redis Queue）が優れた選択肢です。
+
+```python
+# tasks.py (ARQを使ったワーカー定義)
+import google.generativeai as genai
+from arq import create_pool
+from arq.connections import RedisSettings
+from typing import Any
+
+genai.configure(api_key="YOUR_GEMINI_API_KEY")
+model = genai.GenerativeModel("gemini-2.5-flash")
+
+
+async def process_with_gemini(ctx: dict, content: str, task_type: str) -> dict:
+    """
+    ARQワーカー関数: Gemini APIを呼び出して結果を返す
+
+    Args:
+        ctx: ARQコンテキスト（Redisコネクションなど）
+        content: 処理対象コンテンツ
+        task_type: タスクタイプ（summarize/classify/analyze）
+
+    Returns:
+        処理結果を含む辞書
+
+    期待する出力例:
+        {"status": "success", "result": "...", "tokens_used": 450}
+    """
+    response = model.generate_content(
+        f"Task: {task_type}\n\nContent:\n{content}",
+        generation_config={"temperature": 0.3}
+    )
+
+    return {
+        "status": "success",
+        "result": response.text,
+        "tokens_used": response.usage_metadata.total_token_count,
+    }
+
+
+class WorkerSettings:
+    """ARQワーカーの設定"""
+    functions = [process_with_gemini]
+    redis_settings = RedisSettings(host="localhost", port=6379)
+
+    # 並行処理数の制御（Gemini APIのレート制限に合わせる）
+    max_jobs = 5
+
+    # ジョブのタイムアウト（秒）
+    job_timeout = 120
+
+    # 失敗時のリトライ設定
+    retry_jobs = True
+    max_tries = 3
+
+
+# FastAPIからジョブをエンキューする例
+async def enqueue_gemini_task(content: str, task_type: str) -> str:
+    """
+    Gemini処理ジョブをRedisキューに追加する
+    """
+    redis = await create_pool(RedisSettings())
+
+    job = await redis.enqueue_job(
+        "process_with_gemini",
+        content=content,
+        task_type=task_type,
+        # 遅延実行（秒）
+        _defer_by=0,
+        # キュー優先度（高: urgent_tasks, 標準: default）
+        _queue_name="default",
+    )
+
+    return job.job_id
+```
+
+---
+
+## 並列処理とスケーリング戦略
+
+### ワーカーの自動スケーリング
+
+Cloud Runを使えば、キューの深さに応じてワーカーインスタンスを自動スケールできます。
+
+```yaml
+# cloud-run-worker.yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: gemini-worker
+spec:
+  template:
+    metadata:
+      annotations:
+        # 最大同時リクエスト数（Gemini APIのレート制限を考慮）
+        autoscaling.knative.dev/maxScale: "20"
+        autoscaling.knative.dev/minScale: "1"
+        # CPUは常時割り当て（バックグラウンド処理のため）
+        run.googleapis.com/cpu-throttling: "false"
+    spec:
+      containers:
+        - image: gcr.io/your-project/gemini-worker:latest
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gemini-secrets
+                  key: api-key
+          resources:
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+```
+
+### レート制限の考慮
+
+Gemini APIには分あたりのリクエスト数（RPM）とトークン数（TPM）の制限があります。プロダクション環境では、この制限を守るためのスロットリングが不可欠です。
+
+```python
+# rate_limiter.py
+import asyncio
+import time
+from collections import deque
+
+
+class GeminiRateLimiter:
+    """
+    Gemini APIのレート制限に対応するスライディングウィンドウ制限器
+
+    Gemini 2.5 Pro の制限例:
+    - RPM: 2 (Tier 1) / 1000 (Tier 3)
+    - TPM: 32,000 (Tier 1) / 4,000,000 (Tier 3)
+    """
+
+    def __init__(self, max_requests_per_minute: int = 60):
+        self.max_rpm = max_requests_per_minute
+        self.requests = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        """レート制限を守りながらリクエストスロットを確保する"""
+        async with self._lock:
+            now = time.time()
+            window_start = now - 60  # 1分間のウィンドウ
+
+            # 古いリクエストをクリア
+            while self.requests and self.requests[0] < window_start:
+                self.requests.popleft()
+
+            if len(self.requests) >= self.max_rpm:
+                # レート制限に達した場合は待機
+                sleep_time = 60 - (now - self.requests[0])
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+
+            self.requests.append(time.time())
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
+# 使用例
+limiter = GeminiRateLimiter(max_requests_per_minute=50)
+
+async def call_gemini_with_rate_limit(prompt: str) -> str:
+    async with limiter:
+        response = await model.generate_content_async(prompt)
+        return response.text
+```
+
+---
+
+## エラーハンドリングとデッドレターキュー
+
+### エクスポネンシャルバックオフによるリトライ
+
+```python
+# retry_handler.py
+import asyncio
+import random
+from functools import wraps
+from typing import Callable, TypeVar
+
+T = TypeVar("T")
+
+
+def exponential_backoff_retry(
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    exceptions: tuple = (Exception,),
+):
+    """
+    エクスポネンシャルバックオフ + ジッターによるリトライデコレーター
+
+    Gemini APIの一時的なエラー（429, 503など）に対応するために使用する
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+
+            for attempt in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+
+                    if attempt == max_retries:
+                        raise
+
+                    # ジッター付きバックオフ
+                    delay = min(
+                        base_delay * (2 ** attempt) + random.uniform(0, 1),
+                        max_delay
+                    )
+
+                    print(f"Attempt {attempt + 1} failed: {e}. "
+                          f"Retrying in {delay:.2f}s...")
+                    await asyncio.sleep(delay)
+
+            raise last_exception
+
+        return wrapper
+    return decorator
+
+
+@exponential_backoff_retry(
+    max_retries=3,
+    base_delay=2.0,
+    exceptions=(Exception,)
+)
+async def reliable_gemini_call(prompt: str) -> str:
+    """リトライ付きGemini API呼び出し"""
+    response = await model.generate_content_async(prompt)
+    return response.text
+```
+
+### デッドレターキューの設定
+
+最大リトライ数を超えたメッセージはDLQ（Dead Letter Queue）に送り、手動確認や別処理に回します。
+
+```python
+# dead_letter_handler.py
+from google.cloud import pubsub_v1, firestore
+import json
+
+DLQ_TOPIC = "gemini-tasks-dlq"
+publisher = pubsub_v1.PublisherClient()
+db = firestore.Client()
+
+
+async def send_to_dead_letter_queue(
+    original_message: dict,
+    error: str,
+    attempt_count: int
+):
+    """
+    処理失敗メッセージをDLQに転送する
+    """
+    dlq_message = {
+        **original_message,
+        "failure_info": {
+            "error": error,
+            "attempt_count": attempt_count,
+            "moved_to_dlq_at": datetime.utcnow().isoformat(),
+        }
+    }
+
+    # DLQトピックに発行
+    topic_path = publisher.topic_path("your-project-id", DLQ_TOPIC)
+    publisher.publish(
+        topic_path,
+        data=json.dumps(dlq_message).encode("utf-8"),
+        original_task_id=original_message.get("task_id", "unknown"),
+    )
+
+    # アラート送信（例: Slackへの通知）
+    await send_alert_to_slack(
+        f"🚨 DLQ: task_id={original_message.get('task_id')} "
+        f"が{attempt_count}回のリトライ後に失敗しました。"
+        f"エラー: {error}"
+    )
+
+    print(f"Message sent to DLQ: {original_message.get('task_id')}")
+```
+
+---
+
+## 本番監視とトレーシング
+
+### OpenTelemetryによる分散トレーシング
+
+```python
+# tracing.py
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+
+
+# Cloud Traceエクスポーターを設定
+provider = TracerProvider()
+exporter = CloudTraceSpanExporter(project_id="your-project-id")
+processor = BatchSpanProcessor(exporter)
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+
+tracer = trace.get_tracer(__name__)
+
+
+async def traced_gemini_processing(task_id: str, content: str) -> str:
+    """
+    分散トレーシングを付与したGemini API呼び出し
+    Cloud Trace上でエンドツーエンドのレイテンシを可視化できる
+    """
+    with tracer.start_as_current_span("gemini-api-call") as span:
+        span.set_attribute("task.id", task_id)
+        span.set_attribute("content.length", len(content))
+        span.set_attribute("model", "gemini-2.5-pro")
+
+        try:
+            response = await model.generate_content_async(content)
+
+            span.set_attribute("tokens.total",
+                               response.usage_metadata.total_token_count)
+            span.set_attribute("status", "success")
+
+            return response.text
+
+        except Exception as e:
+            span.set_attribute("status", "error")
+            span.set_attribute("error.message", str(e))
+            span.record_exception(e)
+            raise
+```
+
+### Cloud Monitoringへのカスタムメトリクス送信
+
+```python
+# metrics.py
+from google.cloud import monitoring_v3
+import time
+
+client = monitoring_v3.MetricServiceClient()
+project_name = f"projects/your-project-id"
+
+
+def record_gemini_latency(latency_seconds: float, task_type: str):
+    """
+    Gemini API呼び出しのレイテンシをCloud Monitoringに記録する
+    Grafanaダッシュボードで可視化・アラート設定が可能
+    """
+    series = monitoring_v3.TimeSeries()
+    series.metric.type = "custom.googleapis.com/gemini/api_latency"
+    series.metric.labels["task_type"] = task_type
+
+    now = time.time()
+    seconds = int(now)
+    nanos = int((now - seconds) * 10 ** 9)
+    interval = monitoring_v3.TimeInterval(
+        {"end_time": {"seconds": seconds, "nanos": nanos}}
+    )
+
+    point = monitoring_v3.Point(
+        {"interval": interval, "value": {"double_value": latency_seconds}}
+    )
+    series.points = [point]
+
+    client.create_time_series(
+        request={"name": project_name, "time_series": [series]}
+    )
+```
+
+---
+
+## コスト最適化の考え方
+
+### キャッシュによる重複リクエストの削減
+
+同一または類似のコンテンツに対するGemini APIの呼び出しをキャッシュすることで、トークン消費を大幅に削減できます。
+
+```python
+# cache_middleware.py
+import hashlib
+import json
+import redis.asyncio as redis
+from typing import Optional
+
+redis_client = redis.from_url("redis://localhost:6379")
+CACHE_TTL = 3600  # 1時間
+
+
+def generate_cache_key(content: str, task_type: str) -> str:
+    """コンテンツとタスクタイプからキャッシュキーを生成する"""
+    payload = f"{task_type}:{content}"
+    return f"gemini:cache:{hashlib.sha256(payload.encode()).hexdigest()}"
+
+
+async def get_cached_result(content: str, task_type: str) -> Optional[str]:
+    """キャッシュから結果を取得する"""
+    key = generate_cache_key(content, task_type)
+    cached = await redis_client.get(key)
+    return cached.decode() if cached else None
+
+
+async def cache_result(content: str, task_type: str, result: str):
+    """結果をキャッシュに保存する"""
+    key = generate_cache_key(content, task_type)
+    await redis_client.setex(key, CACHE_TTL, result.encode())
+
+
+async def get_or_generate(content: str, task_type: str) -> dict:
+    """
+    キャッシュヒット率を最大化したGemini API呼び出し
+
+    期待する出力例（キャッシュヒット時）:
+    {"result": "...", "cache_hit": True, "tokens_saved": 450}
+    """
+    # キャッシュを確認
+    cached = await get_cached_result(content, task_type)
+    if cached:
+        return {"result": cached, "cache_hit": True, "tokens_saved": 450}
+
+    # Gemini APIを呼び出す
+    response = await model.generate_content_async(
+        f"Task: {task_type}\n\n{content}"
+    )
+    result = response.text
+
+    # 結果をキャッシュ
+    await cache_result(content, task_type, result)
+
+    return {
+        "result": result,
+        "cache_hit": False,
+        "tokens_used": response.usage_metadata.total_token_count,
+    }
+```
+
+### モデル選択によるコスト最適化
+
+すべてのタスクにGemini 2.5 Proを使う必要はありません。タスクの複雑度に応じてモデルを使い分けると、コストを50〜80%削減できます。
+
+- **Gemini 2.5 Flash**: 高速・低コスト。分類、短文要約に最適
+- **Gemini 2.5 Pro**: 高精度。複雑な分析、長文処理に使用
+- **Gemini 2.5 Flash-8B**: 超高速・最低コスト。単純なタグ付け、フォーマット変換に
+
+---
+
+## よくある質問（FAQ）
+
+**Q1: Pub/SubとRedisキューはどちらを選ぶべきですか？**
+
+Google Cloud環境をすでに使っている場合はPub/Subが、オンプレミスやAWSなど他のクラウド環境では Redis（Celery/ARQ）が適しています。Pub/Subはフルマネージドで可用性が高く、Redisは低レイテンシで柔軟な制御が可能です。1日数万件以下の処理量であればRedisで十分で、それ以上のスケールが必要であればPub/Subを推奨します。
+
+**Q2: Gemini APIのレート制限に引っかかった場合、メッセージは失われますか？**
+
+適切にnack（否定応答）を返せば失われません。Pub/SubはnackされたメッセージをAck期限（デフォルト10分）経過後に再配信します。ただし、nackの際はウェイトを入れてすぐ再試行しないよう注意してください。エクスポネンシャルバックオフと組み合わせることで、レート制限時の挙動を最適化できます。
+
+**Q3: Webhookエンドポイントのセキュリティをどう確保すればよいですか？**
+
+HMAC-SHA256による署名検証が基本です。加えて、エンドポイントをCloudflare WAFやCloud Armorで保護し、既知のIPアドレスからのみリクエストを受け付けるIPホワイトリストを設定することを推奨します。また、受信したJSONのスキーマバリデーション（Pydanticなど）も必ず実施してください。
+
+**Q4: 本番でのワーカー数の決め方は？**
+
+Gemini APIのTierによって異なります。Tier 1（無料/低消費）は分あたり2〜10リクエストと制限が厳しいため、ワーカーは1〜2台で十分です。Tier 3以上（大量消費）では分あたり1,000リクエスト以上が可能なため、ワーカーを20台以上に増やしてスループットを最大化できます。まずは小さく始め、キューの深さとレイテンシを監視しながらスケールアウトするのが安全です。
+
+**Q5: イベント駆動パイプラインのデバッグはどうすればよいですか？**
+
+ローカル開発では`google-cloud-pubsub`のエミュレーターを使うと本番と同じコードをテストできます。加えて、各メッセージにトレースIDを付与してログに記録し、Cloud LoggingとCloud Traceを組み合わせることで、分散環境での問題を素早く特定できます。
+
+---
+
+## まとめ
+
+イベント駆動型AIパイプラインの構築は、同期型アーキテクチャと比較して複雑さが増しますが、それを補って余りある恩恵があります。ユーザー体験の向上、システムの堅牢性、コスト効率の最適化を同時に実現できるのが最大の強みです。
+
+本記事で紹介した3つのパターン（Pub/Sub、Webhook、Redisキュー）は、それぞれ異なるユースケースに対応しています。まずは最もシンプルなRedisキューから始め、スケールに応じてPub/Subへ移行するアプローチが現実的です。
+
+既存のGemini API連携を深掘りしたい方には、[Gemini APIのエラーハンドリングとリトライパターン](/articles/gemini-api/gemini-api-error-handling-retry-patterns)や[Gemini API コスト最適化 完全ガイド](/articles/gemini-api/gemini-api-cost-optimization-complete-guide)もあわせてご参照ください。
+
+非同期AIパイプライン設計をさらに体系的に学びたい方には、[「Designing Distributed Systems」（Brendan Burns著）](https://www.amazon.co.jp/dp/4873118751/?tag=pinocchio-22)がおすすめです。Googleのエンジニアによる分散システム設計の名著で、本記事のアーキテクチャパターンの理論的背景を深く理解できます。
