@@ -1,0 +1,1037 @@
+---
+title: "Gemini API on Kubernetes: A Complete Guide to Deploying Scalable AI Microservices in Production"
+slug: "gemini-api-kubernetes-microservices-production-deployment"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-04-04T10:45"
+author: "Gemini Lab"
+description: "A complete guide to deploying Gemini API-powered AI microservices on Kubernetes. Covers Dockerization, Secret management, HPA autoscaling, and Prometheus monitoring with production-ready YAML and Python code."
+tags: ["kubernetes", "gemini-api", "microservices", "docker", "gke", "production", "devops", "hpa", "prometheus"]
+highlights:
+  - "Learn how to deploy Gemini API services on Kubernetes with HPA autoscaling to handle traffic spikes automatically"
+  - "Master secure API key management using Kubernetes Secrets and External Secrets Operator, plus Ingress routing and PodDisruptionBudget for high availability"
+  - "Get production-ready YAML manifests and Python service code you can apply directly to your own Kubernetes projects"
+---
+
+## Introduction
+
+When a Gemini API-powered application gains traction and user numbers start climbing, two fundamental questions arise: how do you scale the service, and how do you keep it running reliably in production?
+
+Serverless deployments like Cloud Run are excellent for proof-of-concept projects and small-to-medium workloads. But when you need fine-grained resource control, sophisticated traffic management, or coordinated deployment of multiple microservices, **Kubernetes (K8s)** is where things get serious.
+
+This guide walks you through deploying a Gemini API-based AI microservice architecture on Kubernetes and Google Kubernetes Engine (GKE) — from building a production-optimized Docker image to configuring Deployments, Services, Ingress, Horizontal Pod Autoscaling (HPA), Secret management, and Prometheus-based observability. Every section includes working YAML manifests and Python code you can adapt immediately.
+
+**What you'll learn:**
+
+- Containerizing a Gemini API service using multi-stage Docker builds for lean production images
+- Managing API keys securely with Kubernetes Secrets and External Secrets Operator (Google Secret Manager integration)
+- Configuring Readiness, Liveness, and Startup Probes for zero-downtime rolling deployments
+- Setting up HPA to automatically scale Pods in response to CPU load and custom metrics
+- Using PodDisruptionBudget to protect availability during planned maintenance
+- Collecting and visualizing request rates, latency percentiles, and cache hit rates with Prometheus
+
+**Who this is for:**
+
+- Engineers running Gemini API applications who need production-scale reliability
+- Backend developers familiar with Kubernetes basics but new to AI workloads on K8s
+- Teams considering a migration from Cloud Run to a more controllable K8s environment
+
+---
+
+## Architecture Overview
+
+### Why Kubernetes for Gemini API Services?
+
+Running Gemini API workloads on Kubernetes provides several advantages that serverless platforms can't match:
+
+**Granular resource control.** AI workloads don't behave like standard web requests — memory and CPU consumption varies significantly depending on prompt length and model selection. Kubernetes Resource Requests and Limits let you define precise boundaries, preventing memory spikes from one noisy Pod from affecting others.
+
+**Flexible horizontal scaling.** HPA automatically adjusts the number of running Pods based on observed metrics. When traffic surges — a common occurrence for consumer-facing AI features — your service scales out within seconds without manual intervention.
+
+**Zero-downtime deployments.** Rolling Update strategy ensures the old version continues serving traffic while the new version starts up, Readiness Probes confirm it's healthy, and then traffic is gradually shifted over. No maintenance windows required.
+
+**Multi-service coordination.** A real-world Gemini application typically involves an authentication layer, a semantic cache, an embedding service, and a core generation service. Kubernetes lets you manage all of these cohesively in a single cluster, using internal DNS for service-to-service communication.
+
+### Service Architecture
+
+This guide implements the following three-tier architecture:
+
+```
+[Client]
+  ↓ HTTPS
+[GKE Ingress / Cloud Load Balancer]
+  ↓
+[Gemini Chat Service]          ← Text generation (Gemini 2.5 Flash)
+[Gemini Analysis Service]      ← Document analysis (Gemini 2.5 Pro)
+[Gemini Embedding Service]     ← Vector generation (text-embedding-004)
+  ↓
+[Redis Cache Service]          ← Semantic response cache (ClusterIP)
+[PostgreSQL StatefulSet]       ← Conversation history & user data
+```
+
+---
+
+## Step 1: Building a Production Docker Image
+
+Multi-stage builds are essential for keeping production images lean. The build stage installs all dependencies (including development tools), and only the runtime artifacts are copied into the final production image.
+
+```dockerfile
+# Dockerfile — Production-optimized multi-stage build
+# --- Stage 1: Build ---
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# --- Stage 2: Production ---
+FROM python:3.12-slim AS production
+
+# Security: run as non-root user
+RUN useradd --system --create-home appuser
+
+WORKDIR /app
+
+# Copy only installed packages from build stage
+COPY --from=builder /root/.local /home/appuser/.local
+COPY --chown=appuser:appuser . .
+
+USER appuser
+
+ENV PYTHONPATH=/home/appuser/.local/lib/python3.12/site-packages
+ENV PATH=/home/appuser/.local/bin:$PATH
+
+# Health check for Kubernetes probes
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD python -c "import httpx; httpx.get('http://localhost:8000/health')"
+
+EXPOSE 8000
+
+# 2 workers is appropriate for a 2-vCPU Pod — adjust to match your resource limits
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+```
+
+```
+# requirements.txt
+google-generativeai>=0.8.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+httpx>=0.27.0
+redis>=5.2.0
+pydantic>=2.9.0
+prometheus-client>=0.21.0
+```
+
+Here's the FastAPI service implementation with built-in Redis caching and Prometheus metrics:
+
+```python
+# main.py — Kubernetes-ready Gemini Chat Service
+import os
+import asyncio
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
+import google.generativeai as genai
+import redis.asyncio as redis_async
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+import json
+import hashlib
+import time
+
+# --- Prometheus metrics ---
+REQUEST_COUNT = Counter(
+    "gemini_requests_total",
+    "Total Gemini API requests",
+    ["model", "status"]
+)
+REQUEST_DURATION = Histogram(
+    "gemini_request_duration_seconds",
+    "Gemini API request duration",
+    ["model"],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+)
+CACHE_HIT_COUNT = Counter("gemini_cache_hits_total", "Total cache hits")
+
+redis_client = None
+gemini_model = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown logic for Kubernetes lifecycle management."""
+    global redis_client, gemini_model
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is required")
+
+    genai.configure(api_key=api_key)
+    gemini_model = genai.GenerativeModel(
+        model_name="gemini-2.5-flash",
+        generation_config=genai.GenerationConfig(temperature=0.7, max_output_tokens=2048)
+    )
+
+    # Kubernetes internal DNS: redis-service.ai-services.svc.cluster.local
+    redis_url = os.environ.get("REDIS_URL", "redis://redis-service:6379")
+    redis_client = await redis_async.from_url(redis_url, decode_responses=True)
+
+    print("✅ Gemini Chat Service ready")
+    yield
+
+    if redis_client:
+        await redis_client.aclose()
+
+app = FastAPI(title="Gemini Chat Service", version="1.0.0", lifespan=lifespan)
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+    use_cache: bool = True
+
+class ChatResponse(BaseModel):
+    response: str
+    cached: bool = False
+    model: str = "gemini-2.5-flash"
+    duration_ms: float
+
+def get_cache_key(message: str) -> str:
+    return f"gemini:chat:{hashlib.sha256(message.encode()).hexdigest()[:16]}"
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """Chat endpoint with Redis caching and Prometheus instrumentation."""
+    start_time = time.time()
+    cache_key = get_cache_key(request.message)
+
+    if request.use_cache and redis_client:
+        cached = await redis_client.get(cache_key)
+        if cached:
+            CACHE_HIT_COUNT.inc()
+            REQUEST_COUNT.labels(model="gemini-2.5-flash", status="cache_hit").inc()
+            return ChatResponse(
+                response=json.loads(cached),
+                cached=True,
+                duration_ms=(time.time() - start_time) * 1000
+            )
+
+    try:
+        with REQUEST_DURATION.labels(model="gemini-2.5-flash").time():
+            response = await asyncio.to_thread(
+                gemini_model.generate_content, request.message
+            )
+
+        result_text = response.text
+        REQUEST_COUNT.labels(model="gemini-2.5-flash", status="success").inc()
+
+        if redis_client:
+            await redis_client.setex(cache_key, 3600, json.dumps(result_text))
+
+        return ChatResponse(response=result_text, duration_ms=(time.time() - start_time) * 1000)
+
+    except Exception as e:
+        REQUEST_COUNT.labels(model="gemini-2.5-flash", status="error").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health():
+    """Health check endpoint for Kubernetes Liveness and Readiness Probes."""
+    try:
+        if redis_client:
+            await redis_client.ping()
+        return {"status": "healthy", "service": "gemini-chat"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Unhealthy: {e}")
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics scrape endpoint."""
+    return PlainTextResponse(generate_latest().decode(), media_type=CONTENT_TYPE_LATEST)
+```
+
+---
+
+## Step 2: Secure API Key Management with Kubernetes Secrets
+
+Never hardcode your Gemini API key in application code or commit it to Git. Kubernetes Secrets provide a dedicated mechanism for injecting sensitive values into Pods at runtime.
+
+```bash
+# Recommended: create the Secret directly with kubectl (no YAML file needed)
+kubectl create namespace ai-services
+
+kubectl create secret generic gemini-api-secret \
+  --from-literal=GEMINI_API_KEY="${GEMINI_API_KEY}" \
+  --from-literal=REDIS_URL="redis://redis-service:6379" \
+  --namespace ai-services
+
+# Verify (values are base64-encoded, not displayed in plaintext)
+kubectl get secret gemini-api-secret -n ai-services
+# NAME                 TYPE     DATA   AGE
+# gemini-api-secret    Opaque   2      5s
+```
+
+For GKE environments, integrating with **Google Secret Manager via External Secrets Operator** is the most robust approach — Secrets are rotated automatically without redeploying Pods:
+
+```yaml
+# external-secret.yaml
+# Prerequisites: External Secrets Operator installed in the cluster
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: gemini-api-external-secret
+  namespace: ai-services
+spec:
+  refreshInterval: 1h  # Sync from Secret Manager every hour
+  secretStoreRef:
+    name: gcp-secret-store
+    kind: ClusterSecretStore
+  target:
+    name: gemini-api-secret
+  data:
+    - secretKey: GEMINI_API_KEY
+      remoteRef:
+        key: gemini-api-key  # The name of your secret in Google Secret Manager
+```
+
+---
+
+## Step 3: Writing the Deployment Manifest
+
+A production-grade Deployment requires careful attention to resource management, health probes, security context, and graceful shutdown behavior.
+
+```yaml
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gemini-chat-service
+  namespace: ai-services
+  labels:
+    app: gemini-chat-service
+    version: "1.0.0"
+spec:
+  replicas: 2  # Starting Pod count — HPA will adjust this automatically
+  selector:
+    matchLabels:
+      app: gemini-chat-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # Allow one extra Pod during updates
+      maxUnavailable: 0  # Never reduce below desired replica count (zero-downtime)
+  template:
+    metadata:
+      labels:
+        app: gemini-chat-service
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Force non-root execution for container security
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+
+      # Allow in-flight requests to complete before Pod termination
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        - name: gemini-chat
+          image: gcr.io/YOUR_PROJECT/gemini-chat-service:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+
+          # Inject secrets as environment variables
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gemini-api-secret
+                  key: GEMINI_API_KEY
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gemini-api-secret
+                  key: REDIS_URL
+            - name: ENV
+              value: "production"
+
+          # Resource requests and limits — tune for your workload profile
+          resources:
+            requests:
+              memory: "256Mi"  # Guaranteed allocation
+              cpu: "100m"      # 0.1 vCPU guaranteed
+            limits:
+              memory: "512Mi"  # OOM Kill if exceeded
+              cpu: "500m"      # 0.5 vCPU cap
+
+          # Readiness Probe: only route traffic once the service is healthy
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30  # Wait for dependencies (Redis) to connect
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Liveness Probe: restart the Pod if it gets into a stuck state
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 5
+
+          # Startup Probe: disable other probes until the service has fully initialized
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 12  # Up to 2 minutes for startup (12 × 10s)
+            periodSeconds: 10
+```
+
+---
+
+## Step 4: Service and Ingress Configuration
+
+```yaml
+# service.yaml — ClusterIP keeps the service internal; Ingress handles external access
+apiVersion: v1
+kind: Service
+metadata:
+  name: gemini-chat-service
+  namespace: ai-services
+spec:
+  selector:
+    app: gemini-chat-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
+```
+
+```yaml
+# ingress.yaml — GKE Managed Certificate for automatic TLS
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-services-ingress
+  namespace: ai-services
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    networking.gke.io/managed-certificates: "ai-services-cert"
+    kubernetes.io/ingress.global-static-ip-name: "ai-services-ip"
+spec:
+  rules:
+    - host: api.your-domain.com
+      http:
+        paths:
+          - path: /chat
+            pathType: Prefix
+            backend:
+              service:
+                name: gemini-chat-service
+                port:
+                  number: 80
+          - path: /analyze
+            pathType: Prefix
+            backend:
+              service:
+                name: gemini-analysis-service
+                port:
+                  number: 80
+          - path: /embed
+            pathType: Prefix
+            backend:
+              service:
+                name: gemini-embedding-service
+                port:
+                  number: 80
+---
+# GKE automatically provisions and renews the SSL certificate
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: ai-services-cert
+  namespace: ai-services
+spec:
+  domains:
+    - api.your-domain.com
+```
+
+---
+
+## Step 5: Horizontal Pod Autoscaler (HPA)
+
+Gemini API workloads experience bursty traffic patterns — a single viral post mentioning your product can trigger a 10x traffic spike within minutes. HPA handles this automatically by adjusting the Pod count based on observed metrics.
+
+The key insight for AI workloads: **scale up aggressively, scale down conservatively**. Scaling down too quickly causes oscillation when traffic remains variable.
+
+```yaml
+# hpa.yaml — autoscaling/v2 with CPU, memory, and custom metrics
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gemini-chat-hpa
+  namespace: ai-services
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gemini-chat-service
+
+  minReplicas: 2   # Maintain at least 2 Pods for high availability
+  maxReplicas: 20  # Hard ceiling to control API costs
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60  # Scale out when CPU exceeds 60% across Pods
+
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70  # Scale out when memory exceeds 70%
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60   # Respond quickly to traffic spikes
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60  # Add up to 4 Pods per minute during scale-out
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Wait 5 minutes before scaling in
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60  # Remove only 1 Pod per minute (conservative)
+```
+
+Monitor HPA behavior in real time:
+
+```bash
+# Watch HPA status continuously
+kubectl get hpa -n ai-services -w
+
+# Sample output:
+# NAME               REFERENCE            TARGETS           MINPODS  MAXPODS  REPLICAS
+# gemini-chat-hpa    Deployment/gemini-chat  28%/60%, 41%/70%     2       20       3
+
+# Inspect recent scaling decisions
+kubectl describe hpa gemini-chat-hpa -n ai-services
+```
+
+---
+
+## Step 6: PodDisruptionBudget for High Availability
+
+When a cluster node is drained for maintenance or an upgrade, Kubernetes needs to evict Pods from that node. Without a PodDisruptionBudget, it might evict all Pods simultaneously, causing a service outage.
+
+```yaml
+# pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gemini-chat-pdb
+  namespace: ai-services
+spec:
+  minAvailable: 1  # At least 1 Pod must remain available at all times
+  selector:
+    matchLabels:
+      app: gemini-chat-service
+```
+
+Pair this with a ResourceQuota to prevent runaway resource consumption:
+
+```yaml
+# resource-quota.yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ai-services-quota
+  namespace: ai-services
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 4Gi
+    limits.cpu: "8"
+    limits.memory: 8Gi
+    pods: "30"
+```
+
+---
+
+## Step 7: Prometheus Monitoring
+
+With the Prometheus Operator installed (typically via the `kube-prometheus-stack` Helm chart), a ServiceMonitor resource automatically configures scraping:
+
+```yaml
+# servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gemini-chat-monitor
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack  # Must match Prometheus's serviceMonitorSelector
+spec:
+  selector:
+    matchLabels:
+      app: gemini-chat-service
+  namespaceSelector:
+    matchNames:
+      - ai-services
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+```
+
+Key PromQL queries for your Grafana dashboard:
+
+```bash
+# Request success rate (%) over the last 5 minutes
+sum(rate(gemini_requests_total{status="success"}[5m])) /
+sum(rate(gemini_requests_total[5m])) * 100
+
+# p95 latency (seconds)
+histogram_quantile(0.95,
+  sum(rate(gemini_request_duration_seconds_bucket[5m])) by (le)
+)
+
+# Cache hit rate (%) — a high cache hit rate directly reduces API costs
+sum(rate(gemini_cache_hits_total[5m])) /
+sum(rate(gemini_requests_total[5m])) * 100
+
+# Current replica count (visualize HPA scaling events)
+kube_horizontalpodautoscaler_status_current_replicas{
+  horizontalpodautoscaler="gemini-chat-hpa"
+}
+```
+
+---
+
+## Step 8: Deployment Script and CI/CD Integration
+
+A straightforward deployment script ensures consistent rollouts and automatic verification. For a full CI/CD pipeline with automated testing, see the [GitHub Actions + Gemini API CI/CD pipeline guide](/en/articles/gemini-dev/gemini-api-github-actions-ai-code-quality-pipeline).
+
+```bash
+#!/bin/bash
+# deploy.sh — Production deployment script
+set -euo pipefail
+
+REGISTRY="gcr.io/your-project-id"
+SERVICE="gemini-chat-service"
+NAMESPACE="ai-services"
+VERSION=$(git rev-parse --short HEAD)
+IMAGE="${REGISTRY}/${SERVICE}:${VERSION}"
+
+echo "🔨 Building Docker image (${VERSION})..."
+docker build -t "${IMAGE}" .
+docker push "${IMAGE}"
+
+echo "🚀 Rolling out to Kubernetes..."
+kubectl set image deployment/gemini-chat-service \
+  gemini-chat="${IMAGE}" \
+  --namespace "${NAMESPACE}"
+
+# Wait for rollout to complete (5-minute timeout)
+kubectl rollout status deployment/gemini-chat-service \
+  --namespace "${NAMESPACE}" \
+  --timeout=300s
+
+echo "✅ Deployment complete — version: ${VERSION}"
+
+# Verify: check that Pods are running
+READY_PODS=$(kubectl get pods -n "${NAMESPACE}" \
+  -l app=gemini-chat-service \
+  --field-selector=status.phase=Running \
+  --no-headers | wc -l)
+echo "🟢 Running Pods: ${READY_PODS}"
+
+# Smoke test: hit the health endpoint inside the cluster
+POD_NAME=$(kubectl get pod -n "${NAMESPACE}" \
+  -l app=gemini-chat-service \
+  -o jsonpath="{.items[0].metadata.name}")
+kubectl exec -n "${NAMESPACE}" "${POD_NAME}" -- \
+  python -c "import httpx; r=httpx.get('http://localhost:8000/health'); print(r.json())"
+```
+
+---
+
+## Troubleshooting FAQ
+
+### Q1: Pods are stuck in CrashLoopBackOff
+
+This almost always means the service can't start because an environment variable is missing or a dependency (Redis, Gemini API) isn't reachable.
+
+```bash
+# Check recent logs from the crashed container
+kubectl logs -n ai-services -l app=gemini-chat-service --previous
+
+# Confirm the Secret exists and has the expected keys
+kubectl get secret gemini-api-secret -n ai-services -o jsonpath='{.data}' \
+  | python3 -c "import sys,json,base64; d=json.load(sys.stdin); [print(k,'=',base64.b64decode(v).decode()) for k,v in d.items()]"
+
+# Verify environment variable injection inside the Pod
+kubectl exec -n ai-services <pod-name> -- env | grep -E "GEMINI|REDIS"
+```
+
+### Q2: HPA isn't scaling out even under high load
+
+The most common cause on self-hosted clusters is a missing Metrics Server.
+
+```bash
+# Check whether Metrics Server is installed
+kubectl get deployment metrics-server -n kube-system
+
+# Install if missing
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# Check HPA events for diagnostic messages
+kubectl describe hpa gemini-chat-hpa -n ai-services
+# Look for: "unable to fetch metrics" — this confirms Metrics Server is missing
+```
+
+### Q3: Frequent 429 (Rate Limit) errors from the Gemini API
+
+When multiple Pods send requests simultaneously without coordination, you can easily exceed per-minute API quotas. The solution is a distributed rate limiter using Redis — one that all Pods share. For detailed implementation patterns, see the [Gemini API error handling and rate limit production guide](/en/articles/gemini-dev/gemini-api-error-handling-rate-limit-production-patterns).
+
+```python
+# rate_limiter.py — Sliding window rate limiter using Redis (shared across all Pods)
+import redis.asyncio as redis_async
+import time
+
+class GeminiRateLimiter:
+    def __init__(self, redis_client, max_requests_per_minute: int = 60):
+        self.redis = redis_client
+        self.max_rpm = max_requests_per_minute
+
+    async def acquire(self, user_id: str = "global") -> bool:
+        """
+        Returns True if the request is allowed, False if rate-limited.
+        Uses a sliding window backed by a Redis sorted set.
+        """
+        key = f"rate_limit:{user_id}"
+        now = time.time()
+        window_start = now - 60
+
+        pipe = self.redis.pipeline()
+        pipe.zremrangebyscore(key, 0, window_start)  # Evict old entries
+        pipe.zadd(key, {str(now): now})              # Record this request
+        pipe.zcard(key)                               # Count requests in window
+        pipe.expire(key, 60)
+        results = await pipe.execute()
+
+        return results[2] <= self.max_rpm
+```
+
+---
+
+## Cost Optimization
+
+Running Gemini API services on Kubernetes can become expensive without deliberate cost management:
+
+**Use Spot/Preemptible Nodes.** Stateless Gemini API Pods are ideal candidates for Spot instances, which cost up to 80% less than on-demand. Kubernetes automatically reschedules evicted Pods on healthy nodes, and your PodDisruptionBudget ensures at least one Pod stays available throughout.
+
+**Invest in semantic caching.** Serving cached responses from Redis instead of calling the Gemini API is the single most impactful cost reduction. Aim for a cache hit rate above 30% — at that point, you're paying for fewer than 70% of API calls.
+
+**Route requests to the right model.** Not every request needs Gemini 2.5 Pro. Simple FAQ-style queries can go to Gemini 2.5 Flash at a fraction of the cost. Implement a lightweight classifier that routes requests based on complexity.
+
+**Set hard cost ceilings with ResourceQuota.** The YAML in Step 6 caps CPU and memory across the entire namespace. This prevents a bug or misconfig from spinning up 50 Pods and generating unexpected API costs.
+
+---
+
+## ConfigMap: Managing Non-Secret Configuration
+
+Kubernetes Secrets handle sensitive values like API keys. For non-sensitive configuration — model names, timeout values, log levels — **ConfigMaps** are the right tool. Externalizing these values means you can change them without rebuilding Docker images or redeploying from scratch.
+
+For example, switching from `gemini-2.5-flash` to `gemini-2.5-pro` for a premium tier becomes a ConfigMap update plus a rolling restart, with no code changes required.
+
+```yaml
+# configmap.yaml — centralize non-secret application settings
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gemini-chat-config
+  namespace: ai-services
+data:
+  GEMINI_MODEL: "gemini-2.5-flash"
+  GEMINI_MAX_TOKENS: "2048"
+  GEMINI_TEMPERATURE: "0.7"
+  CACHE_TTL_SECONDS: "3600"
+  LOG_LEVEL: "INFO"
+  WORKERS: "2"
+  TIMEOUT_SECONDS: "30"
+```
+
+Reference these values in your Deployment alongside Secrets:
+
+```yaml
+# Add to deployment.yaml container.env
+env:
+  - name: GEMINI_MODEL
+    valueFrom:
+      configMapKeyRef:
+        name: gemini-chat-config
+        key: GEMINI_MODEL
+  - name: CACHE_TTL_SECONDS
+    valueFrom:
+      configMapKeyRef:
+        name: gemini-chat-config
+        key: CACHE_TTL_SECONDS
+  # Secret refs remain unchanged
+  - name: GEMINI_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: gemini-api-secret
+        key: GEMINI_API_KEY
+```
+
+Pair ConfigMaps with a Pydantic Settings class for type-safe, IDE-friendly configuration access throughout the application:
+
+```python
+# config.py — type-safe configuration from ConfigMap and Secrets
+from pydantic_settings import BaseSettings
+
+class GeminiServiceConfig(BaseSettings):
+    # From ConfigMap (with defaults for local development)
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_max_tokens: int = 2048
+    gemini_temperature: float = 0.7
+    cache_ttl_seconds: int = 3600
+    log_level: str = "INFO"
+
+    # From Secret (required — no default)
+    gemini_api_key: str
+    redis_url: str = "redis://redis-service:6379"
+
+    class Config:
+        env_file = ".env"  # Used locally; Kubernetes injects from ConfigMap/Secret
+
+settings = GeminiServiceConfig()
+```
+
+---
+
+## Network Policies: Restricting Pod-to-Pod Traffic
+
+By default, every Pod in a Kubernetes cluster can communicate with every other Pod. In a production environment hosting multiple services — some of which handle sensitive user data — this is a significant security risk.
+
+Network Policies let you define allow-list rules for ingress (incoming) and egress (outgoing) traffic at the Pod level. For the Gemini Chat Service, a sensible policy might be: accept traffic only from the API gateway, allow outbound connections only to Redis and the Gemini API, and deny everything else.
+
+```yaml
+# network-policy.yaml — restrict Gemini Chat Service traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gemini-chat-network-policy
+  namespace: ai-services
+spec:
+  podSelector:
+    matchLabels:
+      app: gemini-chat-service
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Accept traffic only from the API gateway Pod
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Allow Prometheus to scrape metrics
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # Allow outbound to Redis within the namespace
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis-cache
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Allow HTTPS to external services (Gemini API on Google's infrastructure)
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 443
+    # Allow DNS resolution
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+```
+
+Best practice is to start with a **default-deny policy** for the namespace, then layer in explicit allow rules:
+
+```yaml
+# default-deny.yaml — deny all traffic by default, allow only what's explicitly permitted
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: ai-services
+spec:
+  podSelector: {}  # Applies to all Pods in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+Network Policies require a CNI plugin that supports them (Cilium, Calico, etc.). GKE supports them out of the box via Dataplane V2.
+
+---
+
+## Multi-Environment Strategy with Kustomize
+
+Production, staging, and development environments need different configurations — different replica counts, resource limits, model versions, and image tags. Kustomize, built into `kubectl`, provides an elegant solution: a shared **base** configuration with environment-specific **overlays** on top.
+
+```
+k8s/
+├── base/                      # Shared manifests (environment-agnostic)
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── hpa.yaml
+│   └── kustomization.yaml
+└── overlays/
+    ├── development/           # Dev-specific overrides
+    │   └── kustomization.yaml
+    ├── staging/               # Staging overrides
+    │   └── kustomization.yaml
+    └── production/            # Production overrides
+        ├── hpa-patch.yaml
+        └── kustomization.yaml
+```
+
+```yaml
+# k8s/overlays/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ai-services-prod
+bases:
+  - ../../base
+patches:
+  - hpa-patch.yaml
+images:
+  - name: gcr.io/YOUR_PROJECT/gemini-chat-service
+    newTag: "v1.2.0"  # Pin a specific version in production
+```
+
+```yaml
+# k8s/overlays/production/hpa-patch.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gemini-chat-hpa
+spec:
+  minReplicas: 3   # Production: always 3 Pods minimum
+  maxReplicas: 50  # Higher ceiling for production traffic
+```
+
+```bash
+# Deploy to production
+kubectl apply -k k8s/overlays/production/
+
+# Deploy to development
+kubectl apply -k k8s/overlays/development/
+
+# Preview changes before applying
+kubectl diff -k k8s/overlays/production/
+```
+
+Kustomize strikes a good balance between simplicity (no templating language to learn) and flexibility (patches can override any field in any manifest), making it ideal for teams that don't need the full complexity of Helm.
+
+---
+
+## Structured Logging for Production Observability
+
+Plain-text log output like `print("Request completed")` is fine for development but becomes a liability in production. Log aggregation systems like Google Cloud Logging, Datadog, or the ELK Stack need **structured, machine-readable output** to enable filtering, alerting, and dashboards.
+
+The solution is JSON-formatted logs, where every log entry is a JSON object with well-defined fields. Cloud Logging automatically parses this format and maps fields like `severity`, `timestamp`, and custom fields to dedicated columns.
+
+```python
+# logging_config.py — Cloud Logging-compatible JSON formatter
+import logging
+import json
+import time
+from typing import Any
+
+class JSONFormatter(logging.Formatter):
+    """Outputs structured JSON logs compatible with Google Cloud Logging."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry: dict[str, Any] = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
+            "severity": record.levelname,
+            "message": record.getMessage(),
+            "service": "gemini-chat-service",
+            "logger": record.name,
+        }
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        # Include any extra fields passed via the 'extra' parameter
+        for key in ("request_id", "model", "duration_ms", "cached", "input_tokens"):
+            if hasattr(record, key):
+                log_entry[key] = getattr(record, key)
+        return json.dumps(log_entry, ensure_ascii=False)
+
+def setup_logging(level: str = "INFO") -> logging.Logger:
+    logger = logging.getLogger("gemini-chat")
+    logger.setLevel(getattr(logging, level.upper()))
+    handler = logging.StreamHandler()
+    handler.setFormatter(JSONFormatter())
+    logger.addHandler(handler)
+    return logger
+
+# Usage in main.py — rich, queryable log entries for every Gemini API call
+logger = setup_logging(settings.log_level)
+
+logger.info(
+    "Gemini API request completed",
+    extra={
+        "request_id": request_id,
+        "model": "gemini-2.5-flash",
+        "duration_ms": round(duration_ms, 2),
+        "cached": False,
+        "input_tokens": getattr(response.usage_metadata, "prompt_token_count", None),
+    }
+)
+```
+
+With this setup, you can run Cloud Logging queries like `jsonPayload.duration_ms > 5000` to find slow requests, or `jsonPayload.model = "gemini-2.5-pro" AND severity = "ERROR"` to isolate errors from the Pro model tier. This kind of precision is impossible with unstructured logs.
+
+---
+
+## Summary
+
+This guide covered the full lifecycle of deploying a production-grade Gemini API microservice on Kubernetes:
+
+We built a lean Docker image using multi-stage builds, injected the API key securely via Kubernetes Secrets (with an optional External Secrets Operator integration for Google Secret Manager), and wrote a Deployment manifest with proper resource limits, three-tier health probes, and a zero-downtime rolling update strategy. HPA handles automatic scale-out under load, PodDisruptionBudget ensures availability during maintenance, and Prometheus scrapes our custom metrics for Grafana dashboards.
+
+For a comparison of when to choose Cloud Run over Kubernetes, see the [Cloud Run serverless deployment guide](/en/articles/gemini-dev/gemini-cloud-run-serverless-ai-api-production). Cloud Run wins on operational simplicity for smaller services; Kubernetes is the right choice when you need multi-service coordination, fine-grained autoscaling, or compliance requirements that serverless can't meet.
+
+For engineers who want a deep understanding of how Kubernetes works under the hood before applying these patterns, [Kubernetes in Action, Second Edition by Marko Lukša](https://www.amazon.co.jp/dp/1617297615/?tag=pinocchio-22) is the most comprehensive reference available. Combining that foundational knowledge with the Gemini API integration patterns in this article will give you everything you need to build resilient, cost-efficient AI infrastructure.
