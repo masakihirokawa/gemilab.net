@@ -1,0 +1,793 @@
+---
+title: "Gemini API × Apache Airflow で本番AIデータパイプラインを構築する完全ガイド"
+slug: "gemini-api-apache-airflow-data-pipeline-production"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-04-05T19:45"
+author: "Gemini Lab"
+description: "Apache AirflowとGemini APIを組み合わせ、本番グレードのAIデータパイプラインを構築する方法を詳解。DAG設計・エラーハンドリング・コスト最適化・モニタリングまで網羅した実践ガイド。"
+tags: ["airflow", "gemini-api", "data-pipeline", "python", "mlops", "production", "dag"]
+highlights:
+  - "Apache AirflowとGemini APIを組み合わせた本番グレードのDAG設計パターンを体系的に理解できる"
+  - "再試行ロジック・モニタリング・コスト最適化を含む堅牢なAIパイプラインの実装ノウハウを習得できる"
+  - "ドキュメント処理・コンテンツ生成・データ分析の3大ユースケースに即応用できる完全なコードを取得できる"
+---
+
+## はじめに：なぜ Airflow × Gemini API なのか
+
+AI 技術の急速な普及に伴い、「単発の API 呼び出し」から「継続的に動く本番 AI パイプライン」への進化を求める声が増えています。Apache Airflow は、データエンジニアリングの世界で長年にわたり信頼されてきたワークフローオーケストレーターです。Gemini API の強力な言語・マルチモーダル処理能力と Airflow の堅牢なスケジューリング・依存管理を組み合わせることで、エンタープライズ品質の AI 自動化基盤を構築できます。
+
+この記事では、実際の本番環境を想定した以下のシナリオを題材にします。
+
+- 毎日数千件のドキュメントを Gemini API で解析し、構造化データとして BigQuery に保存する
+- エラーが起きても自動でリトライし、Slack に通知する
+- API コストをトークン単位でモニタリングし、月次レポートを生成する
+
+対象読者は、Python の基本的な知識があり、Airflow や GCP の経験が多少ある中級〜上級エンジニアです。
+
+---
+
+## 前提条件と環境構築
+
+### 必要なツールとバージョン
+
+- Python 3.11 以上
+- Apache Airflow 2.9 以上（Docker Compose または Astro CLI でのセットアップを推奨）
+- Gemini API キー（Google AI Studio または Vertex AI 経由）
+- Google Cloud SDK（BigQuery・GCS を使う場合）
+
+### Airflow のセットアップ（Docker Compose）
+
+```yaml
+# docker-compose.yml（抜粋）
+version: '3.8'
+services:
+  airflow-webserver:
+    image: apache/airflow:2.9.3
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+      - AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT=google-cloud-platform://?project=your-project-id
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./plugins:/opt/airflow/plugins
+    ports:
+      - "8080:8080"
+```
+
+### 必要な Python パッケージ
+
+```bash
+# requirements.txt
+apache-airflow==2.9.3
+apache-airflow-providers-google==10.18.0
+google-generativeai==0.8.3
+google-cloud-bigquery==3.25.0
+tenacity==9.0.0
+```
+
+### Airflow Variables / Connections の設定
+
+```bash
+# Airflow UI または CLI でシークレットを登録する
+# APIキーには実際のフォーマットは使わず、Airflow のシークレットバックエンドで管理する
+airflow variables set gemini_api_key "YOUR_GEMINI_API_KEY"
+airflow variables set gemini_model "gemini-2.5-pro"
+airflow variables set gemini_max_tokens "8192"
+airflow variables set cost_alert_threshold_usd "50"
+```
+
+---
+
+## 基本統合パターン：Gemini API カスタムオペレーター
+
+Airflow でカスタムオペレーターを作成することで、DAG の可読性と再利用性が大幅に向上します。
+
+```python
+# plugins/gemini_operators.py
+from __future__ import annotations
+
+import json
+import time
+import logging
+from typing import Any, Sequence
+
+import google.generativeai as genai
+from airflow.models import BaseOperator
+from airflow.utils.context import Context
+from airflow.models import Variable
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+logger = logging.getLogger(__name__)
+
+
+class GeminiGenerateOperator(BaseOperator):
+    """
+    Gemini API を呼び出してテキスト生成を行うカスタムオペレーター。
+
+    :param prompt_template: プロンプトテンプレート（Jinja2 形式）
+    :param input_key: XCom から入力データを取得するキー名
+    :param output_key: 結果を XCom に保存するキー名
+    :param model_name: 使用する Gemini モデル名
+    :param max_output_tokens: 最大出力トークン数
+    """
+
+    template_fields: Sequence[str] = ("prompt_template",)
+
+    def __init__(
+        self,
+        *,
+        prompt_template: str,
+        input_key: str = "data",
+        output_key: str = "result",
+        model_name: str | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float = 0.2,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.prompt_template = prompt_template
+        self.input_key = input_key
+        self.output_key = output_key
+        self.model_name = model_name or Variable.get("gemini_model", "gemini-2.5-pro")
+        self.max_output_tokens = max_output_tokens or int(
+            Variable.get("gemini_max_tokens", 8192)
+        )
+        self.temperature = temperature
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=4, max=60),
+        retry=retry_if_exception_type((Exception,)),
+        reraise=True,
+    )
+    def _call_gemini(self, prompt: str) -> dict[str, Any]:
+        """指数バックオフ付きで Gemini API を呼び出す"""
+        api_key = Variable.get("gemini_api_key")
+        genai.configure(api_key=api_key)
+
+        model = genai.GenerativeModel(
+            model_name=self.model_name,
+            generation_config=genai.types.GenerationConfig(
+                temperature=self.temperature,
+                max_output_tokens=self.max_output_tokens,
+            ),
+        )
+
+        start_time = time.time()
+        response = model.generate_content(prompt)
+        elapsed = time.time() - start_time
+
+        result = {
+            "text": response.text,
+            "model": self.model_name,
+            "prompt_tokens": response.usage_metadata.prompt_token_count,
+            "output_tokens": response.usage_metadata.candidates_token_count,
+            "elapsed_seconds": round(elapsed, 2),
+        }
+
+        logger.info(
+            f"Gemini API 呼び出し完了 | "
+            f"モデル: {self.model_name} | "
+            f"プロンプトトークン: {result['prompt_tokens']} | "
+            f"出力トークン: {result['output_tokens']} | "
+            f"処理時間: {elapsed:.2f}s"
+        )
+        return result
+
+    def execute(self, context: Context) -> dict[str, Any]:
+        # 前タスクから入力データを取得
+        task_instance = context["task_instance"]
+        input_data = task_instance.xcom_pull(key=self.input_key) or ""
+
+        # プロンプトを構築（Jinja2 は Airflow が事前に展開する）
+        prompt = self.prompt_template.format(input=input_data)
+
+        logger.info(f"Gemini API 呼び出し開始 | プロンプト長: {len(prompt)} 文字")
+        result = self._call_gemini(prompt)
+
+        # 結果を XCom に保存
+        task_instance.xcom_push(key=self.output_key, value=result)
+        return result
+```
+
+---
+
+## 本番グレード DAG 設計パターン
+
+### パターン 1：ドキュメント一括処理 DAG
+
+数千件の PDF や JSON を GCS から読み込み、Gemini で解析して BigQuery に書き込む典型的なパターンです。
+
+```python
+# dags/document_processing_pipeline.py
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from airflow.decorators import dag, task
+from airflow.providers.google.cloud.operators.gcs import GCSListObjectsOperator
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_ARGS = {
+    "owner": "data-team",
+    "depends_on_past": False,
+    "retries": 3,
+    "retry_delay": timedelta(minutes=5),
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=30),
+    "email_on_failure": True,
+    "email": ["alert@yourcompany.com"],
+}
+
+@dag(
+    dag_id="gemini_document_processing",
+    default_args=DEFAULT_ARGS,
+    description="GCS の PDF/JSON ドキュメントを Gemini で解析し BigQuery に保存",
+    schedule="0 2 * * *",  # 毎日 02:00 JST に実行
+    start_date=datetime(2026, 4, 1),
+    catchup=False,
+    max_active_runs=1,
+    tags=["gemini", "nlp", "production"],
+)
+def document_processing_pipeline():
+
+    # Step 1: 処理対象ファイル一覧を取得
+    list_files = GCSListObjectsOperator(
+        task_id="list_documents",
+        bucket="your-input-bucket",
+        prefix="documents/{{ ds }}/",  # 実行日のフォルダ
+        gcp_conn_id="google_cloud_default",
+    )
+
+    @task
+    def process_documents_batch(file_list: list[str]) -> list[dict]:
+        """ドキュメントを並列処理する（バッチサイズ制御付き）"""
+        import google.generativeai as genai
+        from airflow.models import Variable
+        from google.cloud import storage
+
+        api_key = Variable.get("gemini_api_key")
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.5-pro")
+
+        results = []
+        batch_size = 10  # 並列処理数を制限してレートリミットを回避
+
+        for i, file_path in enumerate(file_list or []):
+            try:
+                # GCS からファイル内容を取得
+                client = storage.Client()
+                bucket = client.bucket("your-input-bucket")
+                blob = bucket.blob(file_path)
+                content = blob.download_as_text()
+
+                # Gemini で解析
+                prompt = f"""以下のドキュメントを解析し、JSONフォーマットで返答してください。
+
+ドキュメント:
+{content[:50000]}  # トークン制限を考慮して切り詰める
+
+出力形式:
+{{
+  "summary": "200文字以内の要約",
+  "category": "ドキュメントカテゴリ",
+  "key_entities": ["エンティティ1", "エンティティ2"],
+  "sentiment": "positive/neutral/negative",
+  "action_items": ["アクション1", "アクション2"]
+}}"""
+
+                response = model.generate_content(prompt)
+                parsed = json.loads(response.text)
+
+                results.append({
+                    "file_path": file_path,
+                    "status": "success",
+                    **parsed,
+                    "processed_at": datetime.utcnow().isoformat(),
+                })
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON パースエラー: {file_path} | {e}")
+                results.append({"file_path": file_path, "status": "parse_error"})
+            except Exception as e:
+                logger.error(f"処理エラー: {file_path} | {e}")
+                results.append({"file_path": file_path, "status": "error", "error": str(e)})
+
+            # レートリミット対策：10件ごとに1秒待機
+            if (i + 1) % batch_size == 0:
+                import time
+                time.sleep(1)
+
+        return results
+
+    @task
+    def save_to_bigquery(results: list[dict]) -> dict:
+        """処理結果を BigQuery に書き込む"""
+        from google.cloud import bigquery
+
+        client = bigquery.Client()
+        table_id = "your-project.your_dataset.document_analysis"
+
+        # 成功したレコードのみ抽出
+        success_records = [r for r in results if r.get("status") == "success"]
+
+        if success_records:
+            errors = client.insert_rows_json(table_id, success_records)
+            if errors:
+                raise ValueError(f"BigQuery 書き込みエラー: {errors}")
+
+        summary = {
+            "total": len(results),
+            "success": len(success_records),
+            "error": len(results) - len(success_records),
+        }
+        logger.info(f"BigQuery 書き込み完了: {summary}")
+        return summary
+
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def send_completion_report(summary: dict) -> None:
+        """処理完了レポートを Slack に送信する"""
+        import requests
+        from airflow.models import Variable
+
+        webhook_url = Variable.get("slack_webhook_url", default_var=None)
+        if not webhook_url:
+            logger.info("Slack Webhook が未設定のため通知をスキップします")
+            return
+
+        message = (
+            f"✅ ドキュメント処理完了\n"
+            f"合計: {summary['total']} 件\n"
+            f"成功: {summary['success']} 件\n"
+            f"エラー: {summary['error']} 件"
+        )
+        requests.post(webhook_url, json={"text": message})
+
+    # DAG の依存関係を定義
+    files = list_files.output
+    processed = process_documents_batch(files)
+    summary = save_to_bigquery(processed)
+    send_completion_report(summary)
+
+document_processing_pipeline()
+```
+
+---
+
+## エラーハンドリングとリトライ戦略
+
+本番 AI パイプラインで最も重要なのは、予期せぬエラーへの対応です。Gemini API は一時的なレートリミットやネットワーク障害が発生することがあり、適切な対処が不可欠です。
+
+### レートリミット対応のトークンバケット実装
+
+```python
+# plugins/rate_limiter.py
+import time
+import threading
+from collections import deque
+
+class TokenBucketRateLimiter:
+    """
+    Gemini API のレートリミットを管理するトークンバケット実装。
+    RPM（リクエスト毎分）と TPM（トークン毎分）の両方を制御する。
+    """
+
+    def __init__(self, rpm: int = 60, tpm: int = 1_000_000):
+        self.rpm = rpm
+        self.tpm = tpm
+        self._request_times: deque = deque()
+        self._token_times: deque = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self, estimated_tokens: int = 1000) -> None:
+        """
+        リクエスト前にレートリミットを確認し、必要なら待機する。
+
+        :param estimated_tokens: 推定使用トークン数（プロンプト + 出力）
+        """
+        with self._lock:
+            now = time.time()
+            minute_ago = now - 60
+
+            # 1分以上前のエントリを削除
+            while self._request_times and self._request_times[0] < minute_ago:
+                self._request_times.popleft()
+            while self._token_times and self._token_times[0][0] < minute_ago:
+                self._token_times.popleft()
+
+            # RPM チェック
+            if len(self._request_times) >= self.rpm:
+                sleep_time = 60 - (now - self._request_times[0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            # TPM チェック
+            current_tpm = sum(t[1] for t in self._token_times)
+            if current_tpm + estimated_tokens > self.tpm:
+                sleep_time = 60 - (now - self._token_times[0][0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            # 現在のリクエストを記録
+            self._request_times.append(time.time())
+            self._token_times.append((time.time(), estimated_tokens))
+
+# グローバルインスタンス（DAG 間で共有）
+_rate_limiter = TokenBucketRateLimiter(rpm=60, tpm=1_000_000)
+```
+
+### センサーを使った前提条件チェック
+
+```python
+# plugins/gemini_sensor.py
+from airflow.sensors.base import BaseSensorOperator
+from airflow.utils.context import Context
+import google.generativeai as genai
+from airflow.models import Variable
+
+class GeminiAPIHealthSensor(BaseSensorOperator):
+    """
+    Gemini API の疎通確認センサー。
+    API が応答するまで DAG をブロックする。
+    """
+
+    def poke(self, context: Context) -> bool:
+        try:
+            api_key = Variable.get("gemini_api_key")
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            # 軽量なテストリクエスト（コスト最小化）
+            response = model.generate_content("ping")
+            return bool(response.text)
+        except Exception as e:
+            self.log.warning(f"Gemini API ヘルスチェック失敗: {e}")
+            return False
+```
+
+---
+
+## コスト管理とモニタリング
+
+Gemini API の料金はトークン数に基づくため、パイプラインのコストを継続的に監視することが重要です。
+
+### コスト計算とアラートの実装
+
+```python
+# plugins/cost_tracker.py
+from dataclasses import dataclass, field
+from typing import ClassVar
+import logging
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class GeminiCostTracker:
+    """
+    Gemini API のコストをリアルタイムで追跡するクラス。
+    トークン数から推定コストを計算し、閾値超過時にアラートを発行する。
+
+    料金は 2026年4月時点の公式料金に基づく（変動する可能性あり）:
+    - gemini-2.5-pro: $3.50/1M tokens (input), $10.50/1M tokens (output)
+    - gemini-2.5-flash: $0.15/1M tokens (input), $0.60/1M tokens (output)
+    """
+
+    PRICING: ClassVar[dict] = {
+        "gemini-2.5-pro": {"input": 3.50 / 1_000_000, "output": 10.50 / 1_000_000},
+        "gemini-2.5-flash": {"input": 0.15 / 1_000_000, "output": 0.60 / 1_000_000},
+        "gemini-2.0-flash": {"input": 0.10 / 1_000_000, "output": 0.40 / 1_000_000},
+    }
+
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cost_usd: float = 0.0
+    model_usage: dict = field(default_factory=dict)
+
+    def add_usage(self, model: str, input_tokens: int, output_tokens: int) -> float:
+        """使用量を記録し、このリクエストのコストを返す"""
+        pricing = self.PRICING.get(model, self.PRICING["gemini-2.5-pro"])
+        cost = input_tokens * pricing["input"] + output_tokens * pricing["output"]
+
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.total_cost_usd += cost
+
+        if model not in self.model_usage:
+            self.model_usage[model] = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+
+        self.model_usage[model]["requests"] += 1
+        self.model_usage[model]["input_tokens"] += input_tokens
+        self.model_usage[model]["output_tokens"] += output_tokens
+        self.model_usage[model]["cost_usd"] += cost
+
+        return cost
+
+    def check_threshold(self, threshold_usd: float) -> bool:
+        """コスト閾値を超えたか確認する"""
+        if self.total_cost_usd > threshold_usd:
+            logger.warning(
+                f"⚠️ コスト閾値超過: ${self.total_cost_usd:.4f} > ${threshold_usd}"
+            )
+            return True
+        return False
+
+    def get_report(self) -> dict:
+        """コストサマリーレポートを返す"""
+        return {
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_tokens": self.total_input_tokens + self.total_output_tokens,
+            "total_cost_usd": round(self.total_cost_usd, 6),
+            "model_breakdown": self.model_usage,
+        }
+```
+
+### コスト最適化のための Airflow Variable 動的更新
+
+```python
+@task
+def check_daily_cost_and_adjust(tracker_report: dict) -> None:
+    """
+    日次コストを確認し、閾値超過時はモデルをダウングレードする。
+    高コストの gemini-2.5-pro から gemini-2.5-flash に切り替える。
+    """
+    from airflow.models import Variable
+
+    threshold = float(Variable.get("cost_alert_threshold_usd", 50))
+    current_cost = tracker_report.get("total_cost_usd", 0)
+
+    if current_cost > threshold:
+        # コスト超過時は軽量モデルに自動切り替え
+        Variable.set("gemini_model", "gemini-2.5-flash")
+        logger.warning(
+            f"コスト ${current_cost:.2f} が閾値 ${threshold} を超過。"
+            f"モデルを gemini-2.5-flash に切り替えました。"
+        )
+    elif current_cost < threshold * 0.5:
+        # コストに余裕がある場合は高性能モデルに戻す
+        Variable.set("gemini_model", "gemini-2.5-pro")
+        logger.info(
+            f"コスト ${current_cost:.2f} が余裕範囲内。"
+            f"モデルを gemini-2.5-pro に復元しました。"
+        )
+```
+
+---
+
+## 実践ユースケース：多言語コンテンツ生成パイプライン
+
+実際のプロダクション環境で使われる、多言語コンテンツを自動生成する DAG の完全実装です。
+
+```python
+# dags/multilingual_content_pipeline.py
+from airflow.decorators import dag, task
+from datetime import datetime, timedelta
+
+@dag(
+    dag_id="gemini_multilingual_content",
+    schedule="0 6 * * 1-5",  # 平日朝6時に実行
+    start_date=datetime(2026, 4, 1),
+    catchup=False,
+    default_args={
+        "retries": 2,
+        "retry_delay": timedelta(minutes=3),
+    },
+    tags=["gemini", "content", "multilingual"],
+)
+def multilingual_content_pipeline():
+
+    @task
+    def fetch_source_articles() -> list[dict]:
+        """データソースから原稿データを取得する"""
+        # 実際の実装では DB や API から取得する
+        return [
+            {"id": "001", "title": "AI技術の最新動向", "content": "...", "lang": "ja"},
+            {"id": "002", "title": "機械学習入門", "content": "...", "lang": "ja"},
+        ]
+
+    @task
+    def translate_and_enhance(articles: list[dict]) -> list[dict]:
+        """Gemini APIで翻訳・品質向上を行う"""
+        import google.generativeai as genai
+        from airflow.models import Variable
+
+        api_key = Variable.get("gemini_api_key")
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(Variable.get("gemini_model", "gemini-2.5-pro"))
+
+        results = []
+        for article in articles:
+            prompt = f"""以下の日本語記事を英語に翻訳し、SEOに最適化されたバージョンを作成してください。
+
+原文:
+タイトル: {article['title']}
+内容: {article['content']}
+
+要件:
+1. 英語ネイティブ向けの自然な文体
+2. SEOキーワードを自然に含める
+3. JSON形式で返答する
+
+出力形式:
+{{
+  "en_title": "英語タイトル",
+  "en_content": "英語本文",
+  "meta_description": "160文字以内のメタ説明",
+  "keywords": ["キーワード1", "キーワード2"]
+}}"""
+
+            response = model.generate_content(prompt)
+            import json
+            translated = json.loads(response.text)
+            results.append({**article, **translated})
+
+        return results
+
+    @task
+    def publish_content(enhanced_articles: list[dict]) -> dict:
+        """処理済みコンテンツを CMS に公開する"""
+        # 実際の実装では CMS API や DB に書き込む
+        published_count = len(enhanced_articles)
+        logger.info(f"{published_count} 件のコンテンツを公開しました")
+        return {"published": published_count}
+
+    articles = fetch_source_articles()
+    enhanced = translate_and_enhance(articles)
+    publish_content(enhanced)
+
+multilingual_content_pipeline()
+```
+
+---
+
+## パフォーマンス最適化とスケーリング戦略
+
+### 1. Dynamic Task Mapping（動的タスクマッピング）
+
+Airflow 2.3 以降で使える動的タスクマッピングを活用すると、ファイル数に応じて自動でタスクを並列展開できます。
+
+```python
+@task
+def load_file_chunk(file_path: str) -> dict:
+    """単一ファイルを処理する（動的マッピング用）"""
+    # 実装省略
+    return {"file": file_path, "status": "processed"}
+
+# DAG 内で動的に展開
+file_list = ["file1.txt", "file2.txt", "file3.txt"]
+processed = load_file_chunk.expand(file_path=file_list)
+```
+
+### 2. Gemini Batch API の活用
+
+大量のリクエストを非同期で処理する Batch API を使うと、コストを最大 50% 削減できます（2026年4月時点）。
+
+```python
+@task
+def submit_batch_job(requests: list[dict]) -> str:
+    """Gemini Batch API にジョブをサブミットする"""
+    import google.generativeai as genai
+    from airflow.models import Variable
+
+    api_key = Variable.get("gemini_api_key")
+    genai.configure(api_key=api_key)
+
+    # バッチリクエストの形式に変換
+    batch_requests = [
+        {
+            "model": "models/gemini-2.5-pro",
+            "contents": [{"parts": [{"text": req["prompt"]}]}],
+        }
+        for req in requests
+    ]
+
+    # バッチジョブを作成（実際のAPIコールはSDKのバージョンによって異なる）
+    # batch = genai.batch_generate_content(batch_requests)
+    # return batch.name
+
+    return "batch_job_id_placeholder"
+
+@task.sensor(poke_interval=60, timeout=3600)
+def wait_for_batch_completion(job_id: str) -> bool:
+    """バッチジョブの完了を待機するセンサー"""
+    # ジョブのステータスを確認して完了したら True を返す
+    return True
+```
+
+### 3. Airflow Pool を使った並列数制限
+
+Gemini API のレートリミットを考慮し、Pool を使って同時実行数を制御します。
+
+```bash
+# Airflow CLI で Pool を作成
+airflow pools set gemini_api_pool 5 "Gemini API rate limit pool (5 concurrent)"
+```
+
+```python
+# DAG でPoolを指定
+GeminiGenerateOperator(
+    task_id="generate_content",
+    pool="gemini_api_pool",  # Pool で並列数を制限
+    pool_slots=1,
+    # ...
+)
+```
+
+---
+
+## セキュリティとアクセス制御のベストプラクティス
+
+### Secret Backend の設定
+
+本番環境では API キーを Airflow Variables に平文で保存せず、Secret Manager を使います。
+
+```python
+# airflow.cfg または環境変数で設定
+# AIRFLOW__SECRETS__BACKEND=airflow.providers.google.cloud.secrets.secret_manager.CloudSecretManagerBackend
+# AIRFLOW__SECRETS__BACKEND_KWARGS={"project_id": "your-project-id", "connections_prefix": "airflow-connections", "variables_prefix": "airflow-variables"}
+```
+
+```python
+# Secret Manager に API キーを登録する例（CLI）
+# echo -n "YOUR_GEMINI_API_KEY" | \
+#   gcloud secrets create airflow-variables-gemini_api_key \
+#   --data-file=- \
+#   --project=your-project-id
+```
+
+### Workload Identity Federation（GKE 環境）
+
+GKE（Google Kubernetes Engine）で Airflow を動かす場合、サービスアカウントキーファイルを使わず、Workload Identity で認証することを強く推奨します。これにより、キーの漏洩リスクをなくせます。
+
+```yaml
+# kubernetes/airflow-serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: airflow-worker
+  namespace: airflow
+  annotations:
+    iam.gke.io/gcp-service-account: airflow-sa@your-project.iam.gserviceaccount.com
+```
+
+---
+
+## FAQ
+
+**Q1. Airflow の Worker が OOM（メモリ不足）になった場合はどうすればよいですか？**
+
+A. 大量のドキュメントを処理する場合、XCom でデータをやり取りするとメモリ問題が起きやすいです。XCom には最小限のメタデータ（ファイルパスや ID など）のみを保存し、実際のデータは GCS や BigQuery を経由させるアーキテクチャに切り替えることを推奨します。また、`AIRFLOW__CORE__XCOM_BACKEND` を GCS ベースの Custom XCom Backend に変更することも有効です。
+
+**Q2. Gemini API のレートリミットに頻繁に引っかかる場合の対処法は？**
+
+A. まず、利用しているプロジェクトの Tier を確認してください（Google AI Studio の無料版と Tier 1/2 ではレートリミットが大きく異なります）。Airflow の Pool を使って同時実行数を制限し、テナシティライブラリの指数バックオフを実装することで、大半のケースは解消できます。それでも不十分な場合は、Gemini 2.5 Flash（レートリミットが緩い）と Pro を動的に切り替える戦略が効果的です。
+
+**Q3. 本番 DAG のデバッグに役立つ Airflow のツールは何ですか？**
+
+A. Airflow の `airflow tasks test` コマンドを使うと、スケジューラーを経由せず特定タスクだけをローカル実行できます。また、`airflow dags backfill` で過去日付のデータを再処理できます。DAG ファイルのシンタックスエラーは `python dags/your_dag.py` で事前にチェックできます。本番では OpenLineage と Airflow の連携によるデータリネージ追跡も強くお勧めします。
+
+**Q4. コストを最小化するためのモデル選定指針を教えてください。**
+
+A. ユースケース別の推奨モデルは次の通りです。単純な分類・要約（精度よりスピード重視）は `gemini-2.5-flash`、複雑な推論・長文処理・コード生成は `gemini-2.5-pro`、実験・開発段階のプロトタイピングは `gemini-2.0-flash` が費用対効果が高いです。パイプライン全体で `gemini-2.5-flash` を使うと、`gemini-2.5-pro` 比で約 95% のコスト削減が可能です。
+
+**Q5. Airflow の DAG テストはどのように行えばよいですか？**
+
+A. `pytest` と `airflow.models.DagBag` を使って DAG の構造テストを行えます。各タスクの Python 関数は純粋なユニットテストとして `unittest.mock` で Gemini API をモックしてテストできます。また、Airflow の `@task` デコレーターを使うと関数を直接呼び出せるため、テストが書きやすくなります。
+
+---
+
+## まとめ
+
+Apache Airflow と Gemini API を組み合わせることで、単発の AI 呼び出しを超えた「継続的に動く本番 AI パイプライン」を構築できることを確認しました。重要なポイントを整理します。
+
+カスタムオペレーターの作成により、DAG の可読性と再利用性を高められます。指数バックオフとテナシティライブラリを活用した堅牢なリトライ戦略により、一時的な API 障害に耐えられます。トークンバケット方式のレートリミット制御で、API の制約内に確実に収まります。コストトラッカーとモデルの動的切り替えで、予算超過を防止できます。Secret Manager と Workload Identity の活用でセキュアな運用が実現します。
+
+次のステップとして、実際のデータソースとの接続（GCS・BigQuery・Cloud SQL）、OpenTelemetry を使ったトレーシング、および Vertex AI Pipelines への移行（より大規模な ML ワークフローが必要になった場合）をご検討ください。
+
+本記事のテーマをさらに深めたい方には、[「実践 Apache Airflow ―データパイプライン開発の教科書」（Maxime Beauchemin、Marc Lamberti 著）](https://www.amazon.co.jp/dp/4873119928/?tag=pinocchio-22)がおすすめです。Airflow の設計思想から本番運用の知見まで体系的に学べる一冊です。
