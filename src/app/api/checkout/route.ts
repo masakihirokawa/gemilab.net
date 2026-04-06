@@ -13,15 +13,22 @@ const PLAN_NAMES: Record<string, string> = {
   "price_1TCQyPEGB5g6A54oqVrc9ron": "Gemini Lab — チップ（¥150）ご支援ありがとうございます",
   "price_1TGSqVEGB5g6A54o54sFGJa7": "Gemini Lab メンバーシップ — Pro（月額プラン）",
   "price_1TCQyxEGB5g6A54o56MtETkI": "Gemini Lab メンバーシップ — Premium（永久アクセス）",
-  "price_1TFRyMEGB5g6A54o4j3brkd6": "Gemini Lab メンバーシップ — Premium（感謝価格 ¥980）",
+  "price_1TFRyMEGB5g6A54o4j3brkd6": "Gemini Lab メンバーシップ — Premium（感謝価格 ¥1,480）",
   // EN
   "price_1TGTQNEGB5g6A54otffwJLGB": "Gemini Lab — Tip ($1.50) Thank you for your support",
   "price_1TGTQOEGB5g6A54oiLbNR1xV": "Gemini Lab Membership — Pro (Monthly)",
   "price_1TGTQOEGB5g6A54oWHbKx4ab": "Gemini Lab Membership — Premium (Lifetime Access)",
-  "price_1TGTQOEGB5g6A54on5ljuNBC": "Gemini Lab Membership — Premium (Thank You Price $7)",
+  "price_1TGTQOEGB5g6A54on5ljuNBC": "Gemini Lab Membership — Premium (Thank You Price $10)",
   // Article
   "price_1TJL6TEGB5g6A54oeHUhtvSp": "Gemini Lab — 記事単体購入（¥250）",
   "price_1TJL6VEGB5g6A54ozB2XkNV4": "Gemini Lab — Single Article Purchase ($1.75)",
+
+  // New Pro (¥580/$5)
+  "price_1TJLvnEGB5g6A54oF433LWjh": "Gemini Lab メンバーシップ — Pro（月額プラン）",
+  "price_1TJLvoEGB5g6A54oGZicazUh": "Gemini Lab Membership — Pro (Monthly)",
+  // New Premium (¥2,480/$15)
+  "price_1TJLw0EGB5g6A54oqvqGqNKg": "Gemini Lab メンバーシップ — Premium（永久アクセス）",
+  "price_1TJLw1EGB5g6A54oAdtjW4AH": "Gemini Lab Membership — Premium (Lifetime Access)",
 };
 
 // Tip price IDs — these should NOT grant premium access
