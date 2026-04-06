@@ -9,7 +9,8 @@ import { TableOfContents } from "@/components/ui/TableOfContents";
 import { PremiumPaywall } from "@/components/ui/PremiumPaywall";
 import { MembershipCTA } from "@/components/ui/MembershipCTA";
 import { TipCTA } from "@/components/ui/TipCTA";
-import { getPremiumAccess } from "@/lib/premium";
+import { SingleArticleCTA } from "@/components/ui/SingleArticleCTA";
+import { getPremiumAccess, getArticleAccess } from "@/lib/premium";
 
 interface Props {
   params: Promise<{ locale: string; category: string; slug: string }>;
@@ -113,6 +114,7 @@ export default async function ArticlePage({ params }: Props) {
 
   const premiumAccess = await getPremiumAccess();
   const canViewPremium = !!premiumAccess;
+  const canViewArticle = canViewPremium || await getArticleAccess(slug);
 
   const articleUrl = `https://gemilab.net${prefix}/articles/${category}/${slug}`;
 
@@ -272,12 +274,13 @@ export default async function ArticlePage({ params }: Props) {
       )}
 
       {/* Article Content with paywall */}
-      {article.meta.premium && !canViewPremium ? (
+      {article.meta.premium && !canViewArticle ? (
         <>
           <div
             className="article-content"
             dangerouslySetInnerHTML={{ __html: content.slice(0, 10000) }}
           />
+          <SingleArticleCTA locale={locale} slug={slug} category={category} />
           <PremiumPaywall locale={locale} highlights={article.meta.highlights} />
         </>
       ) : (
@@ -301,7 +304,7 @@ export default async function ArticlePage({ params }: Props) {
       )}
 
       {/* Tip CTA — shown when full article content is visible */}
-      {(!article.meta.premium || canViewPremium) && <TipCTA locale={locale} />}
+      {(!article.meta.premium || canViewArticle) && <TipCTA locale={locale} />}
 
       {/* Related Articles */}
       <RelatedArticles
