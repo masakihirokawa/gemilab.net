@@ -19,6 +19,9 @@ const PLAN_NAMES: Record<string, string> = {
   "price_1TGTQOEGB5g6A54oiLbNR1xV": "Gemini Lab Membership — Pro (Monthly)",
   "price_1TGTQOEGB5g6A54oWHbKx4ab": "Gemini Lab Membership — Premium (Lifetime Access)",
   "price_1TGTQOEGB5g6A54on5ljuNBC": "Gemini Lab Membership — Premium (Thank You Price $7)",
+  // Article
+  "price_1TJL6TEGB5g6A54oeHUhtvSp": "Gemini Lab — 記事単体購入（¥250）",
+  "price_1TJL6VEGB5g6A54ozB2XkNV4": "Gemini Lab — Single Article Purchase ($1.75)",
 };
 
 // Tip price IDs — these should NOT grant premium access
@@ -29,8 +32,8 @@ const TIP_PRICE_IDS = new Set([
 
 // Article price IDs — per-article purchases
 const ARTICLE_PRICE_IDS = new Set([
-  "price_ARTICLE_JA_GEMILAB",  // ¥250 JPY
-  "price_ARTICLE_EN_GEMILAB",  // $1.75 USD
+  "price_1TJL6TEGB5g6A54oeHUhtvSp",  // ¥250 JPY
+  "price_1TJL6VEGB5g6A54ozB2XkNV4",  // $1.75 USD
 ]);
 
 export async function POST(request: NextRequest) {
