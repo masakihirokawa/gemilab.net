@@ -8,16 +8,16 @@ const NEWS_ITEMS: Record<string, string[]> = {
     "RANK3 — Gemma 4 の 31B Dense モデルが Arena AI テキストリーダーボードで世界第3位のオープンモデルに認定（4/3）",
     "AICORE — Gemma 4 が Android AICore 開発者プレビューに搭載。将来の Gemini Nano 4 搭載デバイスと互換性を確保した設計（4/4）",
     "FLASHLITE — Gemini 3.1 Flash-Lite が GA。速度 2.5 倍・出力 45% 向上で入力 $0.25/1M トークンの最安値クラスを実現（4/4）",
-    "REFERRAL — Google AI が Perplexity を抜いて Web 参照ソース世界第 2 位に浮上、8.65% シェアで前年比 4 倍成長（4/3）",
-    "FLASHLIVE — Gemini 3.1 Flash Live が低遅延リアルタイム音声対話に対応。ハンズフリーでの自然な長文会話が可能に（4/3）",
+    "STUDIO — Firebase Studio が AI エージェント対応のフルスタック開発環境として登場。バックエンド・フロントエンド・モバイルを統合（4/7）",
+    "ELOQUENT — Google AI Edge Eloquent が iOS でリリース。Gemma アーキテクチャによるオンデバイス音声ディクテーションアプリ（4/6）",
   ],
   en: [
     "GEMMA4 — Google releases Gemma 4 open models: E2B to 31B, 256K context, 140+ languages, and Apache 2.0 licensing for commercial use (4/2)",
     "RANK3 — Gemma 4's 31B Dense model earns the #3 spot among all open models worldwide on the Arena AI text leaderboard (4/3)",
     "AICORE — Gemma 4 lands in Android AICore Developer Preview; code written today will automatically work on future Gemini Nano 4 devices (4/4)",
     "FLASHLITE — Gemini 3.1 Flash-Lite hits GA: 2.5x faster responses, 45% higher output speed, at just $0.25/1M input tokens (4/4)",
-    "REFERRAL — Google AI overtakes Perplexity as the world's No. 2 web referral source at 8.65% share, growing 4x year-over-year (4/3)",
-    "FLASHLIVE — Gemini 3.1 Flash Live enables real-time voice conversations with low latency and long-context support for seamless hands-free use (4/3)",
+    "STUDIO — Firebase Studio debuts as a full-stack AI-agent development environment integrating backend, frontend, and mobile app building in one place (4/7)",
+    "ELOQUENT — Google AI Edge Eloquent arrives on iOS: Gemma-powered on-device voice dictation that polishes raw speech into professional text (4/6)",
   ],
 };
 
