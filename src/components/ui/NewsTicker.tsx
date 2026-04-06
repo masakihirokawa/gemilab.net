@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMMA4 — Google が Gemma 4 オープンモデルを公開、Apache 2.0 ライセンスで 2B〜31B の4サイズを提供、140言語対応（4/2）",
-    "AICORE — Android AICore 開発者プレビューに Gemma 4 が搭載、次世代 Gemini Nano 4 のベースモデルとして機能（4/4）",
-    "FLASHLITE — Gemini 3.1 Flash-Lite が GA、速度 2.5 倍・出力 45% 向上で入力 $0.25/1M トークンの最安値モデルに（4/4）",
+    "GEMMA4 — Google が Gemma 4 をリリース。E2B〜31B の4サイズ・256K コンテキスト・140 言語対応、Apache 2.0 で商用利用も可（4/2）",
+    "RANK3 — Gemma 4 の 31B Dense モデルが Arena AI テキストリーダーボードで世界第3位のオープンモデルに認定（4/3）",
+    "AICORE — Gemma 4 が Android AICore 開発者プレビューに搭載。将来の Gemini Nano 4 搭載デバイスと互換性を確保した設計（4/4）",
+    "FLASHLITE — Gemini 3.1 Flash-Lite が GA。速度 2.5 倍・出力 45% 向上で入力 $0.25/1M トークンの最安値クラスを実現（4/4）",
     "REFERRAL — Google AI が Perplexity を抜いて Web 参照ソース世界第 2 位に浮上、8.65% シェアで前年比 4 倍成長（4/3）",
-    "GEMINI3PRO — Gemini 3 Pro Preview が推論・マルチモーダル・エージェント機能を統合、企業向け複合タスク対応（4/3）",
-    "FLASHLIVE — Gemini 3.1 Flash Live がリアルタイム音声対話に対応、低遅延・長文コンテキストで自然な会話を実現（4/3）",
+    "FLASHLIVE — Gemini 3.1 Flash Live が低遅延リアルタイム音声対話に対応。ハンズフリーでの自然な長文会話が可能に（4/3）",
   ],
   en: [
-    "GEMMA4 — Google releases Gemma 4 open models under Apache 2.0: four sizes from 2B to 31B, supporting over 140 languages with agentic capabilities (4/2)",
-    "AICORE — Gemma 4 lands in Android AICore Developer Preview, serving as the foundation for the upcoming Gemini Nano 4 on-device experience (4/4)",
-    "FLASHLITE — Gemini 3.1 Flash-Lite hits GA: 2.5x faster, 45% higher output speed, and just $0.25/1M input tokens — the most cost-efficient Gemini model yet (4/4)",
-    "REFERRAL — Google AI overtakes Perplexity to become the world's No. 2 web referral source at 8.65% share, growing 4x year-over-year (4/3)",
-    "GEMINI3PRO — Gemini 3 Pro Preview integrates advanced reasoning, multimodal understanding, and agent capabilities for complex enterprise workflows (4/3)",
-    "FLASHLIVE — Gemini 3.1 Flash Live delivers real-time voice conversations with reduced latency and longer context for more natural interactions (4/3)",
+    "GEMMA4 — Google releases Gemma 4 open models: E2B to 31B, 256K context, 140+ languages, and Apache 2.0 licensing for commercial use (4/2)",
+    "RANK3 — Gemma 4's 31B Dense model earns the #3 spot among all open models worldwide on the Arena AI text leaderboard (4/3)",
+    "AICORE — Gemma 4 lands in Android AICore Developer Preview; code written today will automatically work on future Gemini Nano 4 devices (4/4)",
+    "FLASHLITE — Gemini 3.1 Flash-Lite hits GA: 2.5x faster responses, 45% higher output speed, at just $0.25/1M input tokens (4/4)",
+    "REFERRAL — Google AI overtakes Perplexity as the world's No. 2 web referral source at 8.65% share, growing 4x year-over-year (4/3)",
+    "FLASHLIVE — Gemini 3.1 Flash Live enables real-time voice conversations with low latency and long-context support for seamless hands-free use (4/3)",
   ],
 };
 
