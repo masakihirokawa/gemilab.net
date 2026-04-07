@@ -5,19 +5,19 @@ import { useLocale } from "next-intl";
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
     "GEMMA4 — Google が Gemma 4 をリリース。E2B〜31B の4サイズ・256K コンテキスト・140 言語対応、Apache 2.0 で商用利用も可（4/2）",
-    "RANK3 — Gemma 4 の 31B Dense モデルが Arena AI テキストリーダーボードで世界第3位のオープンモデルに認定（4/3）",
-    "AICORE — Gemma 4 が Android AICore 開発者プレビューに搭載。将来の Gemini Nano 4 搭載デバイスと互換性を確保した設計（4/4）",
+    "AUDIO — Gemini 2.5 Flash Native Audio が Vertex AI と Gemini API で一般提供開始。音声エージェント構築が本番環境で可能に（4/8）",
     "FLASHLITE — Gemini 3.1 Flash-Lite が GA。速度 2.5 倍・出力 45% 向上で入力 $0.25/1M トークンの最安値クラスを実現（4/4）",
+    "AICORE — Gemma 4 が Android AICore 開発者プレビューに搭載。将来の Gemini Nano 4 搭載デバイスと互換性を確保した設計（4/4）",
     "STUDIO — Firebase Studio が AI エージェント対応のフルスタック開発環境として登場。バックエンド・フロントエンド・モバイルを統合（4/7）",
-    "ELOQUENT — Google AI Edge Eloquent が iOS でリリース。Gemma アーキテクチャによるオンデバイス音声ディクテーションアプリ（4/6）",
+    "ELOQUENT — Google AI Edge Eloquent が iOS でリリース。Gemma アーキテクチャによるオンデバイス AI 音声ディクテーションアプリ（4/7）",
   ],
   en: [
     "GEMMA4 — Google releases Gemma 4 open models: E2B to 31B, 256K context, 140+ languages, and Apache 2.0 licensing for commercial use (4/2)",
-    "RANK3 — Gemma 4's 31B Dense model earns the #3 spot among all open models worldwide on the Arena AI text leaderboard (4/3)",
-    "AICORE — Gemma 4 lands in Android AICore Developer Preview; code written today will automatically work on future Gemini Nano 4 devices (4/4)",
+    "AUDIO — Gemini 2.5 Flash Native Audio is now generally available on Vertex AI and in preview on the Gemini API for voice agent development (4/8)",
     "FLASHLITE — Gemini 3.1 Flash-Lite hits GA: 2.5x faster responses, 45% higher output speed, at just $0.25/1M input tokens (4/4)",
-    "STUDIO — Firebase Studio debuts as a full-stack AI-agent development environment integrating backend, frontend, and mobile app building in one place (4/7)",
-    "ELOQUENT — Google AI Edge Eloquent arrives on iOS: Gemma-powered on-device voice dictation that polishes raw speech into professional text (4/6)",
+    "AICORE — Gemma 4 lands in Android AICore Developer Preview; code written today will automatically work on future Gemini Nano 4 devices (4/4)",
+    "STUDIO — Firebase Studio debuts as a full-stack AI-agent development environment integrating backend, frontend, and mobile app building (4/7)",
+    "ELOQUENT — Google AI Edge Eloquent arrives on iOS: Gemma-powered on-device voice dictation that polishes raw speech into professional text (4/7)",
   ],
 };
 
