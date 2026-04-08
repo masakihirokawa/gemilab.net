@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMMA4 — Google が Gemma 4 をリリース。E2B〜31B の4サイズ・256K コンテキスト・140 言語対応、Apache 2.0 で商用利用も可（4/2）",
-    "AUDIO — Gemini 2.5 Flash Native Audio が Vertex AI と Gemini API で一般提供開始。音声エージェント構築が本番環境で可能に（4/8）",
-    "FLASHLITE — Gemini 3.1 Flash-Lite が GA。速度 2.5 倍・出力 45% 向上で入力 $0.25/1M トークンの最安値クラスを実現（4/4）",
-    "AICORE — Gemma 4 が Android AICore 開発者プレビューに搭載。将来の Gemini Nano 4 搭載デバイスと互換性を確保した設計（4/4）",
-    "STUDIO — Firebase Studio が AI エージェント対応のフルスタック開発環境として登場。バックエンド・フロントエンド・モバイルを統合（4/7）",
-    "ELOQUENT — Google AI Edge Eloquent が iOS でリリース。Gemma アーキテクチャによるオンデバイス AI 音声ディクテーションアプリ（4/7）",
+    "GEMMA 4 — Gemma 4リリース：31BモデルがAIランキング世界3位、スマートフォン・Raspberry Piでオフライン動作（4/2）",
+    "3.1 PRO — Gemini 3.1 Proがグローバルロールアウト、複雑なコーディング・データ分析の推論能力が大幅向上（4/1）",
+    "FLASH LIVE — Gemini 3.1 Flash Liveがリリース：リアルタイム音声対話、ComplexFuncBench Audio 90.8%達成（3/26）",
+    "SAFETY — GoogleがGemini安全性機能を強化、センシティブクエリ対応とガードレール改善を実施（4/1）",
+    "AICORE — Gemma 4 Android AICore開発者プレビュー公開、エッジデバイスでのエージェントAIが現実に（4/2）",
+    "750M — Gemini月間アクティブユーザー7.5億人突破、APIリクエスト月850億件超でAI最速成長を継続（3/28）",
   ],
   en: [
-    "GEMMA4 — Google releases Gemma 4 open models: E2B to 31B, 256K context, 140+ languages, and Apache 2.0 licensing for commercial use (4/2)",
-    "AUDIO — Gemini 2.5 Flash Native Audio is now generally available on Vertex AI and in preview on the Gemini API for voice agent development (4/8)",
-    "FLASHLITE — Gemini 3.1 Flash-Lite hits GA: 2.5x faster responses, 45% higher output speed, at just $0.25/1M input tokens (4/4)",
-    "AICORE — Gemma 4 lands in Android AICore Developer Preview; code written today will automatically work on future Gemini Nano 4 devices (4/4)",
-    "STUDIO — Firebase Studio debuts as a full-stack AI-agent development environment integrating backend, frontend, and mobile app building (4/7)",
-    "ELOQUENT — Google AI Edge Eloquent arrives on iOS: Gemma-powered on-device voice dictation that polishes raw speech into professional text (4/7)",
+    "GEMMA 4 — Gemma 4 launches: 31B model ranks #3 globally on AI leaderboard, runs offline on smartphones & Raspberry Pi (4/2)",
+    "3.1 PRO — Gemini 3.1 Pro rolls out globally with major reasoning improvements for complex coding & data analysis (4/1)",
+    "FLASH LIVE — Gemini 3.1 Flash Live launches: real-time audio dialogue, top score of 90.8% on ComplexFuncBench Audio (3/26)",
+    "SAFETY — Google strengthens Gemini safety features with improved handling of sensitive queries and stricter guardrails (4/1)",
+    "AICORE — Gemma 4 Android AICore Developer Preview enables on-device agentic AI for edge devices (4/2)",
+    "750M — Gemini hits 750M monthly active users, processing 85B+ API requests per month (3/28)",
   ],
 };
 
@@ -35,7 +35,7 @@ export function NewsTicker() {
         width: "100%",
         zIndex: 99,
         height: 35,
-        background: "color-mix(in srgb, var(--accent-coral) 4%, transparent)",
+        background: "color-mix(in srgb, var(--accent-teal) 4%, transparent)",
         borderBottom: "1px solid var(--border-subtle)",
         display: "flex",
         alignItems: "center",
@@ -64,7 +64,7 @@ export function NewsTicker() {
               gap: 12,
             }}
           >
-            <span style={{ color: "var(--accent-coral)", fontSize: 8 }}>●</span>
+            <span style={{ color: "var(--accent-teal)", fontSize: 8 }}>●</span>
             {text}
           </span>
         ))}
