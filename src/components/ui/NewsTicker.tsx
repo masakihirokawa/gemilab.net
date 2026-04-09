@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMMA 4 — Gemma 4リリース：31BモデルがAIランキング世界3位、スマートフォン・Raspberry Piでオフライン動作（4/2）",
-    "3.1 PRO — Gemini 3.1 Proがグローバルロールアウト、複雑なコーディング・データ分析の推論能力が大幅向上（4/1）",
-    "FLASH LIVE — Gemini 3.1 Flash Liveがリリース：リアルタイム音声対話、ComplexFuncBench Audio 90.8%達成（3/26）",
-    "SAFETY — GoogleがGemini安全性機能を強化、センシティブクエリ対応とガードレール改善を実施（4/1）",
-    "AICORE — Gemma 4 Android AICore開発者プレビュー公開、エッジデバイスでのエージェントAIが現実に（4/2）",
-    "750M — Gemini月間アクティブユーザー7.5億人突破、APIリクエスト月850億件超でAI最速成長を継続（3/28）",
+    "AUDIO — Gemini 2.5 Flash Native Audio更新：ライブ音声エージェントが複雑なワークフロー・自然な会話に対応強化（4/9）",
+    "REDESIGN — Gemini Android UIがリデザイン：コンパクトオーバーレイ＋Liveフローティングウィンドウで操作性向上（4/10）",
+    "SAFETY — GoogleがGemini安全機能を強化、メンタルヘルス関連クエリでヘルプライン情報を優先表示（4/9）",
+    "FORMS — Google FormsがGemini AIで質問自動生成に対応、アンケート作成が自然言語で可能に（4/8）",
+    "TRANSLATE — Gemini音声翻訳ベータがGoogle翻訳に展開、AI Studio・Vertex AI・Gemini Live・Search Liveで利用可能（4/9）",
+    "LIFECYCLE — Gemini 2.5 Pro・Flash・Flash-Liteの廃止日が2026年10月16日に更新、移行計画の確認を推奨（4/10）",
   ],
   en: [
-    "GEMMA 4 — Gemma 4 launches: 31B model ranks #3 globally on AI leaderboard, runs offline on smartphones & Raspberry Pi (4/2)",
-    "3.1 PRO — Gemini 3.1 Pro rolls out globally with major reasoning improvements for complex coding & data analysis (4/1)",
-    "FLASH LIVE — Gemini 3.1 Flash Live launches: real-time audio dialogue, top score of 90.8% on ComplexFuncBench Audio (3/26)",
-    "SAFETY — Google strengthens Gemini safety features with improved handling of sensitive queries and stricter guardrails (4/1)",
-    "AICORE — Gemma 4 Android AICore Developer Preview enables on-device agentic AI for edge devices (4/2)",
-    "750M — Gemini hits 750M monthly active users, processing 85B+ API requests per month (3/28)",
+    "AUDIO — Gemini 2.5 Flash Native Audio updated: live voice agents now handle complex workflows & natural conversations better (4/9)",
+    "REDESIGN — Gemini gets a sleek Android redesign with compact overlay and floating Live window for smoother interactions (4/10)",
+    "SAFETY — Google enhances Gemini safety features, prioritizing helpline info for mental health & distress-related queries (4/9)",
+    "FORMS — Google Forms now auto-generates survey questions with Gemini AI — describe your goal, get a full question set (4/8)",
+    "TRANSLATE — Gemini live speech translation beta rolls out to Google Translate, AI Studio, Vertex AI & Search Live (4/9)",
+    "LIFECYCLE — Gemini 2.5 Pro, Flash & Flash-Lite retirement dates updated to October 16, 2026 — plan your migration now (4/10)",
   ],
 };
 
@@ -35,7 +35,7 @@ export function NewsTicker() {
         width: "100%",
         zIndex: 99,
         height: 35,
-        background: "color-mix(in srgb, var(--accent-teal) 4%, transparent)",
+        background: "color-mix(in srgb, var(--accent-coral) 4%, transparent)",
         borderBottom: "1px solid var(--border-subtle)",
         display: "flex",
         alignItems: "center",
@@ -64,7 +64,7 @@ export function NewsTicker() {
               gap: 12,
             }}
           >
-            <span style={{ color: "var(--accent-teal)", fontSize: 8 }}>●</span>
+            <span style={{ color: "var(--accent-coral)", fontSize: 8 }}>●</span>
             {text}
           </span>
         ))}
