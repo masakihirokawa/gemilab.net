@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "AUDIO — Gemini 2.5 Flash Native Audio更新：ライブ音声エージェントが複雑なワークフロー・自然な会話に対応強化（4/9）",
-    "REDESIGN — Gemini Android UIがリデザイン：コンパクトオーバーレイ＋Liveフローティングウィンドウで操作性向上（4/10）",
-    "SAFETY — GoogleがGemini安全機能を強化、メンタルヘルス関連クエリでヘルプライン情報を優先表示（4/9）",
-    "FORMS — Google FormsがGemini AIで質問自動生成に対応、アンケート作成が自然言語で可能に（4/8）",
-    "TRANSLATE — Gemini音声翻訳ベータがGoogle翻訳に展開、AI Studio・Vertex AI・Gemini Live・Search Liveで利用可能（4/9）",
-    "LIFECYCLE — Gemini 2.5 Pro・Flash・Flash-Liteの廃止日が2026年10月16日に更新、移行計画の確認を推奨（4/10）",
+    "USERS — Gemini AIユーザーが7億5,000万人突破（2025年Q4）、複数AIプラットフォーム利用の拡大傾向（4/11）",
+    "MODEL — Gemini 3シリーズ正式ローンチ、Computer Useツール対応で推論・マルチモーダル理解が大幅向上（4/11）",
+    "AUDIO — gemini-3.1-flash-live-preview公開、リアルタイム音声対話とA2A（Audio-to-Audio）変換機能を実装（4/11）",
+    "MUSIC — Lyria 3音楽生成モデル（lyria-3-clip-preview / pro-preview）で高品質な楽曲生成を実現（4/11）",
+    "DEVELOPERS — Gemini API開発者が240万人突破、2026年1月に850億件のAPIリクエスト処理（4/11）",
+    "PERSONAL — Personal Intelligenceが米国全域で拡大、Gmail・Photos連携でパーソナライズ検索体験を提供（4/11）",
   ],
   en: [
-    "AUDIO — Gemini 2.5 Flash Native Audio updated: live voice agents now handle complex workflows & natural conversations better (4/9)",
-    "REDESIGN — Gemini gets a sleek Android redesign with compact overlay and floating Live window for smoother interactions (4/10)",
-    "SAFETY — Google enhances Gemini safety features, prioritizing helpline info for mental health & distress-related queries (4/9)",
-    "FORMS — Google Forms now auto-generates survey questions with Gemini AI — describe your goal, get a full question set (4/8)",
-    "TRANSLATE — Gemini live speech translation beta rolls out to Google Translate, AI Studio, Vertex AI & Search Live (4/9)",
-    "LIFECYCLE — Gemini 2.5 Pro, Flash & Flash-Lite retirement dates updated to October 16, 2026 — plan your migration now (4/10)",
+    "USERS — Gemini surpasses 750M monthly active users (Q4 2025), with increased multi-AI platform adoption trends (4/11)",
+    "MODEL — Gemini 3 series launches with Computer Use support for enhanced reasoning, multimodal understanding & coding (4/11)",
+    "AUDIO — gemini-3.1-flash-live-preview now available for real-time voice dialogue and audio-to-audio transformation (4/11)",
+    "MUSIC — Lyria 3 music generation models (lyria-3-clip-preview and pro-preview) deliver high-quality AI-generated music (4/11)",
+    "DEVELOPERS — Gemini API developer base reaches 2.4M with 85B API requests processed in January 2026 alone (4/11)",
+    "PERSONAL — Personal Intelligence expands nationwide in US, integrating Gmail & Photos for personalized search experiences (4/11)",
   ],
 };
 
