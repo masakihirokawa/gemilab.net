@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "USERS — Gemini AIユーザーが7億5,000万人突破（2025年Q4）、複数AIプラットフォーム利用の拡大傾向（4/11）",
-    "MODEL — Gemini 3シリーズ正式ローンチ、Computer Useツール対応で推論・マルチモーダル理解が大幅向上（4/11）",
-    "AUDIO — gemini-3.1-flash-live-preview公開、リアルタイム音声対話とA2A（Audio-to-Audio）変換機能を実装（4/11）",
-    "MUSIC — Lyria 3音楽生成モデル（lyria-3-clip-preview / pro-preview）で高品質な楽曲生成を実現（4/11）",
-    "DEVELOPERS — Gemini API開発者が240万人突破、2026年1月に850億件のAPIリクエスト処理（4/11）",
-    "PERSONAL — Personal Intelligenceが米国全域で拡大、Gmail・Photos連携でパーソナライズ検索体験を提供（4/11）",
+    "GEMINI 3.1 PRO — 高いユーザー数制限でロールアウト、Gemini app・API・Vertex AI・NotebookLMで利用可能（4/12）",
+    "REASONING — 複雑な問題解決タスク向けに推論能力を大幅改善、ベンチマークで高スコア達成（4/12）",
+    "STUDIO — Google AI Studioの「Vibe Coding」がアップグレード、プロンプトからプロダクション対応アプリへ（4/12）",
+    "CODING AGENT — Google Antigravityコーディングエージェント統合、AI Studioで本格的なコード生成（4/12）",
+    "MUSIC — Lyria・Lyria 3音楽生成モデルが公開プレビュー開始、Gemini API・AI Studioで利用可（4/12）",
+    "SUBSCRIPTION — Google One AI PremiumがGoogle AI Proに改名、新Ultraティア登場＆価格体系を整理（4/12）",
   ],
   en: [
-    "USERS — Gemini surpasses 750M monthly active users (Q4 2025), with increased multi-AI platform adoption trends (4/11)",
-    "MODEL — Gemini 3 series launches with Computer Use support for enhanced reasoning, multimodal understanding & coding (4/11)",
-    "AUDIO — gemini-3.1-flash-live-preview now available for real-time voice dialogue and audio-to-audio transformation (4/11)",
-    "MUSIC — Lyria 3 music generation models (lyria-3-clip-preview and pro-preview) deliver high-quality AI-generated music (4/11)",
-    "DEVELOPERS — Gemini API developer base reaches 2.4M with 85B API requests processed in January 2026 alone (4/11)",
-    "PERSONAL — Personal Intelligence expands nationwide in US, integrating Gmail & Photos for personalized search experiences (4/11)",
+    "GEMINI 3.1 PRO — Rolling out with higher usage limits, available in Gemini app, API, Vertex AI, and NotebookLM (4/12)",
+    "REASONING — Enhanced reasoning for complex problem-solving, scores significantly higher on benchmark tests (4/12)",
+    "STUDIO — Google AI Studio upgrades 'vibe coding' experience to turn prompts into production-ready applications (4/12)",
+    "CODING AGENT — Google Antigravity coding agent integration enables advanced code generation in AI Studio (4/12)",
+    "MUSIC — Lyria and Lyria 3 music generation models now in public preview via Gemini API and AI Studio (4/12)",
+    "SUBSCRIPTION — Google One AI Premium rebranded as Google AI Pro, new Ultra tier introduced with updated pricing (4/12)",
   ],
 };
 
