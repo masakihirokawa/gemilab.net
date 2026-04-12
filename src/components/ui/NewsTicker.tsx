@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMINI 3.1 PRO — 高いユーザー数制限でロールアウト、Gemini app・API・Vertex AI・NotebookLMで利用可能（4/12）",
-    "REASONING — 複雑な問題解決タスク向けに推論能力を大幅改善、ベンチマークで高スコア達成（4/12）",
-    "STUDIO — Google AI Studioの「Vibe Coding」がアップグレード、プロンプトからプロダクション対応アプリへ（4/12）",
-    "CODING AGENT — Google Antigravityコーディングエージェント統合、AI Studioで本格的なコード生成（4/12）",
-    "MUSIC — Lyria・Lyria 3音楽生成モデルが公開プレビュー開始、Gemini API・AI Studioで利用可（4/12）",
-    "SUBSCRIPTION — Google One AI PremiumがGoogle AI Proに改名、新Ultraティア登場＆価格体系を整理（4/12）",
+    "GEMMA 4 — Google DeepMindがGemma 4ファミリーを公開、256Kコンテキスト・ネイティブビジョン・140言語対応のオープンモデル（4/2）",
+    "ANDROID — Gemma 4がAICore Developer Previewに登場、オンデバイスでエージェンティックAIを実現（4月）",
+    "GEMINI 3.1 PRO — グローバル展開開始、推論能力が大幅向上しGemini app・API・Vertex AIで利用可能（4/12）",
+    "CODING — Android BenchでGeminiとGPT-5.4がトップ争い、コーディングAIの最新ランキング更新（4/9）",
+    "WORKSPACE — Gemini for WorkspaceがFortune 500の企業AIクエリの45%を処理（4月時点）",
+    "GROWTH — Geminiの月間アクティブユーザーが7.5億人に到達、エンゲージメント戦略が課題に（3月時点）",
   ],
   en: [
-    "GEMINI 3.1 PRO — Rolling out with higher usage limits, available in Gemini app, API, Vertex AI, and NotebookLM (4/12)",
-    "REASONING — Enhanced reasoning for complex problem-solving, scores significantly higher on benchmark tests (4/12)",
-    "STUDIO — Google AI Studio upgrades 'vibe coding' experience to turn prompts into production-ready applications (4/12)",
-    "CODING AGENT — Google Antigravity coding agent integration enables advanced code generation in AI Studio (4/12)",
-    "MUSIC — Lyria and Lyria 3 music generation models now in public preview via Gemini API and AI Studio (4/12)",
-    "SUBSCRIPTION — Google One AI Premium rebranded as Google AI Pro, new Ultra tier introduced with updated pricing (4/12)",
+    "GEMMA 4 — Google DeepMind releases Gemma 4 family with 256K context, native vision/audio, 140+ languages (4/2)",
+    "ANDROID — Gemma 4 arrives in AICore Developer Preview, bringing agentic AI capabilities to on-device Android (Apr)",
+    "GEMINI 3.1 PRO — Global rollout begins with enhanced reasoning for complex coding and data analysis tasks (4/12)",
+    "CODING — Android Bench updated: Gemini tied with GPT-5.4 for top spot in AI coding model rankings (4/9)",
+    "WORKSPACE — Gemini for Workspace now handles 45% of all enterprise AI queries among Fortune 500 companies (Apr)",
+    "GROWTH — Gemini hits 750M monthly active users but faces engagement challenges as users split across AI platforms (Mar)",
   ],
 };
 
