@@ -38,6 +38,7 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
   if (currentPage > 1) {
     metadata.robots = {
       index: false,
+      follow: true,
     };
   }
 

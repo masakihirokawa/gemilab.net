@@ -44,8 +44,11 @@ export async function generateStaticParams() {
 }
 
 /* ── Metadata ── */
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
+export async function generateMetadata({ params, searchParams }: Props): Promise<Metadata> {
   const { locale, level } = await params;
+  const sp = await searchParams;
+  const currentPage = Math.max(1, parseInt(sp.page || "1", 10) || 1);
+
   if (!VALID_LEVELS.includes(level as ValidLevel)) return {};
 
   const meta = LEVEL_META[level];
@@ -59,7 +62,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const base = "https://gemilab.net";
   const canonical = locale === "ja" ? `${base}/level/${level}` : `${base}/en/level/${level}`;
 
-  return {
+  const metadata: Metadata = {
     title,
     description,
     openGraph: { title, description, images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 630, alt: "Gemini Lab", type: "image/png" }] },
@@ -72,6 +75,12 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       },
     },
   };
+
+  if (currentPage > 1) {
+    metadata.robots = { index: false, follow: true };
+  }
+
+  return metadata;
 }
 
 /* ── Label maps (kept inline to avoid dependency on client-only translation) ── */
