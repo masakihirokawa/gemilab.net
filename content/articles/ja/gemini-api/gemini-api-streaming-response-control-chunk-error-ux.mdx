@@ -1,0 +1,251 @@
+---
+title: "Gemini API のストリーミングレスポンスを完全制御する — チャンク処理・エラーリカバリ・UX最適化"
+slug: "gemini-api-streaming-response-control-chunk-error-ux"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-12T15:00"
+author: "Gemini Lab"
+description: "Gemini API のストリーミングレスポンスを本番品質で実装するための実践ガイド。チャンク分割の仕組み、途中切断からの復帰、ユーザー体験を最適化するレンダリング戦略を解説します。"
+tags: ["gemini-api", "streaming", "error-handling", "ux", "real-time"]
+highlights:
+  - "ストリーミングチャンクの内部構造とパース時の注意点"
+  - "接続断・タイムアウトからの自動復帰パターン"
+  - "Markdown 途中レンダリングとタイピングアニメーションの実装"
+---
+
+Gemini API のストリーミングレスポンスを使ったチャット UI を実装して、デモでは完璧に動いた。ところが本番リリース後、ユーザーから「回答が途中で止まる」「文字化けする」「同じ文章が2回表示される」という報告が相次いだ。
+
+ストリーミングは「動くようにする」のは簡単だが「壊れないようにする」のが圧倒的に難しい。この記事では、本番環境で1年間ストリーミングチャットを運用して得た知見を共有する。
+
+## チャンクの内部構造を理解する
+
+Gemini API の `generateContentStream` は、レスポンスをチャンク（断片）に分割して返す。だが、チャンクの分割位置には法則性がなく、文の途中、単語の途中、さらには UTF-8 マルチバイト文字の途中で切れることさえある。
+
+```typescript
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+const genAI = new GoogleGenerativeAI('YOUR_API_KEY');
+const model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro' });
+
+const stream = await model.generateContentStream('日本の四季について教えてください');
+
+// 各チャンクの構造を確認
+for await (const chunk of stream.stream) {
+  console.log({
+    text: chunk.text(),
+    candidates: chunk.candidates?.length,
+    finishReason: chunk.candidates?.[0]?.finishReason,
+    // safetyRatings は毎チャンクに含まれる
+    safety: chunk.candidates?.[0]?.safetyRatings,
+  });
+}
+```
+
+ここで知っておくべき3つの事実:
+
+1. **`text()` は差分を返す**: 各チャンクの `text()` はそのチャンクのテキスト部分のみ。累積ではない
+2. **`finishReason` は最後のチャンクにだけ存在**: 途中のチャンクでは `undefined`
+3. **空のチャンクが来ることがある**: `text()` が空文字列を返すチャンクは正常。安全性フィルタの更新だけが含まれている
+
+3番目を知らないと、空チャンクでエラー処理が発火してストリームが中断するバグを作りがちだ。
+
+## バッファリングで文字化けを防ぐ
+
+日本語テキストのストリーミングで最も厄介なのが、マルチバイト文字の途中で分割されるケースだ。Server-Sent Events（SSE）経由でストリーミングする場合、この問題が顕著になる:
+
+```typescript
+class StreamBuffer {
+  private buffer = '';
+  private decoder = new TextDecoder('utf-8', { fatal: false });
+
+  // チャンクを受け取り、安全に表示可能なテキストを返す
+  process(chunk: string): string {
+    this.buffer += chunk;
+
+    // 不完全な UTF-8 シーケンスが末尾にないか確認
+    const lastCharCode = this.buffer.charCodeAt(this.buffer.length - 1);
+    if (isHighSurrogate(lastCharCode)) {
+      // サロゲートペアの前半で切れている → 次のチャンクを待つ
+      return this.buffer.slice(0, -1);
+    }
+
+    const output = this.buffer;
+    this.buffer = '';
+    return output;
+  }
+
+  flush(): string {
+    const remaining = this.buffer;
+    this.buffer = '';
+    return remaining;
+  }
+}
+
+const isHighSurrogate = (code: number) => code >= 0xD800 && code <= 0xDBFF;
+```
+
+SDK レベルでは Gemini の Node.js SDK がこの問題をある程度吸収してくれるが、WebSocket や SSE を直接使う場合は自前でバッファリングが必要になる。
+
+## 接続断からの自動復帰
+
+ストリーミング中にネットワークが切れる、あるいは Gemini API 側でタイムアウトが発生するケースへの対応は必須だ。単純なリトライではなく、「途中から再開」する仕組みを作る:
+
+```typescript
+const streamWithRecovery = async (
+  prompt: string,
+  onChunk: (text: string) => void,
+  maxRetries = 3
+) => {
+  let accumulated = '';
+  let retries = 0;
+
+  while (retries <= maxRetries) {
+    try {
+      const currentPrompt = retries === 0
+        ? prompt
+        : `${prompt}\n\n[続きから生成してください。ここまでの回答: "${accumulated.slice(-500)}"]`;
+
+      const stream = await model.generateContentStream(currentPrompt);
+
+      for await (const chunk of stream.stream) {
+        const text = chunk.text();
+        if (text) {
+          accumulated += text;
+          onChunk(text);
+        }
+      }
+
+      // 正常完了
+      return accumulated;
+    } catch (error) {
+      retries++;
+
+      if (retries > maxRetries) throw error;
+
+      // 指数バックオフ
+      const delay = Math.min(1000 * Math.pow(2, retries), 10000);
+      await new Promise(resolve => setTimeout(resolve, delay));
+
+      // ユーザーに復帰中であることを通知
+      onChunk('\n\n[接続を回復中...]\n\n');
+    }
+  }
+
+  return accumulated;
+};
+```
+
+「続きから生成」する際のプロンプト設計が鍵だ。直前の500文字を含めることで、Gemini が文脈を失わずに生成を再開できる。ただし、この方法は完全な再開を保証するものではない。重複や文体の不連続が発生する可能性がある点は、ユーザーに対してUI上で示唆しておくべきだ。
+
+## フロントエンドのレンダリング戦略
+
+ストリーミングテキストをリアルタイムでレンダリングする際、最も重要なのは「いつ Markdown をパースするか」だ:
+
+```typescript
+import { useRef, useState, useCallback } from 'react';
+import { marked } from 'marked';
+
+const useStreamingRenderer = () => {
+  const [displayHtml, setDisplayHtml] = useState('');
+  const rawTextRef = useRef('');
+  const renderTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const appendChunk = useCallback((chunk: string) => {
+    rawTextRef.current += chunk;
+
+    // デバウンス: 50ms以内の連続チャンクはまとめてレンダリング
+    if (renderTimerRef.current) {
+      clearTimeout(renderTimerRef.current);
+    }
+
+    renderTimerRef.current = setTimeout(() => {
+      const html = marked.parse(rawTextRef.current, {
+        breaks: true,
+        gfm: true,
+      });
+      setDisplayHtml(html as string);
+    }, 50);
+  }, []);
+
+  const finalize = useCallback(() => {
+    // 最終レンダリング（デバウンスなし）
+    if (renderTimerRef.current) {
+      clearTimeout(renderTimerRef.current);
+    }
+    const html = marked.parse(rawTextRef.current, {
+      breaks: true,
+      gfm: true,
+    });
+    setDisplayHtml(html as string);
+  }, []);
+
+  return { displayHtml, appendChunk, finalize };
+};
+```
+
+50ms のデバウンスが重要だ。チャンクが来るたびに Markdown パースを実行すると、コードブロックの途中でパースされて表示が崩れる。50ms のバッファを置くことで、ほとんどのコードブロックが完全な状態でパースされる。
+
+ただし、コードブロック内で50msを超える遅延が発生することもある。より堅牢な方法は、開きの ` ``` ` を検出したらそのブロックが閉じるまで Markdown パースを遅延させることだ:
+
+```typescript
+const isInsideCodeBlock = (text: string): boolean => {
+  const matches = text.match(/```/g);
+  return matches \!== null && matches.length % 2 === 1;
+};
+
+// appendChunk 内で
+renderTimerRef.current = setTimeout(() => {
+  if (isInsideCodeBlock(rawTextRef.current)) {
+    // コードブロック内 → パースを遅延
+    return;
+  }
+  // 通常のパース処理
+}, 50);
+```
+
+## レート制限とコスト制御
+
+ストリーミングAPIは通常のAPIと同じレート制限が適用される。だが、ユーザーが連続して質問を送信する場合、前のストリームが完了する前に新しいリクエストが発行され、想定以上の API 呼び出しが発生することがある:
+
+```typescript
+class StreamManager {
+  private activeController: AbortController | null = null;
+
+  async startStream(prompt: string, onChunk: (text: string) => void) {
+    // 既存のストリームをキャンセル
+    if (this.activeController) {
+      this.activeController.abort();
+    }
+
+    this.activeController = new AbortController();
+    const { signal } = this.activeController;
+
+    try {
+      const stream = await model.generateContentStream(prompt, {
+        signal,
+      });
+
+      for await (const chunk of stream.stream) {
+        if (signal.aborted) break;
+        const text = chunk.text();
+        if (text) onChunk(text);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        // ユーザーが新しい質問を送信した → 正常なキャンセル
+        return;
+      }
+      throw error;
+    } finally {
+      this.activeController = null;
+    }
+  }
+}
+```
+
+`AbortController` で前のストリームを確実にキャンセルすることで、無駄なトークン消費とレート制限の超過を防げる。これは ChatGPT の「Stop generating」ボタンと同じ仕組みだ。
+
+## 次のステップ
+
+ストリーミングの本番実装で最初に取り組むべきは、エラーリカバリとバッファリングだ。レンダリングの最適化は後からでも追加できるが、接続断への対応がないまま本番に出すと、ユーザーからの不信感は簡単には取り戻せない。
