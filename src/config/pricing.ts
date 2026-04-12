@@ -78,8 +78,8 @@ export const CAMPAIGN = {
 
   /** キャンペーン用 Stripe Price IDs (Premium のみ) */
   priceIds: {
-    ja: "price_1TFRyMEGB5g6A54o4j3brkd6",  // ¥1,480
-    en: "price_1TGTQOEGB5g6A54on5ljuNBC",  // $10
+    ja: "price_1TCQyxEGB5g6A54o56MtETkI",  // ¥1,480（旧Premium標準価格を再利用）
+    en: "price_1TGTQOEGB5g6A54oWHbKx4ab",  // $10（旧Premium標準価格を再利用）
   },
 
   /** キャンペーン価格の表示テキスト */
