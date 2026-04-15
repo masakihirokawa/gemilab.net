@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "HOME AI — GeminiがGoogle Homeに深く統合、複雑な音声命令と自然な会話パターンの認識が大幅に向上（4/14）",
+    "EMBEDDING — gemini-embedding-2-previewが公開、テキスト・画像・動画・音声・PDFを統一埋め込み空間でマルチモーダル処理（4月）",
     "AI TIERS — Google AI Plus・Pro・Ultraの機能詳細が明確化、各プランで利用できるGemini機能の全体像が判明（4/11）",
     "SLIDES — GeminiがAIによるプレゼンテーション自動生成に対応、ドキュメントや研究論文から完全なスライドを即座に作成（4/11）",
-    "GEMINI 3.1 PRO — グローバル展開開始、複雑なコーディングとデータ分析の推論能力が大幅向上（4月）",
-    "IMPORT — GoogleがChatGPTなど他社AIアプリからの会話・設定インポート機能を開始、ユーザー確保戦略を強化（4月）",
     "GEMMA 4 — 256Kコンテキスト・ネイティブビジョン・140言語対応のオープンモデルファミリーをリリース（4/2）",
-    "GROWTH — Geminiの月間アクティブユーザーが7.5億人に達するも、Claude・ChatGPTとの競争でセッション時間が月次18%減（3月）",
+    "ENTERPRISE — Gemini for WorkspaceがFortune 500企業の企業AIクエリの45%を担う、エンタープライズ市場で存在感拡大（4月）",
   ],
   en: [
+    "HOME AI — Gemini deepens Google Home integration with smarter complex instruction handling and natural speech recognition (4/14)",
+    "EMBEDDING — gemini-embedding-2-preview released: first multimodal embedding supporting text, images, video, audio, and PDF in one space (Apr)",
     "AI TIERS — Google clarifies AI Plus, Pro & Ultra feature breakdown: what each Gemini plan actually includes (4/11)",
     "SLIDES — Gemini now generates full presentations instantly from topics, documents, or research papers with themes and images (4/11)",
-    "GEMINI 3.1 PRO — Global rollout begins with major reasoning improvements for complex coding and data analysis (Apr)",
-    "IMPORT — Google launches chat and preference import from rival AI apps including ChatGPT, signaling aggressive retention push (Apr)",
     "GEMMA 4 — Open model family released with 256K context, native vision/audio, 140+ languages on AI Studio and Gemini API (4/2)",
-    "GROWTH — Gemini hits 750M monthly active users but session duration drops 18% MoM as users split across AI platforms (Mar)",
+    "ENTERPRISE — Gemini for Workspace handles 45% of enterprise AI queries among Fortune 500 Google Workspace users (Apr)",
   ],
 };
 
