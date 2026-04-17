@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEFAULT — Gemini 3 FlashがGeminiアプリのデフォルトモデルに昇格、2.5 Flash比で回答の知性と速度が大幅向上（4月）",
-    "GLOBAL — Personal IntelligenceがAI Plus/Pro/Ultra加入者向けにグローバル展開、Gmail・Drive・Calendar・Photos横断（4/14）",
-    "IMPORT — 他社AIサービスのチャット履歴をZIPでアップロードし、会話を途切れずGeminiへ移行できる機能が追加（4月）",
-    "GEMMA 4 — gemma-4-26b-a4b-itとgemma-4-31b-itを公開、AICore Developer PreviewとAI Studioで無料利用可能（4月）",
-    "WORKSPACE — Docsが文書を自動生成、Sheetsが自然言語でスプレッドシートを構築、Driveにセマンティック検索（4月）",
-    "PENTAGON — Googleが米国防総省とGemini AIの機密領域展開について協議を開始、AI政府契約の風向きが変化（4月）",
+    "PENTAGON — Google が米国防総省と Gemini AI の機密環境への展開を協議中と報道（4/16）",
+    "GEMMA4ANDROID — Gemma 4 が Android AICore デベロッパープレビューに登場、Gemini Nano 4 の基盤に（4月）",
+    "AIPRO — Google AI Pro / Ultra サブスクリプション開始、Gemini 3.1 Pro が Pro・Ultra 専用に（4月）",
+    "PERSONAL — Gemini Personal Intelligence が米国全土に展開拡大、Gmail・写真・YouTube を統合（3月〜4月）",
+    "ADSAFETY — Gemini AI が有害広告検出に本格活用、誤審査停止を 80% 削減（4月）",
+    "750M — Gemini が月間アクティブユーザー 7.5 億人を突破、3月時点（3月）",
   ],
   en: [
-    "DEFAULT — Gemini 3 Flash is now the default model in the Gemini app, a major upgrade over 2.5 Flash in both intelligence and speed (Apr)",
-    "GLOBAL — Personal Intelligence rolls out globally for AI Plus/Pro/Ultra subscribers, spanning Gmail, Drive, Calendar and Photos (4/14)",
-    "IMPORT — New feature lets you upload a ZIP of chat history from other AI providers and resume right where you left off in Gemini (Apr)",
-    "GEMMA 4 — gemma-4-26b-a4b-it and gemma-4-31b-it launch free on AICore Developer Preview and AI Studio (Apr)",
-    "WORKSPACE — Docs auto-generates formatted documents, Sheets builds spreadsheets from plain prompts, Drive adds semantic AI Overviews (Apr)",
-    "PENTAGON — Alphabet is in talks with the US Department of Defense to deploy Gemini in classified environments (Apr)",
+    "PENTAGON — Google in talks with U.S. DoD to deploy Gemini AI in classified environments (4/16)",
+    "GEMMA4ANDROID — Gemma 4 lands in Android AICore Developer Preview as foundation for Gemini Nano 4 (Apr)",
+    "AIPRO — Google AI Pro / Ultra subscriptions launched; Gemini 3.1 Pro exclusive to subscribers (Apr)",
+    "PERSONAL — Gemini Personal Intelligence expands US-wide, integrating Gmail, Photos & YouTube (Mar-Apr)",
+    "ADSAFETY — Gemini AI deployed for harmful ad detection, cutting incorrect suspensions by 80% (Apr)",
+    "750M — Gemini hits 750M monthly active users as of March 2026 (Mar)",
   ],
 };
 
