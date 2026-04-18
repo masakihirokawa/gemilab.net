@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PENTAGON — Google が米国防総省と Gemini AI の機密環境への展開を協議中と報道（4/16）",
-    "GEMMA4ANDROID — Gemma 4 が Android AICore デベロッパープレビューに登場、Gemini Nano 4 の基盤に（4月）",
-    "AIPRO — Google AI Pro / Ultra サブスクリプション開始、Gemini 3.1 Pro が Pro・Ultra 専用に（4月）",
-    "PERSONAL — Gemini Personal Intelligence が米国全土に展開拡大、Gmail・写真・YouTube を統合（3月〜4月）",
-    "ADSAFETY — Gemini AI が有害広告検出に本格活用、誤審査停止を 80% 削減（4月）",
-    "750M — Gemini が月間アクティブユーザー 7.5 億人を突破、3月時点（3月）",
+    "PERSONALAI — Gemini Personal Intelligence が画像生成に対応、Nano Banana で Gmail/Photos と連携した個別最適化（4/17）",
+    "AIMODE — Google Search & 広告への AI Mode 拡大、Gemini が検索全体に深く統合（4/17）",
+    "3.1PRO — Gemini 3.1 Pro グローバル展開、コーディング＆データ分析の推論能力が大幅強化（4月）",
+    "AIPROULTRA — Google AI Pro / Ultra 新サブスク登場、旧 Google One AI Premium から刷新（4月）",
+    "750M — Gemini が月間アクティブユーザー 7.5 億人突破、AI 製品史上最速の成長ペース（2025 Q4）",
+    "PENTAGON — Alphabet が米国防総省と Gemini の機密環境展開を交渉中（4月）",
   ],
   en: [
-    "PENTAGON — Google in talks with U.S. DoD to deploy Gemini AI in classified environments (4/16)",
-    "GEMMA4ANDROID — Gemma 4 lands in Android AICore Developer Preview as foundation for Gemini Nano 4 (Apr)",
-    "AIPRO — Google AI Pro / Ultra subscriptions launched; Gemini 3.1 Pro exclusive to subscribers (Apr)",
-    "PERSONAL — Gemini Personal Intelligence expands US-wide, integrating Gmail, Photos & YouTube (Mar-Apr)",
-    "ADSAFETY — Gemini AI deployed for harmful ad detection, cutting incorrect suspensions by 80% (Apr)",
-    "750M — Gemini hits 750M monthly active users as of March 2026 (Mar)",
+    "PERSONALAI — Gemini Personal Intelligence adds image AI via Nano Banana, integrating Gmail & Google Photos (4/17)",
+    "AIMODE — Google expands AI Mode in Search & Ads with deep Gemini integration across products (4/17)",
+    "3.1PRO — Gemini 3.1 Pro rolls out globally with enhanced reasoning for coding & data analysis (Apr)",
+    "AIPROULTRA — Google AI Pro & Ultra subscription tiers launch, replacing Google One AI Premium (Apr)",
+    "750M — Gemini surpasses 750M monthly active users — fastest-growing AI product in history (Q4 2025)",
+    "PENTAGON — Alphabet in talks with U.S. DoD to deploy Gemini AI in classified environments (Apr)",
   ],
 };
 
@@ -58,13 +58,9 @@ export function NewsTicker() {
               fontSize: 11,
               color: "var(--text-muted)",
               fontFamily: "'DM Mono', monospace",
-              letterSpacing: "0.03em",
-              display: "flex",
-              alignItems: "center",
-              gap: 12,
+              letterSpacing: "0.02em",
             }}
           >
-            <span style={{ color: "var(--accent-coral)", fontSize: 8 }}>●</span>
             {text}
           </span>
         ))}
