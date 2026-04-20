@@ -4,19 +4,19 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PERSONALAI — Gemini Personal Intelligence が画像生成に対応、Nano Banana で Gmail/Photos と連携した個別最適化（4/17）",
-    "AIMODE — Google Search & 広告への AI Mode 拡大、Gemini が検索全体に深く統合（4/17）",
-    "3.1PRO — Gemini 3.1 Pro グローバル展開、コーディング＆データ分析の推論能力が大幅強化（4月）",
-    "AIPROULTRA — Google AI Pro / Ultra 新サブスク登場、旧 Google One AI Premium から刷新（4月）",
-    "750M — Gemini が月間アクティブユーザー 7.5 億人突破、AI 製品史上最速の成長ペース（2025 Q4）",
+    "GEMMA4API — Gemma 4（26b-a4b-it / 31b-it）が Google AI Studio と Gemini API で利用可能に、次世代 Nano の基盤（4月）",
+    "FLASHLITE — Gemini 3.1 Flash-Lite 登場、応答 2.5x 高速・出力 45% 高速化・$0.25/M input で低コスト運用（4月）",
+    "TTS30 — Gemini 3.1 Flash TTS が Google Vids に 30 ボイス × 24 言語のナレーションを展開（4月）",
+    "MACAPP — Gemini macOS アプリが全ユーザー無料公開、macOS 15 以上で gemini.google/mac から入手（4月）",
+    "NANOBANANA2 — Nano Banana 2 が Google Photos と連携、家族や日常を反映したパーソナライズ画像を生成（4月）",
     "PENTAGON — Alphabet が米国防総省と Gemini の機密環境展開を交渉中（4月）",
   ],
   en: [
-    "PERSONALAI — Gemini Personal Intelligence adds image AI via Nano Banana, integrating Gmail & Google Photos (4/17)",
-    "AIMODE — Google expands AI Mode in Search & Ads with deep Gemini integration across products (4/17)",
-    "3.1PRO — Gemini 3.1 Pro rolls out globally with enhanced reasoning for coding & data analysis (Apr)",
-    "AIPROULTRA — Google AI Pro & Ultra subscription tiers launch, replacing Google One AI Premium (Apr)",
-    "750M — Gemini surpasses 750M monthly active users — fastest-growing AI product in history (Q4 2025)",
+    "GEMMA4API — Gemma 4 (26b-a4b-it / 31b-it) now on Google AI Studio & Gemini API, foundation for next-gen Nano (Apr)",
+    "FLASHLITE — Gemini 3.1 Flash-Lite launches with 2.5x faster response, 45% faster output, $0.25/M input pricing (Apr)",
+    "TTS30 — Gemini 3.1 Flash TTS brings 30 new conversational voices in 24 languages to Google Vids (Apr)",
+    "MACAPP — Gemini macOS app now free for all users on macOS 15+, globally at gemini.google/mac (Apr)",
+    "NANOBANANA2 — Nano Banana 2 integrates with Google Photos to generate personalized images from your library (Apr)",
     "PENTAGON — Alphabet in talks with U.S. DoD to deploy Gemini AI in classified environments (Apr)",
   ],
 };
