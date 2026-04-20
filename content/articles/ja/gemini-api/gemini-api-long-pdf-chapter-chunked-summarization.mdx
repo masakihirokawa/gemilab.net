@@ -1,0 +1,168 @@
+---
+title: "Gemini API で長尺 PDF を扱うときの『章ごと要約 → 全体再結合』パターン"
+slug: "gemini-api-long-pdf-chapter-chunked-summarization"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-21T15:00"
+author: "Gemini Lab"
+description: "Gemini 2.5 Pro の長大なコンテキストに 500 ページ級の PDF を丸ごと投げ込むと、要約は動くのに品質が後半で崩れます。章単位でチャンク → 並列要約 → 全体再結合というパターンで安定させる実装を、私自身のつまずきと合わせて整理します。"
+tags: ["gemini-api", "pdf", "summarization", "long-context", "chunking", "python"]
+---
+
+「Gemini 2.5 Pro の 200 万トークンコンテキストに 500 ページの PDF を一気に投げたら、要約が途中からだんだん雑になって終わった」— これは先日、私が実際にやらかした話です。仕様書を読み込んで節単位の要点を抜き出すツールを書いていたのですが、コンテキストに入れさえすれば全部拾ってくれるだろうという油断が裏目に出ました。
+
+ロングコンテキストは「入力できる量」と「出力に均等に反映される量」が別物です。本記事では、長尺 PDF を安定して要約するための「章ごと要約 → 全体再結合」パターンを、Python 実装つきで紹介していきます。
+
+## 長文を一括で投げて失敗した話
+
+最初に試したのは、PDF 全体をそのまま `generate_content` に渡す単純なコードでした。ページ数を減らしたサンプル（20〜50 ページ）ではうまく動きます。ところが実データである 500 ページの技術仕様書を入れた瞬間、症状が変わりました。
+
+- 前半 30% の章は細かく要約されている
+- 中盤からだんだん粒度が粗くなる
+- 後半 20% は「その他、付録には各種設定例や参考文献が掲載されています」のような一行で片付いている
+
+問題は、モデルが注意を長大な入力全体に配る過程で後半の情報密度が薄くなることです。これはコンテキスト長の理論値とは別の、実用上のボトルネックです。類似の挙動は [Gemini のロングコンテキスト活用の実感](/articles/gemini-advanced/gemini-long-context-practical-patterns) でも触れましたが、要約タスクでは特に顕在化しやすいと感じています。
+
+「入るなら全部入れて、あとはプロンプトで頑張ろう」は、ドキュメントが一定のサイズを越えたところで通用しなくなる、というのが実装を通じて得た結論です。
+
+## 章単位でチャンクする設計
+
+一番素直な分割は、固定長（たとえば 4,000 トークンずつ）で切り刻む方法です。ただ仕様書や書籍のように論理構造を持ったドキュメントでは、章・節の境界を無視した分割は文脈を不自然に切断します。固定長チャンクで要約すると「ここまでの議論を踏まえると…」のような参照が空振りすることがよくあります。
+
+私が開発現場で好んで使うのは、PDF のアウトライン（ブックマーク／目次）を起点にした章単位チャンクです。
+
+- セマンティックに意味のある境界で切れる
+- 章ごとの要約に「章のタイトル」という自然な見出しが付く
+- 並列呼び出しのバッチ単位が明確
+
+アウトラインが取れない PDF（画像スキャンや古い PDF）については後半で代替策を扱いますが、まずは目次が取得できる前提で進めます。
+
+## 実装コード（Python）
+
+以下は、PDF から章境界を抽出して各章を Gemini API で並列要約し、最後に全体要約を組み立てる最小実装です。`pypdf` と `google-genai` SDK を利用します。
+
+```python
+# pip install google-genai pypdf
+# 必要な環境変数: GOOGLE_API_KEY="YOUR_API_KEY"
+import asyncio
+import os
+from dataclasses import dataclass
+from pypdf import PdfReader
+from google import genai
+
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+MODEL = "gemini-2.5-pro"
+
+@dataclass
+class Chapter:
+    title: str
+    start: int  # 0-indexed page
+    end: int    # exclusive
+    body: str
+
+def extract_chapters(pdf_path: str) -> list[Chapter]:
+    """PDF のアウトラインを使って章ごとに分割する"""
+    reader = PdfReader(pdf_path)
+    outlines = reader.outline
+    # フラットな見出しリストを作る（ネストは最上位のみ採用）
+    top_level = [o for o in outlines if not isinstance(o, list)]
+    chapters: list[Chapter] = []
+    for i, entry in enumerate(top_level):
+        start = reader.get_destination_page_number(entry)
+        end = (
+            reader.get_destination_page_number(top_level[i + 1])
+            if i + 1 < len(top_level)
+            else len(reader.pages)
+        )
+        body = "\n".join(reader.pages[p].extract_text() or "" for p in range(start, end))
+        chapters.append(Chapter(title=entry.title, start=start, end=end, body=body))
+    return chapters
+
+async def summarize_chapter(ch: Chapter) -> str:
+    """章ごとに Gemini で要約を作る"""
+    prompt = (
+        f"以下はある技術文書の『{ch.title}』の本文です。\n"
+        "この章の主張を箇条書き 5 項目以内でまとめてください。\n"
+        "章の中だけで完結するように書き、他章への参照は避けてください。\n\n"
+        f"本文:\n{ch.body}"
+    )
+    # Python SDK は同期 API のみなので asyncio.to_thread で退避
+    resp = await asyncio.to_thread(
+        client.models.generate_content,
+        model=MODEL,
+        contents=prompt,
+    )
+    return resp.text.strip()
+
+async def summarize_pdf(pdf_path: str) -> str:
+    chapters = extract_chapters(pdf_path)
+    # 章要約を並列実行（同時実行数を絞ってレート制限を回避）
+    semaphore = asyncio.Semaphore(4)
+
+    async def bounded(ch: Chapter) -> tuple[str, str]:
+        async with semaphore:
+            return ch.title, await summarize_chapter(ch)
+
+    results = await asyncio.gather(*(bounded(c) for c in chapters))
+
+    # 章要約を束ねて全体要約を依頼
+    joined = "\n\n".join(f"## {title}\n{summary}" for title, summary in results)
+    merge_prompt = (
+        "以下は一冊の技術文書を章ごとに要約したものです。\n"
+        "この文書が読者に何を伝えようとしているか、全体の主張を 300 字で書いてください。\n"
+        "個別の章の要点を羅列するのではなく、通底するメッセージを抽出してください。\n\n"
+        f"章要約:\n{joined}"
+    )
+    final = client.models.generate_content(model=MODEL, contents=merge_prompt)
+    return f"{joined}\n\n---\n\n# 全体要約\n{final.text.strip()}"
+
+if __name__ == "__main__":
+    out = asyncio.run(summarize_pdf("./spec.pdf"))
+    print(out)
+```
+
+`extract_chapters` で章境界を取り、`summarize_chapter` を `asyncio.gather` で並列に回し、最後に章要約を束ねて全体要約を作る、という流れです。500 ページ・40 章程度の PDF でも、同時実行数 4 なら無料枠のレート制限の範囲に収まり、体感で 2〜3 分で完走します。
+
+## 章要約を『全体再結合』する意味
+
+このパターンの肝は、最後の `merge_prompt` です。章ごとの要約をそのまま並べるだけなら、それは「目次つきの抜粋集」に過ぎません。そこからもう一段階、全体の主張を問い直すパスを挟むことで、初めて「この文書が何を言いたかったか」が立ち上がります。
+
+一括要約と比べると、この 2 段階アプローチが優れている点は次の通りです。
+
+- 章ごとの粒度が均等になる（後半が薄くならない）
+- 全体要約の入力サイズが章要約 × 40 章 ≒ 数千トークンに収まるので、最終ステップの精度が安定する
+- 章単位でキャッシュしやすい（次節で触れます）
+
+逆にデメリットは、API 呼び出し回数が増えるためコストが嵩むことです。1 回呼び出し（素朴な一括要約）に比べて 40 倍以上のリクエスト数になります。この点は次節で整理しましょう。
+
+## コスト感と context caching の使いどころ
+
+コスト面で考慮すべきは、ドキュメントを 1 回だけ要約するのか、複数の問いを投げるのかで戦略が変わる点です。
+
+- 1 回だけ要約したい場合: 章単位 + 並列呼び出しでも、入力トークンは結局 1 冊分しか流れません。章ごとに分けても総入力量は大きく変わらず、出力側の分量は並列分だけ増えますが、課金はほぼ線形に収まります
+- 同じ PDF に何度も問いを投げたい場合（「第 3 章の要点を詳しく教えて」「引用文献だけ抜き出して」など）: [context caching](/articles/gemini-api/context-caching-guide) を併用して PDF 全体をキャッシュし、章チャンクは検索キーとして使う構成が有効です
+
+コスト試算は、最終的には手元のワークロードで測るのが一番です。参考までに、私が使うケースでは、一度だけ要約するワンショット用途では章チャンク方式、QA を繰り返す対話用途では context caching 方式、という切り分けで落ち着いています。API 単価の詳細は [Gemini API 料金の完全ガイド](/articles/gemini-api/gemini-api-cost-optimization-complete-guide) も参考にしてみてください。
+
+## アウトラインが取れない PDF への対処
+
+実運用では「目次がない PDF」「スキャン画像の PDF」「アウトラインはあるが深すぎる／浅すぎる PDF」に必ず出くわします。それぞれの落としどころを挙げておきます。
+
+- **目次がない**: PDF テキストから `re.compile(r'^第\s*[0-9一二三四五六七八九十]+\s*[章節]')` のような正規表現で見出し候補を拾い、擬似的なアウトラインを作ります。見出し体系が破綻している PDF では素直に諦めて固定長チャンク（4,000〜6,000 トークン）にフォールバックするのが現実的です
+- **スキャン画像**: Gemini API 自体に PDF をそのまま渡せばマルチモーダルで読み取ってくれます。ただし 1 章あたりのページ数が多いと再びコンテキスト問題に戻るため、[PDF 解析の基本パターン](/articles/gemini-api/gemini-api-pdf-analysis-guide) にも整理した通り、ページ範囲を絞って渡すのが無難です
+- **アウトラインが深すぎる**: 見出し階層のトップレベル（`章`）だけ残し、中見出し（`節`）は本文に含める扱いで問題ありません。粒度は多くても 30〜50 章程度に抑えるとプロンプト設計が楽になります
+
+## 繰り返しハマっているつまずきポイント
+
+実装を重ねる中で、何度も引っかかって苦笑いした部分を書き残しておきます。
+
+- **同時実行数を上げすぎる**: 無料枠に対して 10 並列を超えたあたりから 429 が散発し、部分的な結果だけが返ってくる挙動に陥ります。上のコードで `Semaphore(4)` にしているのは保守的な設定で、クォータを確認してから少しずつ上げるのがおすすめです
+- **`extract_text()` の出力を信じ切る**: 複数段組の論文 PDF や数式が多い資料では、抽出テキストがぐちゃぐちゃになります。モデルを疑う前に、必ず一度 chapter の `body` をそのまま print して目視確認してください。崩壊している場合は、別の PDF パーサやマルチモーダル入力に切り替える判断が先です
+- **すべての章に「箇条書き 5 項目」を強制する**: 参考資料的な章なら箇条書きで十分ですが、議論を積み上げる章では段落形式の要約のほうが情報落ちが少なくなります。私は 2 種類のプロンプトを手元に置いて、章の性格で使い分けています
+
+## 次の一歩
+
+お手元に 200 ページ以上の PDF が 1 冊あれば、まずその章数を数えて、本記事のコードをほぼそのまま走らせてみてください。体感として「一括で投げたとき後半が雑になる」感覚と「章ごとに同じ粒度で並ぶ」感覚の違いは、動かしてみないとなかなか伝わらないと思います。
+
+章境界の判定さえ安定させれば、あとはほぼ機械的に回せるパターンです。私は書籍の読書メモ、議事録の長尺集合、論文群のサーベイなど、毎日のように使っています。みなさんの手元の長尺ドキュメントにも、ぜひ試してみていただければ嬉しいです。
