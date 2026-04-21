@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { ArticlePagination } from "@/components/ui/ArticlePagination";
@@ -52,10 +51,7 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
     },
   };
 
-  if (currentPage > 1) {
-    metadata.robots = { index: false, follow: true };
-  }
-
+  // Pagination: rely on canonical (to page 1) instead of noindex for GSC compatibility
   return metadata;
 }
 
@@ -71,11 +67,6 @@ export default async function TagPage({ params, searchParams }: Props) {
   const articles = allArticles.filter((a) =>
     (a.tags || []).some((t) => t.toLowerCase() === decoded.toLowerCase())
   );
-
-  /* Return proper 404 for unknown tags — prevents soft 404 (#85) */
-  if (articles.length === 0) {
-    notFound();
-  }
 
   /* Pagination */
   const currentPage = Math.max(1, parseInt(sp.page || "1", 10) || 1);
