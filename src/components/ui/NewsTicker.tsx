@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMMA4API — Gemma 4（26b-a4b-it / 31b-it）が Google AI Studio と Gemini API で利用可能に、次世代 Nano の基盤（4月）",
-    "FLASHLITE — Gemini 3.1 Flash-Lite 登場、応答 2.5x 高速・出力 45% 高速化・$0.25/M input で低コスト運用（4月）",
-    "TTS30 — Gemini 3.1 Flash TTS が Google Vids に 30 ボイス × 24 言語のナレーションを展開（4月）",
+    "CHROME7 — Gemini in Chrome がアジア太平洋 7 カ国（日本・オーストラリア・インドネシア・フィリピン・シンガポール・韓国・ベトナム）に展開（4/20）",
+    "GCAAPI — geminicloudassist.googleapis.com API が対象プロジェクトで自動有効化、Gemini Cloud Assist チャット連携が進む（4/16以降）",
+    "ROBOT15EOL — gemini-robotics-er-1.5-preview モデルは 4/30 9AM PST でシャットダウン、後継モデルへの移行を推奨（4月）",
+    "EXAMAI — Gemini の無料模擬試験が SAT・JEE Main に続いて NEET UG へ拡大、学習サポートを強化（4月）",
     "MACAPP — Gemini macOS アプリが全ユーザー無料公開、macOS 15 以上で gemini.google/mac から入手（4月）",
-    "NANOBANANA2 — Nano Banana 2 が Google Photos と連携、家族や日常を反映したパーソナライズ画像を生成（4月）",
-    "PENTAGON — Alphabet が米国防総省と Gemini の機密環境展開を交渉中（4月）",
+    "TTS30 — Gemini 3.1 Flash TTS が Google Vids に 30 ボイス × 24 言語のナレーションを展開（4月）",
   ],
   en: [
-    "GEMMA4API — Gemma 4 (26b-a4b-it / 31b-it) now on Google AI Studio & Gemini API, foundation for next-gen Nano (Apr)",
-    "FLASHLITE — Gemini 3.1 Flash-Lite launches with 2.5x faster response, 45% faster output, $0.25/M input pricing (Apr)",
-    "TTS30 — Gemini 3.1 Flash TTS brings 30 new conversational voices in 24 languages to Google Vids (Apr)",
+    "CHROME7 — Gemini in Chrome rolls out to seven APAC countries: Japan, Australia, Indonesia, Philippines, Singapore, South Korea, Vietnam (4/20)",
+    "GCAAPI — geminicloudassist.googleapis.com auto-enabled on projects that used Gemini Cloud Assist chat in prior 60 days (4/16+)",
+    "ROBOT15EOL — gemini-robotics-er-1.5-preview model shuts down 4/30 9AM PST; plan migration to successor models (Apr)",
+    "EXAMAI — Gemini's free full-length practice tests expand from SAT & JEE Main to include NEET UG (Apr)",
     "MACAPP — Gemini macOS app now free for all users on macOS 15+, globally at gemini.google/mac (Apr)",
-    "NANOBANANA2 — Nano Banana 2 integrates with Google Photos to generate personalized images from your library (Apr)",
-    "PENTAGON — Alphabet in talks with U.S. DoD to deploy Gemini AI in classified environments (Apr)",
+    "TTS30 — Gemini 3.1 Flash TTS brings 30 new conversational voices in 24 languages to Google Vids (Apr)",
   ],
 };
 
