@@ -1,0 +1,202 @@
+---
+title: "Gemini API の応答が空になるときの正体 — finish_reason で原因を1秒で特定する"
+slug: "gemini-api-empty-response-finish-reason-troubleshooting"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-21T09:15"
+author: "Gemini Lab"
+description: "Gemini API を呼び出したのに response.text が空、あるいは AttributeError で落ちる — その真犯人はほぼ finish_reason です。4つの値の意味と実際の対処法を実装コード付きで整理します。"
+tags: ["gemini-api", "troubleshooting", "python", "nodejs", "error-handling"]
+---
+
+「サンプルコードどおりに `response.text` を読もうとしたら空っぽだった」「ローカルでは動いていたのに本番で突然 AttributeError が飛ぶようになった」— Gemini API を本番で使い始めた方であれば、一度は体験しているのではないでしょうか。
+
+結論から申し上げると、このトラブルの犯人はほぼ一択で `finish_reason`（Node SDK では `finishReason`）です。空返答に見える応答の中には、実はモデルが「ここで止めました」という理由が必ず含まれており、その値さえ読めば再現性のあるリカバリが書けます。本記事では、私が個人開発で Gemini API を Cloud Run・Vercel・Firebase Functions に載せてきた経験を踏まえて、4つの終了理由ごとの原因と実装レベルの対処をまとめます。
+
+## なぜ `response.text` が空・AttributeError になるのか
+
+Python SDK（`google-genai`）の `response.text` は便利なヘルパーですが、内部では `candidates[0].content.parts` を舐めてテキストを連結しているだけです。したがってパーツが空、あるいはパーツ自体が存在しないと、`"".join()` の結果は空文字列になり、ケースによっては `ValueError: The response.text quick accessor requires the response to contain a valid Part` という例外が飛びます。
+
+Node SDK（`@google/genai`）は同じ挙動を `response.text()` という関数呼び出しで提供しますが、同様にパーツがない状態では空文字を返すか、ライブラリバージョンによっては例外になります。
+
+つまり「空に見える応答」は壊れているのではなく、モデルがテキストを生成せずに処理を打ち切ったシグナルです。その打ち切り理由を教えてくれるフィールドこそが `finish_reason` で、Gemini API では主に以下の値が返ります。
+
+- **`STOP`**（正常終了・普段はここ）
+- **`MAX_TOKENS`**（出力トークン上限で途切れた）
+- **`SAFETY`**（セーフティフィルターでブロックされた）
+- **`RECITATION`**（著作権・学習データとの過度な一致で停止）
+- **`OTHER`** / `FINISH_REASON_UNSPECIFIED`（内部エラーや未分類）
+
+空返答の原因を潰すには、まず `response.text` に触る前にこの値を見るコードを書くのが最短ルートです。
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents="Gemini について300字で解説してください",
+)
+
+candidate = resp.candidates[0]
+finish = getattr(candidate, "finish_reason", None)
+print(f"finish_reason = {finish}")
+
+# パーツが存在する場合のみ本文を取り出す
+parts = getattr(getattr(candidate, "content", None), "parts", []) or []
+text = "".join(getattr(p, "text", "") for p in parts)
+print(f"text length = {len(text)}")
+```
+
+このデバッグコードを本番に入れておくと、「空に見える応答」が届いた瞬間に `finish` の値から原因が切り分けられます。ここから先は、値ごとにどう対処すべきかを順に見ていきます。
+
+## `MAX_TOKENS` — 出力上限で途切れたケース
+
+ローカル検証では問題なくても、本番で「長い要約を依頼するとほぼ毎回空文字」というパターンはこれが犯人です。`max_output_tokens` を明示していない場合、モデル・リージョン・SDK バージョンによって既定値が変わるため、思っていたより早く打ち切られていることがあります。
+
+見分け方は単純で、`finish_reason == "MAX_TOKENS"` かつ `usage_metadata.candidates_token_count` が上限にぴったり張り付いている場合です。
+
+対処は二段構えにすると安定します。まず上限そのものを適切な値に広げ、次に thinking モードを使う場合は `thinking_budget` と `max_output_tokens` の関係を意識します。Gemini 2.5 系では思考トークンも `candidates_token_count` に加算されるため、思考に全部食われて本文が空になる事故が起きます。
+
+```python
+from google.genai import types
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=prompt,
+    config=types.GenerateContentConfig(
+        max_output_tokens=4096,
+        thinking_config=types.ThinkingConfig(thinking_budget=1024),
+    ),
+)
+```
+
+目安としては、本文で欲しいトークン数の1.5倍程度を `max_output_tokens` に設定し、`thinking_budget` はその内数として明示的にコントロールする運用が実用的です。なお、関連する挙動は [Gemini API の応答が途中で切れる問題の修正](/articles/gemini-api/gemini-api-response-truncated-incomplete-fix) でも扱っています。
+
+## `SAFETY` — セーフティフィルターでブロックされたケース
+
+意外と多いのが、明らかに無害なプロンプトなのに `SAFETY` で止まるパターンです。ニュース要約・医療記事の翻訳・競合製品名を含む比較など、海外のセーフティポリシーと日本語での表現のずれによってブロックされやすい領域があります。
+
+この場合、`candidate.safety_ratings` を読むと HARM_CATEGORY がどの閾値を超えたかが分かります。まずはそこを確認し、誤判定であれば `safety_settings` で閾値を調整します。
+
+```python
+from google.genai import types
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=prompt,
+    config=types.GenerateContentConfig(
+        safety_settings=[
+            types.SafetySetting(
+                category="HARM_CATEGORY_HARASSMENT",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+            types.SafetySetting(
+                category="HARM_CATEGORY_HATE_SPEECH",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+        ],
+    ),
+)
+
+if resp.candidates[0].finish_reason == "SAFETY":
+    for rating in resp.candidates[0].safety_ratings:
+        print(rating.category, rating.probability)
+```
+
+実務では、ユーザー入力をそのままモデルに流し込む場合に限って閾値を `BLOCK_MEDIUM_AND_ABOVE` に、社内文書など信頼できる入力には `BLOCK_ONLY_HIGH` に、という二段構えが扱いやすい印象です。詳細な設定値とユースケースは [Gemini API セーフティフィルターでブロックされた応答の修正](/articles/gemini-api/gemini-api-safety-filter-blocked-response-fix) も合わせて参照してください。
+
+## `RECITATION` — 著作権保護で停止するケース
+
+`RECITATION` は学習データとの過度な一致が検出されたときに発生します。有名な歌詞・小説の一節・企業のプレスリリース原文を「そのまま引用して要約して」と頼むと、ほぼ確実にこの値が返ります。
+
+対処は発想の転換が必要で、プロンプト側で原文の引用比率を下げてもらう指示を明示するか、Structured Output で「要約のみ・原文引用禁止」と明示的に制約する方法が有効です。もう一点、私が個人開発で効果を感じたのは、入力側の長い原文を事前に短く要約してからもう一度モデルに投げる二段階処理です。入力が短くなると RECITATION の発火率が目に見えて下がります。
+
+```python
+rewrite_prompt = (
+    "以下の文章を、独自の表現で200字以内に要約してください。"
+    "原文の表現を3語以上連続して使わないでください。\n\n"
+    f"{original_text}"
+)
+
+summary = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=rewrite_prompt,
+).text
+```
+
+## `OTHER` / 空返答・未分類エラー
+
+ここまでの3つに該当しない、いわゆる「未分類で落ちる」ケースです。内部的な一時障害、プロンプト中の制御文字、極端に長い入力トークン、あるいはレアですが Function Calling の呼び出し側スキーマが不正な場合などに発生します。
+
+運用では指数バックオフ付きのリトライが効きますが、闇雲にリトライすると `SAFETY` や `RECITATION` のように再実行しても同じ結果になる値まで叩いてしまいます。そこで、`finish_reason` の値ごとにリトライ可否を分岐させる小さなラッパーを用意しておくと、プロダクション運用が一段階安定します。
+
+```python
+import time
+
+RETRYABLE = {"OTHER", "FINISH_REASON_UNSPECIFIED", None}
+
+def call_with_retry(prompt, max_attempts=3):
+    for attempt in range(max_attempts):
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        finish = resp.candidates[0].finish_reason
+        parts = resp.candidates[0].content.parts if resp.candidates[0].content else []
+        if parts and finish == "STOP":
+            return resp.text
+        if finish not in RETRYABLE:
+            raise RuntimeError(f"Non-retryable finish_reason={finish}")
+        time.sleep(2 ** attempt)
+    raise TimeoutError("Exhausted retries")
+```
+
+ここで大事なのは、`SAFETY` と `RECITATION` は再試行するほどクォータを消費するだけで結果が変わらないため、非リトライ扱いにしておくことです。API の不安定さに対するリトライ戦略全般については、[Gemini API 本番環境のエラーハンドリングとレート制限ガイド](/articles/gemini-api/gemini-api-production-error-handling-rate-limit-guide) にまとまった形で書いています。
+
+## Node.js SDK での同等コード
+
+SDK が異なるだけで原理はまったく同じです。Node/TypeScript で本番運用している方向けに、同じ finish_reason 判定を紹介しておきます。
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: "YOUR_API_KEY" });
+
+const resp = await ai.models.generateContent({
+  model: "gemini-2.5-flash",
+  contents: "Gemini について300字で解説してください",
+});
+
+const candidate = resp.candidates?.[0];
+const finish = candidate?.finishReason;
+const text = candidate?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+
+if (\!text) {
+  console.error(`Empty response. finishReason=${finish}`);
+}
+```
+
+JSON Mode や Structured Output を使っている場合は、`text` ではなく `parts[0].functionCall` や `parts[0].inlineData` が入っていることもあります。`parts` を直接ログに出す癖をつけておくと、こういった「テキスト以外のパーツが返っている」系の問題も見逃さなくなります。
+
+## 本番に入れておきたい最低限のログ設計
+
+最後に、同じトラブルを二度と繰り返さないために、私が必ず本番コードに入れているログのテンプレートを置いておきます。3行追加するだけで、事後の原因特定が劇的に楽になります。
+
+```python
+logger.info(
+    "gemini.response",
+    extra={
+        "finish_reason": str(resp.candidates[0].finish_reason),
+        "prompt_tokens": resp.usage_metadata.prompt_token_count,
+        "candidate_tokens": resp.usage_metadata.candidates_token_count,
+        "has_text": bool(resp.candidates[0].content and resp.candidates[0].content.parts),
+    },
+)
+```
+
+こうしておくと、ユーザーから「何も返ってこない」と言われたときに、ログ一発でどの理由で止まっていたのかが分かります。空返答は怖い現象ではなく、API が丁寧にシグナルを出してくれているだけだと捉え直すと、扱いやすくなるはずです。
+
+まずは次にエラーが出たときに、`response.text` に触れる前のコードへ `print(resp.candidates[0].finish_reason)` を一行足すところから始めてみてください。それだけで、今日のデバッグ時間は確実に短くなります。

@@ -1,0 +1,202 @@
+---
+title: "Debugging Empty Responses from the Gemini API — A Practical Guide to finish_reason"
+slug: "gemini-api-empty-response-finish-reason-troubleshooting"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-21T09:15"
+author: "Gemini Lab"
+description: "When the Gemini API returns an empty response.text — or raises AttributeError out of nowhere — the culprit is almost always finish_reason. Here is how to read it, what each value means, and how to recover cleanly."
+tags: ["gemini-api", "troubleshooting", "python", "nodejs", "error-handling"]
+---
+
+If you have shipped anything on top of the Gemini API, you have probably hit this: the sample code works, but one day `response.text` comes back empty, or production starts raising AttributeError at random. The good news is that there is a single field that explains it in nine cases out of ten, and once you learn to read it, most "empty response" bugs stop being mysterious.
+
+That field is `finish_reason` (called `finishReason` in the Node SDK). Rather than silently failing, the model is telling you exactly why it stopped generating. This guide walks through the four reasons you will actually encounter in production, based on deploying Gemini on Cloud Run, Vercel, and Firebase Functions for my own apps.
+
+## Why `response.text` is Empty or Raises AttributeError
+
+In the Python SDK (`google-genai`), `response.text` is a convenience accessor that walks `candidates[0].content.parts` and joins the text pieces. If there are no parts, the join returns an empty string — and on some library versions you get `ValueError: The response.text quick accessor requires the response to contain a valid Part` instead.
+
+The Node SDK (`@google/genai`) exposes the same behaviour via the `response.text()` method and has the same failure modes.
+
+The key insight is that an "empty" response is not broken — it is a deliberate signal from the model that it stopped before writing any text. The reason it stopped is encoded in `finish_reason`, which in practice returns one of these values:
+
+- **`STOP`** — normal completion, what you want to see
+- **`MAX_TOKENS`** — output was cut off by the token cap
+- **`SAFETY`** — safety filters blocked the response
+- **`RECITATION`** — output too close to training data (copyright guard)
+- **`OTHER`** / `FINISH_REASON_UNSPECIFIED`** — internal error or unclassified
+
+The fastest way to stop being surprised by empty responses is to check `finish_reason` before you ever touch `response.text`.
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents="Explain the Gemini API in three sentences.",
+)
+
+candidate = resp.candidates[0]
+finish = getattr(candidate, "finish_reason", None)
+print(f"finish_reason = {finish}")
+
+# Only read text when parts actually exist
+parts = getattr(getattr(candidate, "content", None), "parts", []) or []
+text = "".join(getattr(p, "text", "") for p in parts)
+print(f"text length = {len(text)}")
+```
+
+With that snippet in place, the next time an "empty response" lands in production you will know exactly which of the four categories below to look at.
+
+## `MAX_TOKENS` — Cut Off by the Output Cap
+
+If your app works locally but returns nothing for long summaries in production, this is usually the reason. When you do not set `max_output_tokens`, the default varies by model, region, and SDK version, so it is easy to get silently truncated earlier than expected.
+
+The tell is simple: `finish_reason == "MAX_TOKENS"` and `usage_metadata.candidates_token_count` sitting exactly at the cap.
+
+I recommend fixing this in two layers. First, raise the cap itself; second, if you are using thinking mode, keep an eye on the relationship between `thinking_budget` and `max_output_tokens`. In Gemini 2.5 models, thinking tokens are counted against `candidates_token_count`, which means the budget can swallow all your output and leave nothing for the actual response.
+
+```python
+from google.genai import types
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=prompt,
+    config=types.GenerateContentConfig(
+        max_output_tokens=4096,
+        thinking_config=types.ThinkingConfig(thinking_budget=1024),
+    ),
+)
+```
+
+A practical rule of thumb: set `max_output_tokens` to roughly 1.5× the tokens you expect for the response, and declare `thinking_budget` explicitly so it lives inside that envelope. For related truncation symptoms, see [Fixing Truncated or Incomplete Gemini API Responses](/articles/gemini-api/gemini-api-response-truncated-incomplete-fix).
+
+## `SAFETY` — Blocked by Content Filters
+
+Safety blocks are more common than most people expect, even for benign prompts. News summarization, medical article translation, and product comparisons that include competitor names all tend to trigger safety filters more easily when the input is in a non-English language, because the policy thresholds were tuned on English.
+
+When you see `SAFETY`, read `candidate.safety_ratings` — each rating tells you which `HARM_CATEGORY` crossed the threshold. If it is a false positive, you can relax the threshold per category.
+
+```python
+from google.genai import types
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=prompt,
+    config=types.GenerateContentConfig(
+        safety_settings=[
+            types.SafetySetting(
+                category="HARM_CATEGORY_HARASSMENT",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+            types.SafetySetting(
+                category="HARM_CATEGORY_HATE_SPEECH",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+        ],
+    ),
+)
+
+if resp.candidates[0].finish_reason == "SAFETY":
+    for rating in resp.candidates[0].safety_ratings:
+        print(rating.category, rating.probability)
+```
+
+In production I use a two-tier approach: `BLOCK_MEDIUM_AND_ABOVE` when the input is free-form end-user text, and `BLOCK_ONLY_HIGH` when the input is trusted (internal documents, first-party content). For a deeper walkthrough of the settings, see [Fixing Safety Filter Blocks in the Gemini API](/articles/gemini-api/gemini-api-safety-filter-blocked-response-fix).
+
+## `RECITATION` — Stopped to Protect Copyright
+
+`RECITATION` fires when the output matches training-data text too closely. Ask Gemini to "summarize these lyrics verbatim" or "rewrite this press release keeping the original phrasing," and you will hit it almost every time.
+
+The fix is to change the prompt rather than retry. Either instruct the model to reduce quoted spans, or pin the shape with Structured Output and forbid direct quotes. One trick that has worked well for me is a two-step rewrite: pre-summarize the source into a shorter paraphrase, then feed that paraphrase to the downstream prompt. Shorter, already-paraphrased inputs fire `RECITATION` far less often.
+
+```python
+rewrite_prompt = (
+    "Summarize the following text in under 200 words using your own wording. "
+    "Do not reuse any phrase of three or more consecutive words.\n\n"
+    f"{original_text}"
+)
+
+summary = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=rewrite_prompt,
+).text
+```
+
+## `OTHER` / Unclassified Empty Responses
+
+This is the catch-all bucket: transient internal issues, control characters in the prompt, extremely long inputs, or — less commonly — a malformed Function Calling schema on the caller side.
+
+Exponential backoff is the right tool for this value, but a blanket retry wastes quota on `SAFETY` and `RECITATION` responses that will never succeed on retry. The pattern I use is a thin wrapper that decides retryability from `finish_reason`.
+
+```python
+import time
+
+RETRYABLE = {"OTHER", "FINISH_REASON_UNSPECIFIED", None}
+
+def call_with_retry(prompt, max_attempts=3):
+    for attempt in range(max_attempts):
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        finish = resp.candidates[0].finish_reason
+        parts = resp.candidates[0].content.parts if resp.candidates[0].content else []
+        if parts and finish == "STOP":
+            return resp.text
+        if finish not in RETRYABLE:
+            raise RuntimeError(f"Non-retryable finish_reason={finish}")
+        time.sleep(2 ** attempt)
+    raise TimeoutError("Exhausted retries")
+```
+
+The important detail: `SAFETY` and `RECITATION` are intentionally excluded from the retry set, because retrying only burns quota without changing the outcome. For a fuller picture of retry and rate-limit strategy, see [Production Error Handling and Rate Limits for the Gemini API](/articles/gemini-api/gemini-api-production-error-handling-rate-limit-guide).
+
+## The Node.js SDK Looks the Same
+
+The principle carries over one-to-one to Node/TypeScript. Here is the same `finishReason` check for teams running Gemini on the JS side.
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: "YOUR_API_KEY" });
+
+const resp = await ai.models.generateContent({
+  model: "gemini-2.5-flash",
+  contents: "Explain the Gemini API in three sentences.",
+});
+
+const candidate = resp.candidates?.[0];
+const finish = candidate?.finishReason;
+const text = candidate?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+
+if (\!text) {
+  console.error(`Empty response. finishReason=${finish}`);
+}
+```
+
+If you are using JSON Mode or Structured Output, the first part may be a `functionCall` or `inlineData` rather than text. I recommend logging `parts` directly in development — it makes these "non-text parts returned" situations obvious at a glance.
+
+## The Logging You Actually Want in Production
+
+The single most valuable thing I have added to every Gemini-backed service is a short structured log line on every response. It takes three lines and makes post-hoc debugging trivial.
+
+```python
+logger.info(
+    "gemini.response",
+    extra={
+        "finish_reason": str(resp.candidates[0].finish_reason),
+        "prompt_tokens": resp.usage_metadata.prompt_token_count,
+        "candidate_tokens": resp.usage_metadata.candidates_token_count,
+        "has_text": bool(resp.candidates[0].content and resp.candidates[0].content.parts),
+    },
+)
+```
+
+When a user reports "nothing came back," one grep over the log is enough to tell you which of the four stop conditions hit. Reframe empty responses as the API telling you politely what happened, and they become one of the easiest classes of bug to fix.
+
+Next time you hit this, try adding a single `print(resp.candidates[0].finish_reason)` before you touch `response.text`. That one line will almost certainly cut today's debugging time in half.
