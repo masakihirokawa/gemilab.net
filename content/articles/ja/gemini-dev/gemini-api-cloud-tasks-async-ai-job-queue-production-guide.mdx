@@ -1,0 +1,542 @@
+---
+title: "Gemini API × Cloud Tasks で作る非同期AIジョブキュー — タイムアウトとリトライを設計から解く実践ガイド"
+slug: "gemini-api-cloud-tasks-async-ai-job-queue-production-guide"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-04-22T04:45"
+author: "Gemini Lab"
+description: "Cloud Run のタイムアウトと Gemini API のレート制限に挟まれて落ちる同期実装から、Cloud Tasks を軸にした非同期ジョブキュー設計へ移行する実践ガイドです。リトライ・DLQ・進捗通知まで本番で通る形で解説します。"
+tags: ["Gemini API", "Cloud Tasks", "Cloud Run", "非同期処理", "ジョブキュー", "本番運用"]
+highlights:
+  - "Cloud Run のタイムアウトと Gemini API のレート制限に挟まれて落ち続ける同期実装から、Cloud Tasks 経由で安定稼働する非同期ジョブキューへ設計移行できる"
+  - "Cloud Tasks の dispatchDeadline・max retries・min/max backoff を Gemini API のクォータ設計に合わせてチューニングできるようになり、過剰リトライによるクォータ枯渇を回避できる"
+  - "進捗通知・Dead Letter Queue・冪等性のある Worker 実装パターンを、コピーしてすぐ動くコードで手に入れられる"
+---
+
+実装レビューを依頼されて、こんなコードをよく見かけます。「Cloud Run 上の HTTP ハンドラーから Gemini API を直接呼び出し、応答を `await` して HTML を返す」— 動作確認のうちは動きます。けれど本番投入から数日経つと、「リクエストが 10% くらい 504 で返ってくる」「Gemini から 429 が突発的に出る」「タイムアウトなのにジョブは内部で最後まで進んでいた形跡がある」といった不思議な症状に包囲されます。
+
+これは API コール自体の問題ではなく、**「同期レスポンス前提のアーキテクチャに、確率的に遅い AI 処理を直接載せている」構造的な問題**です。同じ対処療法（タイムアウト延ばす／リトライ回数増やす）を繰り返しても悪化こそすれ、根本解決にはなりません。私自身、個人アプリに AI 機能を組み込んだ初期に同じ罠を踏みました。切り分けを終えた結論は、**Cloud Tasks を挟んでジョブキュー化し、HTTP レスポンスと AI 実行を分離する**こと一択でした。
+
+本記事では、Cloud Run + Gemini API の典型構成を、Cloud Tasks を軸にした非同期ジョブキューに設計移行する手順を、動作するコード付きで解説します。タイムアウトの考え方・リトライ戦略・レート制限との衝突回避・進捗通知・Dead Letter Queue まで、本番で通る粒度まで踏み込みます。
+
+## 同期呼び出しが破綻する本当の理由
+
+まず「なぜ Cloud Run 上で Gemini API を直接 await してはいけないのか」を整理しておきます。単に「遅いから」ではありません。
+
+Cloud Run には HTTP 要求あたり**最長 60 分**（2nd gen）の制限がありますが、クライアント側（ブラウザ・モバイル端末・Cloudflare）の実効タイムアウトは**多くの場合 30〜120 秒**です。Gemini 2.5 Pro で長文入力を扱うと、Thinking Budget や多段 Function Calling が入った瞬間に応答時間が 60 秒を超えることは珍しくありません。**クライアント側はタイムアウトで切断しているのに、サーバー側は処理を続けている**という状態が発生し、ユーザー視点では「失敗した」、料金上は「課金されている」というちぐはぐが生まれます。
+
+同じタイミングで発生しやすいのが Gemini の 429（Rate Limit）です。Cloud Run は同時実行数を自動スケールするので、ピーク時に多数のインスタンスが同時に Gemini を叩き、**プロジェクト単位の 1 分あたりリクエスト数（RPM）を集団で踏み抜きます**。HTTP 同期ではリトライを入れにくく、入れたとしても「クライアント接続が既に切れている」状態でリトライすることになります。
+
+さらに、HTTP サーバーは本来「素早く結果を返す」ことに最適化されています。Cloud Run のインスタンスが AI 処理でブロックされている間、他のリクエストは待たされ、スケールアウトが連鎖的に走り、課金も線形に増えます。「遅い処理を速いレイヤに載せる」と、コストとユーザー体験が同時に悪化する構造になります。
+
+Cloud Tasks を挟む設計は、この構造問題を「HTTP レスポンスは即時／実作業は非同期ワーカー」と明示的に分離することで解決します。
+
+## 設計全体像 — ジョブを作って返す、作業は別プロセスで
+
+これから作る構成は、大まかに 3 つのレイヤに分かれます。
+
+- **API レイヤ（Cloud Run ① — job-api）**: ユーザー要求を受けて Firestore に `jobs/{jobId}` を作成し、Cloud Tasks にタスクを enqueue する。HTTP レスポンスは `202 Accepted` と `jobId` のみで、ほぼ即時に返す。
+- **ワーカーレイヤ（Cloud Run ② — job-worker）**: Cloud Tasks から HTTP POST される形で起動し、Gemini API を呼び、進捗・結果を Firestore に書き戻す。Gemini が遅くても、ここはクライアント接続と無関係。
+- **クライアント通知レイヤ**: Firestore のドキュメントをクライアントが `onSnapshot` で購読し、進捗と完了を UI に反映する。あるいは完了時に FCM / Webhook でプッシュする。
+
+Cloud Tasks のキーポイントは、**「リトライ・バックオフ・dispatchDeadline・同時実行数」をキュー単位で宣言的に設定できる**ことです。この設定がそのまま Gemini API への負荷コントロール弁になります。「Worker 側に何も書かなくても、キューの設定だけでレート制限に沿った呼び出しを実現できる」のが、Pub/Sub や SQS にない強みだと私は受け止めています。
+
+## キューを作る — Gemini のクォータに合わせる設計
+
+まずキューを作ります。Gemini 2.5 Pro の一般的なプロジェクトクォータ（2 RPS / 60 RPM 想定）を例に、衝突を避ける保守的な値を設定します。実際の数値は Google AI Studio のクォータページで確認し、ご自身のプランに合わせてください。
+
+```bash
+# Cloud Tasks キュー作成（ai-jobs）
+gcloud tasks queues create ai-jobs \
+  --location=asia-northeast1 \
+  --max-dispatches-per-second=1.5 \
+  --max-concurrent-dispatches=4 \
+  --max-attempts=5 \
+  --min-backoff=10s \
+  --max-backoff=600s \
+  --max-doublings=4
+```
+
+それぞれの数値の意味と、Gemini 連携における私のおすすめ設定は次のとおりです。
+
+- **`--max-dispatches-per-second=1.5`**: キューが Worker にリクエストを配送する秒間速度の上限。Gemini の 2 RPS 制限より少し下に取ると、別経路（手動デバッグ・管理画面）からの呼び出しとぶつかっても余裕があります。
+- **`--max-concurrent-dispatches=4`**: 同時処理中のタスク数の上限。Worker Cloud Run の最大インスタンス数とも合わせます。「1 インスタンスが Gemini 応答待ちで長くブロックしても、他の 3 並列は動ける」という粒度にします。
+- **`--max-attempts=5`**: 最大 5 回リトライ。`5xx` と `429` を自動リトライしてくれるため、Worker 側の try/except を最小化できます。
+- **`--min-backoff=10s --max-backoff=600s --max-doublings=4`**: 指数バックオフの下限・上限・倍加回数。10s → 20s → 40s → 80s → 160s のように広がり、ピーク時の輻輳に追従します。
+
+初期に `max-attempts=100` のような大きな値を設定してしまうと、恒久的エラー（たとえばプロンプトの入力エラー）でも 100 回クォータを食い潰すので、**「5〜7 回で諦める」のが本番向きの初期値**です。
+
+## API レイヤ — ジョブを作って即時に返す
+
+API 側は非常に薄く保ちます。Python + FastAPI + Cloud Run を想定しますが、考え方は Node でも同じです。
+
+```python
+# job_api.py — ユーザー要求を受けて Cloud Tasks に enqueue する最小実装
+import os
+import json
+import uuid
+from datetime import datetime, timezone, timedelta
+from fastapi import FastAPI, HTTPException
+from google.cloud import firestore, tasks_v2
+from pydantic import BaseModel
+
+PROJECT = os.environ["GOOGLE_CLOUD_PROJECT"]
+LOCATION = "asia-northeast1"
+QUEUE = "ai-jobs"
+WORKER_URL = os.environ["WORKER_URL"]  # 例: https://job-worker-xxx-an.a.run.app/run
+WORKER_SA = os.environ["WORKER_INVOKER_SA"]  # Cloud Tasks が使う呼び出し元 SA
+
+app = FastAPI()
+db = firestore.Client()
+tasks = tasks_v2.CloudTasksClient()
+QUEUE_PATH = tasks.queue_path(PROJECT, LOCATION, QUEUE)
+
+class AnalyzeRequest(BaseModel):
+    user_id: str
+    input_text: str
+
+@app.post("/jobs/analyze", status_code=202)
+def enqueue(req: AnalyzeRequest):
+    if len(req.input_text) > 1_000_000:
+        raise HTTPException(413, "input too large")
+
+    job_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    db.collection("jobs").document(job_id).set({
+        "userId": req.user_id,
+        "status": "queued",
+        "progress": 0,
+        "createdAt": now,
+        "updatedAt": now,
+        "input": req.input_text[:2000],  # 原本は別ストレージでも可
+    })
+
+    # Cloud Tasks タスク: Worker の /run に HTTP POST
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": WORKER_URL,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"jobId": job_id}).encode(),
+            "oidc_token": {"service_account_email": WORKER_SA, "audience": WORKER_URL},
+        },
+        "dispatch_deadline": {"seconds": 1800},  # 30 分で諦める
+    }
+    tasks.create_task(parent=QUEUE_PATH, task=task)
+
+    return {"jobId": job_id, "status": "queued"}
+```
+
+期待する動作としては、POST /jobs/analyze が 100〜300 ms で戻り、Firestore に `jobs/{jobId}` が `status: "queued"` で作られ、数秒以内に Cloud Tasks が Worker を起動します。Worker URL を直接 Body に書かず `oidc_token` を付けているのは、Cloud Run の IAM 認証を使って**「Cloud Tasks 以外からこの Worker を叩けない」ようにするため**です。これで公開エンドポイントを公開しても、第三者から Worker を直接叩かれるリスクを排除できます。
+
+なお `dispatch_deadline` は「この時間内に Worker からの 2xx 応答が返らなければタスクを失敗扱いにする」上限です。Gemini の長文処理を想定して **30 分** に設定しました。Worker 側で無限ループしても、Cloud Tasks が強制的に打ち切ってくれます。
+
+## ワーカー — 冪等・再入可能に書く
+
+Worker は「同じ jobId で複数回叩かれても問題ない」ように設計する必要があります。Cloud Tasks は **At-Least-Once 配送**のため、2xx を返す前にネットワーク瞬断が起きると同じタスクが再配送されます。安全側に倒すなら必ず **ジョブの状態遷移をトランザクションで書く** ことです。
+
+```python
+# job_worker.py — Cloud Tasks から呼ばれて Gemini API を叩くワーカー
+import os
+import json
+import time
+from fastapi import FastAPI, HTTPException, Request
+from google.cloud import firestore
+from google import genai
+from google.genai import types
+
+PROJECT = os.environ["GOOGLE_CLOUD_PROJECT"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+
+app = FastAPI()
+db = firestore.Client()
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+def _transition(job_ref, expected_from, to, extra=None):
+    """状態遷移を原子的に行う。期待状態と合わなければ何もしない"""
+    @firestore.transactional
+    def txn(transaction):
+        snap = job_ref.get(transaction=transaction)
+        if not snap.exists:
+            return False
+        if snap.get("status") \!= expected_from:
+            return False
+        payload = {"status": to, "updatedAt": firestore.SERVER_TIMESTAMP}
+        if extra:
+            payload.update(extra)
+        transaction.update(job_ref, payload)
+        return True
+    return txn(db.transaction())
+
+@app.post("/run")
+async def run_job(req: Request):
+    body = await req.json()
+    job_id = body.get("jobId")
+    if not job_id:
+        raise HTTPException(400, "jobId required")
+
+    job_ref = db.collection("jobs").document(job_id)
+    snap = job_ref.get()
+    if not snap.exists:
+        # ジョブが消えている = リトライ不要 → 2xx で終了
+        return {"status": "missing"}
+
+    status = snap.get("status")
+    if status in ("completed", "failed"):
+        return {"status": status}  # 冪等: 既に終わっていれば何もしない
+
+    # queued → running に遷移できた場合のみ実処理を走らせる
+    acquired = _transition(job_ref, "queued", "running", {"startedAt": firestore.SERVER_TIMESTAMP})
+    if not acquired and status \!= "running":
+        # 競合: 誰かが先に running にした
+        return {"status": "conflict"}
+
+    try:
+        input_text = snap.get("input")
+        response = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=input_text,
+            config=types.GenerateContentConfig(
+                system_instruction="入力を構造化し JSON で返す。日本語で。",
+                response_mime_type="application/json",
+                temperature=0.2,
+            ),
+        )
+        result_text = response.text  # API 側で JSON バリデーション済み
+
+        _transition(job_ref, "running", "completed", {
+            "result": result_text,
+            "finishedAt": firestore.SERVER_TIMESTAMP,
+            "progress": 100,
+        })
+        return {"status": "completed"}
+
+    except Exception as e:
+        code = getattr(e, "status_code", None) or getattr(e, "code", None)
+        # 429 / 5xx は Cloud Tasks の自動リトライに任せる
+        if code in (429, 500, 502, 503, 504):
+            job_ref.update({"lastError": str(e)[:500], "updatedAt": firestore.SERVER_TIMESTAMP})
+            raise HTTPException(503, "retryable")
+        # 恒久的エラーはここで終わらせる
+        _transition(job_ref, "running", "failed", {
+            "error": str(e)[:500],
+            "finishedAt": firestore.SERVER_TIMESTAMP,
+        })
+        return {"status": "failed"}
+```
+
+期待する挙動は以下のとおりです。
+
+- 初回配送では `queued → running → completed` と進み、Firestore に結果 JSON が書かれる
+- 同じ jobId で再配送されても、先頭の `status` チェックで弾かれ二重課金が起きない
+- 429 や 5xx を受けたときは **HTTPException(503) を返してタスクを失敗扱い**にし、Cloud Tasks の自動リトライに委ねる
+- 入力不正などの恒久的エラーは `failed` で確定させ、リトライされないようにする
+
+「なぜ `try/except` 内で自前リトライを書かないか」と問われることがありますが、**Cloud Tasks のリトライを二重化するとクォータ消費が指数的に悪化する**からです。リトライ設計は一層に絞り、キュー側に一元化するのが運用上の鉄則です。
+
+## 進捗通知 — Firestore スナップショットで UI を滑らかに
+
+Worker 実行中に進捗を表示したいケースはとても多いはずです。長いプロンプトを段階的に処理する、動画を分割して Gemini に渡す、といった工程ではユーザーが「壊れたのか動いているのか」判別できないと不安になります。
+
+私はクライアントに対しては Firestore を直接購読させるのをおすすめしています。理由は単純で、Gemini の Thinking 経由の長時間応答中でも、Worker 側から `progress` をインクリメンタルに書けば、そのままリアルタイム更新が届くためです。
+
+```python
+# Worker 内で段階ごとに進捗を更新する例
+def update_progress(job_ref, p: int, note: str):
+    job_ref.update({
+        "progress": p,
+        "note": note,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+
+# 例: 画像 N 枚を分割処理する
+for i, image in enumerate(images):
+    analyze_one(image)
+    update_progress(job_ref, int((i + 1) / len(images) * 90), f"{i+1}/{len(images)} 枚完了")
+# 最後に 100% に遷移
+update_progress(job_ref, 100, "完了")
+```
+
+クライアント側（Web）はこう購読します。
+
+```javascript
+// client.js — 進捗をリアルタイム表示
+import { getFirestore, doc, onSnapshot } from "firebase/firestore";
+
+const db = getFirestore();
+
+function subscribeJob(jobId, onUpdate) {
+  return onSnapshot(doc(db, "jobs", jobId), (snap) => {
+    if (\!snap.exists()) return;
+    const data = snap.data();
+    onUpdate({
+      status: data.status,          // queued / running / completed / failed
+      progress: data.progress || 0, // 0〜100
+      note: data.note || "",
+      result: data.result,
+    });
+  });
+}
+```
+
+`onSnapshot` は接続が切れても自動再接続され、差分だけ届くので、数秒間ページを離れても戻ったときに正しい状態が表示されます。Polling 方式で /jobs/{id} を叩くより、Firestore の実効読み取り回数が減るのも副次的な利点です。
+
+## Dead Letter Queue とエラー分析
+
+`max-attempts=5` を超えても終わらなかったタスクは、Cloud Tasks のデフォルトでは単に消えます。これは本番運用ではとてもまずいので、**必ず DLQ 相当の仕組みを別に作ります**。
+
+最も簡単なのは「Worker で 5xx を返す前に、Firestore `dead_letters/{jobId}` にスナップショットを書く」ことです。上の Worker に数行足すだけで DLQ が実現できます。
+
+```python
+# Worker の 503 を返す直前に追記する処理
+if code in (429, 500, 502, 503, 504):
+    # 何回目の試行かを Cloud Tasks のヘッダから取得
+    attempt = int(req.headers.get("X-CloudTasks-TaskRetryCount", "0"))
+    if attempt >= 4:  # 最後の試行（max-attempts=5 の手前）なら DLQ に退避
+        db.collection("dead_letters").document(job_id).set({
+            "jobId": job_id,
+            "lastError": str(e)[:1000],
+            "attempts": attempt + 1,
+            "movedAt": firestore.SERVER_TIMESTAMP,
+        })
+    raise HTTPException(503, "retryable")
+```
+
+`X-CloudTasks-TaskRetryCount` は Cloud Tasks が自動で付与するヘッダで、「現在が何回目のリトライか」を教えてくれます。私はこれを「最後の試行でのみ DLQ に書く」条件として使っています。こうしておくと、失敗の瞬間のジョブ入力・エラー本文を確実に残せるので、翌朝のレビューで「なぜ失敗したのか」をその場で解析できます。
+
+数週間運用していると、DLQ に溜まるパターンがだいたい次の 3 種に収束します。私の観測ベースでは、この分類をしておくと原因究明が 10 倍早くなります。
+
+- **入力長の想定外**: 1M トークンを超えるドキュメントが紛れ込んだ。API の 413 / 400 として弾かれる。
+- **プロンプトが安全性フィルタに引っかかる**: ユーザー投稿型のアプリで頻発。`response.prompt_feedback.block_reason` を必ずログに残す。
+- **Gemini 側のモデル更新**: マイナーアップデートで応答形式が変わり、JSON 構造が微妙に変化した。バージョン固定していなかったケースで起きる。
+
+## レート制限と衝突したときの挙動を読む
+
+Cloud Tasks が 429 で自動リトライしてくれるとはいえ、「仕様通りにバックオフしているか」を本番で観測する習慣は持っておくべきです。Cloud Logging では以下のフィルターが即役立ちます。
+
+```
+resource.type="cloud_run_revision"
+resource.labels.service_name="job-worker"
+httpRequest.status=503
+```
+
+503 が複数並んだ後、次の 503 までの間隔が `10s → 20s → 40s → 80s` と伸びていれば、キュー設定通りにバックオフが効いています。もし間隔が伸びていなければ、`max-doublings` が小さすぎる・`min-backoff` が短すぎる可能性が高いです。
+
+また、Cloud Tasks の「キューあたりのディスパッチレート」とインスタンスあたりの実 QPS は別物で、**同時実行 4・1.5 RPS** なら各インスタンスは最大 1.5/4 ≈ 0.375 RPS しか叩きません。Gemini の同時ストリームを複数握りたい場合は、`--max-concurrent-dispatches` を増やし、`--max-dispatches-per-second` はクォータの 70% 程度に抑える、という独立した 2 軸のチューニングになります。この 2 軸を混同してモデルの応答速度で議論しないのが、私の経験上、ハマりを減らす近道です。
+
+## よくある間違いと対処
+
+実装レビューで本当によく見かける 3 つの落とし穴をまとめておきます。プロジェクト立ち上げ時のチェックリストとしてそのままお使いいただけると思います。
+
+- **Worker を公開エンドポイントにしてしまう**: `oidc_token` を省略すると、誰でも Worker URL を叩けます。結果、本体は Firestore 書き込み権限で守られていても、ジョブ入力の改竄や水増し実行で簡単に課金が膨らみます。必ず **Cloud Run の「すべて必要な認証」+ Cloud Tasks 用 SA の `roles/run.invoker`** を組み合わせてください。
+- **冪等性チェックを入れない**: 「完了したジョブに対する再配送」を想定せず Worker を書くと、Gemini が 2 回走って 2 回課金され、結果も上書きされます。ジョブ状態の遷移は必ずトランザクションで、完了／失敗からは二度と遷移しない構造にしてください。
+- **リトライを Worker 内にもキューにも書く**: どちらかに一元化しないと、5 回 × 5 回の 25 回呼ばれる事故が起きます。クォータ消費量が跳ねるだけでなく、ユーザーから見れば「完了通知が出たのにもう 1 通来る」ような不気味な挙動になります。**リトライは Cloud Tasks 側に集約する**が鉄則です。
+
+他にも「`gcloud tasks queues update` で一部パラメータだけ上書きしてしまう」「Firestore の書き込み回数が多すぎて予算を食う」といったハマりどころがありますが、まずは上記 3 つをチェックに入れてください。
+
+## 段階的パイプライン — 長い処理を複数の Task に分割する
+
+Gemini を 1 回呼ぶだけで終わる処理はむしろ少数派です。実用的なアプリでは「PDF 解析 → 章ごとに要約 → 全体を統合 → 校正」のように複数ステージに分かれます。この全体を 1 つの Worker で回そうとすると、どうしても Cloud Run のリクエスト上限と Cloud Tasks の `dispatchDeadline` に挟まれます。
+
+私の経験では、**ステージごとに Cloud Tasks を再 enqueue する**のが、運用上もっとも安定します。各ステージは最大数分で完結し、次ステージのタスクを自身で投入して 2xx で終わる。これで「1 つのステージが失敗しても、他のステージは独立してリトライできる」構造が得られます。
+
+```python
+# ワーカー内で次ステージを enqueue する例
+def enqueue_next(job_id: str, stage: str):
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": f"{WORKER_URL}?stage={stage}",
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"jobId": job_id}).encode(),
+            "oidc_token": {"service_account_email": WORKER_SA, "audience": WORKER_URL},
+        },
+        "dispatch_deadline": {"seconds": 900},  # 各ステージは最長 15 分
+    }
+    tasks.create_task(parent=QUEUE_PATH, task=task)
+
+# 例: 章ごとの要約が終わったら integrate ステージを enqueue
+if stage == "chapter_summary":
+    # ... Gemini 呼び出し ...
+    job_ref.update({"progress": 60, "stage": "chapter_summary_done"})
+    enqueue_next(job_id, "integrate")
+    return {"status": "chapter_summary done, enqueued integrate"}
+```
+
+このパターンにはもう 1 つ副次効果があって、**ステージごとに別のキュー（RPS 設定も別）に流せる**ようになります。「章要約は並列度 8」「統合は並列度 1」のように、ステージの重さに合わせてクォータ配分を変えられます。単一キュー・単一 Worker で全部やろうとすると、どこかのステージでボトルネックが詰まり、全体が遅くなります。
+
+## キャンセル可能なジョブにする
+
+ユーザーが「途中でやめたい」と言ったときに素直に止められるようにしておくと、体験は段違いに良くなります。AI 処理は長引きがちなので、キャンセル機能は本番ではほぼ必須だと私は考えています。
+
+Cloud Tasks には「特定のタスクだけ削除する」API がありますが、**すでに Worker が走り出したタスクを強制停止することはできません**。実用的な方法は、Firestore のジョブドキュメントに `cancelRequested: true` を立てておき、Worker 側で段階の境目で毎回確認して自主的に終了することです。
+
+```python
+def is_cancelled(job_ref) -> bool:
+    snap = job_ref.get()
+    return bool(snap.exists and snap.get("cancelRequested"))
+
+# 各ステージの冒頭で確認
+if is_cancelled(job_ref):
+    _transition(job_ref, "running", "cancelled", {"finishedAt": firestore.SERVER_TIMESTAMP})
+    return {"status": "cancelled"}
+```
+
+Gemini のストリーミング応答を使っているなら、`for chunk in response` のループ内にも `is_cancelled` を挟みます。ただし Firestore の読み取り回数が増えるので、私の実装では「5 秒に 1 回だけ確認する」くらいに絞っています。キャンセルの反映に多少ラグがあっても、ユーザーはあまり気にしません。
+
+## Cloud Monitoring で「遅い」を見える化する
+
+「なんとなく遅い気がする」は感覚であって、チューニングの入口ではありません。数値で見るために、Worker の処理時間を Firestore に毎回書き込み、Cloud Monitoring でカスタム指標にします。
+
+```python
+import time
+
+start = time.time()
+# ... Gemini 呼び出し ...
+elapsed_ms = int((time.time() - start) * 1000)
+job_ref.update({
+    "geminiLatencyMs": elapsed_ms,
+    "inputTokens": response.usage_metadata.prompt_token_count,
+    "outputTokens": response.usage_metadata.candidates_token_count,
+})
+```
+
+Cloud Monitoring に投げるカスタム指標としては、`gemini/latency_ms`、`gemini/input_tokens`、`gemini/output_tokens` の 3 つがあれば大きな問題は可視化できます。アラートは「P95 レイテンシが 30 秒を超えたら通知」「日次合計トークンが前日比 200% を超えたら通知」の 2 つで十分です。私は「最初に P95 だけ、アラートを 1 つ」立てる流派で、過剰なアラートは見なくなる原因になるので避けています。
+
+### ダッシュボードに並べておくと役立つグラフ
+
+- **ステージ別レイテンシ（P50 / P95）**: どのステージが詰まっているか一目で判る
+- **失敗率（status=failed / status=completed）**: 品質悪化を早期検知できる
+- **DLQ 投入数の日次推移**: 恒久的エラー（プロンプト不備など）の発見に直結
+- **キューの backlog 長**: `cloudtasks.googleapis.com/queue/depth` を見れば、流入に対して処理が追いついているか判る
+
+## コスト試算 — 同期構成との比較
+
+同期呼び出しから非同期化すると、Cloud Run の「遊休時間」がほぼゼロに近づきます。数字で見るために、1 ジョブ平均 45 秒・1 日 5,000 ジョブ・同時 8 並列という中規模想定で比較してみます。
+
+- **同期構成（Cloud Run 第 2 世代・min-instances=0・CPU 2 / Mem 2GiB）**: HTTP タイムアウトを避けるため実質 min-instances≥2 が必要。アイドル課金と応答待ちのブロックで、月 $120〜150 程度の CPU 課金になりがち。失敗ジョブは 5〜8%。
+- **非同期構成（job-api: min=0 / job-worker: min=0・maxInst=8）**: API は 100ms 未満で終わるのでほぼ従量課金のみ。Worker は実処理時間だけ課金される。同負荷で月 $40〜55、失敗率 1% 未満。
+
+同期・非同期の差はピークに近いほど広がります。スパイクの多いアプリほど恩恵が大きく、トラフィックが極端に平坦ならそこまで差は出ません。**ご自身のアプリの「忙しい 1 時間／暇な 1 時間」の比を測ってから、最適化の優先度を判断する**のが私のおすすめです。
+
+## 開発環境での動作確認 — ローカルで「ほぼ本番」を再現する
+
+本番と差分が大きいローカルでテストすると、いざデプロイした瞬間にバグが噴き出します。Cloud Tasks エミュレータはないのですが、**「HTTP の Worker を起動してキューの代わりに即時叩く」薄いアダプタ**を書いておくと、ほぼ本番と同じ挙動をローカルで再現できます。
+
+```python
+# local_dev.py — ローカルでは即時に Worker を叩く fallback
+import os
+import requests
+
+LOCAL_MODE = os.environ.get("LOCAL_MODE") == "1"
+
+def enqueue_or_invoke(url: str, body: dict, sa: str):
+    if LOCAL_MODE:
+        r = requests.post(url, json=body, timeout=600)
+        r.raise_for_status()
+        return {"status": "invoked_local"}
+    # 本番は Cloud Tasks
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(body).encode(),
+            "oidc_token": {"service_account_email": sa, "audience": url},
+        },
+        "dispatch_deadline": {"seconds": 1800},
+    }
+    tasks.create_task(parent=QUEUE_PATH, task=task)
+    return {"status": "queued"}
+```
+
+この薄いアダプタを挟むと、Firestore エミュレータと合わせてオフラインでも結合テストが書けます。私はこの構成にしてから、「デプロイして初めて気づく冪等性バグ」がほぼゼロになりました。
+
+### テストで必ず押さえたい観点
+
+- **同じ jobId で 2 回 Worker を呼んでも Gemini は 1 回しか呼ばれないこと**（冪等性の確認）
+- **`cancelRequested` を立てた状態で Worker が走ったら途中で終わること**（キャンセル動作）
+- **意図的に 429 相当の例外を投げたときに 503 が返ること**（Cloud Tasks リトライに委ねる契約）
+- **入力が長すぎて Gemini が 413 を返すようなケースで `failed` に遷移すること**（恒久的エラーの扱い）
+
+この 4 ケースを自動テストで回しておくと、本番でほぼ問題が起きません。私は pytest + httpx で 30 分もあれば書けてしまうので、手を抜かない価値があると受け止めています。
+
+## セキュリティと権限の最小化
+
+本番で雑に作った非同期パイプラインは、じわじわとコストとセキュリティ負債を積み上げます。最低限、以下の 3 つは最初から正しく設定しておくことを強くおすすめします。
+
+**1. サービスアカウントを分ける**  
+`job-api` と `job-worker` は別の SA で動かします。job-api は Firestore 書き込み + Cloud Tasks タスク作成権限のみ、job-worker は Firestore 書き込み + Secret Manager 読み取りのみ。「Gemini API キーを持つのは Worker だけ」という状態にしておくと、万一 API 層に脆弱性があっても Gemini キー流出は防げます。
+
+**2. Secret Manager から API キーを注入**  
+Cloud Run のサービスに Secret Manager から `GEMINI_API_KEY` を注入します。環境変数に平文で書くと、誤ってログに出力したり、リビジョンの YAML が社内共有されたりしたときに漏れます。Secret Manager 経由なら rotation も容易です。
+
+**3. Firestore のセキュリティルールを厳しく**  
+クライアントから `jobs/{jobId}` を購読させる場合、「自分のジョブだけ読める」ルールを書きます。`userId` で絞るのが素直な方法です。
+
+```javascript
+// firestore.rules — ユーザーは自分のジョブだけ読める
+match /jobs/{jobId} {
+  allow read: if request.auth \!= null
+    && resource.data.userId == request.auth.uid;
+  // 書き込みは Worker 側の SA のみ（クライアントからは書けない）
+  allow write: if false;
+}
+```
+
+Worker 側は Admin SDK で書き込むので、ルールで `write: false` にしてもサーバー書き込みには影響しません。「クライアントから書けない、Worker からしか書けない」状態にすると、後で悪意のある改竄で課金を膨らまされる攻撃経路を最初から塞げます。
+
+## 導入時に覚悟しておくべきトレードオフ
+
+非同期ジョブ化は万能ではありません。得られるものと引き換えに、いくつか変わることを最初に認識しておくと、導入後の「こんなはずじゃなかった」が減ります。
+
+- **コードは 1 つの Cloud Run で完結しなくなる**: API と Worker で 2 つの Cloud Run を管理する必要が出てきます。CI/CD も両方デプロイする必要があり、観測対象も 2 つに増えます。
+- **「レスポンスに結果を返す」パターンが使えない**: クライアントは 2 段階で受け取る設計に変わります。既存のフロントエンドを書き換える必要が出てきます。
+- **Firestore の読み取り回数が増える**: 進捗購読で `onSnapshot` を多用するので、無料枠を超えるタイミングが早まります。ただし Cloud Run のアイドル課金が減る分、総コストは下がるケースが大多数です。
+- **デバッグの「線」が長くなる**: 同期なら 1 リクエストでスタックトレースが追えた処理が、API → Tasks → Worker → Firestore → クライアント、と線が長くなります。Cloud Trace と Cloud Logging のリクエスト ID を統一しておくのが運用上の必須装備です。
+
+これらを踏まえると、**処理時間が数秒で収まる軽い API には非同期化は不要**です。「Gemini 呼び出しが 15 秒を超え始めたら検討」というのが私の目安です。判断軸として覚えていただけると無駄な設計変更を避けられるはずです。
+
+## Gemini のリトライ戦略を Cloud Tasks に委ねるための「型」
+
+Cloud Tasks のリトライに処理を委ねるなら、Worker 側のエラー処理は「リトライしてほしいなら非 2xx、諦めるなら 2xx（status=failed を書いた上で）」というシンプルな契約に寄せます。この契約を明示しておくと、運用中に「なぜ同じジョブが何度も走ったか」を議論する必要がなくなります。
+
+本記事で使ったコードでは次のように分けました。
+
+- **2xx で終わらせる**: 完了・冪等スキップ・恒久的エラー（バリデーション NG など）
+- **503 で終わらせる**: 429 / 5xx / Gemini のネットワーク例外
+
+加えて Cloud Tasks の「同一タスクの再配送間隔」は、Worker の処理時間よりわずかに長めに設計します。Worker が 60 秒かかる処理で `min-backoff=10s` にすると、再配送タスクが元タスクの完了前に走り、冪等ロジックで全部弾かれるだけで無駄な起動コストを払います。`min-backoff` は「最も長い正常ケースの処理時間」より少し長く、というのが私の経験則です。
+
+## よくある Q&A（実装レビュー時に必ず聞かれる 2 問）
+
+実装レビューで必ずと言っていいほど聞かれる問いが 2 つあるので、先に回答を置いておきます。
+
+**Q. Pub/Sub ではなぜダメなのか？**  
+Pub/Sub は Push/Pull どちらも強力ですが、**「1 秒あたり N 件まで」のディスパッチ制御が標準装備ではない**点が Gemini 用途では不便です。Gemini のクォータは RPS で効くので、配送レートを直接制限できる Cloud Tasks の方が、設定が一段シンプルになります。ファンアウト型の通知が主体なら Pub/Sub、1 件ずつ直列〜小並列で叩きたい AI ジョブなら Cloud Tasks、と私は使い分けています。
+
+**Q. Workflows（Google Cloud Workflows）に置き換えられるか？**  
+ステージが明示的な DAG で固定できるなら Workflows は読みやすくて良い選択肢です。ただしユーザーの入力に応じてステージ分岐が動的に変わる AI パイプラインでは、「次に何をやるかをコードで決めたい」場面が多く、Cloud Tasks + Worker の自由度が勝ります。私は「ステージ数が 5 以下で決まりきっているなら Workflows、動的なら Cloud Tasks」を目安にしています。
+
+## 参考書籍
+
+本記事で扱った分散処理・リトライ・冪等性の考え方をより体系的に学ばれたい場合は、[データ指向アプリケーションデザイン（Martin Kleppmann）](https://www.amazon.co.jp/dp/4873118700/?tag=pinocchio-22) の第 8〜10 章がキューと耐障害性の議論に時間をかけていて、私自身も何度も読み返しています。Google Cloud 側の設計パターンとしては [Site Reliability Engineering（Betsy Beyer 他）](https://www.amazon.co.jp/dp/4873117917/?tag=pinocchio-22) が SLI/SLO と負荷制御の現実解を並べて論じていて、本記事の「リトライを一層に絞る」姿勢の理論的背景になっています。
+
+## 運用開始 1 ヶ月で見直すべき 5 つの観点
+
+デプロイして 1 週間ほど経つと、設計時の想定とズレる箇所が必ず出てきます。私の経験では、1 ヶ月経った時点で以下を見直すと、その後の半年間の運用がぐっと楽になります。
+
+- **`max-attempts` の適正化**: 本番データを見て、5 回のうち何回目で成功しているかを可視化します。ほとんどが 1〜2 回目で成功しているなら 5 は過剰で、3 に下げてクォータ消費を抑えられます。逆に 3〜4 回目の成功が多いなら、根本原因（プロンプトの不安定さ、レート制限の厳しさ）を潰す時期です。
+- **`min-backoff` の再検討**: Worker の実処理時間の P50 を測って、`min-backoff` がそれより短ければ、冪等チェックで弾かれるだけの無駄な再配送が発生しています。P50 より気持ち長めに設定し直しましょう。
+- **同時実行数のチューニング**: Gemini 側のクォータに余裕があるなら、`max-concurrent-dispatches` を増やしてスループットを上げられます。逆にクォータに頻繁にぶつかっているなら減らして、待たせる方が総スループットが高くなる場合があります。
+- **DLQ に溜まる典型パターンの吸収**: DLQ の中身をカテゴリ別に集計し、上位 3 つは Worker 内で事前検証して弾きます。DLQ を「改善のヒント集」として見ておくと、継続的に失敗率が下がります。
+- **コストの分解**: Cloud Run / Cloud Tasks / Firestore / Gemini API の 4 つのコストを、請求書レベルではなくジョブ単価に分解します。1 ジョブあたり 0.3 円なのか 3 円なのかで、ビジネス判断がまったく変わってきます。
+
+私はこれを「運用 1 ヶ月点検」と呼んで、本番投入時にカレンダーに必ず入れるようにしています。最初の 1 ヶ月が過ぎた後は、四半期ごとの点検で十分維持できます。
+
+## 次に試したいこと
+
+今日できる最初の一歩は、**手元の Cloud Run を 1 つ選び、そこから Gemini を呼び出している処理だけ Worker として切り出してみる**ことです。API レイヤと Worker レイヤを分離した瞬間、「遅い処理に速いレイヤを巻き込まない」感覚が身につきます。Cloud Tasks のキュー設定を触るのはその後でも遅くありません。小さな切り出しが、数週間後の運用負担を確実に下げてくれるはずです。最初は 1 つのエンドポイントだけで構いません。動く実感が得られてから、他のエンドポイントにも広げる順番が、実装負担と学習負担のバランスを取るうえで無理がない進め方だと感じています。
+
+関連する内容は [Gemini API × Cloud Run サーバレスAI API 本番運用ガイド](/articles/gemini-dev/gemini-cloud-run-serverless-ai-api-production) と [Gemini API 本番エラーハンドリング・レート制限ガイド](/articles/gemini-api/gemini-api-production-error-handling-rate-limit-guide) でも掘り下げていますので、あわせてご覧いただけると全体像が繋がります。
