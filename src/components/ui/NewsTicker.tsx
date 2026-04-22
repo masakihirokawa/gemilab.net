@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CHROME7 — Gemini in Chrome がアジア太平洋 7 カ国（日本・オーストラリア・インドネシア・フィリピン・シンガポール・韓国・ベトナム）に展開（4/20）",
-    "GCAAPI — geminicloudassist.googleapis.com API が対象プロジェクトで自動有効化、Gemini Cloud Assist チャット連携が進む（4/16以降）",
-    "ROBOT15EOL — gemini-robotics-er-1.5-preview モデルは 4/30 9AM PST でシャットダウン、後継モデルへの移行を推奨（4月）",
-    "EXAMAI — Gemini の無料模擬試験が SAT・JEE Main に続いて NEET UG へ拡大、学習サポートを強化（4月）",
-    "MACAPP — Gemini macOS アプリが全ユーザー無料公開、macOS 15 以上で gemini.google/mac から入手（4月）",
-    "TTS30 — Gemini 3.1 Flash TTS が Google Vids に 30 ボイス × 24 言語のナレーションを展開（4月）",
+    "CLOUDNEXT — Google Cloud Next 2026 ラスベガス開催、TPU v7 と Gemini 3.2、Agentic AI を企業向けコア機能として発表（4/22）",
+    "TTS31 — Gemini 3.1 Flash TTS プレビュー公開、70 以上の言語と audio tags、SynthID ウォーターマーク対応（4月）",
+    "MACAPP — Gemini ネイティブ macOS アプリが macOS 15 以上で全世界無料公開、gemini.google/mac から入手可能（4月）",
+    "AISTUDIO — Google AI Studio が AI Pro／Ultra 向けに利用上限を拡張、Nano Banana Pro と Gemini Pro モデルへのアクセスも追加（4月）",
+    "GEMMA4 — Gemma 4 が AI Studio と Gemini API に到着、次世代 Gemini Nano の基盤モデル（4月）",
+    "CHROME7 — Gemini in Chrome がアジア太平洋 7 カ国へ展開（日本含む）、Agentic Features は AI Pro／Ultra 向けに US でテスト中（4月）",
   ],
   en: [
-    "CHROME7 — Gemini in Chrome rolls out to seven APAC countries: Japan, Australia, Indonesia, Philippines, Singapore, South Korea, Vietnam (4/20)",
-    "GCAAPI — geminicloudassist.googleapis.com auto-enabled on projects that used Gemini Cloud Assist chat in prior 60 days (4/16+)",
-    "ROBOT15EOL — gemini-robotics-er-1.5-preview model shuts down 4/30 9AM PST; plan migration to successor models (Apr)",
-    "EXAMAI — Gemini's free full-length practice tests expand from SAT & JEE Main to include NEET UG (Apr)",
-    "MACAPP — Gemini macOS app now free for all users on macOS 15+, globally at gemini.google/mac (Apr)",
-    "TTS30 — Gemini 3.1 Flash TTS brings 30 new conversational voices in 24 languages to Google Vids (Apr)",
+    "CLOUDNEXT — Google Cloud Next 2026 opens in Las Vegas spotlighting TPU v7, Gemini 3.2 and Agentic AI as enterprise pillars (4/22)",
+    "TTS31 — Gemini 3.1 Flash TTS preview launches with 70+ languages, audio tags and SynthID watermarking (Apr)",
+    "MACAPP — Gemini native macOS app rolls out free to all users on macOS 15+, globally at gemini.google/mac (Apr)",
+    "AISTUDIO — Google AI Studio raises limits for AI Pro/Ultra subscribers and unlocks Nano Banana Pro & Gemini Pro access (Apr)",
+    "GEMMA4 — Gemma 4 arrives on AI Studio & Gemini API as foundation for next-gen Gemini Nano (Apr)",
+    "CHROME7 — Gemini in Chrome expands to seven APAC countries; agentic features in US test for AI Pro/Ultra (Apr)",
   ],
 };
 
