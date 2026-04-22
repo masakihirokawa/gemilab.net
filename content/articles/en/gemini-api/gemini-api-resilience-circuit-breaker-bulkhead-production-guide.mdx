@@ -1,0 +1,461 @@
+---
+title: "Resilient Gemini API Services in Production — Circuit Breakers, Bulkheads, and Fallback Models That Keep Your App Alive"
+slug: "gemini-api-resilience-circuit-breaker-bulkhead-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-22T19:45"
+author: "Gemini Lab"
+description: "A production-ready resilience playbook for Gemini API: circuit breakers, bulkheads, jittered retries, and model fallback chains — with working Python so your service stays up even when the upstream doesn't."
+tags: ["gemini-api", "resilience", "circuit-breaker", "bulkhead", "production", "fallback", "python"]
+highlights:
+  - "You can now contain cascading 429 / 503 storms before they take your entire product down with users"
+  - "You'll wire up a tiered Pro → Flash → local-model → cache fallback chain that degrades gracefully instead of failing hard"
+  - "You'll avoid the three most common traps — retry amplification, worker starvation, and 'one-lung' circuit state — at both the code and architecture level"
+---
+
+Last month, an indie product I run leaning heavily on the Gemini API went nearly completely dark for twenty minutes because of one 503 from the upstream. The direct cause was a transient outage on Google's side, but the real cause was my design: it assumed the API would always be available, and when that assumption broke, everything else broke with it. Once you use a large AI API in production, you learn quickly that you cannot design around the assumption that it won't fail — you have to design around the certainty that it will.
+
+This article collects the four patterns I added afterwards: bulkheads, circuit breakers, jittered retries, and model fallback chains. We'll look at each one individually, then stack them together into a single flow you can drop into a FastAPI or any async Python service. The goal is not to avoid failure; it's to contain failure, so that a bad ten minutes for Gemini doesn't turn into a bad ten minutes for your users. I'll share the numbers I watch in production, the thresholds that survived contact with real traffic, and the misconfigurations that cost me sleep so you can skip those lessons.
+
+## Why You Have to Design for Failure With External AI APIs
+
+Gemini publishes SLAs, but transient 429s (rate limited), 503s (service unavailable), and tail-latency spikes happen anyway — especially during peak hours on the US West Coast. A single failure isn't the problem. The problem is the cascade: Gemini slows down → your FastAPI workers block waiting for responses → your worker pool drains → unrelated endpoints (search, static content, webhooks) start timing out → from the outside, your whole product looks dead.
+
+My original implementation made this cascade worse, not better. I had a `try/except` with five retries. When Gemini got slow, every user hit five retries in parallel, and a three-minute upstream blip turned into a twenty-minute outage on my side. My Cloudflare dashboard showed CPU sitting around 10% while upstream connection counts pinned to the limit and every downstream request rolled over into timeouts — a textbook saturation failure.
+
+The goal of resilience engineering is not "don't fail." It is "**fail in a bounded, isolated way that the rest of the system can survive.**" That distinction rewires how you think about every dependency your service has. It also changes what "tested" means: you don't just test that the happy path works; you test what happens when the dependency is slow, lossy, or dead for ten minutes at a time.
+
+## The Four Layers, Ordered From Outside In
+
+The design I'll walk through has four layers, traversed in this order on every call:
+
+- **Layer 1 (outermost): Bulkheads** — separate connection pools per feature so one overloaded feature cannot starve the others
+- **Layer 2: Circuit breakers** — detect sustained upstream failure and stop hammering the API for a cooldown period
+- **Layer 3: Retries with exponential backoff and jitter** — for narrow, recoverable errors (429, 5xx), retry a few times with randomized spacing
+- **Layer 4 (closest to Gemini): Fallback chain** — try Pro, then Flash, then a local model, then cache — in that order, with the first one that works winning
+
+These layers are useful on their own but only really shine when stacked. The combination is what gets you from "my service is down because Gemini is down" to "my service is slightly degraded for a handful of users while Gemini recovers." On my own service after stacking all four, a thirty-minute partial outage on the upstream side produced an end-to-end user-visible success rate above 98% — not because nothing was wrong, but because most users landed on Flash or cache without ever noticing. That's the shape of a resilient system: from the outside, "nothing happened," while the dashboards tell a completely different story. Your users' trust is built in the space between those two views.
+
+## Layer 1: Bulkheads — Give Each Feature Its Own Pool
+
+A bulkhead (as in the watertight compartments of a ship) means each Gemini-backed feature gets its own dedicated slice of resources. My mistake was using one shared `httpx.AsyncClient` pool for everything — when a heavy report-generation flow occupied all the connections, my lightweight chat endpoint had nothing left.
+
+A per-feature `asyncio.Semaphore` is the simplest possible bulkhead in Python:
+
+```python
+# What this solves: a slow, heavy feature (report generation) monopolizing
+# the Gemini connection pool and starving lightweight features (chat).
+import asyncio
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable, TypeVar
+
+T = TypeVar("T")
+
+@dataclass
+class Bulkhead:
+    """Minimal bulkhead with per-feature concurrency cap and rejection counters."""
+    name: str
+    max_concurrent: int
+    _semaphore: asyncio.Semaphore = field(init=False)
+    rejected: int = 0
+    accepted: int = 0
+
+    def __post_init__(self) -> None:
+        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+
+    async def run(self, fn: Callable[[], Awaitable[T]]) -> T:
+        # If the pool is full, fail immediately — never queue.
+        if self._semaphore.locked():
+            self.rejected += 1
+            raise BulkheadFullError(
+                f"bulkhead '{self.name}' is full "
+                f"(max={self.max_concurrent}, rejected={self.rejected})"
+            )
+        async with self._semaphore:
+            self.accepted += 1
+            return await fn()
+
+
+class BulkheadFullError(RuntimeError):
+    pass
+
+
+# Allocate per-feature pools
+BULKHEADS = {
+    "chat":    Bulkhead("chat",    max_concurrent=30),  # light, high frequency
+    "summary": Bulkhead("summary", max_concurrent=10),
+    "report":  Bulkhead("report",  max_concurrent=3),   # heavy, low frequency
+}
+```
+
+Two design choices matter here. First, **fail immediately when the pool is full** — never queue. Queued requests hold FastAPI workers, which is exactly what we're trying to avoid. Second, **size the pools differently per feature**. In my own service, setting chat to 30 and report generation to 3 was what finally broke the cascade: a burst on chat can no longer take report generation down with it.
+
+Expected behavior: if chat gets slammed with 100 simultaneous requests, 70 of them fail fast with `BulkheadFullError`, while report-generation's three slots stay untouched. From the user's perspective, some chat requests fail; reports keep working. That is exactly the kind of graceful, bounded degradation you want.
+
+### How to Size a Bulkhead
+
+A decent starting formula:
+
+- **Concurrency limit = average response time (sec) × target QPS × safety factor 1.3**
+- But also: the sum across all features should not exceed ~80% of your worker count, or you still risk starving unrelated endpoints
+
+For example, if report generation takes 10 seconds and you want to sustain 2 QPS, the math gives you 26. But on a 32-worker host, dedicating 26 to one feature is dangerous, so you'd cap it lower (say 13) and spill the rest to a queue. The rule that's held up for me: pick the value that doesn't starve the other features, even when it's mathematically lower than optimal throughput for this feature. "Empty room for neighbors" is a feature, not a bug.
+
+## Layer 2: Circuit Breaker — Stop Calling an API That's Clearly Down
+
+A circuit breaker stops calling the upstream entirely when failures exceed a threshold. It's the software analogue of an electrical breaker: when the fault is obvious, don't keep pushing current through the fuse.
+
+Three states:
+
+- **CLOSED**: normal operation. Calls go through. If consecutive failures exceed threshold → transition to OPEN
+- **OPEN**: blocked. Return immediately without calling upstream. After a cooldown → transition to HALF_OPEN
+- **HALF_OPEN**: probing. Allow exactly one request through. If it succeeds → CLOSED; if it fails → OPEN again
+
+The single most important implementation detail: **in HALF_OPEN, let exactly one request through at a time**. If you let the full flood back in while the upstream is still recovering, you just knock it back over.
+
+```python
+# What this solves: you keep slamming Gemini while it's returning 503s,
+# which prolongs its recovery and wastes your workers on dead calls.
+import time
+import asyncio
+from enum import Enum
+from dataclasses import dataclass, field
+
+class State(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+@dataclass
+class CircuitBreaker:
+    name: str
+    failure_threshold: int = 10        # consecutive failures before OPEN
+    reset_timeout_sec: float = 30.0    # OPEN → HALF_OPEN after this cooldown
+    state: State = State.CLOSED
+    _failure_count: int = 0
+    _opened_at: float = 0.0
+    _half_open_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Observability counters
+    total_opened: int = 0
+    total_requests_rejected: int = 0
+
+    async def call(self, fn):
+        now = time.monotonic()
+        if self.state == State.OPEN:
+            if now - self._opened_at < self.reset_timeout_sec:
+                self.total_requests_rejected += 1
+                raise CircuitOpenError(f"circuit '{self.name}' is OPEN")
+            self.state = State.HALF_OPEN
+
+        # HALF_OPEN serializes trial requests — this is the critical invariant.
+        if self.state == State.HALF_OPEN:
+            async with self._half_open_lock:
+                return await self._try_and_update(fn)
+
+        return await self._try_and_update(fn)
+
+    async def _try_and_update(self, fn):
+        try:
+            result = await fn()
+        except Exception:
+            self._failure_count += 1
+            if self._failure_count >= self.failure_threshold:
+                self.state = State.OPEN
+                self._opened_at = time.monotonic()
+                self.total_opened += 1
+            raise
+        self.state = State.CLOSED
+        self._failure_count = 0
+        return result
+
+
+class CircuitOpenError(RuntimeError):
+    pass
+```
+
+After deploying this, my observed behavior during a late-night Gemini incident went from "every worker hanging" to "first ten failures trip the breaker, next 30 seconds return `CircuitOpenError` instantly from our side, then one probe succeeds and everything goes back to normal." Workers no longer hang waiting on a sick upstream. The second the breaker trips, subsequent requests fail in microseconds instead of seconds — and that millisecond-vs-second difference is exactly what keeps your worker pool alive.
+
+**A common mistake**: setting `failure_threshold` too low. Three feels aggressive and safe, but Gemini occasionally bursts three consecutive 429s even under normal load, and you'd trip the breaker on healthy traffic. I ended up at 10 — low enough to react quickly to a real outage, high enough to absorb normal noise. Fifty is too slow to matter. The 10–15 range is where I land in practice.
+
+### Distributed State: Local vs. Shared
+
+If you run multiple pods in Kubernetes, independent per-pod breakers create "one-lung" states where Pod A is OPEN while Pod B is CLOSED, and load re-balances unpredictably. Two options:
+
+- **A: Keep it local per pod.** Simple. Works fine with a handful of pods.
+- **B: Share state in Redis.** More consistent, but the breaker is now only as reliable as Redis.
+
+I default to A below five pods and consider B above that, knowing that B introduces a new failure mode: if Redis goes down, the breaker effectively becomes useless. Simplicity usually wins at small scale. If you do go with local state, scale the per-pod threshold down (say from 10 to 6 if you run five pods) so the cluster as a whole trips at roughly the same call count a single-instance breaker would.
+
+## Layer 3: Retry With Exponential Backoff and Jitter
+
+For 429s and transient 5xx, a short retry often recovers cleanly. The critical addition is **jitter**. Without jitter, every client retries at the same delays (1s, 2s, 4s, 8s), producing synchronized waves of traffic that make the upstream's recovery slower. With jitter, each client's retry schedule is randomized, so the combined load is smoother. AWS's "Full Jitter" strategy applies almost directly here — same reasoning, same fix.
+
+```python
+# What this solves: without jitter, every client retries on the same
+# cadence and slams the upstream in synchronized waves, delaying recovery.
+import asyncio
+import random
+
+async def retry_with_jitter(
+    fn,
+    *,
+    max_retries: int = 3,
+    base_sec: float = 0.5,
+    max_sec: float = 8.0,
+    retry_on=(429, 500, 502, 503, 504),
+):
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await fn()
+        except HttpStatusError as e:
+            last_exc = e
+            if e.status_code not in retry_on:
+                raise  # never retry 400 / 401 / 403
+            if attempt == max_retries:
+                raise
+            backoff = min(base_sec * (2 ** attempt), max_sec)
+            sleep_sec = random.uniform(0, backoff)  # full jitter
+            await asyncio.sleep(sleep_sec)
+    raise last_exc  # unreachable
+
+
+class HttpStatusError(RuntimeError):
+    def __init__(self, status_code: int, message: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+```
+
+Two subtle points:
+
+**Retry only on a whitelist.** 400 Bad Request will be 400 forever — retrying it just burns tokens and wall-clock time. Same with 401 and 403. Only 429 and 5xx deserve retries.
+
+**Do not nest retry inside the circuit breaker.** If you do, the retries bump the breaker's failure counter and trip OPEN unnecessarily. The order I use is: `call_with_fallback → bulkhead.run → breaker.call → retry_with_jitter → tier.call`. The retry happens at the innermost layer, inside a single API call. Getting this ordering right is the difference between a breaker that protects you and a breaker that flaps constantly and wakes you up at 3 AM for nothing.
+
+## Layer 4: Fallback Chain — Pro, Then Flash, Then Local, Then Cache
+
+This is the centerpiece. When Gemini 2.5 Pro's breaker is OPEN, Flash often isn't. When both are down, you can still serve a precomputed cached answer. Serving a slightly worse answer beats serving no answer almost every time.
+
+```python
+# What this solves: keep the service responsive even when Gemini Pro is
+# unavailable — by degrading to Flash, then to a local model, then cache.
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional
+
+@dataclass
+class ModelTier:
+    name: str
+    call: Callable[[str], Awaitable[str]]
+    breaker: CircuitBreaker
+    bulkhead: Bulkhead
+
+async def call_with_fallback(
+    prompt: str,
+    tiers: list[ModelTier],
+    cache_lookup: Callable[[str], Optional[str]],
+) -> tuple[str, str]:
+    """Returns (winning_tier_name, response). Falls through to cache if all tiers fail."""
+    errors: list[str] = []
+    for tier in tiers:
+        try:
+            async def invoke() -> str:
+                return await retry_with_jitter(lambda: tier.call(prompt))
+            async def guarded() -> str:
+                return await tier.breaker.call(invoke)
+            result = await tier.bulkhead.run(guarded)
+            return tier.name, result
+        except (CircuitOpenError, BulkheadFullError, HttpStatusError) as e:
+            errors.append(f"{tier.name}: {type(e).__name__}")
+            continue
+
+    # Last resort: cache
+    cached = cache_lookup(prompt)
+    if cached is not None:
+        return "cache", cached
+    raise AllTiersFailed(errors)
+
+
+class AllTiersFailed(RuntimeError):
+    pass
+
+
+# Usage
+tiers = [
+    ModelTier("pro",   call_pro,   breaker_pro,   BULKHEADS["report"]),
+    ModelTier("flash", call_flash, breaker_flash, BULKHEADS["summary"]),
+    ModelTier("local", call_local, breaker_local, BULKHEADS["chat"]),
+]
+
+source, answer = await call_with_fallback(prompt, tiers, redis_cache_lookup)
+# source == "flash" means Pro was down and we recovered by serving Flash
+```
+
+Two operational notes. First, **always log and emit the winning tier name**. You may not show it to users, but you absolutely want an alert when the rate of `source == "cache"` spikes, because that means both Pro and Flash are down and you're about to be in serious trouble. Mine sits on a Datadog dashboard.
+
+Second, **whether to disclose the degradation to users is a product decision**, not a technical one. For conversational UIs it's often worth a small indicator ("Simplified response mode"). For background batch jobs, silent degradation is usually fine. Either way, the system's behavior should be legible to you via logs even when it's invisible to users.
+
+### Gotchas With a Local Fallback Model
+
+If you park a local LLM (say Gemma 3 or Llama 3.1 8B) at the bottom of the stack, you get a true "everything's down" safety net. But:
+
+- **Latency is in a different world.** Flash returns in ~800ms, a local 8B on CPU is several seconds. Tier-specific timeouts are required.
+- **Quality delta is visible.** You should probably tell the user, at least subtly, that they're in a degraded mode.
+
+If you're evaluating how to run Gemma locally for this purpose, the [Gemma 4 local execution and zero-cost AI app guide](/articles/gemini-updates/gemma-4-local-execution-zero-cost-app) walks through the mechanics end to end — including the hardware tradeoffs that make this practical for a small team.
+
+## Graceful Degradation: Your Last Line Is the Cache
+
+When every tier fails, what you serve from cache determines whether users see a soft degradation or a hard error. A trivial "exact-match key" cache almost never hits in production — slight wording changes bust the key. What works is a hybrid:
+
+- **Semantic cache**: treat prompts as equivalent if embedding cosine similarity ≥ 0.95
+- **Template cache**: normalize variable slots in prompts like `"Tell me about product {X}"` and hit on the templated part
+- **Default response**: a per-feature static fallback ("We're experiencing high load, here's a simplified response") — the last line when nothing else matches
+
+The [Gemini API Redis semantic cache guide](/articles/gemini-api/gemini-api-redis-semantic-cache-guide) covers the semantic layer in detail and pairs well with this architecture.
+
+The value of a default response only becomes obvious during an outage. Empirically, **a slightly off-target answer beats a 5xx every time** for user retention. This is where engineering correctness and product correctness split — and product correctness wins. An unhappy user who got a plausible response will usually try again in ten minutes. A user who got a 500 may never come back.
+
+### How to Pre-Warm Your Cache
+
+Cache that only fills from live traffic is cache that's empty when you need it most. The trick is to pre-warm the cache with the most common prompts **before** they're needed in an outage. Three tactics that have worked well for me:
+
+- **Log-replay warm-up**: every night, take the last 7 days of top 1,000 prompts and run them through the pipeline, warming the semantic cache embeddings. Low traffic hour, low cost, always ready.
+- **Feature-launch warm-up**: when you ship a new feature, pre-generate the 50 most likely first-use prompts and stuff them into cache before the feature flag flips for real users.
+- **Template cache seeding**: for any templated prompt (e.g., product descriptions), generate answers for the top N product IDs by traffic and cache under the templated key. This routinely gets me >40% cache hit rates during incidents.
+
+These warm-ups run entirely outside the hot path, so they don't contribute to saturation. The investment in warm-up infrastructure pays back the first time Gemini is down for 30 minutes and your cache hit rate is 60% instead of 5%.
+
+## Four Design Mistakes I See Repeatedly
+
+### Mistake 1: Circuit breaker without bulkhead
+
+A circuit breaker catches "Gemini is down" but cannot catch "my workers are saturated." Heavy calls pile up before the breaker trips, and by then the damage is done. Bulkheads exist to buy the circuit breaker time to work. Skip the bulkhead and you're trying to stop a fire with a smoke alarm.
+
+### Mistake 2: Reusing Pro-optimized prompts on Flash
+
+Long Pro-tuned prompts (few-shot examples, elaborate system instructions) often underperform on Flash because Flash is a smaller model operating under different defaults. Use tier-specific `build_prompt(tier, user_input)`: fewer shots for Flash, and even simpler phrasing for local models.
+
+If you use DSPy, per-model prompt optimization is a deep topic in its own right — the [Gemini × DSPy auto-prompt optimization guide](/articles/gemini-advanced/gemini-dspy-prompt-auto-optimization-guide) pairs well with the fallback design here.
+
+### Mistake 3: Per-pod circuit breakers in large fleets
+
+Independent breakers in ten pods produce "one-lung" states: half open, half closed. Either share state in Redis, or reduce the per-pod threshold so the cluster trips as a group. The [Gemini API production architecture patterns 2026](/articles/gemini-advanced/gemini-api-production-architecture-patterns-2026) article has more on this dimension.
+
+### Mistake 4: Timeouts that don't nest
+
+Probably the most common mistake and definitely the most maddening to debug. If the Gemini SDK timeout is 60s, FastAPI's is 30s, and your CDN's is 100s, you have no idea which one fires first — usually not the one you wanted.
+
+The principle: **timeouts must shrink as you go inward.**
+
+- Gemini SDK timeout: 20s
+- Retry per attempt: 20s (same)
+- Circuit breaker total window: 25s (retry × 1.5)
+- FastAPI request timeout: 30s
+- CDN/LB: 35s or higher
+
+With this stack, a slow Gemini response is caught at 20s by the SDK, leaving you 10s to try a fallback tier before FastAPI gives up. If the SDK is 60s and FastAPI is 30s, FastAPI kills the request before the SDK even decides to fail, and no fallback runs. The fix is a five-minute change. The amount of pain that five minutes saves over a year is genuinely remarkable.
+
+## A Deployment Runbook — What I Actually Did, In Order
+
+The theory is one thing, the order you ship it in is another. Here's the exact sequence I used when I applied these patterns to a live service. I share it not because it's the only way, but because "which one do I ship first?" is the question that blocks most people.
+
+### Week 1: Observability before intervention
+
+Before adding any resilience logic, I added timing, per-feature counters, and per-tier error breakdowns to existing calls. No behavior changes, just instrumentation. This matters because (a) you need a baseline to measure whether the resilience changes helped, and (b) you'll often discover a problem in the data that invalidates your original assumptions. In my case, I discovered that 85% of "Gemini errors" were actually coming from one feature, so the bulkhead work could be focused rather than global.
+
+### Week 2: Bulkhead on the heaviest feature
+
+I added an `asyncio.Semaphore(3)` around report generation. Nothing else. I watched for a week. The bulkhead-rejected counter gave me a clean picture of when the feature was saturated and what else was happening at those times. Surprising finding: most saturation happened during a 15-minute window every morning when a batch job was running — removing the overlap took more saturation off the system than any subsequent pattern I added.
+
+### Week 3: Circuit breaker, Pro tier only
+
+I wrapped the Pro tier in a circuit breaker with `failure_threshold=10` and `reset_timeout_sec=30`. I deliberately did not add it to Flash yet — keeping one tier unprotected let me observe how the breaker-protected path compared to the unprotected baseline during normal traffic. After 10 days I moved Flash under a breaker as well.
+
+### Week 4: Jittered retry, inside the breaker
+
+Adding retry before the breaker is a common mistake I've already warned about. The order I recommend is: breaker first (so you have the "stop calling the sick upstream" behavior), then retry inside (so the retries happen against a breaker-protected call). If you ship retry before breaker, you'll likely see the breaker trip more than it should, because retry amplification pushes the failure count up faster than you expected.
+
+### Week 5: Fallback chain
+
+This was the biggest code change — introducing the `ModelTier` abstraction and the `call_with_fallback` helper. The bulk of the risk here is prompt-engineering risk, not resilience risk: the Flash prompt needs to be tested against production inputs to make sure the degraded mode is actually useful. I had a week where Flash was serving responses that were technically successful but materially worse, and a light eval harness comparing outputs across tiers caught it.
+
+### Week 6: Cache as the final safety net
+
+I added semantic caching (through the Redis semantic-cache layer) last, because it was the highest-leverage addition but also the one with the most configuration dials. Similarity thresholds that are too tight produce zero hits in production; thresholds that are too loose return irrelevant cached answers. I landed on 0.95 cosine similarity after a week of A/B testing on relevance.
+
+Shipping in this order meant that at each step I could measure the marginal impact of that single change. When something regressed, I knew exactly what caused it. This matters more than it sounds — "ship it all at once, then debug whatever breaks" is a seductive trap that almost always costs you more time than the incremental path.
+
+## Metrics to Keep On Your Dashboard
+
+Resilience isn't a one-time change — you have to measure that it's actually working. My permanent dashboard has five:
+
+- **Circuit breaker transitions** (CLOSED → OPEN), per hour, per tier
+- **Bulkhead rejection rate**: `rejected / (rejected + accepted)` per feature
+- **Fallback activation rate**: fraction of responses served by a non-primary tier
+- **Cache hit rate**: split across semantic, template, and default
+- **End-to-end success rate**: fraction of user requests that eventually got *something* back — **this is the metric that matters most**
+
+End-to-end success is distinct from Gemini's success rate. If Gemini drops to 80% and your fallback chain is good, users can still see 99%+. That's the whole point of the architecture. Don't let your "raw Gemini success rate" page you in the middle of the night if your user-facing success rate is fine. Page on the user-facing metric, watch the raw metric in dashboards.
+
+Conversely: a **Fallback activation rate sustained above 30%** is a silent-fire warning. Things look healthy to users, but you're actually running mostly on Flash because Pro's breaker keeps tripping. When I see that, I go look at quota, regional endpoints, or whether my Pro request rate has drifted up without me noticing. Silent degradation is still degradation.
+
+For the broader distributed-systems thinking behind all of this, Sam Newman's "[Building Microservices, 2nd Edition](https://www.amazon.co.jp/dp/4814400373/?tag=pinocchio-22)" covers circuit breakers, bulkheads, and timeouts at depth. It's not about Gemini, but the mental model transfers cleanly and sharpens how you reason about any external AI API.
+
+## Wiring Observability With OpenTelemetry
+
+Resilience patterns give you levers; observability tells you whether the levers work. I instrument three signals for each tier using OpenTelemetry: a counter for calls, a histogram for per-call latency, and a gauge for the breaker's current state (0 = CLOSED, 1 = HALF_OPEN, 2 = OPEN). On top of those raw signals, I compute derived SLIs (the metrics from the previous section) in the metric backend (Grafana or Datadog) rather than in the app, because recomputing them in code is error-prone.
+
+```python
+# What this adds: per-tier OpenTelemetry metrics so you can see, in real time,
+# which tier is carrying your traffic and how often each one fails.
+from opentelemetry import metrics
+
+meter = metrics.get_meter("gemini.resilience")
+tier_calls = meter.create_counter("gemini.tier.calls", unit="1")
+tier_errors = meter.create_counter("gemini.tier.errors", unit="1")
+tier_latency = meter.create_histogram("gemini.tier.latency_ms", unit="ms")
+breaker_state = meter.create_observable_gauge(
+    "gemini.breaker.state",
+    callbacks=[lambda _: [
+        metrics.Observation(
+            value={"closed": 0, "half_open": 1, "open": 2}[b.state.value],
+            attributes={"tier": b.name},
+        ) for b in ALL_BREAKERS
+    ]],
+)
+
+# Wrap the existing call with timing + error counting
+import time
+async def instrumented_call(tier, prompt):
+    start = time.monotonic()
+    attrs = {"tier": tier.name}
+    tier_calls.add(1, attrs)
+    try:
+        return await tier.call(prompt)
+    except Exception:
+        tier_errors.add(1, attrs)
+        raise
+    finally:
+        tier_latency.record((time.monotonic() - start) * 1000, attrs)
+```
+
+The breaker-state gauge is the quiet killer-feature: plotting it alongside the Pro-tier's error rate makes "when did the breaker trip, and for how long?" a single glance in Grafana. Before I added this, my incident reviews were ten minutes of combing through logs; now I can answer the timing question in ten seconds.
+
+## Testing Your Resilience Without Breaking Production
+
+The uncomfortable truth: if you haven't tested your resilience patterns against an actual failure, you don't know if they work. Three lightweight ways to test them that don't require a production incident:
+
+- **Fault injection in staging**: use a Gemini client wrapper that randomly raises `HttpStatusError(503)` for, say, 20% of calls. Run your load test and confirm the fallback chain kicks in as expected.
+- **Breaker exercise tests**: a unit test that calls `breaker.call` with a function that always raises, confirms the state goes CLOSED → OPEN after `failure_threshold`, then waits past `reset_timeout_sec` and confirms HALF_OPEN.
+- **Chaos week**: once a quarter, pick a low-traffic window and flip a feature flag that force-returns `CircuitOpenError` from the Pro tier for 10 minutes. Watch end-to-end success rate. If it dips below 95%, your fallback chain needs work.
+
+I run the first two in CI. The third I do by hand every three months or so. The first time you run a chaos exercise you almost always find something that doesn't behave as designed — a timeout that didn't nest correctly, a log line that wasn't actually being written, a dashboard that lagged five minutes. Better to find these in a controlled window than in an incident.
+
+## One Small Step for Tomorrow Morning
+
+If you read this far and want to actually ship something Monday, here's my advice: **don't try to add all four layers at once.** Start with a single bulkhead on your heaviest feature — `asyncio.Semaphore(3)` around your report-generation endpoint, say. Watch it for a week. You'll immediately see how much smaller the blast radius of an upstream hiccup becomes.
+
+From there, layer in the circuit breaker, then retries, then the fallback chain, in that order. Three to four weeks in, you'll have a service that stays up when Gemini doesn't. The unglamorous truth of running an AI product is that the defensive design work — the stuff users never notice — ends up being what differentiates a product that holds users from one that loses them to every transient outage upstream. Your users don't pay you for Gemini; they pay you for service that responds. Protecting that is worth just as much engineering investment as any feature on the roadmap.
+
+One more thing worth saying, since many resilience articles skip it: resilience work is **emotional** infrastructure too. When you wake up at 3 AM to a page, the quality of the system you shipped three months ago determines whether you can go back to sleep in ten minutes or whether you'll be up for the next four hours. Every hour you spend on bulkheads and circuit breakers is an hour you're investing in your future self — and that future self will thank you more than you currently expect.

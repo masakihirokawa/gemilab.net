@@ -1,0 +1,450 @@
+---
+title: "Gemini API 本番の耐障害性設計完全ガイド — Circuit Breaker・Bulkhead・フォールバックモデルで AI サービスを落とさない実装パターン"
+slug: "gemini-api-resilience-circuit-breaker-bulkhead-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-22T19:45"
+author: "Gemini Lab"
+description: "Gemini API の本番運用で発生する 429・503・タイムアウト障害を乗り切るための耐障害性設計を実装レベルで解説します。Circuit Breaker、Bulkhead、フォールバックモデル切替、Graceful Degradation までコード付きで網羅します。"
+tags: ["gemini-api", "resilience", "circuit-breaker", "bulkhead", "production", "fallback", "python"]
+highlights:
+  - "Gemini API で 429 / 503 が連鎖して全ユーザーに障害が波及する状況を、Circuit Breaker で局所化できるようになります"
+  - "Pro・Flash・ローカルモデルを優先度付きでつなぎ、品質を落としつつサービスを止めない段階的フォールバックを実装できます"
+  - "本番で実際に詰まりやすい『リトライ爆発』『ワーカー枯渇』『片肺運転』の各失敗パターンを、コードと設計レベルで回避できるようになります"
+---
+
+先日、個人開発で運用している Gemini API 連携サービスが、たった 1 つの API エラーでほぼ全機能が止まる事態に陥りました。直接の原因は Gemini 側の一時的な 503 でしたが、本当の原因はそこではなく、こちらの設計が「Gemini が落ちたら全部落ちる」前提になっていたことでした。障害を何度か踏んでようやく腹落ちしたのですが、外部 AI API を本番で使う以上、落ちる前提で設計していないと、いつか必ず自社サービスまで道連れにされます。
+
+この記事では、実際に私が詰まった失敗と、そこから作り直した設計パターンを全部まとめました。対象は Gemini 2.5 Pro / Flash を本番に組み込んで運用している開発者で、Python の実コードを読みながら進める構成です。Circuit Breaker、Bulkhead、フォールバックモデル、Graceful Degradation の 4 つを、個別ではなく「組み合わせて動く状態」で紹介します。単発のパターン紹介ではなく、**本番投入した翌週に何を見れば効いているか分かるのか**、というメトリクスの話まで含めているので、明日から動く設計図として使ってもらえるはずです。
+
+## なぜ Gemini API は落ちる前提で設計する必要があるのか
+
+外部 API の障害は、自分たちのコードの外で起きます。ここが厄介なところです。Gemini API は SLA を公表していますが、それでも一時的な 429（Rate Limit）、503（Service Unavailable）、応答の遅延は珍しくありません。特に日本時間の深夜帯（米国西海岸のピーク時）は 503 の頻度が体感で上がる印象があります。
+
+問題は「1 リクエストが失敗すること」ではありません。本当に怖いのは、1 つの失敗が連鎖して全体に波及することです。典型的にはこういう流れで起きます。Gemini が遅延する → アプリの FastAPI ワーカーが応答待ちで詰まる → 空いているワーカーが枯渇する → Gemini と無関係な検索 API や画像配信までレスポンスが返らなくなる → ユーザーから見るとサイト全体が落ちたように見える。いわゆる「カスケード障害」です。
+
+私がやっていた最初の実装は、まさにこの状態でした。`try / except` でエラーは拾っていましたが、失敗しても即座に諦めず、5 回までリトライするようになっていたのです。Gemini が重い時に全ユーザーが同時に 5 回ずつリトライを投げるため、雪だるま式に負荷が膨らんで、結果として本来なら 3 分で回復したはずの一時的な揺らぎが 20 分級の全面障害に化けました。Cloudflare のダッシュボードで見ると、CPU は 10% 程度なのに上流への接続数が上限に達して、後続のリクエストがすべてタイムアウトに倒れていく、という絵が克明に残っています。
+
+耐障害性設計が目指すべきゴールは「失敗しないこと」ではありません。「**失敗したときに被害を小さく閉じ込めること**」「**一部の機能が落ちても残りのサービスを継続させること**」です。順に実装していきましょう。
+
+## 設計の全体像 — 4 つのレイヤーを重ねる
+
+本番環境では、以下の 4 層を組み合わせて使うのが私の推奨です。層の順番が重要で、外側から内側の Gemini API に向けてリクエストが流れていきます。
+
+- **レイヤー 1（入り口）**: Bulkhead — 機能ごとにコネクションプールを分離し、一部の過負荷を隔離する
+- **レイヤー 2**: Circuit Breaker — 連続失敗を検知したら一定時間 API 呼び出しを止め、自動で半開状態に戻して回復を確認する
+- **レイヤー 3**: Retry with Exponential Backoff + Jitter — 429・一過性のネットワークエラーのみ、短時間の再試行で回復を狙う
+- **レイヤー 4（Gemini 直前）**: Fallback Chain — Pro → Flash → ローカルモデル → キャッシュ、の順に段階的に品質を落として応答を返す
+
+この 4 層は、それぞれ単独でも機能しますが、重ねることで初めて「部分的に機能が劣化するが全体は生きている」という理想的な状態を作れます。先に結論を書いてしまうと、最終的に私の環境では、Gemini 側で 30 分規模の部分障害が起きても、ユーザーから見える成功率は 98% を下回らなくなりました。Fallback が効いている分、応答品質は若干落ちますが、ユーザーの離脱は大きく減りました。
+
+## レイヤー 1: Bulkhead — 機能ごとに専用の枠を持つ
+
+Bulkhead（船の防水区画）は、Gemini を呼ぶ機能ごとに別々のリソースプールを割り当てるパターンです。私がやっていた失敗は、全機能で同じ `httpx.AsyncClient` のコネクションを共有していたことでした。これだと、重いレポート生成が Gemini を長時間占有すると、軽量なチャット機能まで巻き込まれます。
+
+Python の `asyncio.Semaphore` を機能ごとに持つだけで、最低限の Bulkhead になります。
+
+```python
+# 解決するもの: 重い機能（レポート生成）が Gemini のコネクションを占有し、
+# 軽量機能（チャット応答）まで待たされるのを防ぐ。
+import asyncio
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable, TypeVar
+
+T = TypeVar("T")
+
+@dataclass
+class Bulkhead:
+    """機能ごとに同時実行数の上限を持つ、シンプルな Bulkhead 実装。"""
+    name: str
+    max_concurrent: int
+    _semaphore: asyncio.Semaphore = field(init=False)
+    rejected: int = 0
+    accepted: int = 0
+
+    def __post_init__(self) -> None:
+        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+
+    async def run(self, fn: Callable[[], Awaitable[T]]) -> T:
+        # 同時実行枠に空きがなければ即座に失敗させる（= 待たせない）
+        if self._semaphore.locked():
+            self.rejected += 1
+            raise BulkheadFullError(
+                f"bulkhead '{self.name}' is full "
+                f"(max={self.max_concurrent}, rejected={self.rejected})"
+            )
+        async with self._semaphore:
+            self.accepted += 1
+            return await fn()
+
+
+class BulkheadFullError(RuntimeError):
+    pass
+
+
+# 機能ごとに独立したプールを用意する
+BULKHEADS = {
+    "chat":    Bulkhead("chat",    max_concurrent=30),  # 軽量・高頻度
+    "summary": Bulkhead("summary", max_concurrent=10),  # 中程度
+    "report":  Bulkhead("report",  max_concurrent=3),   # 重い・低頻度
+}
+```
+
+ここでのポイントは 2 つです。まず、**プールが満杯なら即座に失敗させる**こと。待たせてしまうとそのリクエスト自身がキューに溜まって、結局ワーカーを食います。次に、**機能ごとに上限を変える**こと。私の環境では、チャットは 30、レポート生成は 3 に絞ることで、重い処理が全体に波及するのを防げるようになりました。
+
+期待する挙動としては、チャットに 100 件同時アクセスがあっても、レポート生成枠の 3 は確保されたまま、チャット側が 70 件の `BulkheadFullError` を返す形になります。ユーザー体験上は、チャットが一部失敗するだけで済み、レポート生成には影響しません。これが「障害を局所化する」ということです。
+
+### Bulkhead のサイズをどう決めるか
+
+よく聞かれるのが「`max_concurrent` をどう決めればいいか」です。私は以下の式を目安にしています。
+
+- **上限 = 1 リクエストの平均応答時間（秒） × 目標 QPS × 安全係数 1.3**
+- **かつ、アプリサーバーの全機能の合計が、ワーカー数の 80% を超えないようにする**
+
+例えばレポート生成が 10 秒かかり、目標 2 QPS なら `10 × 2 × 1.3 = 26`。ただし、ワーカーが 32 なら、この 1 機能で 26 を占有するのは危険なので、実際には半分の 13 に抑えて、超過はキャッシュやキューに流します。「**数学的な最適値より、他機能を絞り殺さない値**」のほうが運用上は正解、というのが経験則です。
+
+## レイヤー 2: Circuit Breaker — 落ちている API に投げ続けない
+
+Circuit Breaker は、連続失敗を検知したら一定時間 API 呼び出し自体を止めてしまうパターンです。電気回路のブレーカーと同じ発想で、故障が明らかな時にこれ以上負荷をかけない、という守りの仕組みです。
+
+状態は 3 つあります。
+
+- **CLOSED**: 通常状態。API を呼び出す。失敗がしきい値を超えたら OPEN へ
+- **OPEN**: 遮断状態。API を呼ばず即座に失敗を返す。一定時間経過後に HALF_OPEN へ
+- **HALF_OPEN**: 様子見状態。1 リクエストだけ試し、成功したら CLOSED へ、失敗したら再び OPEN へ
+
+実装で一番大切なのは、**HALF_OPEN 状態で複数リクエストを同時に通さない**ことです。ここで複数通してしまうと、まだ回復していない API に対して再び集中砲火を浴びせることになります。
+
+```python
+# 解決するもの: Gemini が長時間 503 を返している状況で、
+# こちら側が延々とリクエストを投げ続けて相手の回復を遅らせるのを防ぐ。
+import time
+import asyncio
+from enum import Enum
+from dataclasses import dataclass, field
+
+class State(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+@dataclass
+class CircuitBreaker:
+    name: str
+    failure_threshold: int = 10       # 連続失敗がこの値を超えたら OPEN
+    reset_timeout_sec: float = 30.0   # OPEN からこの秒数経過で HALF_OPEN
+    state: State = State.CLOSED
+    _failure_count: int = 0
+    _opened_at: float = 0.0
+    _half_open_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 監視用カウンタ
+    total_opened: int = 0
+    total_requests_rejected: int = 0
+
+    async def call(self, fn):
+        now = time.monotonic()
+        # OPEN 状態なら、経過時間を見て HALF_OPEN に遷移
+        if self.state == State.OPEN:
+            if now - self._opened_at < self.reset_timeout_sec:
+                self.total_requests_rejected += 1
+                raise CircuitOpenError(f"circuit '{self.name}' is OPEN")
+            self.state = State.HALF_OPEN
+
+        # HALF_OPEN は 1 リクエストずつしか通さない（ここが肝）
+        if self.state == State.HALF_OPEN:
+            async with self._half_open_lock:
+                return await self._try_and_update(fn)
+
+        return await self._try_and_update(fn)
+
+    async def _try_and_update(self, fn):
+        try:
+            result = await fn()
+        except Exception:
+            self._failure_count += 1
+            if self._failure_count >= self.failure_threshold:
+                self.state = State.OPEN
+                self._opened_at = time.monotonic()
+                self.total_opened += 1
+            raise
+        # 成功したら CLOSED に戻し、カウンタをリセット
+        self.state = State.CLOSED
+        self._failure_count = 0
+        return result
+
+
+class CircuitOpenError(RuntimeError):
+    pass
+```
+
+このコードを入れた後、深夜の Gemini 遅延時間帯にどう変わったかというと、最初の 10 回の失敗で OPEN になった後、30 秒間は Gemini を呼ばなくなりました。その間のリクエストは即座に `CircuitOpenError` を返すので、ワーカーが詰まりません。30 秒後に HALF_OPEN で様子見して、Gemini が回復していれば CLOSED に戻る、という自律的な動きになります。
+
+**よくある設計ミス**として、`failure_threshold` を小さくしすぎるパターンがあります。3 に設定すると、たまたま連続で 429 を引いただけで OPEN になってしまい、本来は処理できたはずのリクエストまで落とします。私は最終的に 10 に上げました。Gemini の性質上、瞬間的に 3〜5 連続失敗は普通に起きます。逆に 50 まで上げると、障害を検知するまでに時間がかかりすぎて、Circuit Breaker の意味が薄れます。10〜15 が、私の感覚では実用域の中央です。
+
+### Circuit Breaker の状態を分散環境でどう扱うか
+
+Kubernetes で複数 Pod が走っている場合、各 Pod が独立した Circuit Breaker を持っていると、Pod A が OPEN で Pod B が CLOSED という「片肺運転」状態が生まれ、結局負荷がばらつきます。本番では以下のどちらかを選びます。
+
+- **A: プロセスローカルに持つ（各 Pod 独立）**: 実装が楽。Pod 数が少ないなら実用上問題ない
+- **B: Redis など共有ストアに持つ**: 挙動が統一される。ただし Redis 自体が落ちると Circuit Breaker が無効化する
+
+私は 5 Pod 以下なら A、それ以上なら B を検討する、というゆるい基準で運用しています。A の場合は `failure_threshold` を Pod 数で割った値（全体で 30 の失敗を検知したければ、1 Pod あたり 6 など）にして、全体として早めに OPEN に倒れるよう調整します。
+
+## レイヤー 3: Retry with Exponential Backoff + Jitter
+
+429 や一時的なネットワークエラーは、短時間のリトライで回復することが多いです。ここで大切なのは、**ジッター（ランダム揺らぎ）を必ず入れる**ことです。
+
+全クライアントが同じ間隔でリトライすると、1 秒後・2 秒後・4 秒後…にリクエストが同期してしまい、Gemini 側から見ると規則的な波が押し寄せる形になって回復を妨げます。ジッターを入れると、クライアントごとにリトライタイミングがばらけ、負荷が平坦になります。AWS のアーキテクチャブログで詳細に議論されている「Full Jitter」戦略がほぼそのまま当てはまります。
+
+```python
+# 解決するもの: 全クライアントが同じ間隔でリトライすることで生まれる
+# 「同期爆発」を防ぎ、Gemini 側の回復を妨げないようにする。
+import asyncio
+import random
+
+async def retry_with_jitter(
+    fn,
+    *,
+    max_retries: int = 3,
+    base_sec: float = 0.5,
+    max_sec: float = 8.0,
+    retry_on=(429, 500, 502, 503, 504),
+):
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await fn()
+        except HttpStatusError as e:
+            last_exc = e
+            if e.status_code not in retry_on:
+                raise  # 400 や 401 は即座に諦める
+            if attempt == max_retries:
+                raise
+            # Full jitter: 0 〜 backoff の範囲でランダム
+            backoff = min(base_sec * (2 ** attempt), max_sec)
+            sleep_sec = random.uniform(0, backoff)
+            await asyncio.sleep(sleep_sec)
+    raise last_exc  # unreachable
+
+
+class HttpStatusError(RuntimeError):
+    def __init__(self, status_code: int, message: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+```
+
+細かい点ですが、**リトライ対象のステータスコードをホワイトリストで明示する**ことが重要です。400（Bad Request）をリトライしても永遠に 400 が返ってくるだけで、無駄にトークンも時間も食います。401・403 も同様です。私は上のコードのように 429 と 5xx のみリトライ対象にしています。
+
+もう一つ、**Circuit Breaker と Retry は同じ層で使わない**ように気をつけてください。Retry をしながら Circuit Breaker に入ると、リトライ回数がカウンタを押し上げて不必要に OPEN 状態を誘発します。私の構成では、Retry は Circuit Breaker の「内側」で、単一の API コールの粒度で回しています。`call_with_fallback → bulkhead.run → breaker.call → retry_with_jitter → tier.call` という入れ子の順が、経験上いちばん事故が少ないです。
+
+## レイヤー 4: Fallback Chain — Pro が無理なら Flash、それも無理ならキャッシュ
+
+ここが本記事の核心です。Gemini 2.5 Pro が OPEN 状態でも、Flash は生きていることが多いです。Flash も落ちているなら、事前計算済みの応答で代用する。完全に止まるよりは、品質を段階的に落としてでもサービスを返す方が望ましい、という思想です。
+
+```python
+# 解決するもの: Pro が落ちているときでも、品質を落としながら応答を返し続け、
+# ユーザーからは「遅いけど動いている」状態を維持する。
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional
+
+@dataclass
+class ModelTier:
+    name: str
+    call: Callable[[str], Awaitable[str]]
+    breaker: CircuitBreaker
+    bulkhead: Bulkhead
+
+async def call_with_fallback(
+    prompt: str,
+    tiers: list[ModelTier],
+    cache_lookup: Callable[[str], Optional[str]],
+) -> tuple[str, str]:
+    """成功した tier 名と応答を返す。全 tier が失敗したらキャッシュへ。"""
+    errors: list[str] = []
+    for tier in tiers:
+        try:
+            async def invoke() -> str:
+                return await retry_with_jitter(lambda: tier.call(prompt))
+            async def guarded() -> str:
+                return await tier.breaker.call(invoke)
+            result = await tier.bulkhead.run(guarded)
+            return tier.name, result
+        except (CircuitOpenError, BulkheadFullError, HttpStatusError) as e:
+            errors.append(f"{tier.name}: {type(e).__name__}")
+            continue
+
+    # 最後の砦: キャッシュ
+    cached = cache_lookup(prompt)
+    if cached is not None:
+        return "cache", cached
+    raise AllTiersFailed(errors)
+
+
+class AllTiersFailed(RuntimeError):
+    pass
+
+
+# 使い方の例
+tiers = [
+    ModelTier("pro",   call_pro,   breaker_pro,   BULKHEADS["report"]),
+    ModelTier("flash", call_flash, breaker_flash, BULKHEADS["summary"]),
+    ModelTier("local", call_local, breaker_local, BULKHEADS["chat"]),
+]
+
+source, answer = await call_with_fallback(prompt, tiers, redis_cache_lookup)
+# source == "flash" なら、Pro は落ちていたが Flash で代替できた、の意味
+```
+
+このパターンの本番運用で気をつけるのは、**どの tier で応答したかをレスポンスメタデータやログに必ず残す**ことです。ユーザー向け UI には出さなくても、監視で `source == "cache"` の比率が急増していれば、Pro と Flash の両方が長時間落ちている、という異常事態を検知できます。私は Datadog でこの比率をダッシュボードに出しています。
+
+もう一点、**fallback で品質が落ちることをクライアント側に知らせるかどうか**は事業判断です。チャット UI であれば「現在、簡易モードで応答しています」と薄く表示するのは親切です。一方、裏側のバッチ処理なら黙って fallback して OK です。
+
+### ローカルモデルを最終 tier に置くときの注意
+
+ローカル LLM（たとえば Gemma 3 や Llama 3.1 の 8B を GPU 付きサーバーで回す）を最下層に置くと、Gemini がまるごと落ちても何かは返せる状態になります。ただし、以下 2 点は要注意です。
+
+- **レイテンシが段違い**: Gemini Flash が 800ms で返すところ、ローカル 8B モデルは CPU 推論だと数秒〜十数秒かかる。タイムアウト設定を tier ごとに分ける必要がある
+- **品質の差をクライアントに伝える**: ローカル応答は体感で明らかに質が落ちる。「この応答は簡易モードで生成されています」のような注記を添える
+
+Gemma をローカルで動かす具体的な手順は、[Gemma 4 ローカル実行 × ゼロコスト AI アプリ構築ガイド](/articles/gemini-updates/gemma-4-local-execution-zero-cost-app)で詳しく扱っています。合わせて読むと fallback tier の選定が具体的になると思います。
+
+## Graceful Degradation — 最後の砦はキャッシュ
+
+すべての tier が落ちているときに返すものとして、Redis や Cloudflare KV のキャッシュを活用します。ただし、単なる「完全一致キャッシュ」では、少しでもプロンプトが違えば効かず、実戦ではほとんど当たりません。
+
+私が使っているのは **セマンティックキャッシュ** と **テンプレートキャッシュ** のハイブリッドです。
+
+- **セマンティックキャッシュ**: プロンプトの embedding 類似度が 0.95 以上なら同義とみなす
+- **テンプレートキャッシュ**: `"商品 {X} の魅力を教えて"` のように変数部を正規化し、テンプレート部分でヒットさせる
+- **デフォルト応答**: 上記で引っかからない時の最終砦。機能ごとに「今システムが混雑しており、簡易応答を返しています」のような固定文を返す
+
+セマンティックキャッシュについては、[Gemini API 向け Redis セマンティックキャッシュ実装ガイド](/articles/gemini-api/gemini-api-redis-semantic-cache-guide) で詳しく扱っています。この記事と組み合わせて使うと効果的です。
+
+デフォルト応答を用意しておくことの価値は、障害時に初めて身に染みて分かります。「**5xx を返すより、やや的外れでも何か返す**」方が、ユーザーの離脱率は低くなるというのが、私の運用実績での結論です。ここが「技術的に正しい」と「事業的に正しい」が分岐する箇所でもあります。
+
+## 本番導入でよくある 4 つの設計ミス
+
+ここからは、私自身が踏んだ（あるいは他の開発者の相談を受けて見つけた）典型的な失敗例を 4 つ紹介します。
+
+### ミス 1: Bulkhead を入れずに Circuit Breaker だけ導入する
+
+Circuit Breaker は「Gemini が落ちたこと」を検知して止めてくれますが、「**こちらのワーカーが枯渇すること**」は防げません。重い処理が全ワーカーを占有している間は、Circuit Breaker が反応する前に自社アプリが詰まります。Bulkhead で事前に機能ごとの枠を切っておくことが、Circuit Breaker の前提条件です。
+
+### ミス 2: フォールバックモデルのプロンプトを Pro 用のまま流用する
+
+Pro 向けに最適化した長文プロンプト（Few-shot 例付き、System Instructions 込み）をそのまま Flash に投げると、Flash の性能では期待した結果が出ないことがあります。私は最終的に、tier ごとに異なる `build_prompt(tier, user_input)` を使うようにしました。Flash 用は Few-shot を 2 個に削り、指示文を短くします。ローカルモデル用はさらに簡素化します。
+
+もし DSPy を使っているなら、モデルごとのプロンプト最適化はそれ自体が 1 本の記事になる深さがあります。このあたりは[Gemini × DSPy プロンプト自動最適化ガイド](/articles/gemini-advanced/gemini-dspy-prompt-auto-optimization-guide)の内容と併読するのがおすすめです。
+
+### ミス 3: Circuit Breaker の状態をプロセスローカルだけで持つ
+
+Kubernetes で複数 Pod が走っている場合、各 Pod が独立した Circuit Breaker を持っていると、Pod A が OPEN で Pod B が CLOSED という状態が生まれ、結局負荷がばらつきます。本番では Redis などの共有ストアに状態を持たせる、あるいは各 Pod のしきい値を小さく保つ、のどちらかを選びます。
+
+私は小規模サービスなら各 Pod ローカルで良いと思っています。共有ストアに寄せると「ストアが落ちたら Circuit Breaker 自体が機能しない」という皮肉な状態になるので、シンプルさとのトレードオフです。この判断は[Gemini API の本番アーキテクチャパターン 2026](/articles/gemini-advanced/gemini-api-production-architecture-patterns-2026)でも触れているので、アーキテクチャ全体を考えるときに参考になるはずです。
+
+### ミス 4: タイムアウトを層ごとに合わせない
+
+これは地味ですが、かなり多い失敗です。Gemini SDK のデフォルトタイムアウトが 60 秒、FastAPI 側のリクエストタイムアウトが 30 秒、上流の Cloudflare が 100 秒、というように**層ごとに違う値**が設定されていると、どこでタイムアウトするかが不定になります。
+
+原則として、**内側の層ほど短いタイムアウトにする**のが安全です。以下の順序で短くしていきます。
+
+- Gemini SDK タイムアウト: 20 秒
+- Retry 1 回あたりの上限: 20 秒（上と同じ）
+- Circuit Breaker 経由の合計上限: 25 秒（Retry × 1.5 程度）
+- FastAPI の全体タイムアウト: 30 秒
+- CDN / LB タイムアウト: 35 秒以上
+
+こうしておくと、Gemini が遅延したときに、Gemini SDK が 20 秒でちゃんと諦め、FastAPI はまだ 10 秒の余裕があって Fallback に回せます。一方、Gemini SDK が 60 秒、FastAPI が 30 秒だと、FastAPI 側のタイムアウトが先に来て、Gemini の応答が途中で打ち切られるのに Fallback する時間もない、という最悪の形になります。
+
+## OpenTelemetry によるオブザーバビリティ統合
+
+耐障害性パターンは「手段」であり、「効いているかどうか」を測るためにはオブザーバビリティが必要です。私は OpenTelemetry を使って、tier ごとに 3 種類のシグナルを計装しています。呼び出し回数のカウンタ、レイテンシのヒストグラム、Circuit Breaker の状態ゲージ（CLOSED=0 / HALF_OPEN=1 / OPEN=2）の 3 つです。この上に、前セクションで挙げた SLI（エンドツーエンド成功率、Fallback 発動率など）はメトリクスバックエンド（Grafana / Datadog）側で計算します。アプリコードの中で再計算するとバグの温床になるためです。
+
+```python
+# 解決するもの: tier ごとの挙動を可視化し、「どの tier がトラフィックを捌いているか・
+# どのくらいの頻度で失敗しているか」をリアルタイムで把握できる状態にする。
+from opentelemetry import metrics
+import time
+
+meter = metrics.get_meter("gemini.resilience")
+tier_calls = meter.create_counter("gemini.tier.calls", unit="1")
+tier_errors = meter.create_counter("gemini.tier.errors", unit="1")
+tier_latency = meter.create_histogram("gemini.tier.latency_ms", unit="ms")
+
+async def instrumented_call(tier, prompt):
+    start = time.monotonic()
+    attrs = {"tier": tier.name}
+    tier_calls.add(1, attrs)
+    try:
+        return await tier.call(prompt)
+    except Exception:
+        tier_errors.add(1, attrs)
+        raise
+    finally:
+        tier_latency.record((time.monotonic() - start) * 1000, attrs)
+```
+
+特に Circuit Breaker の状態ゲージは、意外と効果的な「隠れた主役」です。Pro tier のエラー率と並べてプロットすると、「いつ breaker が OPEN になり、どのくらいの時間で復帰したか」がダッシュボード 1 枚で把握できます。これを入れる前は障害レビューで 10 分ログを追う必要がありましたが、今は 10 秒で答えが出せるようになりました。
+
+## 本番投入前のテスト — Chaos エンジニアリングの軽量版
+
+正直な話、実際に障害を起こしてテストしていない耐障害性パターンは、「たぶん効くはず」という祈りと区別がつきません。本番インシデントに頼らずテストする方法を 3 つ紹介します。
+
+- **ステージング環境でのフォルトインジェクション**: Gemini クライアントをラップして、20% の確率で `HttpStatusError(503)` を投げるバージョンを作る。これで負荷テストを回し、Fallback chain が想定通り発火するかを確認する
+- **Breaker の単体テスト**: `breaker.call` に必ず例外を投げる関数を渡し、`failure_threshold` 回で CLOSED → OPEN、`reset_timeout_sec` 経過後に HALF_OPEN、成功で CLOSED に戻る、という状態遷移を全部テストする
+- **Chaos Week（四半期に 1 回）**: 低トラフィック帯を選んで、Pro tier から強制的に `CircuitOpenError` を返すフィーチャーフラグを 10 分間 ON にする。エンドツーエンド成功率が 95% を下回れば、Fallback chain のどこかに穴がある
+
+最初の 2 つは私は CI で回しています。3 つ目は手動で 3 ヶ月に 1 度くらい実施しています。初めて Chaos 演習をやると、ほぼ必ず「想定通りに動いていない何か」が見つかります。タイムアウトの入れ子が間違っていたり、ログ行が実は出ていなかったり、ダッシュボードが 5 分遅延していたり、です。本番インシデントでこれらを発見するより、演習で発見する方が何倍も安いです。
+
+## 本番導入の推奨順序 — 私が実際にやった手順
+
+理論と順序は別物です。「どれから入れればいいか」という問いで止まる方が多いので、私が live サービスに適用した実際の順序をそのまま共有します。
+
+### Week 1: 介入の前にまず観測
+
+耐障害性ロジックを入れる前に、計装だけ入れます。処理時間、機能別カウンタ、tier 別のエラー内訳など、ベースラインを取ります。ベースラインがないと後で「効いたかどうか」が判断できません。私はこの週に「Gemini エラーの 85% が 1 機能から出ている」ことに気付き、Bulkhead の対象を絞れました。
+
+### Week 2: 一番重い機能に Bulkhead
+
+レポート生成に `asyncio.Semaphore(3)` だけ入れます。他には何も変えません。1 週間観測する間に、Bulkhead 拒否カウンタから「いつ詰まっているか」が見えてきます。私の場合、朝 15 分のバッチジョブと重なる時間帯だけに詰まりが集中していることが分かり、その重なり自体を解消したことで、後続パターンを入れる前に大きな改善が得られました。
+
+### Week 3: Pro tier のみに Circuit Breaker
+
+まず Pro tier だけに `failure_threshold=10, reset_timeout_sec=30` の breaker を付けます。Flash には意図的に付けません。片側だけ保護した状態で 10 日間観測することで、「breaker 付きの挙動」と「breaker なしの挙動」を比較できます。その後で Flash 側にも breaker を追加します。
+
+### Week 4: Breaker の内側に Retry
+
+Retry を breaker の外側に置くのは、既述の通りよくある失敗です。私の推奨順は、breaker を先、retry はその内側、です。この順で入れないと、retry の増幅効果で breaker が想定より頻繁に OPEN に倒れ、寝る時間が削れます。
+
+### Week 5: Fallback chain
+
+ここが最大のコード変更で、`ModelTier` 抽象と `call_with_fallback` の導入です。ここで注意すべきはむしろプロンプト側のリスクで、Flash 用プロンプトを本番入力で十分にテストしないと、「技術的には成功しているが、内容が明らかに劣化している」状態が 1 週間続いてしまいます。軽い evaluation harness を入れて、tier 間の出力比較を走らせるのがおすすめです。
+
+### Week 6: 最後の砦としてのキャッシュ
+
+セマンティックキャッシュは最後に入れます。効果は大きいですが、類似度しきい値の調整が必要なためです。しきい値がきつすぎると本番ではまったくヒットせず、緩すぎると無関係な回答を返します。私は A/B テストを 1 週間回して、コサイン類似度 0.95 に落ち着きました。
+
+この順で入れる最大のメリットは、**各ステップで「単独の効果」が測れる**ことです。何かが悪化した時に原因が特定できるので、全部一気に入れて後からデバッグする、という茨の道を回避できます。
+
+## 運用時に見るべきメトリクス
+
+耐障害性の仕組みは、入れたら終わりではなく、常に「ちゃんと効いているか」を測り続ける必要があります。私がダッシュボードに必ず載せている指標は 5 つです。
+
+- **Circuit Breaker 状態遷移回数**（CLOSED → OPEN）: 1 時間に何回起きたか
+- **Bulkhead 拒否率**: 機能別に `rejected / (rejected + accepted)` の比率
+- **Fallback 発動率**: 全応答のうち、Pro 以外の tier で返した割合
+- **Cache Hit 比率**: セマンティック/テンプレート/デフォルトそれぞれ
+- **エンドツーエンド成功率**: ユーザーから見て「最終的に何か応答が返った」割合（これが最重要）
+
+特に最後の「エンドツーエンド成功率」は、Gemini 側の成功率とは違うということに注意してください。Gemini が 20% 落ちていても、Fallback が効いていればユーザーの体感成功率は 99% 以上を維持できます。これが設計の目的そのものです。
+
+逆に、**Fallback 発動率が常に 30% を超えている**ような状態は、「一見成功しているように見えるが、実はほとんど Flash で回っている」という隠れ障害のサインです。Pro の Circuit Breaker が頻繁に OPEN している可能性が高いので、その場合は Pro 側のクォータやリージョン設定を見直します。
+
+耐障害性まわりでもう一歩踏み込んで学びたい方には、マイクロサービス設計の古典ですが『[マイクロサービスアーキテクチャ 第2版（Sam Newman 著）](https://www.amazon.co.jp/dp/4814400373/?tag=pinocchio-22)』が、Circuit Breaker・Bulkhead・Timeout の思想的な背景を理解するのに非常に役立ちました。Gemini 特有の話ではありませんが、分散システムの観点から AI API の扱い方が一段深く見えてきます。
+
+## まとめ — 今日の一歩目
+
+ここまで読んでくださった方が、明日月曜の朝にまず手を動かすとしたら、**Bulkhead を 1 機能分だけ入れる**のを強くおすすめします。全部を一度に入れようとすると、既存コードとの整合性で疲れて結局進みません。まずは一番重い機能（私の場合はレポート生成）に `asyncio.Semaphore(3)` を入れて、その挙動を 1 週間見てみる。これだけでも、障害時の被害範囲が目に見えて小さくなるはずです。
+
+そこから Circuit Breaker → Retry → Fallback Chain の順に積んでいけば、3〜4 週間で「**Gemini が落ちてもサービスは落ちない**」状態まで到達できます。AI サービスを本番で運用する醍醐味は、こうした地味な守りの設計が実は最も差別化になる、というところにあると感じています。ユーザーにとっては「Gemini が使われていること」ではなく「サービスがちゃんと応答すること」が価値の源泉なので、そこを守るための設計は、機能追加と同じくらい投資に値する領域です。
