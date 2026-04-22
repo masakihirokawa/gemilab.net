@@ -1,0 +1,188 @@
+---
+title: "Gemini Batch API のジョブが進まない・失敗する時の原因切り分けガイド"
+slug: "gemini-batch-api-stuck-job-troubleshooting"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-22T09:15"
+author: "Gemini Lab"
+description: "Gemini Batch API のジョブが QUEUED や RUNNING のまま進まない、あるいは FAILED で返ってくる時の原因切り分けと、実運用で使えるフォールバック設計を解説します。"
+tags: ["Gemini API", "Batch API", "troubleshooting", "非同期処理", "運用"]
+---
+
+「30分で終わるはずの Batch ジョブが2時間経っても Completed にならない」— Gemini Batch API を本番運用で使い始めた方の多くが、一度はぶつかる壁ではないでしょうか。私自身、月次のレポート生成パイプラインに Batch API を組み込んだ際、朝に投入したジョブが夕方になっても QUEUED のままで、結局その日の納品に間に合わなかった苦い経験があります。
+
+通常のリクエストと違って Batch API は SLA が緩く、非同期でステータスをポーリングする設計のため、どこで詰まっているのかが見えにくいのが厄介なところです。この記事では、ジョブが進まない・失敗するパターンを状態ごとに分解し、すぐに手を動かせる切り分け手順と、再発を防ぐためのフォールバック設計までを整理します。
+
+## まずは 3 つのステータスを読み分ける
+
+Batch ジョブは大きく分けて `QUEUED` / `RUNNING` / `SUCCEEDED` / `FAILED` / `CANCELLED` の状態を遷移します。「進まない」と感じる状況の多くは、実際には QUEUED か RUNNING のいずれかで滞留しています。まずはどちらで止まっているかを正確に把握しましょう。
+
+```python
+# 何を確認するコードか:
+# Batch ジョブの現在状態・滞留時間・失敗理由をまとめて表示する
+import os
+from datetime import datetime, timezone
+from google import genai
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def inspect_batch(name: str):
+    job = client.batches.get(name=name)
+    created = job.create_time
+    elapsed = datetime.now(timezone.utc) - created
+    print(f"name    : {job.name}")
+    print(f"state   : {job.state.name}")
+    print(f"created : {created.isoformat()}")
+    print(f"elapsed : {elapsed}")
+    if job.error:
+        print(f"error   : {job.error.message}")
+
+inspect_batch("batches/xxxxxxxx")
+# 期待される出力例:
+# state   : BATCH_STATE_RUNNING
+# elapsed : 1:45:23.120000
+```
+
+`elapsed` が数十分以内なら想定内です。Google の公式ドキュメントでは最大 24 時間で完了することが SLA として示されており、通常の負荷なら数分〜数十分に収まります。90 分を超えて QUEUED のままなら、次のいずれかの問題を疑います。
+
+## QUEUED のまま進まない時に疑うべきこと
+
+### 同時実行ジョブ数の上限に達している
+
+意外と見落とされがちなのが、プロジェクトごとに課されている同時実行ジョブ数の制限です。無料枠や立ち上げ直後のプロジェクトでは、RUNNING になれるジョブがごく少数に制限されていて、先に投入したジョブが完了するまで次のジョブは QUEUED のまま待機します。
+
+`list` API で「いま走っているジョブ」を並べて確認します。
+
+```python
+# 何を確認するコードか:
+# 自分のプロジェクト内で動いている（または待機中の）全ジョブを一覧化し、
+# どこで滞留しているかを把握する
+for b in client.batches.list(page_size=50):
+    print(f"{b.state.name:25} {b.name}  created={b.create_time}")
+# 出力例:
+# BATCH_STATE_RUNNING        batches/aaa  created=2026-04-22T08:10:12+00:00
+# BATCH_STATE_QUEUED         batches/bbb  created=2026-04-22T08:11:47+00:00
+# BATCH_STATE_QUEUED         batches/ccc  created=2026-04-22T08:12:03+00:00
+```
+
+RUNNING が上限に張り付いているのが見えたら、不要なジョブを `cancel` するか、RUNNING の完了を待つ以外に手はありません。複数ジョブを同時投入する設計は避け、ジョブキューを自前で持って順次投入するほうが運用は安定します。
+
+### モデルの指定ミスで受理だけされている
+
+Batch API は投入時のバリデーションが緩く、存在しないモデル名や、Batch 非対応のモデルを指定しても投入時点ではエラーにならず、QUEUED のままフェードアウトすることがあります。投入前に必ずモデル名をリテラルで定義し、スペルミスや末尾スペースに注意しましょう。
+
+```python
+# 何を解決するコードか:
+# 投入するモデル名のタイポ・末尾スペースを事前に検出する
+SUPPORTED = {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"}
+
+def guard_model(model: str) -> str:
+    normalized = model.strip()
+    if normalized not in SUPPORTED:
+        raise ValueError(f"Unsupported model for batch: {model!r}")
+    return normalized
+```
+
+## RUNNING のまま進まない時に疑うべきこと
+
+### 入力ファイルの形式崩れ
+
+JSONL で投入した入力ファイルの末尾に空行が混入していたり、1 行の JSON に改行が含まれていると、ジョブ全体が RUNNING のまま進行しないケースがあります。ログには明示的に出ないため、投入前の検証が重要です。
+
+```python
+# 何を解決するコードか:
+# JSONL 入力ファイルの各行が単一行 JSON として有効かを事前チェックする
+import json
+from pathlib import Path
+
+def validate_jsonl(path: str) -> int:
+    valid = 0
+    for i, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            raise ValueError(f"line {i}: empty line not allowed in JSONL input")
+        try:
+            json.loads(line)
+            valid += 1
+        except json.JSONDecodeError as e:
+            raise ValueError(f"line {i}: invalid JSON ({e.msg})")
+    return valid
+
+print(f"OK: {validate_jsonl('requests.jsonl')} records")
+```
+
+### 安全フィルタで大量ブロックが発生している
+
+入力に安全フィルタに抵触する内容（医療相談、個人情報を含む生ログ、ユーザー生成コンテンツなど）が混ざっていると、1 件ずつブロック処理が走り、ジョブ全体の進行が極端に遅くなります。ユーザー生成コンテンツを投入する場合は、事前に `HarmCategory` の閾値を緩める設定を検討してください。ただし、緩めすぎると出力の安全性が損なわれるため、私は「社内向け用途は緩め、外部向けは標準のまま」を基準に使い分けています。
+
+## FAILED で返ってきた時の読み方
+
+ジョブが失敗した場合、`error.message` に一次情報が入っています。よく遭遇するメッセージと対処を整理します。
+
+- **`INVALID_ARGUMENT: input file too large`**: 1 ファイルあたりのサイズ上限（現行は約 2GB）を超えています。チャンク分割して複数ジョブに分けてください。
+- **`RESOURCE_EXHAUSTED`**: プロジェクトのクォータを超過しています。`/cloud/resource-manager` でクォータ上限を確認し、必要なら引き上げ申請を出します。Batch は通常の API と別のクォータ枠を持つため、通常 API が動いていても Batch だけ失敗することがあります。
+- **`UNAUTHENTICATED`**: API キーまたはサービスアカウントの権限が不足しています。特に Vertex AI 経由で使う場合、`aiplatform.batchPredictionJobs.create` 権限が必要です。
+- **`PERMISSION_DENIED` + GCS バケットパス**: 入出力に指定した GCS バケットへの read/write 権限がサービスアカウントにないケースです。IAM ロール `roles/storage.objectAdmin` をプロジェクトサービスアカウントに付与してください。
+
+より詳細なエラー別の対処は [Gemini API エラー一覧と対処ガイド](/articles/gemini-api/gemini-api-error-fix-guide) や [Gemini API のクォータ・429 エラー対処ガイド](/articles/gemini-api/gemini-api-quota-429-error-troubleshooting) も合わせて参照すると立体的に理解できます。
+
+## 24 時間を超えた時に備えるフォールバック設計
+
+Batch API の SLA は「24 時間以内の完了」です。つまり運用側では「24 時間経っても終わらない場合のフォールバック」を前提に設計する必要があります。私は以下の 3 層に分けて組んでいます。
+
+### Layer 1: 監視ポーリング
+
+ポーリング間隔は最初の 5 分間は 30 秒、以降は 5 分間隔でバックオフさせます。短すぎる間隔は API レート制限を食い潰すため避けましょう。
+
+```python
+# 何を解決するコードか:
+# 進捗を監視しつつ、閾値を超えたら通知・フォールバックを発火する
+import time
+
+SOFT_LIMIT = 60 * 60          # 1 時間を超えたら警告
+HARD_LIMIT = 24 * 60 * 60     # 24 時間を超えたら強制フォールバック
+
+def watch(name: str, notifier):
+    started = time.time()
+    interval = 30
+    while True:
+        job = client.batches.get(name=name)
+        state = job.state.name
+        elapsed = time.time() - started
+        if state in {"BATCH_STATE_SUCCEEDED", "BATCH_STATE_FAILED", "BATCH_STATE_CANCELLED"}:
+            return job
+        if elapsed > SOFT_LIMIT:
+            notifier.warn(f"{name} elapsed={elapsed:.0f}s still {state}")
+        if elapsed > HARD_LIMIT:
+            client.batches.cancel(name=name)
+            notifier.error(f"{name} hit hard limit, cancelled")
+            return None
+        time.sleep(interval)
+        interval = min(interval * 2, 300)  # 最大 5 分間隔
+```
+
+### Layer 2: オンデマンド切り替え
+
+24 時間を超えた場合は、同じ入力を通常の `generate_content` に流し直して即時応答で埋め合わせる経路を用意しておくと、納期崩壊を防げます。コストは 2 倍になりますが、事業への影響と比べれば十分許容範囲です。
+
+### Layer 3: 入力側の分割設計
+
+そもそも 1 ジョブあたりのレコード数を抑えておくと、詰まった時の被害が小さくなります。私の運用では 1 ジョブ 5,000 件以内、1 日あたり最大 3 ジョブまでに抑え、障害発生時も再投入が数時間で完了するように設計しています。
+
+## 運用で効いてくる監視項目
+
+Batch まわりのトラブルが「なぜ動かないのか分からない」に発展する最大の理由は、デフォルトのログが薄いからです。私はパイプラインに Batch を組み込む際、必ず 4 つの情報を自前でログに残すようにしています。提出時に返ってきた `name`、提出のタイムスタンプ、状態遷移のたびの経過時間、そして失敗時の `error.message` の冒頭 100 文字です。たったこれだけでも、後から調査する時に「ジョブのどの段階で詰まったか」が一目で判断できるようになります。
+
+監視基盤側で気をつけたいのは、ログがサンプリングされないようにすることです。状態遷移ログは件数が多くないのでサンプリング対象に含めてしまうと、ちょうど欲しいタイミングの 1 行が落ちてしまい「記録がない」状態になりがちです。Batch 関連ログは無条件で保存するカテゴリに分けておくのがおすすめです。
+
+## 実際の障害分布
+
+過去 1 年の社内の Batch 関連障害を集計すると、原因の分布はかなり偏っています。最も多いのは同時実行ジョブ数の上限到達、次いで JSONL の形式崩れ、その次が GCS バケットの権限設定ミス。「Google 側のバックログで単に遅い」というケースは意外と少なく、体感では 1 割程度でした。つまり、詰まっている時にサポートチケットを切るより、先に手元で 3 つのチェックを回すほうが圧倒的に早く解決します。
+
+## まとめ
+
+Batch API が詰まったら、まず `inspect_batch` で状態と滞留時間を確認し、QUEUED ならプロジェクトの同時実行枠、RUNNING なら入力ファイルの妥当性、FAILED ならエラーメッセージの先頭から読むという順序で切り分けていくと、原因に最短で辿り着けます。
+
+明日の運用で最初に入れるなら、まずは「24 時間経っても終わらないジョブを検知してオンデマンドに切り替える」フォールバック経路の整備をおすすめします。Batch API はコスト 50% 減の魅力はありますが、非同期である以上、必ず同期の逃げ道を用意しておくほうが本番では安心です。
+
+関連記事として [Gemini Batch API 完全ガイド](/articles/gemini-api/gemini-batch-api) では正常系の使い方を、[Gemini API のリトライ設計パターン](/articles/gemini-api/gemini-api-error-handling-retry-patterns) では同期 API との組み合わせを解説していますので、あわせて読んでいただくとフォールバック経路の設計がしやすくなるはずです。

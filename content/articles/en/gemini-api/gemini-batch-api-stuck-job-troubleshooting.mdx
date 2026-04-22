@@ -1,0 +1,189 @@
+---
+title: "Diagnosing Stuck or Failed Jobs in the Gemini Batch API"
+slug: "gemini-batch-api-stuck-job-troubleshooting"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-22T09:15"
+author: "Gemini Lab"
+description: "A field guide to the Gemini Batch API: how to diagnose jobs stuck in QUEUED or RUNNING, how to read FAILED error messages, and how to design fallbacks that survive the 24-hour SLA."
+tags: ["Gemini API", "Batch API", "troubleshooting", "async", "production"]
+---
+
+"My Batch job should have finished in thirty minutes, but it's been two hours and it's still not Completed." If you've shipped anything non-trivial on the Gemini Batch API, you've probably had that afternoon. The first time it happened to me, I had a monthly report pipeline depending on the 50% batch discount, and the job I submitted in the morning was still QUEUED when the team needed the results. We missed the deadline and fell back to the on-demand API — at full price.
+
+Batch jobs are attractive because of the lower price point, but they come with a very different failure profile from synchronous requests. The SLA is loose, you're expected to poll for status, and when something goes wrong it often goes wrong silently. This guide walks through the specific checks I now run before assuming a job is actually stuck, and the fallback design that's kept my pipelines out of trouble since.
+
+## Start by reading the three states correctly
+
+A Batch job transitions through `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, and `CANCELLED`. Most of the "it's not moving" situations are really "it's sitting in QUEUED" or "it's sitting in RUNNING" — and the fixes are completely different. The first move is always to confirm which of the two you're in.
+
+```python
+# What this does:
+# prints current state, wall-clock age, and the failure reason (if any)
+import os
+from datetime import datetime, timezone
+from google import genai
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def inspect_batch(name: str):
+    job = client.batches.get(name=name)
+    created = job.create_time
+    elapsed = datetime.now(timezone.utc) - created
+    print(f"name    : {job.name}")
+    print(f"state   : {job.state.name}")
+    print(f"created : {created.isoformat()}")
+    print(f"elapsed : {elapsed}")
+    if job.error:
+        print(f"error   : {job.error.message}")
+
+inspect_batch("batches/xxxxxxxx")
+# Example output:
+# state   : BATCH_STATE_RUNNING
+# elapsed : 1:45:23.120000
+```
+
+Anything under roughly an hour is within normal variance. Google's published SLA is "within 24 hours"; in practice most jobs finish in minutes. If you're past ninety minutes in QUEUED, one of the cases below is probably in play.
+
+## If it's stuck in QUEUED
+
+### You've hit the concurrent-job limit
+
+This is the one people miss most often. Projects — especially newer ones or ones on the free tier — have a limited number of concurrently RUNNING batches. Any jobs submitted beyond that cap sit in QUEUED until a RUNNING job completes. There is no explicit error for this; the UI shows QUEUED as if it were a normal queue wait.
+
+Use `list` to see everything your project currently has in flight:
+
+```python
+# What this does:
+# enumerates every batch job visible to the project, so you can see
+# exactly how many slots are in use
+for b in client.batches.list(page_size=50):
+    print(f"{b.state.name:25} {b.name}  created={b.create_time}")
+# Example:
+# BATCH_STATE_RUNNING        batches/aaa  created=2026-04-22T08:10:12+00:00
+# BATCH_STATE_QUEUED         batches/bbb  created=2026-04-22T08:11:47+00:00
+# BATCH_STATE_QUEUED         batches/ccc  created=2026-04-22T08:12:03+00:00
+```
+
+If you see RUNNING pinned at the cap, your only options are to wait or `cancel` something unimportant. My rule of thumb now: never fire off batches in parallel. Keep an in-process queue that submits one at a time.
+
+### Silent acceptance of an invalid model
+
+The batch submission endpoint is lenient — it accepts requests even when the model name is misspelled or not actually supported by the batch path. The job gets created, sits in QUEUED, and quietly stalls. Guard against this before submission rather than trying to diagnose it after.
+
+```python
+# What this solves:
+# catches typos and trailing whitespace before you ever submit
+SUPPORTED = {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"}
+
+def guard_model(model: str) -> str:
+    normalized = model.strip()
+    if normalized not in SUPPORTED:
+        raise ValueError(f"Unsupported model for batch: {model!r}")
+    return normalized
+```
+
+## If it's stuck in RUNNING
+
+### Malformed JSONL input
+
+I've seen jobs sit in RUNNING indefinitely because the input file had a trailing blank line, or because one of the JSON records had an embedded newline and spanned two physical lines. Neither of these shows up as an error message. Validate the file before it leaves your machine.
+
+```python
+# What this solves:
+# rejects JSONL files that would cause silent hangs downstream
+import json
+from pathlib import Path
+
+def validate_jsonl(path: str) -> int:
+    valid = 0
+    for i, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            raise ValueError(f"line {i}: empty line not allowed in JSONL input")
+        try:
+            json.loads(line)
+            valid += 1
+        except json.JSONDecodeError as e:
+            raise ValueError(f"line {i}: invalid JSON ({e.msg})")
+    return valid
+
+print(f"OK: {validate_jsonl('requests.jsonl')} records")
+```
+
+### Safety filter grinding through blocked content
+
+If the inputs contain material the safety classifier flags heavily — medical queries, raw user-generated content, PII-bearing strings — each record goes through the block path individually and overall throughput falls off a cliff. If you're batching user-generated content, loosen the `HarmCategory` thresholds deliberately rather than letting the defaults throttle you. My preference is to keep defaults for anything user-facing and relax them only for internal analysis pipelines.
+
+## How to read a FAILED response
+
+When the job does fail, `error.message` is where the real information lives. The ones I see most often:
+
+- **`INVALID_ARGUMENT: input file too large`**: the input exceeds the ~2 GB per-file ceiling. Split it and submit as multiple jobs.
+- **`RESOURCE_EXHAUSTED`**: you've blown past a project quota. Check the Cloud console's quota page; batch has its own quota bucket separate from synchronous calls, so the synchronous API continuing to work doesn't mean you have batch headroom.
+- **`UNAUTHENTICATED`**: the API key or service account is missing permissions. On Vertex AI you specifically need `aiplatform.batchPredictionJobs.create`.
+- **`PERMISSION_DENIED` referencing a GCS path**: the service account can't read or write the input/output bucket. Add `roles/storage.objectAdmin` to the project's service account.
+
+For a fuller map of error codes and their fixes, see our [Gemini API error catalog](/en/articles/gemini-api/gemini-api-error-fix-guide), and for quota-specific guidance [the 429 troubleshooting guide](/en/articles/gemini-api/gemini-api-quota-429-error-troubleshooting) is worth reading alongside this one.
+
+## Designing for the 24-hour SLA
+
+The Batch API promises "completion within 24 hours," which means your production code has to assume that sometimes it won't. I layer the fallback in three parts.
+
+### Layer 1: polling with backoff
+
+Poll every 30 seconds for the first few minutes, then back off to five-minute intervals. Tight polling eats into your rate limits and doesn't help jobs finish faster.
+
+```python
+# What this solves:
+# keeps a watchful eye on job progress and pulls the ejection handle
+# when the wall-clock goes past your service's tolerance
+import time
+
+SOFT_LIMIT = 60 * 60          # warn after one hour
+HARD_LIMIT = 24 * 60 * 60     # force fallback after 24 hours
+
+def watch(name: str, notifier):
+    started = time.time()
+    interval = 30
+    while True:
+        job = client.batches.get(name=name)
+        state = job.state.name
+        elapsed = time.time() - started
+        if state in {"BATCH_STATE_SUCCEEDED", "BATCH_STATE_FAILED", "BATCH_STATE_CANCELLED"}:
+            return job
+        if elapsed > SOFT_LIMIT:
+            notifier.warn(f"{name} elapsed={elapsed:.0f}s still {state}")
+        if elapsed > HARD_LIMIT:
+            client.batches.cancel(name=name)
+            notifier.error(f"{name} hit hard limit, cancelled")
+            return None
+        time.sleep(interval)
+        interval = min(interval * 2, 300)
+```
+
+### Layer 2: on-demand failover
+
+Have a code path that re-submits the same inputs through synchronous `generate_content` when the hard limit trips. You'll pay double, but compared to missing a delivery that's a cheap insurance policy.
+
+### Layer 3: smaller batches
+
+The real defense is upstream. I cap jobs at five thousand records apiece and run no more than three a day. That way even if one gets wedged, re-running the work through the synchronous path is measured in hours, not days.
+
+## A note on observability
+
+The reason so many batch problems turn into "why isn't this moving" mysteries is that the default logging is thin. Whenever I add a batch step to a pipeline, I log four things: the batch `name` returned at submission time, the submission wall-clock timestamp, every state transition with its elapsed time, and the first hundred characters of `error.message` on failure. That log is cheap to produce and turns a three-hour debugging session into a two-minute glance at the dashboard.
+
+A practical trap to watch for: if your logging system rate-limits or samples, make sure state-transition logs are in an unsampled category. Nothing is worse than having the one log line you actually need dropped because the monitoring layer thought it was noise.
+
+## Why batches stall in practice
+
+If you boil the last few months of incidents I've seen down to causes, the ranking is consistent: hitting the concurrent-job cap is the single largest category, malformed JSONL is a close second, and permission misconfiguration on the GCS bucket is third. Pure "platform slowness" — where Google simply has a backlog — accounts for a surprisingly small share. That matters because it means most stalls are fixable on your side, and reaching for a support ticket too early will usually cost you more time than just running the checks above.
+
+## Closing thought
+
+Next time a Batch job looks stuck, the fastest path is: run `inspect_batch` to see the state and age, list siblings if it's QUEUED to check the concurrent cap, validate the JSONL if it's RUNNING, and read `error.message` from the top if it's FAILED.
+
+If you only have time to do one thing today, add the hard-limit fallback. The Batch API's 50% discount is real, but so is the need for a synchronous escape hatch, and the two work together far better than either does alone.
+
+For the happy path, our [complete Gemini Batch API guide](/en/articles/gemini-api/gemini-batch-api) walks through normal operation, and our [retry-pattern guide](/en/articles/gemini-api/gemini-api-error-handling-retry-patterns) pairs well with this one when you're wiring in the synchronous fallback.
