@@ -1,0 +1,499 @@
+---
+title: "Gemini API × Langfuse — A Production Playbook for LLM Observability"
+slug: "gemini-api-langfuse-llm-observability-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-23T19:45"
+author: "Gemini Lab"
+description: "A practical, production-grade guide to wiring Gemini API into Langfuse — tracing architecture, cost attribution, LLM-as-Judge on live traffic, PII masking, and sampling — with runnable code."
+tags: ["gemini-api", "langfuse", "observability", "production", "llm-ops", "tracing", "evaluation", "python"]
+highlights:
+  - "If you've been losing half a day per incident stitching Gemini logs together, you'll leave with a single-pane-of-glass Langfuse setup you can ship tomorrow"
+  - "You'll learn how to attach app-specific metadata (user, plan, feature) to every Gemini trace so production spend breaks down cleanly by feature, not just by model"
+  - "You'll plug LLM-as-Judge evaluations and PII masking into live traces so you catch quality regressions before your users do"
+---
+
+A few weeks into running Gemini API in production, almost every team hits the same wall. A user reports that "the answers got noticeably shorter today" and you can't even identify which request they mean. The month's Gemini bill ends up twice the budget and no one can say which feature is the culprit. You tweak a prompt, suspect it regressed on some inputs, but you have no numbers to back that up. Every one of these is a symptom of missing LLM-specific observability.
+
+Standard app logs (structured JSON shipped to Cloud Logging) get you part of the way, but LLMs have their own observability axes: token counts, input and output length, per-model cost, prompt version, tool-call chains, per-user quality scores. A platform built to record, query, and evaluate all of that as one object is [Langfuse](https://langfuse.com/) — open source (MIT), deployable with Docker on your own infrastructure, or consumed as managed Cloud.
+
+In [our earlier deep dive on Gemini API observability](/en/articles/gemini-api/gemini-api-observability-production-monitoring) we focused on rolling your own structured logging. This article goes a layer deeper: plugging a dedicated LLM-tracing platform into a Gemini stack. Examples lean on the Python SDK, with notes for Node.js along the way. I'll call out the pitfalls I ran into in real production deployments so you don't have to rediscover them.
+
+## Why pair Langfuse with Gemini specifically
+
+"Wouldn't it be faster to stitch together Cloud Logging and BigQuery ourselves?" is a reasonable question. I started there too. But three things tend to compound in importance once an LLM app has been live for a while.
+
+**Hierarchical traces come for free.** One user request often fans out into a chain of LLM calls, tool invocations, and sub-LLM calls. With Gemini's function calling, a single question can trigger three to five internal model calls. Rolling your own correlation IDs for that takes a sprint. Langfuse gives you the parent-child structure automatically.
+
+**Prompts and execution logs live together.** Decisions like "v1.3 of the prompt lifted the error rate by 1.2 points" become a UI filter instead of a half-day investigation that spans GitHub, Notion, and your DB.
+
+**LLM-as-Judge runs on real production traffic.** Not a curated eval set — actual user input, scored continuously for answering the question, hallucination risk, or brand voice. We'll wire this up later in the article.
+
+Langfuse has weaknesses too. The UI is English only. Complex aggregations are still less flexible than BigQuery. And at serious scale, sampling is mandatory. We'll cover those operational concerns near the end.
+
+## Setup — Cloud vs. self-hosted
+
+First, stand up a Langfuse instance. For solo developers and small teams, [Cloud](https://cloud.langfuse.com/) (free tier up to ~50k observations/month) is usually plenty. For larger setups, or when inputs and outputs must not leave your network, self-hosting is the move.
+
+Self-hosting is straightforward: clone the official `docker-compose.yml` and run `docker compose up -d`. Postgres, ClickHouse, the Langfuse web app, and the worker all come up. A small VPS (e.g. a Hetzner CX22 at €4/month) handles it without breaking a sweat. I personally run client work on Langfuse Cloud and my own products on a self-hosted instance.
+
+Once it's up, create a project in the UI and issue a public key (`pk-lf-...`) and secret key (`sk-lf-...`). Drop those into your environment:
+
+```bash
+# .env — in production, use Secret Manager / Cloud Run secrets
+LANGFUSE_PUBLIC_KEY="pk-lf-xxxxxxxxxxxxxxxxxxxx"
+LANGFUSE_SECRET_KEY="sk-lf-xxxxxxxxxxxxxxxxxxxx"
+LANGFUSE_HOST="https://cloud.langfuse.com"  # or https://langfuse.your-domain.com
+GOOGLE_API_KEY="YOUR_GEMINI_API_KEY"
+```
+
+Two Python packages are all you need:
+
+```bash
+pip install "langfuse>=3.0.0" "google-genai>=1.0.0"
+```
+
+## Bridging Gemini and Langfuse — two integration paths
+
+There are essentially two ways to wire Gemini into Langfuse. They have different tradeoffs, so pick deliberately.
+
+### Path A: manual instrumentation with the `@observe` decorator
+
+This is the most explicit and most powerful option. You carve out your application's logical flow as parent traces, and record individual Gemini calls as child generations.
+
+```python
+# app/services/article_summarizer.py
+import os
+from google import genai
+from google.genai import types
+from langfuse import observe, get_client
+
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+langfuse = get_client()
+
+
+@observe(name="summarize_article", as_type="generation")
+def summarize_article(article_text: str, *, user_id: str, plan: str) -> str:
+    """Summarize an article to ~200 chars.
+
+    Why we use @observe with as_type='generation':
+    - Langfuse treats it as an LLM call, auto-computing token and cost metrics.
+    - It nests under the parent trace (e.g. the API endpoint) cleanly.
+    """
+    model = "gemini-2.5-flash"
+    prompt = (
+        "Summarize the following article in at most 200 characters. "
+        "Prose only, no bullet points.\n\n"
+        f"---\n{article_text}\n---"
+    )
+
+    langfuse.update_current_generation(
+        model=model,
+        input=prompt,
+        metadata={"user_id": user_id, "plan": plan, "feature": "article_summary"},
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=400,
+        ),
+    )
+
+    usage = response.usage_metadata
+    langfuse.update_current_generation(
+        output=response.text,
+        usage_details={
+            "input": usage.prompt_token_count,
+            "output": usage.candidates_token_count,
+            "total": usage.total_token_count,
+        },
+    )
+    return response.text
+
+
+if __name__ == "__main__":
+    summary = summarize_article(
+        "Today Gemini API introduced a new feature...",
+        user_id="u_123",
+        plan="pro",
+    )
+    print(summary)
+    langfuse.flush()  # always flush before short-lived processes exit
+```
+
+**What shows up in the UI:** a `summarize_article` trace containing one generation. Prompt, completion, token counts, latency, and metadata (`user_id`, `plan`, `feature`) become filterable.
+
+One gotcha: on short-lived runtimes (AWS Lambda, Cloud Functions), skipping `langfuse.flush()` means buffered traces die with the process. Call it in your handler's finalizer, or register it via `atexit`.
+
+### Path B: OpenAI-compatible endpoint + the `openai` SDK
+
+Gemini exposes an OpenAI-compatible REST surface, and Langfuse ships a drop-in OpenAI SDK wrapper. This combo is ideal if you're migrating an existing OpenAI codebase to Gemini and want observability unchanged.
+
+```python
+# app/services/openai_compat.py
+import os
+from langfuse.openai import openai  # Langfuse drop-in
+
+client = openai.OpenAI(
+    api_key=os.environ["GOOGLE_API_KEY"],
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+)
+
+response = client.chat.completions.create(
+    model="gemini-2.5-pro",
+    messages=[
+        {"role": "system", "content": "You are a senior code reviewer."},
+        {"role": "user", "content": "Point out one bug in this function:\n\ndef div(a, b): return a / b"},
+    ],
+    metadata={"user_id": "u_123", "trace_name": "code_review"},
+)
+print(response.choices[0].message.content)
+```
+
+Just importing from `langfuse.openai` auto-instruments every call. Minimal code, but you lose access to Gemini-specific features (thinking mode, context caching, some function-calling shapes) that aren't exposed by the OpenAI-compatible layer. If you need that level of control, use path A.
+
+## Designing the trace hierarchy — where agents pay off
+
+For endpoints that expand into multiple Gemini calls (agents, RAG pipelines), trace design directly affects how debuggable your system is. I recommend the three-layer pattern below.
+
+```
+Trace (= one request = one user experience)
+  └─ Span (= a logical step: search, draft, polish, ...)
+       └─ Generation (= a single LLM call)
+```
+
+A worked example using function calling:
+
+```python
+# app/agents/research_agent.py
+import os
+from google import genai
+from google.genai import types
+from langfuse import observe, get_client
+
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+langfuse = get_client()
+
+
+@observe(name="research_agent")  # root trace
+def run_research_agent(user_question: str, *, user_id: str) -> str:
+    langfuse.update_current_trace(
+        user_id=user_id,
+        session_id=f"session_{user_id}",
+        tags=["research", "production"],
+    )
+
+    search_results = _search_knowledge_base(user_question)
+    draft = _draft_answer(user_question, search_results)
+    polished = _polish_answer(draft)
+    return polished
+
+
+@observe(name="search_knowledge_base", as_type="span")
+def _search_knowledge_base(query: str) -> list[str]:
+    # Pretend vector search — in production, call pgvector or similar.
+    return [
+        "Gemini 2.5 Pro supports up to 2M input tokens.",
+        "Context Caching kicks in at 32,768 tokens or more.",
+    ]
+
+
+@observe(name="draft_answer", as_type="generation")
+def _draft_answer(question: str, docs: list[str]) -> str:
+    model = "gemini-2.5-flash"
+    prompt = f"Reference docs:\n{chr(10).join(docs)}\n\nQuestion: {question}\n\nAnswer in English."
+    langfuse.update_current_generation(model=model, input=prompt)
+    response = client.models.generate_content(model=model, contents=prompt)
+    usage = response.usage_metadata
+    langfuse.update_current_generation(
+        output=response.text,
+        usage_details={
+            "input": usage.prompt_token_count,
+            "output": usage.candidates_token_count,
+        },
+    )
+    return response.text
+
+
+@observe(name="polish_answer", as_type="generation")
+def _polish_answer(draft: str) -> str:
+    model = "gemini-2.5-flash"
+    prompt = f"Rewrite the following for clarity and a warm, professional tone:\n\n{draft}"
+    langfuse.update_current_generation(model=model, input=prompt)
+    response = client.models.generate_content(model=model, contents=prompt)
+    usage = response.usage_metadata
+    langfuse.update_current_generation(
+        output=response.text,
+        usage_details={
+            "input": usage.prompt_token_count,
+            "output": usage.candidates_token_count,
+        },
+    )
+    return response.text
+
+
+if __name__ == "__main__":
+    answer = run_research_agent("What's the strength of Gemini 2.5 Pro?", user_id="u_456")
+    print(answer)
+    langfuse.flush()
+```
+
+**How this renders:** one `research_agent` trace with a `search_knowledge_base` span and two generations (`draft_answer` → `polish_answer`) beneath it, laid out on a timeline. Latency attribution is immediate — you see at a glance whether draft or polish is the slow one.
+
+The underrated move is populating `update_current_trace()` with `user_id` and `session_id`. In the Langfuse UI you can then filter "all traces for this user in the past week" or "all LLM calls within this session." In my experience, the single biggest operational payoff is support tickets: "I got a weird answer around 5 PM yesterday" goes from a multi-hour archaeology trip to a thirty-second `user_id` + time filter.
+
+## Cost attribution — registering model prices and slicing by feature
+
+Langfuse ships a table of known model prices, but Gemini's newest models (especially those released in the last few weeks) often aren't in it yet. When a model isn't registered, USD cost renders as `—`. Use the "Models" page in the settings UI to register each Gemini SKU with its input and output price. Approximate 2026-Q2 numbers (always confirm against the [current pricing page](https://ai.google.dev/pricing)):
+
+- **gemini-2.5-flash**: $0.075 / 1M input tokens, $0.30 / 1M output tokens
+- **gemini-2.5-pro**: $1.25 / 1M input (≤200K), $10.00 / 1M output
+- **Context Caching hit**: roughly 25% of normal input cost (varies by model)
+
+Registering prices retroactively recomputes cost across historical traces. Once that's in place, **feature-level cost slicing** becomes the feature you'll come back to daily. If you've been tagging `metadata.feature`, you'll immediately see "article_summary accounts for 38% of spend" or "code_review is 17%" — decisions that were guesses a week ago are now reports.
+
+One implementation rule: **keep metadata flat and low-cardinality.** `{"feature": "article_summary"}` groups cleanly. Slipping `{"article_id": "12345"}` directly into metadata blows up cardinality and destroys dashboard grouping. High-cardinality IDs belong in `input`/`output` payloads or in `session_id` links.
+
+## LLM-as-Judge for continuous production evaluation
+
+The highest-ROI Langfuse feature, in my opinion, is LLM-as-Judge applied to live traces. Langfuse has this built in: set up an evaluator prompt in the UI, filter the traces you want scored, and quality scores start flowing in continuously.
+
+Three evaluators I add to every product I ship:
+
+**1. answer_relevance (1–5).** Another Gemini grades whether the output actually answers the user's question. This is your regression signal for prompt edits.
+
+**2. hallucination_flag (0/1).** Does the output assert specific facts (numbers, proper nouns) not present in the provided reference docs? Essential for any RAG setup.
+
+**3. tone_compliance (0/1).** Is the response in the expected register — polite, professional, on-brand? The single most effective way I've found to catch brand voice drift.
+
+Configuration is GUI-driven (no code) in the Langfuse Evaluators tab. You can either pick a template or write your own judge prompt. For cost control, pair evaluations with 5% sampling of production traffic — that's the sweet spot most teams land on.
+
+You can also write scores from your own code when you want rule-based signals alongside LLM judges:
+
+```python
+from langfuse import get_client
+langfuse = get_client()
+
+with langfuse.start_as_current_generation(name="rule_check") as gen:
+    output = "Sample generated content"
+    has_forbidden_word = any(w in output.lower() for w in ["confidential", "internal-only"])
+    langfuse.score_current_trace(
+        name="no_forbidden_words",
+        value=0 if has_forbidden_word else 1,
+        comment="Rule-based compliance check",
+    )
+```
+
+## PII masking and payload sanitization
+
+User input will contain personal data — email addresses, phone numbers, postal addresses — sooner rather than later. Forwarding that raw to Langfuse means PII accumulates in Langfuse's storage layer. This is the most common compliance gap I see, and it has to be addressed before any serious production traffic.
+
+The three-layer approach I use:
+
+```python
+# app/services/safe_observer.py
+import re
+from langfuse import Langfuse
+
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+PHONE_RE = re.compile(r"\+?\d[\d\s\-]{7,}\d")
+
+
+def mask_pii(text: str) -> str:
+    """Replace PII — call just before Langfuse receives payloads."""
+    text = EMAIL_RE.sub("[EMAIL]", text)
+    text = PHONE_RE.sub("[PHONE]", text)
+    return text
+
+
+def mask_hook(data: dict) -> dict:
+    if isinstance(data, dict):
+        if "input" in data and isinstance(data["input"], str):
+            data["input"] = mask_pii(data["input"])
+        if "output" in data and isinstance(data["output"], str):
+            data["output"] = mask_pii(data["output"])
+    return data
+
+
+langfuse = Langfuse(mask=mask_hook)  # applies to every generation globally
+```
+
+**One crucial caveat:** the regexes above are illustrative, not production-ready. For anything regulated (healthcare, finance), use Google Cloud DLP or a dedicated library like Microsoft Presidio, and build your masking dictionary to your compliance policy.
+
+On self-hosted Langfuse you can also enable the "metadata-only" mode via `LANGFUSE_FEATURES`, which skips storing input/output bodies entirely. For extremely sensitive workloads, consider that mode as the default.
+
+## Sampling strategies for high-traffic workloads
+
+Both Langfuse cost (Cloud paid tiers, self-hosted DB growth) and dashboard responsiveness scale directly with observation count. At hundreds of thousands of LLM calls per day, shipping 100% of traffic is not realistic.
+
+A three-tier sampling pattern I've had success with:
+
+**Tier 1 — deterministic sampling (5–10% of traffic).** Hash `user_id` and include the last two bytes in a range, say `00–09`. This way you capture complete user journeys instead of stray fragments.
+
+**Tier 2 — always trace errors.** 5xx responses, Gemini safety-filter blocks, or any non-success exit should always be shipped. Catch in `try / except` and bypass the sampling gate.
+
+**Tier 3 — backfill on negative signals.** When a user thumbs-downs an answer, clicks retry, or abandons mid-conversation, ship the corresponding trace ID to Langfuse after the fact. This is the highest-signal-to-noise rule you'll install: the traces that survive are exactly the ones you'll want in the morning.
+
+A Flask sketch:
+
+```python
+import hashlib
+from flask import Flask, request
+
+def should_trace(user_id: str) -> bool:
+    h = hashlib.sha1(user_id.encode()).hexdigest()
+    return int(h[-2:], 16) < 26  # ~10% of 256
+
+
+app = Flask(__name__)
+
+
+@app.post("/ask")
+def ask():
+    user_id = request.json["user_id"]
+    question = request.json["question"]
+
+    if should_trace(user_id) or request.json.get("force_trace"):
+        from app.agents.research_agent import run_research_agent
+        answer = run_research_agent(question, user_id=user_id)
+    else:
+        from app.agents.research_agent_silent import run_research_agent_silent
+        answer = run_research_agent_silent(question)
+
+    return {"answer": answer}
+```
+
+## Pitfalls I've hit (so you don't have to)
+
+**Pitfall 1 — missing `flush()` drops traces on short-lived runtimes.** Lambda, Cloud Functions, and non-persistent Cloud Run workers terminate the process before Langfuse's batch uploader fires. Wire `langfuse.flush()` into your `after_request` middleware or register it with `atexit`.
+
+**Pitfall 2 — high-cardinality keys in metadata.** `article_id` or `order_id` in `metadata` destroys grouping. Either embed them in `input`/`output` payloads or promote them to `session_id`.
+
+**Pitfall 3 — new Gemini models showing $0 cost.** When a fresh Gemini SKU appears, register it in the Langfuse Models page immediately. Skipping this puts "`$0` this month" on your report — a dangerous kind of misleading.
+
+**Pitfall 4 — `@observe` hiding exceptions that inner code swallowed.** The decorator passes exceptions through correctly, but `try / except` blocks inside your function can mask errors and make the Langfuse error-rate dashboard lie. Audit for these during code review.
+
+**Pitfall 5 — ClickHouse disk exhaustion on self-hosted installs.** Without sampling, ClickHouse grows by several GB/day. Configure a retention window (e.g. 90 days) and archive older data to S3 on a scheduled job.
+
+**Pitfall 6 — dev spam polluting production dashboards.** Debugging locally by hitting the same prompt 20 times warps the aggregate numbers. Either point `LANGFUSE_PROJECT` at a separate project in dev, or tag every dev call with `tags=["dev"]` and filter it out.
+
+## A concrete incident: how a Langfuse trace saved a weekend
+
+A few months back I was on call for a small Gemini-powered product. A user emailed on Saturday morning saying an answer their team had received the previous evening contained a confident-sounding but wrong client name. Without observability, this is the kind of report that eats up the rest of the weekend — you end up asking the user for the exact question, trying to reproduce, checking git history to see what prompt was active.
+
+With Langfuse already in place, the triage took about twelve minutes. I filtered traces by the user's email domain and Friday's timestamp, found the exact generation, and saw immediately that the prompt template had substituted the client name from a retrieval step. The hallucination_flag evaluator had already scored the trace as a 1 overnight, so the alert had fired — I'd just missed checking Slack on Friday night. The root cause turned out to be a retrieval returning a stale document, and the fix shipped on Saturday morning with a targeted prompt-level guard telling the model to say "I don't have verified information" when the reference docs lacked the specific client.
+
+That kind of incident is the real return on the hours you put into observability. Not dashboards, not abstract metrics — specific, searchable traces that turn "something went wrong somewhere" into "something went wrong on this exact request, and here is the input, output, reference docs, and score."
+
+## Running Langfuse itself reliably
+
+If you self-host, remember that Langfuse is now part of your production stack. A few operational habits I suggest:
+
+- **Separate environments.** Run two Langfuse projects or two Langfuse instances: one for production, one for staging and development. Mixing them makes dashboards noisy and makes compliance reviews harder.
+- **Monitor Langfuse as you would any service.** ClickHouse disk, Postgres connections, worker lag. The Docker Compose bundle exposes `/api/public/health` — wire it to your uptime monitor.
+- **Plan for upgrades.** Langfuse versions regularly, and major versions sometimes include ClickHouse schema migrations. Read release notes; never auto-update a production deployment during business hours.
+- **Backups.** Postgres holds prompt definitions, project config, and users — back it up nightly. ClickHouse holds traces and is the bigger volume; decide what retention you actually need (in most jurisdictions, 30–90 days is plenty for debugging, and longer retention invites compliance questions you don't want).
+- **Key rotation.** Treat Langfuse API keys like any other secret — rotate quarterly, or when a team member leaves.
+
+## Node.js and TypeScript — a quick bridge
+
+Many Gemini deployments run on Node.js (Next.js edge handlers, Cloud Run workers, serverless frameworks). Langfuse's JavaScript SDK offers a nearly identical experience to Python. A minimal setup with the official `@google/genai` client looks like this:
+
+```typescript
+// app/lib/observed-gemini.ts
+import { GoogleGenAI } from "@google/genai";
+import { Langfuse } from "langfuse";
+
+const langfuse = new Langfuse({
+  publicKey: process.env.LANGFUSE_PUBLIC_KEY!,
+  secretKey: process.env.LANGFUSE_SECRET_KEY!,
+  baseUrl: process.env.LANGFUSE_HOST,
+});
+
+const genai = new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY! });
+
+export async function summarize(
+  text: string,
+  opts: { userId: string; plan: string }
+): Promise<string> {
+  const trace = langfuse.trace({
+    name: "summarize_article",
+    userId: opts.userId,
+    metadata: { plan: opts.plan, feature: "article_summary" },
+  });
+
+  const generation = trace.generation({
+    name: "gemini-2.5-flash-call",
+    model: "gemini-2.5-flash",
+    input: text,
+  });
+
+  const response = await genai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: `Summarize in 200 chars:\n${text}`,
+  });
+
+  const out = response.text ?? "";
+  const usage = response.usageMetadata;
+  generation.end({
+    output: out,
+    usage: {
+      input: usage?.promptTokenCount,
+      output: usage?.candidatesTokenCount,
+    },
+  });
+
+  await langfuse.shutdownAsync(); // serverless-safe flush
+  return out;
+}
+```
+
+Two caveats worth knowing about the Node SDK. First, on serverless platforms (Vercel, Cloudflare Workers, AWS Lambda) you must call `langfuse.shutdownAsync()` — or `flushAsync()` — before the handler resolves, otherwise traces are lost. Second, at the time of writing, the Node SDK does not have a direct equivalent of Python's `@observe` decorator; you build the trace/generation hierarchy manually. I find that slightly more verbose but also more explicit, which has its own merits in code review.
+
+For edge runtimes like Cloudflare Workers, double-check that your bundler ships the full `langfuse` package (not a broken tree-shaken subset) and that `LANGFUSE_HOST` is reachable from the edge region you're deployed to. A couple of production incidents I've seen were caused by region-pinned firewalls blocking the Langfuse ingestion endpoint.
+
+## Langfuse compared to the other options
+
+You'll inevitably get asked whether Langfuse is really the right pick. Here's how I think about the main alternatives, written as of spring 2026 — this space moves quickly, so always re-check.
+
+**LangSmith** is LangChain's first-party observability tool, and it's excellent if your codebase already uses LangChain heavily. The trace shape maps one-to-one onto LangChain's abstractions. If your app doesn't use LangChain (and many Gemini apps don't), the semantic advantage disappears and you're left with a managed-only, proprietary product at a relatively steep price. Langfuse works equally well with or without LangChain.
+
+**Helicone** sits as a proxy in front of your LLM calls. Setup is trivial — point your base URL at Helicone and every call becomes observable. The tradeoff: the proxy is in the critical path, so latency and reliability matter. For teams who want the lowest-effort onboarding and are willing to accept a proxy, Helicone is a sensible pick. Langfuse is decorator/SDK-based and doesn't sit in the request path, which I prefer for hot-path endpoints.
+
+**Phoenix by Arize** is open source and strong on evaluation (especially LLM-as-Judge with pre-built templates) and embedding inspection. If your workflow leans heavily on RAG tuning and offline eval, Phoenix is worth a serious look. For general day-to-day production observability with cost attribution and prompt management, I find Langfuse's UI and SDK ergonomics a little more refined.
+
+**Roll your own with OpenTelemetry.** Absolutely valid for teams who already operate an observability platform (Grafana, Datadog, Honeycomb). The semantic conventions for GenAI in OTel are maturing. You get full control of storage and retention. The cost is ongoing schema maintenance — every new Gemini feature (thinking tokens, grounding metadata, cached tokens) becomes a conversation about which attribute names to use. Langfuse absorbs that work on your behalf.
+
+My default recommendation for a team shipping Gemini to production without an existing observability commitment is Langfuse Cloud for the first three months, then self-hosted on a small VPS once the workload is understood. The cost and operational overhead of self-hosting only makes sense once you have a clear picture of observation volume.
+
+## Alerting, dashboards, and datasets — the pieces worth adding later
+
+Once the core observability loop is running, three extensions pay back quickly.
+
+**Alerts on regression signals.** Langfuse supports webhook-based alerts tied to metrics (error rate, p95 latency, average LLM-as-Judge score, cost). Send them into Slack or PagerDuty. The alert I rely on most is "answer_relevance drops below 3.5 on a rolling 500-trace window" — that fires before users notice, because the drop appears in sampled traces minutes after a bad deploy.
+
+**Custom dashboards via the Langfuse API.** The built-in UI covers most needs, but occasionally you want a cost-vs-revenue chart that joins Langfuse data with your billing system. The Langfuse API is OpenAPI-documented; pulling observations into BigQuery or Snowflake once an hour and joining them against Stripe revenue makes a "cost per paying user" dashboard achievable in an afternoon.
+
+**Datasets for offline regression testing.** Before you promote a prompt change to production, run it against a Langfuse dataset composed of past traces that matter (edge cases, complaints, top customers). Langfuse's Datasets feature lets you tag historical traces and replay them against a candidate prompt version, comparing LLM-as-Judge scores side by side. This closes the loop from production observations back into the development workflow.
+
+## A pragmatic four-week rollout
+
+Switching on everything at once will stall your team. The order I recommend to client teams:
+
+**Week 1 — instrument the skeleton.** Add `@observe` to three to five core endpoints. Populate `user_id` and `feature` metadata. This alone transforms support response time.
+
+**Week 2 — cost visibility.** Register model prices and build the feature-level cost dashboard. Expect to find at least one feature that's spending far more than you assumed.
+
+**Week 3 — evaluation.** Turn on `answer_relevance` and `tone_compliance` LLM-as-Judge at 5% sampling. This pays back the next time you ship a prompt change.
+
+**Week 4 — PII and sampling.** Now that traffic patterns are visible, wire up the masking hook and the sampling rules. Installing sampling too early blinds you to the patterns you'd want to sample intelligently later.
+
+This cadence extracts Langfuse's value while minimizing surprise in existing systems. It pairs well with the upstream and downstream pieces — our guides on [context caching](/en/articles/gemini-api/context-caching-guide) and [rate-limit and quota management in production](/en/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) slot in on either side of this observability layer.
+
+## Your first move today
+
+Create one Langfuse Cloud account. Decorate one Python script with `@observe`. Fire ten real Gemini calls from your dev environment. Then spend ten minutes clicking around in the Langfuse UI — inputs, outputs, latencies, metadata, all stitched together. That physical experience of "so this is what real observability feels like" is the fastest way to get your team's priorities right for a production rollout. Everything after that is sequencing.

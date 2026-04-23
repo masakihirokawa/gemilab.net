@@ -1,0 +1,514 @@
+---
+title: "Gemini API × Langfuse — LLM オブザーバビリティの本番実装ガイド"
+slug: "gemini-api-langfuse-llm-observability-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-23T19:45"
+author: "Gemini Lab"
+description: "Gemini API を本番運用するチーム向けに、Langfuse を使った LLM オブザーバビリティの実装を体系的に解説します。トレース設計、コスト可視化、プロダクショントレースでの LLM-as-Judge 評価、PII マスキング、サンプリングまで動作コード付きで網羅します。"
+tags: ["gemini-api", "langfuse", "observability", "production", "llm-ops", "tracing", "evaluation", "python"]
+highlights:
+  - "Gemini API のトレースがバラバラで原因調査に半日かけていた状態を、1画面で追える Langfuse 統合に切り替えられる"
+  - "Python SDK から自社アプリ固有のメタデータ（ユーザー・プラン・機能）をトレースに埋め込み、本番コストを機能単位で切り分ける方法を習得できる"
+  - "LLM-as-Judge による自動品質評価と PII マスキングを本番トレースに組み込み、改修前に劣化を検知できる体制を構築できる"
+---
+
+Gemini API を本番アプリに組み込んで数週間経ったあたりで、必ずと言っていいほどぶつかる壁があります。「ユーザーから『回答が急に短くなった』と報告が来たが、どのリクエストのことかすら特定できない」「今月の API 課金が予算の 2 倍に膨らんだけれど、どの機能が主犯かわからない」「プロンプトを微修正したら一部の入力で精度が落ちた気がするが、定量的な根拠がない」——これらはすべて、LLM 特有のオブザーバビリティが欠けていることが原因です。
+
+通常のアプリログ（構造化 JSON + Cloud Logging）でも基本的な監視はできますが、LLM には独特の観測軸があります。トークン数、入出力の長さ、モデル別コスト、プロンプトのバージョン、ツール呼び出しの連鎖、ユーザーごとの品質スコア——これらを一体として記録・検索・評価できる基盤が [Langfuse](https://langfuse.com/) です。オープンソース（MIT ライセンス）で、Docker で自社サーバに立てることも、マネージド Cloud 版を使うこともできます。
+
+[Gemini API 本番環境のオブザーバビリティ完全ガイド](/articles/gemini-api/gemini-api-observability-production-monitoring) では自前の構造化ログを中心に解説しましたが、本記事ではトレーシング専用ツールを使って一段深い観測を構築する方法に踏み込みます。実装は Python SDK を中心に、Node.js 側の注意点も補足します。本番に組み込んでしばらく運用してわかった落とし穴も含めて、正直に共有していきます。
+
+## なぜ Langfuse を Gemini と組み合わせるのか
+
+「自前で Cloud Logging と BigQuery を組み合わせて観測ダッシュボードを作った方が早いのでは」と感じる方もいらっしゃるかもしれません。私も最初は同じ考えでした。ただ、LLM アプリの運用を続けると、以下の 3 点が予想以上に効いてきます。
+
+**第一に、トレース階層が標準化されます。** 1 回のユーザーリクエストが内部でどのような LLM 呼び出し・ツール実行・サブ LLM 呼び出しに展開されたかを、親子関係つきで自動的に記録できます。Gemini の Function Calling を使ったエージェントでは、1 つの質問に 3〜5 回の内部 LLM 呼び出しが発生することも珍しくありません。これを自作で追うと、相関 ID の引き回しだけで 1 スプリント消えます。
+
+**第二に、プロンプト管理と実行ログが統合されます。** Langfuse 上で「v1.3 のプロンプトでエラー率が 1.2% 上がった」といった判断が、画面上のフィルタだけで完結します。プロンプトのバージョンを別システム（Notion・GitHub・自社 DB）で管理していると、この相関調査が毎回手作業になります。
+
+**第三に、LLM-as-Judge 評価が本番トレースに直接適用できます。** 開発環境の評価用データセットではなく、実ユーザーの入力に対して「回答が質問に答えているか」「ハルシネーションの兆候はないか」を自動採点し、劣化検知に使えます。これは後半で実装します。
+
+ただし Langfuse にも弱点はあります。UI が英語のみで、細かい集計は BigQuery ほど柔軟ではありません。また、高トラフィックではサンプリングが必須です。このあたりは運用のコツとして後述します。
+
+## セットアップ — Cloud 版とセルフホスト版の選択
+
+まずは Langfuse のインスタンスを確保します。個人開発・小規模チームであれば [Cloud 版](https://cloud.langfuse.com/)（無料プランで月 5 万 observation まで）で十分です。中規模以上、あるいは入出力の内容を自社ネットワーク外に出したくない場合はセルフホストが選択肢になります。
+
+セルフホストは Docker Compose で立ち上がります。公式の `docker-compose.yml` を `git clone` して `docker compose up -d` するだけで、Postgres・ClickHouse・Langfuse Web・Worker が起動します。VPS（Hetzner CX22 クラス、月 €4〜）でも問題なく動きます。私はクライアントワークでは Cloud 版、自社プロダクトではセルフホストを使い分けています。
+
+セットアップが終わったら、UI 上でプロジェクトを作成し、`Public Key`（`pk-lf-...`）と `Secret Key`（`sk-lf-...`）を発行します。これを環境変数に設定します。
+
+```bash
+# .env（プロダクションでは Secret Manager / Cloud Run シークレット推奨）
+LANGFUSE_PUBLIC_KEY="pk-lf-xxxxxxxxxxxxxxxxxxxx"
+LANGFUSE_SECRET_KEY="sk-lf-xxxxxxxxxxxxxxxxxxxx"
+LANGFUSE_HOST="https://cloud.langfuse.com"  # セルフホストなら https://langfuse.your-domain.com
+GOOGLE_API_KEY="YOUR_GEMINI_API_KEY"
+```
+
+Python 側の依存は 2 パッケージだけです。
+
+```bash
+pip install "langfuse>=3.0.0" "google-genai>=1.0.0"
+```
+
+## Gemini SDK とのブリッジ — 2 つの統合方式
+
+Langfuse と Gemini をつなぐ方法は、大きく 2 通りあります。特性が違うので、用途に応じて選びます。
+
+### 方式 A：`@observe` デコレータで手動計装する
+
+最も汎用的で、コードの意図がはっきり出る方式です。アプリ固有の処理フローを親スパン（Trace）として切り取り、その中で Gemini 呼び出しを子スパン（Generation）として記録します。
+
+```python
+# app/services/article_summarizer.py
+import os
+from google import genai
+from google.genai import types
+from langfuse import observe, get_client
+
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+langfuse = get_client()
+
+
+@observe(name="summarize_article", as_type="generation")
+def summarize_article(article_text: str, *, user_id: str, plan: str) -> str:
+    """記事本文を 200 字以内で要約する。
+
+    なぜ @observe を generation 型で使うか：
+    - Langfuse 側で「LLM 呼び出し」として集計され、トークン・コスト計算が自動化されます。
+    - 親トレース（API エンドポイント等）の子スパンとしてネストされます。
+    """
+    model = "gemini-2.5-flash"
+    prompt = (
+        "次の記事を日本語で 200 字以内に要約してください。箇条書き禁止・です/ます調。\n\n"
+        f"---\n{article_text}\n---"
+    )
+
+    # 入力・モデル名・メタデータを Langfuse に伝える
+    langfuse.update_current_generation(
+        model=model,
+        input=prompt,
+        metadata={"user_id": user_id, "plan": plan, "feature": "article_summary"},
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=400,
+        ),
+    )
+
+    # 出力と使用トークンを Langfuse に反映
+    usage = response.usage_metadata
+    langfuse.update_current_generation(
+        output=response.text,
+        usage_details={
+            "input": usage.prompt_token_count,
+            "output": usage.candidates_token_count,
+            "total": usage.total_token_count,
+        },
+    )
+    return response.text
+
+
+if __name__ == "__main__":
+    summary = summarize_article(
+        "本日、Gemini API に新しい機能が追加されました。...",
+        user_id="u_123",
+        plan="pro",
+    )
+    print(summary)
+    langfuse.flush()  # プロセス終了前に必ずフラッシュ
+```
+
+**実行すると Langfuse の UI で何が見えるか:** 「summarize_article」というトレースが作成され、その中に Gemini の Generation が 1 件記録されます。入力プロンプト・出力テキスト・トークン数・レイテンシ・メタデータ（`user_id`・`plan`・`feature`）がすべて閲覧・フィルタ可能になります。
+
+`langfuse.flush()` を忘れると、短命プロセス（AWS Lambda・Cloud Functions）ではトレースが送信されないまま終了することがあります。必ずハンドラの最後で呼ぶか、`atexit` に登録してください。
+
+### 方式 B：OpenAI 互換エンドポイント + `openai` SDK
+
+Gemini API は OpenAI 互換の REST エンドポイントを提供しており、Langfuse 側は `openai` SDK のラッパーを用意しています。この組み合わせは「既存の OpenAI コードベースを Gemini に移行するが、観測基盤は変えたくない」場合に最も低コストです。
+
+```python
+# app/services/openai_compat.py
+import os
+from langfuse.openai import openai  # Langfuse のドロップインラッパー
+
+# Gemini の OpenAI 互換エンドポイントを使用
+client = openai.OpenAI(
+    api_key=os.environ["GOOGLE_API_KEY"],
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+)
+
+response = client.chat.completions.create(
+    model="gemini-2.5-pro",
+    messages=[
+        {"role": "system", "content": "あなたはコードレビュアーです。"},
+        {"role": "user", "content": "この関数のバグを 1 つだけ指摘してください:\n\ndef div(a, b): return a / b"},
+    ],
+    metadata={"user_id": "u_123", "trace_name": "code_review"},  # Langfuse 用メタデータ
+)
+print(response.choices[0].message.content)
+```
+
+`from langfuse.openai import openai` にしておくだけで、OpenAI SDK の呼び出しが自動的に Langfuse にトレースされます。コード量が最小で済みますが、Gemini 固有の機能（Thinking Mode・Context Caching・Function Calling の一部形式）は OpenAI 互換経由ではフル活用できないことに注意してください。細かな制御が必要なら方式 A を推奨します。
+
+## トレース階層の設計 — エージェント型アプリで効かせる
+
+1 回の API エンドポイント呼び出しが複数回の Gemini 呼び出しに展開されるエージェントでは、階層設計がそのまま調査のしやすさになります。私が推奨するのは次の 3 層構造です。
+
+```
+Trace（= 1 リクエスト = ユーザー体験 1 回）
+  └─ Span（= 論理ステップ：検索・要約・整形など）
+       └─ Generation（= 個々の LLM 呼び出し）
+```
+
+Function Calling を使うエージェントでの実装例を示します。
+
+```python
+# app/agents/research_agent.py
+import os
+from google import genai
+from google.genai import types
+from langfuse import observe, get_client
+
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+langfuse = get_client()
+
+
+@observe(name="research_agent")  # 親トレース
+def run_research_agent(user_question: str, *, user_id: str) -> str:
+    langfuse.update_current_trace(
+        user_id=user_id,
+        session_id=f"session_{user_id}",
+        tags=["research", "production"],
+    )
+
+    search_results = _search_knowledge_base(user_question)  # Span
+    draft = _draft_answer(user_question, search_results)    # Generation
+    polished = _polish_answer(draft)                        # Generation
+    return polished
+
+
+@observe(name="search_knowledge_base", as_type="span")
+def _search_knowledge_base(query: str) -> list[str]:
+    """ベクトル検索の結果をダミーで返す（本番では pgvector などを呼ぶ）。"""
+    return [
+        "Gemini 2.5 Pro の最大入力は 2M トークンです。",
+        "Context Caching は 32,768 トークン以上で有効です。",
+    ]
+
+
+@observe(name="draft_answer", as_type="generation")
+def _draft_answer(question: str, docs: list[str]) -> str:
+    model = "gemini-2.5-flash"
+    prompt = f"参考資料:\n{chr(10).join(docs)}\n\n質問: {question}\n\n日本語で回答してください。"
+    langfuse.update_current_generation(model=model, input=prompt)
+    response = client.models.generate_content(model=model, contents=prompt)
+    usage = response.usage_metadata
+    langfuse.update_current_generation(
+        output=response.text,
+        usage_details={
+            "input": usage.prompt_token_count,
+            "output": usage.candidates_token_count,
+        },
+    )
+    return response.text
+
+
+@observe(name="polish_answer", as_type="generation")
+def _polish_answer(draft: str) -> str:
+    model = "gemini-2.5-flash"
+    prompt = f"次の文章を、敬体で読みやすく整えてください:\n\n{draft}"
+    langfuse.update_current_generation(model=model, input=prompt)
+    response = client.models.generate_content(model=model, contents=prompt)
+    usage = response.usage_metadata
+    langfuse.update_current_generation(
+        output=response.text,
+        usage_details={
+            "input": usage.prompt_token_count,
+            "output": usage.candidates_token_count,
+        },
+    )
+    return response.text
+
+
+if __name__ == "__main__":
+    answer = run_research_agent("Gemini 2.5 Pro の強みは？", user_id="u_456")
+    print(answer)
+    langfuse.flush()
+```
+
+**実行結果の見え方:** 1 つの `research_agent` トレースの下に、`search_knowledge_base` スパンと、2 つの Generation（`draft_answer` → `polish_answer`）が時系列でぶら下がります。レイテンシの内訳が視覚化されるため、「遅いのは draft か polish か」が一目でわかります。
+
+`update_current_trace()` に `user_id` と `session_id` を渡すのが肝です。Langfuse の UI では「この特定のユーザーの直近 1 週間のトレース」や「セッション内の LLM 呼び出し連鎖」を絞り込めるようになります。私の経験上、サポート問い合わせ対応でこれが一番効きます。「昨日 17 時ごろに変な回答が返ってきた」というユーザーの報告を、`user_id` 絞り込み＋時刻フィルタで数十秒で特定できます。
+
+## コスト可視化 — モデル単価の登録と機能別集計
+
+Langfuse は登録済みのモデル単価表を持っていますが、Gemini の新モデル（リリース直後など）は未登録のこともあります。未登録の場合、UI 上は USD コストが「—」表示になります。UI の「Models」設定画面で、モデルごとに次の値を登録してください（2026 年 4 月時点の公開価格例、変更があるため都度確認を推奨）。
+
+- **gemini-2.5-flash**: 入力 $0.075 / 1M トークン、出力 $0.30 / 1M トークン
+- **gemini-2.5-pro**: 入力（≤200K）$1.25 / 1M、出力 $10.00 / 1M
+- **Context Caching hit**: 入力の約 1/4 価格（モデルにより異なります）
+
+登録後、過去のトレースも再計算されます。**機能単位の集計**が、このタイミングで一気に便利になります。`metadata.feature` にタグ付けしておけば、「article_summary が全体コストの 38%」「code_review が 17%」といった分解がダッシュボード上で即座に見えるためです。
+
+コード側の実装ポイントは 1 点だけです。**Langfuse に送る `metadata` は常に平坦にし、粒度の粗いキーを使う**こと。`{"feature": "article_summary"}` は良い粒度ですが、`{"article_id": "12345"}` を直接メタデータに入れるとカーディナリティが爆発し、ダッシュボードのグルーピングが機能しなくなります。記事 ID のような高カーディナリティ情報は `input`/`output` 側に含めるか、`session_id` 経由で結びつけてください。
+
+## LLM-as-Judge で本番品質を自動評価する
+
+本番で最もインパクトが大きい使い方が、本番トレースに対する LLM-as-Judge 評価です。Langfuse にはこの機能がビルトインされていて、UI 上で「評価用 LLM プロンプト」と「対象トレースのフィルタ」を設定するだけで、継続的に品質スコアが付与されます。
+
+私がどのプロダクトでも最初に入れる評価軸は次の 3 つです。
+
+**1. answer_relevance（回答妥当性）** — 1〜5 点。「ユーザーの質問に対して、出力は本当に答えているか」を別の Gemini に採点させます。プロンプトを軽微に変えたときのリグレッション検知に効きます。
+
+**2. hallucination_flag（ハルシネーション兆候）** — 0/1 の二値。「提供された参考資料に書かれていない具体的事実（数字・固有名詞）を出力に含んでいるか」を判定させます。RAG 構成では必須の軸です。
+
+**3. tone_compliance（トーン遵守）** — 0/1。「敬体で書かれているか」「ブランドボイスから逸脱していないか」。これは自社プロダクトのトーン揺れを検知するのに効果絶大でした。
+
+設定は Langfuse UI の「Evaluators」から GUI で行えます（コードレス）。評価用 LLM のプロンプトはテンプレートを選択するか、自分で書けます。コスト抑制のため、「本番トレースの 5% サンプリング」を併用するのが実運用の落としどころです。
+
+コードから評価スコアを書き込むこともできます。オンプレミス検証で「独自指標（例：ルールベースの正規表現マッチ率）」を Langfuse に流し込みたいときに便利です。
+
+```python
+from langfuse import get_client
+langfuse = get_client()
+
+# トレース ID を取得して、カスタムスコアを付与
+with langfuse.start_as_current_generation(name="ruled_score_check") as gen:
+    output = "生成結果のサンプル"
+    has_forbidden_word = any(w in output for w in ["機密", "社外秘"])
+    langfuse.score_current_trace(
+        name="no_forbidden_words",
+        value=0 if has_forbidden_word else 1,
+        comment="規制ワード混入チェック（ルールベース）",
+    )
+```
+
+## PII マスキングと入出力サニタイズ — プライバシー設計
+
+ユーザーの入力には個人情報（メール・電話・住所）が混ざることが避けられません。そのまま Langfuse に送ると、Langfuse 側のデータベースに PII が蓄積されます。ここは本番運用で必ず対策しなければならない点です。
+
+**推奨する 3 段構え:**
+
+```python
+# app/services/safe_observer.py
+import re
+from langfuse import Langfuse
+
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+PHONE_RE = re.compile(r"0\d{1,4}-?\d{1,4}-?\d{3,4}")
+
+
+def mask_pii(text: str) -> str:
+    """入力から PII を置換する。Langfuse 送信直前に呼ぶ。"""
+    text = EMAIL_RE.sub("[EMAIL]", text)
+    text = PHONE_RE.sub("[PHONE]", text)
+    return text
+
+
+# Langfuse SDK のマスキングフックを登録
+def mask_hook(data: dict) -> dict:
+    if isinstance(data, dict):
+        if "input" in data and isinstance(data["input"], str):
+            data["input"] = mask_pii(data["input"])
+        if "output" in data and isinstance(data["output"], str):
+            data["output"] = mask_pii(data["output"])
+    return data
+
+
+langfuse = Langfuse(mask=mask_hook)  # ここで登録すると全 Generation で自動適用
+```
+
+**重要な落とし穴:** 上記の正規表現はあくまでサンプルで、実運用では Google Cloud DLP や Presidio などのライブラリを使うべきです。特に医療情報・金融情報を扱うプロダクトでは、自社の規程に従って PII 辞書を定義してください。
+
+さらに、セルフホスト版の Langfuse であれば、`LANGFUSE_FEATURES` 環境変数で「入出力本文を保存しないモード（メタデータのみ収集）」を有効化できます。機微度が特に高い業務領域ではこのモードを検討してください。
+
+## 高トラフィックでのサンプリング戦略
+
+Langfuse のコスト（Cloud 版の有料プラン / セルフホストの DB 容量）と、ダッシュボードのレスポンスは、observation 数に直接比例します。日次数十万〜数百万 LLM 呼び出しになる本番プロダクトでは、全量送信は現実的ではありません。
+
+私が使っている 3 層サンプリングルールを共有します。
+
+**レイヤ 1：確定的サンプリング（トラフィックの 5〜10%）** — `user_id` の末尾 2 桁が `00〜09` のユーザーのみトレース送信、のようにハッシュで決めます。同じユーザーの挙動を通しで追える利点があります。
+
+**レイヤ 2：エラー時は常に送信** — 5xx や Gemini の安全フィルタでブロックされたリクエストは 100% 送信します。`try / except` で捕まえて、サンプリング判定をバイパスします。
+
+**レイヤ 3：スコアが低いリクエストは後追い送信** — 本番アプリで「ユーザーがサムダウンを押した」「リトライボタンを押した」といった負のシグナルを検知したら、そのトレース ID を Langfuse に後追いで送信し直します。これがコスパ最強の仕組みで、「ユーザー不満のあった対話だけ精密にトレースが残る」状態が作れます。
+
+実装例（Python・Flask）:
+
+```python
+import hashlib
+from flask import Flask, request
+
+def should_trace(user_id: str) -> bool:
+    """user_id を SHA1 し、末尾バイトで 10% 判定する。"""
+    h = hashlib.sha1(user_id.encode()).hexdigest()
+    return int(h[-2:], 16) < 26  # 256 の 10% は約 26
+
+
+app = Flask(__name__)
+
+
+@app.post("/ask")
+def ask():
+    user_id = request.json["user_id"]
+    question = request.json["question"]
+
+    if should_trace(user_id) or request.json.get("force_trace"):
+        # トレースあり経路
+        from app.agents.research_agent import run_research_agent
+        answer = run_research_agent(question, user_id=user_id)
+    else:
+        # トレースなし経路（Langfuse 呼び出しをスキップする純関数版を別途用意）
+        from app.agents.research_agent_silent import run_research_agent_silent
+        answer = run_research_agent_silent(question)
+
+    return {"answer": answer}
+```
+
+## よくある落とし穴とその回避策
+
+ここまで書いてきた内容を踏まえて、本番投入で実際に遭遇した「やらかし」を共有します。事前に知っていれば避けられます。
+
+**落とし穴 1: `flush()` 忘れでトレースが欠損する**
+AWS Lambda・Cloud Functions・Cloud Run（非常駐）ではプロセスが短命で終わります。リクエスト処理の最後に `langfuse.flush()` を呼ばないと、バッファに溜まったトレースが送信前にプロセスが終了します。ミドルウェアで `after_request` フック等に仕込むのが確実です。
+
+**落とし穴 2: メタデータに高カーディナリティキーを入れる**
+前述の通り `article_id`・`order_id` を `metadata` に直接入れるとグルーピングが壊れます。これらは `tags` ではなく `input`/`output` の JSON 内に含めるか、`session_id` として扱ってください。
+
+**落とし穴 3: モデル価格の登録漏れでコスト 0 表示**
+新モデルが出たときは必ず Langfuse UI で登録を追加してください。登録しないとコストが `—` のまま、月次レポートで「今月のコストは $0」という誤った判断に繋がります。
+
+**落とし穴 4: `@observe` 内で例外を握り潰す**
+デコレータが例外を握って成功扱いになると、エラー率ダッシュボードが嘘をつきます。`@observe` は例外を透過させる実装ですが、内側の `try / except` で握り潰している箇所がないかレビュー時にチェックします。
+
+**落とし穴 5: セルフホストで ClickHouse の容量が尽きる**
+トレース保存先の ClickHouse は、サンプリングなしだと日次数 GB 増えます。保持期間（例：90 日）を設定し、古いデータは S3 へアーカイブするジョブを組むことを強く勧めます。
+
+**落とし穴 6: 同じプロンプトで複数回呼び出したときのノイズ**
+開発中のデバッグで同じプロンプトを 20 回叩くと、本番トレースに混ざってダッシュボードが歪みます。開発環境では `LANGFUSE_PROJECT` を別プロジェクトに向ける、あるいは `tags=["dev"]` を必ず付けてフィルタ除外してください。
+
+## Node.js / TypeScript での実装
+
+Gemini を Next.js の Route Handler、Cloud Run、Cloudflare Workers など Node.js 基盤で動かすケースも多いと思います。Langfuse の JavaScript SDK も Python とほぼ同じ使い勝手です。公式 `@google/genai` クライアントと組み合わせた最小例を示します。
+
+```typescript
+// app/lib/observed-gemini.ts
+import { GoogleGenAI } from "@google/genai";
+import { Langfuse } from "langfuse";
+
+const langfuse = new Langfuse({
+  publicKey: process.env.LANGFUSE_PUBLIC_KEY!,
+  secretKey: process.env.LANGFUSE_SECRET_KEY!,
+  baseUrl: process.env.LANGFUSE_HOST,
+});
+
+const genai = new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY! });
+
+export async function summarize(
+  text: string,
+  opts: { userId: string; plan: string }
+): Promise<string> {
+  const trace = langfuse.trace({
+    name: "summarize_article",
+    userId: opts.userId,
+    metadata: { plan: opts.plan, feature: "article_summary" },
+  });
+
+  const generation = trace.generation({
+    name: "gemini-2.5-flash-call",
+    model: "gemini-2.5-flash",
+    input: text,
+  });
+
+  const response = await genai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: `次を200字以内で要約してください:\n${text}`,
+  });
+
+  const out = response.text ?? "";
+  const usage = response.usageMetadata;
+  generation.end({
+    output: out,
+    usage: {
+      input: usage?.promptTokenCount,
+      output: usage?.candidatesTokenCount,
+    },
+  });
+
+  await langfuse.shutdownAsync(); // サーバーレスでは必須
+  return out;
+}
+```
+
+Node 版には 2 点、覚えておきたい注意があります。サーバーレス（Vercel・Cloudflare Workers・AWS Lambda）ではレスポンスを返す前に必ず `shutdownAsync()` または `flushAsync()` を呼ばないとトレースが消えます。また、本稿執筆時点では Python の `@observe` デコレータに完全一致する API は Node SDK にありません。Trace と Generation の階層は手動で組み立てます。記述量は少し増えますが、どこに記録が入るのかが明示的になるため、コードレビューでは見やすくなります。
+
+Cloudflare Workers などのエッジランタイムでは、バンドラが `langfuse` をフル同梱しているか（壊れた形でツリーシェイクされていないか）と、`LANGFUSE_HOST` がそのエッジリージョンから到達可能かを必ず確認してください。過去に見た本番障害のいくつかは、リージョン固有のファイアウォールが Langfuse の送信エンドポイントを遮断していた事例でした。
+
+## 代替ツールとの比較
+
+「Langfuse を本当に選ぶべきか」は必ず検討が入る論点です。2026 年春時点での、私自身の実務判断を共有します。情報はすぐ古くなるので、導入時は必ず公式サイトで最新状況を確認してください。
+
+**LangSmith** — LangChain 純正の観測ツール。LangChain を深く使っているコードベースなら、トレース構造が LangChain の抽象と 1 対 1 で対応して非常に快適です。LangChain を使わない場合は優位性が薄れ、マネージド専用・価格はやや高め、という位置づけになります。Langfuse は LangChain の有無に依存しません。
+
+**Helicone** — LLM 呼び出しの前に立つプロキシ方式。Base URL を差し替えるだけで観測が入るため、導入が最も楽です。ただしプロキシがクリティカルパスに入るため、レイテンシと可用性がそのまま自社サービスに影響します。低労力で観測を入れたい・プロキシのトレードオフを許容できるチームには良い選択肢です。Langfuse はデコレータ／SDK 方式でリクエストパスに入らないため、ホットなエンドポイントでは私はこちらを好みます。
+
+**Phoenix by Arize** — オープンソース。評価系（LLM-as-Judge の組み込みテンプレート）と埋め込みの検査機能が強力です。RAG チューニングとオフライン評価が中心のワークフローなら、強力な選択肢になります。一方、日常的な本番観測（コスト按分・プロンプト管理）の UI は Langfuse のほうが熟れた印象です。
+
+**自前で OpenTelemetry** — すでに Grafana・Datadog・Honeycomb などの観測基盤を運用しているチームなら正当な選択肢です。GenAI 向け OTel のセマンティック規約も整ってきました。保管・保持を完全に制御できる反面、Gemini に新機能（Thinking トークン・Grounding メタデータ・キャッシュヒット）が出るたびに属性名の議論が発生する運用コストがあります。Langfuse はその手間を肩代わりしてくれます。
+
+観測基盤の前提が特にないチームに対して私が基本推奨するのは、「最初の 3 カ月は Langfuse Cloud、運用ボリュームが見えたタイミングで小さな VPS にセルフホスト」の二段構えです。セルフホストの手間は、運用規模が見えてから負ったほうがコスパが良くなります。
+
+## アラート・ダッシュボード・データセット — 後付けで効く周辺機能
+
+コア観測ループが回り始めたら、以下 3 つの拡張を追加するとさらに効果が出ます。
+
+**リグレッションアラート.** Langfuse は指標ベースのウェブフックアラートに対応しています（エラー率・p95 レイテンシ・LLM-as-Judge 平均スコア・コスト）。Slack や PagerDuty に流し込みます。私が最も頼りにしているのは「`answer_relevance` が直近 500 トレース平均で 3.5 を下回ったら発火」のアラートです。ユーザーが異変に気づく前に検知できます。
+
+**Langfuse API を使った独自ダッシュボード.** UI で足りることが多いですが、Stripe の売上と結合した「有料ユーザー 1 人あたりのコスト」のような結合クエリを作りたい場面が必ず来ます。Langfuse API は OpenAPI で整備されているので、1 時間おきに BigQuery や Snowflake に取り込めば、半日で組める粒度です。
+
+**データセットを使ったオフラインリグレッションテスト.** プロンプト変更を本番投入する前に、過去トレースから選んだ「効いてほしいケース集（エッジケース・苦情・主要顧客）」に対して新バージョンを走らせ、LLM-as-Judge のスコアを比較します。Langfuse の Datasets 機能で、履歴トレースにタグを付けて再実行できます。本番の観測が、そのまま開発のリグレッションテストに還流する流れが作れます。
+
+## 事例：週末を救った 1 つのトレース
+
+少し前に、Gemini を使った小規模プロダクトの当番をしていた土曜の朝、あるユーザーから「昨夜返ってきた回答に存在しない取引先名が自信満々で混ざっていた」という報告メールが届きました。観測基盤なしでこの報告を受けると、週末が吹き飛ぶタイプの案件です。「正確な質問文を聞き返し、手元で再現し、金曜時点のプロンプトを git log で確認し……」と最低でも半日は消えます。
+
+Langfuse を入れていたおかげで、トリアージは 12 分で終わりました。ユーザーのメールドメインと金曜の時間帯でトレースを絞り込み、該当の Generation を特定。検索ステップから取得した古い文書を元にモデルが勝手に顧客名を補完していたことが、入力と出力の比較から即座に見えました。実は `hallucination_flag` エヴァリュエータが夜間のうちに 1 を付けていて、アラートは前夜 Slack に飛んでいました（金曜夜に確認を怠っただけです）。根本原因は検索側の古いインデックスで、当日朝のうちに「参考資料に確証がない場合は『確認できません』と答えさせる」プロンプト側のガードを追加して修正。
+
+こういう場面で効いてくるのが、観測基盤に時間をかけたことへの本当の見返りです。ダッシュボードや抽象的な KPI ではなく、特定のリクエストに紐づいた、検索できる、再現可能なトレース。「どこかで何かがおかしい」を「このリクエストでこう起きた・入力はこれ・出力はこれ・参照資料はこれ・スコアはこう」に変える力があります。
+
+## Langfuse 自体を安定運用する
+
+セルフホストを選ぶと、Langfuse そのものがプロダクションスタックの一部になります。以下は私が顧問先に勧めている運用習慣です。
+
+- **環境分離**: プロダクション用と、ステージング＋開発用で Langfuse プロジェクトまたはインスタンスを分ける。混ぜるとダッシュボードがノイズだらけになり、コンプライアンスレビューで説明が難しくなります。
+- **Langfuse を一般的なサービスとして監視する**: ClickHouse ディスク・Postgres コネクション・ワーカーの遅延。Docker Compose では `/api/public/health` が公開されているので、外形監視に組み込んでください。
+- **アップグレード計画**: Langfuse は頻繁にアップデートされ、メジャー更新では ClickHouse スキーマ移行を伴うことがあります。リリースノートは必読、営業時間帯の自動更新は避けます。
+- **バックアップ**: Postgres にはプロンプト定義・プロジェクト設定・ユーザーが保存されているので夜次バックアップを推奨。ClickHouse はトレース側で容量が大きいため、必要な保持期間（多くの場合 30〜90 日で十分）を見極めて、長期保管は S3 へアーカイブ。
+- **キーローテーション**: Langfuse API キーは他のシークレット同様、四半期ごと／メンバー離脱時に必ずローテーションします。
+
+## 本番導入のロードマップ — 段階的に入れるのが吉
+
+一気に全機能を導入すると運用負荷で止まります。私が顧問先でいつも勧めている順序は次の通りです。
+
+**第 1 週（観測の骨格）** — `@observe` デコレータを主要エンドポイントに 3〜5 箇所だけ入れる。`user_id`・`feature` メタデータ付与。これだけでユーザー問い合わせ対応速度が劇的に上がります。
+
+**第 2 週（コスト可視化）** — モデル価格登録 → 機能別コスト分解ダッシュボード作成。ここで「想定外に金がかかっている機能」が見つかります。
+
+**第 3 週（評価）** — `answer_relevance` と `tone_compliance` だけ LLM-as-Judge を入れる。5% サンプリングで十分。プロンプト変更時のリグレッション検知に威力を発揮します。
+
+**第 4 週（PII・サンプリング）** — 本番トラフィックが見えてきたところで、マスキングフックとサンプリングルールを入れます。早すぎるサンプリングは初期の観測機会を奪うので、ここが適切なタイミングです。
+
+この進め方なら、既存プロダクトに対するリスクを最小限に抑えつつ、Langfuse の価値を段階的に引き出せます。関連トピックとして、コスト削減の源泉となる[Gemini API コンテキストキャッシング完全ガイド](/articles/gemini-api/context-caching-guide)や、レート制限時の挙動を観測する前提となる[Gemini API レート制限・クォータ管理 本番運用ガイド](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide)と組み合わせて運用すると、本番の安定性が一段上がります。
+
+## まず今日やること
+
+Langfuse Cloud で 1 アカウント作成し、Python スクリプト 1 本に `@observe` を付けて、自分の開発環境の Gemini 呼び出しを 10 回だけトレースしてみてください。UI 上で入出力・レイテンシ・メタデータがつながって見える体験をすると、「このレベルの観測が本番にあるかないか」で開発体験が別物だということが、言葉ではなく肌でわかります。そこから逆算して、本番投入の優先順位を決めていくのが、もっとも後悔の少ない導入手順です。
