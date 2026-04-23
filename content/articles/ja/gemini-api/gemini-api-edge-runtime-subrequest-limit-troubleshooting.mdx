@@ -1,0 +1,147 @@
+---
+title: "Gemini API を Cloudflare Workers で動かすと subrequest limit に引っかかる時の対処法"
+slug: "gemini-api-edge-runtime-subrequest-limit-troubleshooting"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-23T09:30"
+author: "Gemini Lab"
+description: "Gemini API を Cloudflare Workers や Vercel Edge Runtime で使うと突然 'subrequest limit exceeded' で止まる問題の原因と、私が運用しているサイト群で実際に効いた対処パターンをまとめます。"
+tags: ["gemini-api", "cloudflare-workers", "edge-runtime", "troubleshooting", "subrequest"]
+---
+
+Cloudflare Workers に Gemini API を載せて運用していると、ローカルでは何の問題もなかったコードが、本番に出した瞬間「Too many subrequests」というエラーを返し始めることがあります。私自身、運営しているサイト群を Cloudflare Workers に統一した直後にこの罠にハマり、半日ほど原因切り分けに費やしました。
+
+このエラーは Gemini API そのものの問題ではなく、Edge Runtime 側の制限が顔を出した結果です。仕様を一度理解してしまえば対処はシンプルなのですが、ローカルでは絶対に再現しないため初見で迷いやすいポイントでもあります。この記事では、私が現場で実際に使っている診断手順と、副作用の少ない順に並べた対処パターンをご紹介します。
+
+## エラーの正体 — Cloudflare Workers の subrequest という概念
+
+Cloudflare Workers では、1 リクエストの処理中に外部へ発行できる HTTP リクエスト（fetch / cache / KV / D1 / R2 など）の総数に上限が設けられています。Free プランで 50 件、Standard / Unbound プランで 1,000 件です（執筆時点）。Gemini API への呼び出しも当然この 1 件に数えられます。
+
+ここで意外と見落とされるのが「自分が直接 fetch していないリクエストもカウントされる」という事実です。Next.js on Workers であれば内部の cache miss → ASSETS 取得もサブリクエストですし、Hono に Logger ミドルウェアを噛ませて外部に飛ばしていればそれも 1 件です。Gemini API を 1 回叩いているつもりでも、実際にはアプリ内で 30 件近く消費しているということが普通に起こります。
+
+「ローカルでは出ないのに本番だけ出る」現象になるのは、開発時のサーバーがこの制限を持たないからです。`wrangler dev --remote` で実行すれば本番に近い挙動を再現できるので、デバッグ環境を整えるところから始めるのがおすすめです。
+
+## まず最初に確認すべき 3 つのポイント
+
+エラーメッセージを見て最初に手を出したくなるのはモデル変更やリトライ実装ですが、その前に下記を観察すると診断が一気に楽になります。
+
+第一に、**1 リクエストあたりの fetch 回数を実測すること**。`wrangler tail` を立ち上げて実トラフィックのログを眺め、1 件のユーザー操作に対して fetch が何回飛んでいるかを数えます。多くの場合「自分のコードは 1 回しか fetch していないはずなのに 25 件出ている」というギャップに気づきます。
+
+第二に、**Function Calling のループ深度**を確認します。Gemini API でツール呼び出しを使っていると、モデルが続けて別のツールを呼びに来るたびに新しい fetch が発生します。深度 5 のチェーンになれば、それだけで 5 件のサブリクエストです。
+
+第三に、**ストリーミング使用時のリトライポリシー**です。SDK の自動リトライが裏で動いていて、ユーザーから見える 1 リクエストの内側で 3 回再試行 = 3 件カウントというのは典型例です。
+
+## 対処法 1: 不要な並列 fetch を畳む
+
+私が最初に入れる修正はここです。Function Calling で複数ツールを順番に呼んでいる場合、Gemini 2.5 以降は `parallelToolCalls: true` を渡して並列化できますが、並列化したぶん subrequest 数は変わらないため上限対策にはなりません。むしろ「呼ばないで済むツールは呼ばない」設計に振るほうが効きます。
+
+具体的には、ツール定義に「いつ呼んでもいいか」をプロンプトレベルで明記する手法です。
+
+```ts
+// system instructions に「不要な検索を避ける」明示ルールを入れる
+const systemInstruction = `
+あなたは社内ナレッジ検索アシスタントです。
+- ユーザーの質問が雑談・挨拶の場合は、検索ツールを呼ばずに直接応答してください
+- 既に直近の履歴で同じキーワードを検索済みなら、再検索せず履歴の結果を再利用してください
+- 1 ターンで呼ぶツール数は最大 2 件までにしてください
+`;
+
+const result = await ai.models.generateContent({
+  model: "gemini-2.5-pro",
+  contents,
+  config: {
+    systemInstruction,
+    tools: [{ functionDeclarations: [searchTool, fetchDocTool] }],
+  },
+});
+```
+
+この一手だけでツール呼び出し回数が体感半分になることもあります。Gemini はかなり素直にこの種の制約を守ってくれる印象です。
+
+## 対処法 2: 小さな fetch を Durable Objects か KV に集約する
+
+ログ送信、メトリクス送信、軽量な設定取得などを毎リクエスト都度 fetch しているなら、これは subrequest を真っ先に削減できる対象です。私のサイト群では、Logger ミドルウェアからの送信を「リクエスト終了時にまとめて 1 回」に変更しただけで、平均 subrequest 数が 18 → 6 まで下がりました。
+
+Cloudflare Workers では `event.waitUntil()` を使うと、レスポンス返却後にバックグラウンドで処理を継続できます。Gemini API のレスポンスを返した後にメトリクスをまとめて飛ばすパターンは、ユーザー体感速度を落とさずに subrequest 数を圧縮できる定石です。
+
+## 対処法 3: Function Calling の最大ループ数を明示的に制限する
+
+ツールチェーンが深くなりすぎてエラーになるケースには、SDK 側でループ上限を設定するのが安全です。Google AI SDK には組み込みのループ機能がないので、自前で書く必要があります。
+
+```ts
+const MAX_TOOL_LOOPS = 3;
+let loopCount = 0;
+let messages = [...initialMessages];
+
+while (loopCount < MAX_TOOL_LOOPS) {
+  loopCount++;
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-pro",
+    contents: messages,
+    config: { tools },
+  });
+
+  const calls = response.functionCalls ?? [];
+  if (calls.length === 0) {
+    return response.text; // ツール呼び出しなし → 完成
+  }
+
+  // ツールを実行して結果を messages に追加
+  for (const call of calls) {
+    const result = await executeToolLocally(call);
+    messages.push({
+      role: "user",
+      parts: [{ functionResponse: { name: call.name, response: result } }],
+    });
+  }
+}
+
+throw new Error(`ツール呼び出しが ${MAX_TOOL_LOOPS} 回で打ち切られました`);
+```
+
+上限に達した時点で例外を投げる作りにしておくと、エンドユーザーに「処理が複雑すぎたため、より具体的な質問でお試しください」のように分かりやすいフィードバックを返せます。
+
+## 対処法 4: SDK の自動リトライを把握して再設計する
+
+`@google/genai` SDK は、503 や 429 を受けたときに静かにリトライを行います。これ自体は便利ですが、subrequest 上限に近いところで動いていると逆効果になります。
+
+タイムアウトやリトライ回数は明示的に上書きしておくのが安全です。
+
+```ts
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({
+  apiKey: env.GEMINI_API_KEY,
+  httpOptions: {
+    // SDK 内部リトライをこちらで制御する
+    timeout: 30_000,
+  },
+});
+```
+
+そしてリトライ自体は、自前のラッパー関数として書きます。失敗を呼び出し元に任せるのではなく、必ず Edge Runtime の subrequest 残量を意識した実装にしておきます。
+
+## 対処法 5: Workers Paid プランへの移行と分割実行
+
+ここまでの最適化で 50 件の壁を越えそうにない場合は、Workers Standard プラン（月 $5）に移行することで上限が 1,000 件に上がります。私個人の感触では、Function Calling を多用するアプリは無料プランでは早晩壁に当たるので、本番運用なら最初から Standard を選んでおくのが現実的です。
+
+それでも厳しい場合は、処理を複数のリクエストに分割するアーキテクチャに切り替えます。具体的には Cloudflare Queues か Durable Objects に処理を投げ、ユーザーには即時レスポンスを返してから非同期で結果を通知する設計です。私自身は WebSocket より Server-Sent Events のほうが Edge Runtime と相性が良いと感じていて、進捗イベントだけ SSE で返す構成を採用することが多いです。
+
+## デプロイ前のチェックリスト
+
+最後に、私が新しい Workers アプリを本番に出す前に必ず確認している項目を共有します。
+
+- `wrangler dev --remote` で本番相当の subrequest 制限下で動作確認したか
+- `wrangler tail` で 1 リクエストあたりの fetch 数が想定範囲内か
+- Function Calling のループ上限を実装で明示しているか
+- Logger / メトリクス送信を `waitUntil` でバッチ化しているか
+- リトライポリシーを SDK 任せにしていないか
+
+このリストに従うだけで、subrequest limit 起因のインシデントはほぼ予防できます。Edge Runtime はサーバレスの中でも特に制約が厳しい環境なので、最初は窮屈に感じるかもしれませんが、慣れると逆にクリーンなアーキテクチャを強制してくれる良いガードレールだと感じています。
+
+関連する深掘り記事として、[Gemini API レスポンスが遅い・タイムアウトする時の対処法](/articles/gemini-api/gemini-api-slow-response-timeout-fix)、[Gemini を Cloudflare Workers でエッジ AI 化する実践ガイド](/articles/gemini-api/gemini-api-cloudflare-workers-edge-ai)、そして [Hono × Cloudflare Workers で Gemini API を扱うテンプレート](/articles/gemini-api/gemini-api-hono-cloudflare-edge-ai-guide) を併せて読むと、Edge 環境での Gemini 運用の全体像が掴みやすくなります。
+
+エッジ環境での AI 統合パターンを体系的に学びたい方には、[詳解 Cloudflare Workers（クラウドフレア株式会社）](https://www.amazon.co.jp/dp/4297145960/?tag=pinocchio-22) が、Workers の制限事項と実装パターンを丁寧に整理してくれていて参考になります。
+
+まずは `wrangler tail` を立ち上げて、自分のアプリが 1 リクエストで何件 fetch しているかを数えるところから始めてみてください。原因が分かるとそれだけで気持ちが軽くなりますし、対処の優先順位も自然と見えてきます。

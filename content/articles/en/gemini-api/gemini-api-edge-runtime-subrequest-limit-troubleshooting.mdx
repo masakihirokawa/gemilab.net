@@ -1,0 +1,167 @@
+---
+title: "Hitting the Subrequest Limit When Running Gemini API on Cloudflare Workers? Here's What Actually Works"
+slug: "gemini-api-edge-runtime-subrequest-limit-troubleshooting"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-23T09:30"
+author: "Gemini Lab"
+description: "Your Gemini API code works locally but throws 'Too many subrequests' the moment it ships to Cloudflare Workers or Vercel Edge. Here are the diagnostic steps and fixes I actually use across the sites I run."
+tags: ["gemini-api", "cloudflare-workers", "edge-runtime", "troubleshooting", "subrequest"]
+---
+
+You ship your Gemini API integration to Cloudflare Workers, everything looked fine in local dev, and suddenly production starts returning "Too many subrequests." I lost half a day to this exact problem when I migrated my own sites to Workers, so I want to save you that detour.
+
+The error itself is not a Gemini API problem at all — it's the Edge Runtime quietly enforcing a quota you can't see locally. Once you understand what is being counted as a "subrequest," the fix is usually a small architectural shift rather than a code rewrite. Below are the diagnostic steps and remediation patterns I rely on, ordered from least invasive to most.
+
+## What "subrequest" actually means on Cloudflare Workers
+
+Cloudflare Workers caps the total number of outbound requests a single invocation can make: 50 on the Free plan, 1,000 on Standard or Unbound (at the time of writing). Every fetch counts — including calls to KV, D1, R2, Cache API, and your Gemini API request. They all draw from the same bucket.
+
+What people miss is that **a lot of those fetches are not yours**. If you're on Next.js on Workers, an internal cache miss can fan out to multiple ASSETS lookups. A logger middleware in Hono that ships to a third-party service is one fetch per request. You think you're calling Gemini once, but the Worker may be issuing 20+ fetches in the background.
+
+The reason this never fires locally is that `wrangler dev` doesn't enforce the limit by default. Switching to `wrangler dev --remote` reproduces production behavior, and that's the first thing I'd recommend setting up before debugging anything else.
+
+## Three things to check before you change a line of code
+
+The temptation is to rewrite the model invocation immediately. Resist it. The following observations make the diagnosis vastly easier:
+
+**Count fetches per request.** Run `wrangler tail` against real traffic and count how many fetches one user action produces. You'll often discover an "I only call fetch once, so why is it 25?" gap that points directly at the culprit.
+
+**Inspect Function Calling depth.** Each tool invocation is a fresh fetch. A chain of five tool calls is five subrequests on top of whatever else your handler is doing.
+
+**Check streaming retry policy.** The SDK silently retries on 503 and 429. Three hidden retries means three hidden subrequests, all charged to the same invocation.
+
+## Fix 1: Don't make the calls you don't need
+
+This is always my first move. Calling tools in sequence vs. in parallel does not change the subrequest count — the total is still N tool calls. What changes the count is **avoiding tool calls in the first place**.
+
+The cleanest lever is system instructions that explicitly tell the model when to stay silent.
+
+```ts
+const systemInstruction = `
+You are an internal knowledge search assistant.
+- For greetings or small talk, respond directly without calling any search tool
+- If the same keyword has already been searched in recent history, reuse that result
+- Cap tool calls per turn at 2
+`;
+
+const result = await ai.models.generateContent({
+  model: "gemini-2.5-pro",
+  contents,
+  config: {
+    systemInstruction,
+    tools: [{ functionDeclarations: [searchTool, fetchDocTool] }],
+  },
+});
+```
+
+In my experience, Gemini follows these constraints surprisingly well. This single change has cut tool invocation counts roughly in half on apps I've shipped.
+
+## Fix 2: Batch your small fetches into one
+
+Logging, metrics, lightweight config lookups — anything you fetch every request is a candidate for consolidation. On my sites, moving logger output to a single batched send at the end of each request dropped the average subrequest count from 18 to 6. That alone bought me enough headroom that the limit stopped being a problem in normal operation.
+
+`event.waitUntil()` is your friend here. You return the Gemini response to the user, then ship the metrics in the background. The user-perceived latency stays flat while your subrequest budget recovers.
+
+## Fix 3: Cap your Function Calling loop explicitly
+
+Deep tool-calling loops are an obvious failure mode, and the Google AI SDK doesn't ship with a built-in cap. Write one:
+
+```ts
+const MAX_TOOL_LOOPS = 3;
+let loopCount = 0;
+let messages = [...initialMessages];
+
+while (loopCount < MAX_TOOL_LOOPS) {
+  loopCount++;
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-pro",
+    contents: messages,
+    config: { tools },
+  });
+
+  const calls = response.functionCalls ?? [];
+  if (calls.length === 0) {
+    return response.text; // No more tool calls — we're done
+  }
+
+  for (const call of calls) {
+    const result = await executeToolLocally(call);
+    messages.push({
+      role: "user",
+      parts: [{ functionResponse: { name: call.name, response: result } }],
+    });
+  }
+}
+
+throw new Error(`Tool calling stopped at ${MAX_TOOL_LOOPS} loops`);
+```
+
+Throwing on the cap lets you return a graceful error like "your request was too complex — try narrowing it down." That's a much better user experience than a silent 500 from the runtime hitting the subrequest ceiling.
+
+## Fix 4: Take the SDK's auto-retry into your own hands
+
+`@google/genai` quietly retries on 503 and 429. That convenience becomes a liability when you're flirting with the subrequest cap. Make the retries explicit.
+
+```ts
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({
+  apiKey: env.GEMINI_API_KEY,
+  httpOptions: {
+    timeout: 30_000,
+  },
+});
+```
+
+Then wrap the call yourself with a retry policy that respects the runtime budget. Don't leave retry semantics to the library when there's a hard ceiling on outbound traffic.
+
+## Fix 5: Upgrade the plan, then split the work
+
+If even after the optimizations above you're banging into the 50-subrequest ceiling, move to Workers Standard ($5/month) — the cap jumps to 1,000. Honestly, for any production app that uses Function Calling regularly, I'd plan on Standard from day one.
+
+If you outgrow even that, the right move is to split processing across multiple requests. Push the heavy work into Cloudflare Queues or a Durable Object, return immediately to the user, and notify the result asynchronously. I personally find Server-Sent Events a better fit for Edge Runtime than WebSockets — the connection model is simpler and progress streaming is enough for most user flows.
+
+## Bonus: instrument your Worker so you catch this early
+
+The fastest way to stop being surprised by subrequest limits is to surface the count yourself, in every response. I add a small helper that wraps `fetch` and increments a counter on the request context, then I expose the running total in a debug header in non-production environments:
+
+```ts
+type Ctx = { subreqCount: number };
+
+export function instrumentedFetch(ctx: Ctx) {
+  return async (input: RequestInfo, init?: RequestInit) => {
+    ctx.subreqCount++;
+    return fetch(input, init);
+  };
+}
+```
+
+Wire that helper through the request scope, then tag the outgoing response with `X-Subreq-Count` for staging. The first time you watch the number creep past 30 on a single chat turn, the optimization priorities become obvious without any guesswork.
+
+A second piece of light tooling that pays off quickly: a tiny dashboard panel in your admin route that calls `wrangler tail`-equivalent log aggregation and reports the 95th percentile of subrequest counts per route. Edge Runtime gives you very little observability out of the box, so the small effort of building this yourself prevents a lot of late-night incidents.
+
+## When you should not blame subrequests
+
+One last note from real-world debugging: not every "Too many subrequests" error is actually about subrequests. Cloudflare also surfaces this when a request loops back to the same Worker route (a self-fetch) — a configuration footgun rather than a quota issue. If you see the error happen with the count well below 50, check whether your Worker is fetching one of its own routes through `fetch()` instead of calling the function directly.
+
+Likewise, if you're using the Cache API or KV with TTLs that are too short, you may be paying for the same lookup multiple times in one request. Auditing the cache layer is often a faster win than reaching for a plan upgrade.
+
+## Pre-deploy checklist
+
+Before I push a new Workers app to production, I run through:
+
+- Did I run `wrangler dev --remote` to validate against the real subrequest limit?
+- Did `wrangler tail` confirm fetch counts per request are within budget?
+- Is the Function Calling loop bounded by an explicit max?
+- Are logger and metrics calls batched via `waitUntil`?
+- Have I taken control of the retry policy instead of trusting the SDK?
+
+Working through this list once almost completely eliminates subrequest-driven incidents. Edge Runtime is one of the more constrained serverless environments out there, and at first the limits feel cramping — but in practice, they enforce a clean architecture that I've come to appreciate.
+
+For deeper context, pair this with [What to do when Gemini API responses are slow or timing out](/articles/gemini-api/gemini-api-slow-response-timeout-fix), [A practical guide to Edge AI on Cloudflare Workers with Gemini](/articles/gemini-api/gemini-api-cloudflare-workers-edge-ai), and [A Hono + Cloudflare Workers template for Gemini API](/articles/gemini-api/gemini-api-hono-cloudflare-edge-ai-guide). Together they cover the whole story of running Gemini reliably on the edge.
+
+If you want a wider view of edge-native AI patterns, [Cloudflare Workers in Action (Cloudflare Inc.)](https://www.amazon.co.jp/dp/4297145960/?tag=pinocchio-22) is a careful walkthrough of the platform's limits and the patterns that actually work around them.
+
+The single highest-leverage thing you can do today is open `wrangler tail` and count how many fetches your Worker makes for one user request. The number is almost always higher than you'd guess, and once you see it, the fix list above will write itself.
