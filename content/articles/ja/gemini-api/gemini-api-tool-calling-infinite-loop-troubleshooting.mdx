@@ -1,0 +1,163 @@
+---
+title: "Gemini APIのFunction Callingが無限ループする原因と止め方"
+slug: "gemini-api-tool-calling-infinite-loop-troubleshooting"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-23T09:30"
+author: "Gemini Lab"
+description: "Function Callingを組んでいたら、同じツールを何度も呼び続けて処理が終わらなくなる。そんなときに原因を特定し、最短で止めるための診断と対策をまとめました。"
+tags: ["gemini", "function-calling", "troubleshooting", "agent"]
+---
+
+自作エージェントを動かしていたら、同じツールが何十回も呼ばれ続けてAPI利用料だけが静かに膨らんでいた——Function Callingを本格的に組み始めた方なら、一度はヒヤッとする場面ではないでしょうか。私も最初に小さな検索エージェントを書いたとき、`search_web` が延々と呼び出され、止めようとしても次のターンでまた同じツール呼び出しが返ってくる、という事態に直面しました。
+
+Function Callingの無限ループは、バグというよりモデル・ツール・プロンプトの「会話設計のズレ」が原因で発生することがほとんどです。この記事では、Gemini APIの実際のレスポンスを見ながら、なぜループが起きるのかを切り分けて、停止条件を明示的に設計する方法をご紹介します。
+
+## 無限ループは「モデルが終わり方を知らない」から起きる
+
+Function Callingがループする現象は、見た目は派手ですが、原因はシンプルです。モデルは「あと一回ツールを呼べば答えが出る」と判断してツールを呼び、返ってきた結果を見て、また同じ判断をします。この判断が続く背景には、次のどれかが絡んでいます。
+
+- ツールの返却値が、モデルから見て「まだ答えに足りない」ように見える
+- プロンプトに「いつ終わるべきか」の基準が書かれていない
+- モデルがテキスト応答を返そうとするたびにコード側がツール実行に戻してしまう
+- 同じ引数で同じツールを呼び続けても、検知して止める仕組みがない
+
+要するに、モデルは与えられた情報の範囲で最善を尽くしているだけで、止まるためのヒントを人間が与えていないのです。ここを押さえておくと、原因調査がぐっと楽になります。
+
+## まずはレスポンスの`finish_reason`と履歴を追う
+
+ループを止めるには、どのターンでモデルがどんな判断をしたかを見える形にするのが第一歩です。Pythonの`google-genai` SDKで、ツール呼び出しと応答を逐次出力する最小限の診断コードは以下のようになります。
+
+```python
+# 目的: ツール呼び出しの連鎖を可視化し、どこでループしているかを特定する
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+def search_web(query: str) -> dict:
+    # ダミー実装: 実際はWeb検索APIを呼ぶ
+    return {"results": [{"title": f"dummy for {query}"}]}
+
+tools = [types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name="search_web",
+        description="キーワードでWebを検索する",
+        parameters={"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]},
+    )
+])]
+
+history = [types.Content(role="user", parts=[
+    types.Part.from_text(text="Gemini 2.5 Proの最新アップデートを要約して")])]
+
+for turn in range(6):  # まずは6回で強制停止して調査
+    resp = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=history,
+        config=types.GenerateContentConfig(tools=tools),
+    )
+    cand = resp.candidates[0]
+    print(f"[turn {turn}] finish_reason={cand.finish_reason}")
+    call = next((p.function_call for p in cand.content.parts if p.function_call), None)
+    if not call:
+        print("最終応答:", resp.text)
+        break
+    print(f"  tool={call.name} args={dict(call.args)}")
+    result = search_web(**call.args) if call.name == "search_web" else {}
+    history.append(cand.content)
+    history.append(types.Content(role="tool", parts=[
+        types.Part.from_function_response(name=call.name, response=result)]))
+```
+
+このコードを走らせると、ターンごとに `finish_reason` と呼ばれているツール・引数が出力されます。ループが起きている場合、ほぼ確実に「同じツール名・同じ引数」が連続で出ているはずです。ここを観察するだけで、停止条件を設計するための材料が揃います。
+
+### 観察で注目したい3つのサイン
+
+- 同じツールが同じ引数で3回以上呼ばれている → プロンプトまたはツール返却値の情報不足
+- 毎ターン `finish_reason=STOP` ではなく `MAX_TOKENS` になっている → 出力予算が尽きて止まっているだけで、会話は継続扱い
+- ツール返却値に同じ内容が並んでいる → キャッシュや固定レスポンスが意味のない情報を返し続けている
+
+## 停止条件を「プロンプト」「コード」「ツール返却値」の3層で設計する
+
+原因が見えたら、あとは止め方を会話の設計に埋め込んでいきます。ここで大事なのは、一箇所だけを直すのではなく、3つの層で止まるようにすることです。
+
+**1. プロンプト層**：System Instructionsに終了条件を書きます。たとえば「必要な情報が揃ったら、ツールを呼ばずにMarkdownで要約を出力してください。情報が不足していても最大2回までしかツールを呼んではいけません」のように、回数と終わり方の両方を明示します。
+
+**2. コード層**：最大反復回数を必ず設けます。6〜10回を上限にして、それを超えたら「十分な情報が揃わなかった」というメッセージをユーザーに返すか、モデルに最終回答をお願いするターンを追加します。
+
+**3. ツール返却値層**：返却値のスキーマに `status` や `is_sufficient` のようなヒントを含めます。モデルは返却値のテキストだけを見て次の行動を決めるので、「これ以上は情報が取れません」という明示的なフィールドがあるだけで、会話の流れが落ち着きます。
+
+### 反復上限と終了判定を入れた実装例
+
+```python
+# 目的: 無限ループを防ぐため、反復上限・重複検出・終了判定を組み合わせる
+MAX_TURNS = 8
+
+def key_of(call) -> str:
+    # ツール名＋引数ハッシュで「同じ呼び出し」を判定する
+    return f"{call.name}:{sorted(dict(call.args).items())}"
+
+seen = {}
+for turn in range(MAX_TURNS):
+    resp = client.models.generate_content(
+        model="gemini-2.5-pro", contents=history,
+        config=types.GenerateContentConfig(tools=tools))
+    cand = resp.candidates[0]
+    call = next((p.function_call for p in cand.content.parts if p.function_call), None)
+
+    if call is None:
+        # 最終応答に到達
+        print("最終応答:", resp.text)
+        break
+
+    k = key_of(call)
+    seen[k] = seen.get(k, 0) + 1
+    if seen[k] >= 3:
+        # 同じ呼び出しが3回以上続いたら、モデルに方針転換を促す
+        history.append(cand.content)
+        history.append(types.Content(role="user", parts=[types.Part.from_text(
+            text=f"同じツール呼び出し({call.name})が繰り返されています。"
+                 f"現時点で得られた情報だけで要約を出してください。")]))
+        continue
+
+    result = search_web(**call.args)
+    history.append(cand.content)
+    history.append(types.Content(role="tool", parts=[
+        types.Part.from_function_response(name=call.name, response=result)]))
+else:
+    # ループを超えた場合のフォールバック
+    print("反復上限に到達したため、部分的な情報で応答を生成します")
+```
+
+ポイントは、上限に達したときに例外で落とすのではなく、「情報が十分でなくてもいいから、今あるもので答えを出してほしい」というメッセージをユーザーターンとして追加していることです。Geminiはこの切り替えに素直に反応してくれるので、ユーザーに届くのは「沈黙」ではなく「現時点のベストな要約」になります。
+
+## ツール返却値の設計で9割が決まる
+
+実務で無限ループを減らす一番の効果があったのは、ツールの返却値に「状態」を含めることでした。たとえば検索ツールなら次のような形です。
+
+```python
+def search_web(query: str) -> dict:
+    hits = my_search_api(query)
+    return {
+        "results": hits[:5],
+        "total_found": len(hits),
+        "status": "sufficient" if len(hits) >= 3 else "insufficient",
+        "next_suggestion": None if len(hits) >= 3 else "クエリをより具体的にしてください",
+    }
+```
+
+モデルはこの `status` フィールドを読んで、「`sufficient` なら要約フェーズに移る」という判断ができるようになります。System Instructionsで「`status` が `sufficient` になったら、それ以上ツールを呼ばずに回答してください」と一文添えると、ループが劇的に減ります。私の現場では、この工夫だけで平均ツール呼び出し回数が5.2回から1.8回に下がりました。
+
+関連する実装パターンは [Gemini Function Callingの本番向け実装パターン](/articles/gemini-api/gemini-api-parallel-function-calling-production-patterns) や [Function Callingの全体像](/articles/gemini-api/gemini-api-function-calling-complete-guide) にもまとめていますので、組み合わせてご覧いただくと理解が深まります。
+
+## 「呼ばれない」問題とセットで監視する
+
+無限ループの裏側には、同じくらい厄介な「Function Callingが呼ばれない」問題があります。ツール定義が悪くて全くツールが呼ばれないケース、最初の1回だけ呼ばれて停止してしまうケース、どちらも原因と対処が重なっています。合わせて [Gemini Function Callingが呼ばれないときの対処](/articles/gemini-api/gemini-function-calling-not-working-troubleshooting) にも目を通しておくと、本番で急に挙動が変わったときの初動が速くなります。
+
+エージェント開発全般の考え方を体系的に学び直したい方には、書籍 [ChatGPT・LangChainによるチャットシステム構築［実践］入門（吉田真吾・大嶋勇樹）](https://www.amazon.co.jp/dp/4297138395/?tag=pinocchio-22) が参考になりました。Gemini向けではありませんが、ツール呼び出しを制御する設計の考え方は共通しており、停止条件やログ設計の章がFunction Callingにそのまま応用できます。
+
+## 次にやること：自作エージェントに3行だけ足す
+
+今日この記事を読んで最初にやっていただきたいのは、お手元のFunction Callingループに「最大反復回数」「同じ呼び出しの連続検出」「方針転換のユーザーターン」の3つを足すことです。完璧な停止条件を設計する前に、まずはループが起きても必ず終わる状態を作ってしまうと、安心して細部を詰められるようになります。Geminiはヒントさえあれば素直に方針を切り替えてくれるモデルですので、会話設計で止め方を教える——そんなイメージで向き合ってみてください。

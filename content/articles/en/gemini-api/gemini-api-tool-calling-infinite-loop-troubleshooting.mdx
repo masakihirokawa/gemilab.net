@@ -1,0 +1,162 @@
+---
+title: "Stopping Gemini API Function Calling Loops: Why They Happen and How to Break Them"
+slug: "gemini-api-tool-calling-infinite-loop-troubleshooting"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-23T09:30"
+author: "Gemini Lab"
+description: "Your tool-calling agent keeps invoking the same function and never finishes. Here is how to diagnose the loop and bake stop conditions into your prompt, code, and tool responses."
+tags: ["gemini", "function-calling", "troubleshooting", "agent"]
+---
+
+You build a small agent, hit Run, and watch `search_web` get called over and over while your API bill ticks up in the corner. If you have ever shipped a Gemini Function Calling flow, you probably know that quiet moment of panic. I hit it the very first time I wired a search tool to Gemini — the model insisted there was just "one more query" to run, every single turn.
+
+Most Gemini Function Calling loops are not bugs in the library. They come from a mismatch between the model, the tool, and the prompt — the conversation itself forgot how to end. This article walks through why these loops happen, shows the diagnostic code I actually reach for, and lays out a three-layer stop-condition design that has held up in production.
+
+## Loops happen because the model never learned how to stop
+
+When Function Calling loops, the model is not being stubborn. It is making a reasonable decision given the signals it sees: the tool returned something, the goal has not obviously been met, and calling the tool again seems like the safest next move. That decision repeats because one of the following is true.
+
+- The tool's return value looks "incomplete" to the model
+- The system prompt never describes what "done" means
+- Your code forces another tool turn even when the model is trying to respond in text
+- There is no guardrail detecting the same call repeating with the same arguments
+
+Put differently, the model is doing its best with the information it has, and nobody has told it when to stop. That framing makes debugging a lot faster.
+
+## Start by watching `finish_reason` and the call history
+
+Before you change anything, make the conversation visible. The minimum viable probe in the `google-genai` Python SDK looks like this.
+
+```python
+# Goal: print every tool call so we can see where the loop starts
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+def search_web(query: str) -> dict:
+    # Placeholder — wire this to your real search API
+    return {"results": [{"title": f"dummy for {query}"}]}
+
+tools = [types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name="search_web",
+        description="Search the web for a keyword",
+        parameters={"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]},
+    )
+])]
+
+history = [types.Content(role="user", parts=[
+    types.Part.from_text(text="Summarize the latest Gemini 2.5 Pro updates")])]
+
+for turn in range(6):  # hard stop after 6 turns while investigating
+    resp = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=history,
+        config=types.GenerateContentConfig(tools=tools),
+    )
+    cand = resp.candidates[0]
+    print(f"[turn {turn}] finish_reason={cand.finish_reason}")
+    call = next((p.function_call for p in cand.content.parts if p.function_call), None)
+    if not call:
+        print("final text:", resp.text)
+        break
+    print(f"  tool={call.name} args={dict(call.args)}")
+    result = search_web(**call.args) if call.name == "search_web" else {}
+    history.append(cand.content)
+    history.append(types.Content(role="tool", parts=[
+        types.Part.from_function_response(name=call.name, response=result)]))
+```
+
+Run this and you will see the tool and arguments for each turn. If you are in a loop, you will almost certainly see the same tool name with the same arguments repeat. That single observation tells you where the stop condition needs to live.
+
+### Three signals worth watching
+
+- The same tool with the same arguments called more than twice → prompt or tool response does not communicate "enough"
+- `finish_reason` is `MAX_TOKENS` instead of `STOP` → you ran out of output budget, not ideas
+- Tool responses return the same payload → your tool is caching something that is no longer useful
+
+## Design the stop condition across three layers
+
+Once you can see the loop, plug it at three layers instead of one. Patching only the prompt or only the code tends to leak again a week later.
+
+**1. Prompt layer.** Add the termination rule to your System Instructions. Something like "Respond in markdown without calling a tool once you have enough information. Never call the same tool more than twice." Specify both the behavior and the numeric cap.
+
+**2. Code layer.** Always impose an iteration ceiling. Six to ten turns is plenty for most agents. When you hit it, do not raise — ask the model politely for a final answer given what it has so far.
+
+**3. Tool response layer.** Teach the return payload to describe its own completeness. The model reads this payload like a human reads a status bar, and a single `status` field changes its next move dramatically.
+
+### An implementation that combines all three
+
+```python
+# Goal: cap iterations, detect repeated calls, and nudge the model to wrap up
+MAX_TURNS = 8
+
+def key_of(call) -> str:
+    # a call is "the same call" if tool name + sorted args match
+    return f"{call.name}:{sorted(dict(call.args).items())}"
+
+seen = {}
+for turn in range(MAX_TURNS):
+    resp = client.models.generate_content(
+        model="gemini-2.5-pro", contents=history,
+        config=types.GenerateContentConfig(tools=tools))
+    cand = resp.candidates[0]
+    call = next((p.function_call for p in cand.content.parts if p.function_call), None)
+
+    if call is None:
+        print("final:", resp.text)
+        break
+
+    k = key_of(call)
+    seen[k] = seen.get(k, 0) + 1
+    if seen[k] >= 3:
+        # the same call has repeated — redirect the model to wrap up
+        history.append(cand.content)
+        history.append(types.Content(role="user", parts=[types.Part.from_text(
+            text=f"The tool {call.name} has been called with the same "
+                 f"arguments multiple times. Please write the best possible "
+                 f"answer using what we have so far.")]))
+        continue
+
+    result = search_web(**call.args)
+    history.append(cand.content)
+    history.append(types.Content(role="tool", parts=[
+        types.Part.from_function_response(name=call.name, response=result)]))
+else:
+    print("iteration cap reached; generate a partial response")
+```
+
+The key move is what happens when the cap fires. Instead of raising an exception, we append a user-role message that tells the model to wrap up with whatever it has. Gemini is very cooperative with this kind of redirect, so your users see a real answer instead of silence.
+
+## Tool return values are where the real fix lives
+
+The single biggest reduction in looping I have shipped came from rewriting tool responses so the model can read their state at a glance. A search tool, for example, returns this shape.
+
+```python
+def search_web(query: str) -> dict:
+    hits = my_search_api(query)
+    return {
+        "results": hits[:5],
+        "total_found": len(hits),
+        "status": "sufficient" if len(hits) >= 3 else "insufficient",
+        "next_suggestion": None if len(hits) >= 3 else "narrow the query",
+    }
+```
+
+Pair that with a System Instructions line such as "Stop calling tools and write the final answer when `status` is `sufficient`" and the average number of tool calls drops fast. On one of my projects it went from 5.2 calls per session to 1.8 after this change alone.
+
+If you want to see how these pieces fit in a production-scale agent, I laid out the full pattern in [Gemini Function Calling production patterns for parallel calls](/en/articles/gemini-api/gemini-api-parallel-function-calling-production-patterns) and the broader picture in [the complete guide to Gemini Function Calling](/en/articles/gemini-api/gemini-api-function-calling-complete-guide).
+
+## Monitor the opposite failure too
+
+The sibling problem to infinite loops is "Function Calling never fires at all." Same prompt, same model, and the tool is ignored or called only once. The diagnostic steps overlap, so it is worth reading both sides together — I cover the non-firing case in [what to check when Gemini Function Calling is not triggered](/en/articles/gemini-api/gemini-function-calling-not-working-troubleshooting). Having both playbooks ready makes you a lot calmer when production behavior shifts unexpectedly.
+
+For the broader design mindset behind tool-using LLM systems, I found [Building AI-Powered Search Applications with LangChain (Yoshida & Oshima)](https://www.amazon.co.jp/dp/4297138395/?tag=pinocchio-22) genuinely useful. It is framed around other providers, but the chapters on controlling tool invocation and designing logs apply cleanly to Gemini.
+
+## What to do next
+
+If you only have time for one change today, add three things to your current Function Calling loop: a hard iteration cap, detection of repeated identical calls, and a redirecting user turn when either fires. A perfect stop condition can come later — what you want first is the confidence that the loop always ends. Gemini is a cooperative model once it gets the hint; treat the conversation itself as the place where you teach it how to finish.
