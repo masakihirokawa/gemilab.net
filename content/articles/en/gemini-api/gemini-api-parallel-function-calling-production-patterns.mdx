@@ -1,0 +1,636 @@
+---
+title: "Parallel Function Calling in Gemini API: Production Patterns, Pitfalls, and Monitoring"
+slug: "gemini-api-parallel-function-calling-production-patterns"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-23T10:45"
+author: "Gemini Lab"
+description: "A production guide to Parallel Function Calling in the Gemini API: DAG tool design, partial failure handling, rate limits, and monitoring — with working code."
+tags: ["Gemini API", "Function Calling", "Parallel Function Calling", "Production", "Agent Architecture", "Python", "Concurrency"]
+highlights:
+  - "If your Function-Calling agent feels sluggish because tools run one after another, this guide shows how to switch to parallel execution and cut perceived latency by 2–4x"
+  - "You will learn the failure modes unique to parallel tool calls — partial failures, ordering, and race conditions — with code patterns that are safe for production"
+  - "You can build support and data-analysis agents that stay within SLA latency budgets, with a monitoring story that actually catches regressions"
+---
+
+If you have ever built a tool-using agent on top of the Gemini API, you have probably felt the slowness creep in. The more tools you wire up, the longer the user waits after pressing Enter. When I first shipped a research agent that called search, math, RAG, and an external API in sequence, the full round trip took well over ten seconds.
+
+Parallel Function Calling is the Gemini API feature that lets you skip that pain. The model can return multiple `functionCall` parts in a single turn, and your application can dispatch them in parallel before sending the results back. Done right, you spend one model round-trip instead of three or four, and the user sees answers in seconds rather than teenagers-refreshing-Instagram time.
+
+This article goes beyond the happy path. We cover the spec, why "just parallelize everything" breaks in production, and the design patterns I rely on for dependency graphs, partial failures, rate limits, and observability — all with working code you can adapt. If you have tried to parallelize and ended up with flaky agents, you should find something concrete to take back to your codebase.
+
+## What Parallel Function Calling Actually Is
+
+In the Gemini API, Parallel Function Calling means the model can emit several `functionCall` parts inside a single `candidates[0].content`:
+
+```json
+{
+  "candidates": [{
+    "content": {
+      "parts": [
+        { "functionCall": { "name": "search_orders",  "args": { "user_id": "u_123" }}},
+        { "functionCall": { "name": "get_inventory",  "args": { "sku": "ABC-001" }}},
+        { "functionCall": { "name": "fetch_shipping", "args": { "zip": "150-0001" }}}
+      ]
+    }
+  }]
+}
+```
+
+Because these three calls are independent, your app can run them concurrently with `asyncio.gather` or `Promise.all`. You go from three model round-trips (each adding 200–800 ms of network latency) down to one.
+
+Whether the model actually decides to parallelize depends on the tool signatures, the conversation history, and your `toolConfig`. In practice it tends to fall back to sequential calls when:
+
+- Tool B needs the result of Tool A as an argument
+- `toolConfig.function_calling_config.mode` is set to `ANY` with `allowed_function_names` narrowed to one tool
+- Your prompt says something like "First call A, then decide whether to call B"
+
+To coax the model into parallelizing, write tool descriptions that explicitly state which tools are independent, or that the same information is best gathered from multiple sources simultaneously. I show the exact wording I use later in this article.
+
+## A Minimal Implementation in Python
+
+Let's start with a small working example. This uses the new `google-genai` SDK and simulates a support agent that answers "What's the status of my order, and when will it arrive?" by fetching order history, inventory, and shipping info in parallel.
+
+```python
+# pip install google-genai httpx tenacity
+import asyncio
+import os
+from typing import Any
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["YOUR_GEMINI_API_KEY"])
+
+# --- Tool declarations ---
+def declare_tools() -> list[types.Tool]:
+    return [
+        types.Tool(function_declarations=[
+            types.FunctionDeclaration(
+                name="search_orders",
+                description=(
+                    "Look up a user's orders from the last 3 months. "
+                    "Safe to call in parallel with get_inventory and fetch_shipping."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={"user_id": types.Schema(type="STRING")},
+                    required=["user_id"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="get_inventory",
+                description=(
+                    "Return the current stock count for a SKU. "
+                    "Safe to call in parallel with search_orders and fetch_shipping."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={"sku": types.Schema(type="STRING")},
+                    required=["sku"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="fetch_shipping",
+                description=(
+                    "Return shipping ETA and available carriers for a postal code. "
+                    "Safe to call in parallel with search_orders and get_inventory."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={"zip": types.Schema(type="STRING")},
+                    required=["zip"],
+                ),
+            ),
+        ])
+    ]
+
+# --- Tool implementations (replace with real DB / API calls) ---
+async def search_orders(user_id: str) -> dict[str, Any]:
+    await asyncio.sleep(0.3)  # simulated DB round-trip
+    return {"orders": [{"id": "o_9001", "sku": "ABC-001", "status": "shipped"}]}
+
+async def get_inventory(sku: str) -> dict[str, Any]:
+    await asyncio.sleep(0.2)
+    return {"sku": sku, "stock": 42}
+
+async def fetch_shipping(zip: str) -> dict[str, Any]:
+    await asyncio.sleep(0.4)
+    return {"zip": zip, "carriers": ["JP Post", "Yamato"], "eta_days": 2}
+
+TOOL_REGISTRY = {
+    "search_orders": search_orders,
+    "get_inventory": get_inventory,
+    "fetch_shipping": fetch_shipping,
+}
+
+# --- Parallel dispatcher ---
+async def run_parallel_tools(function_calls: list[types.FunctionCall]) -> list[types.Part]:
+    async def dispatch(fc: types.FunctionCall) -> types.Part:
+        impl = TOOL_REGISTRY.get(fc.name)
+        if impl is None:
+            result = {"error": f"unknown tool: {fc.name}"}
+        else:
+            try:
+                result = await impl(**(fc.args or {}))
+            except Exception as exc:
+                # Never let one failing tool bring down the whole batch.
+                result = {"error": str(exc), "tool": fc.name}
+        return types.Part.from_function_response(name=fc.name, response=result)
+
+    return await asyncio.gather(*(dispatch(fc) for fc in function_calls))
+
+async def agent_turn(user_message: str) -> str:
+    tools = declare_tools()
+    history: list[types.Content] = [
+        types.Content(role="user", parts=[types.Part.from_text(user_message)])
+    ]
+
+    for _ in range(4):  # max 4 turns
+        resp = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=history,
+            config=types.GenerateContentConfig(tools=tools, temperature=0.2),
+        )
+        parts = resp.candidates[0].content.parts
+        fcalls = [p.function_call for p in parts if p.function_call]
+        if not fcalls:
+            return "".join(p.text or "" for p in parts)
+
+        history.append(types.Content(role="model", parts=parts))
+        tool_parts = await run_parallel_tools(fcalls)
+        history.append(types.Content(role="user", parts=tool_parts))
+
+    return "Conversation looped without convergence. Escalating to a human."
+
+if __name__ == "__main__":
+    msg = (
+        "User u_123 wants the status of SKU ABC-001, "
+        "and shipping info for postal code 150-0001."
+    )
+    print(asyncio.run(agent_turn(msg)))
+```
+
+With this setup, Gemini will usually emit all three calls in the first turn. The dispatcher runs them concurrently, so the total tool latency is driven by the slowest one (~400 ms), not their sum (~900 ms). You will see the difference in your logs immediately.
+
+### Why it's written this way
+
+I always wrap each tool in `try / except` and return `{"error": ...}` on failure. Raising out of `asyncio.gather` is convenient for quick scripts, but in an agent you want the model to see which tool failed and decide how to recover, not die with a 500. Making every tool return a response object — even an error one — keeps the downstream prompt logic simple.
+
+I use `asyncio.gather` instead of thread pools because most tools end up calling async HTTP clients (`httpx.AsyncClient`) or async DB drivers. Mixing sync blocking code into an otherwise async agent is a common source of subtle slowdowns.
+
+## Handling Tool Dependencies: Think in DAGs
+
+The hardest part of Parallel Function Calling is not on the model side, it's on the application side. As soon as tools depend on one another, you need to think in terms of a DAG, with some steps parallel and others sequential. Consider a travel booking agent:
+
+- `search_flights(dep, arr, date)` — find candidate flights
+- `search_hotels(city, date)` — find candidate hotels
+- `book_flight(flight_id)` — depends on `search_flights`
+- `book_hotel(hotel_id)` — depends on `search_hotels`
+- `send_itinerary(booking_ids)` — depends on both bookings
+
+The ideal flow is: turn 1 runs `search_flights` and `search_hotels` in parallel, turn 2 runs `book_flight` and `book_hotel` in parallel, turn 3 runs `send_itinerary`. If you leave ordering entirely up to the model it will sometimes deviate and cause failures. I prefer to bake the ordering into the tool descriptions themselves:
+
+```python
+types.FunctionDeclaration(
+    name="book_flight",
+    description=(
+        "Reserve a flight using a flight_id. "
+        "Only call this after search_flights has produced a chosen flight_id. "
+        "Safe to call in parallel with book_hotel."
+    ),
+    ...
+)
+```
+
+Gemini 2.5 Pro is surprisingly reliable at following these rules when you spell them out. Before you add a new tool, try writing one sentence that answers "which other tools can safely run alongside this one?" If you can't, your tool design isn't finished yet.
+
+### Argument design that keeps parallelism safe
+
+Beyond descriptions, the shape of arguments and side effects matters. These are the three rules I enforce:
+
+- **Do not allow concurrent writes to the same resource**: running `book_flight(flight_id)` and `cancel_flight(flight_id)` for the same flight in parallel is a race waiting to happen. I sometimes use `toolConfig.function_calling_config.allowed_function_names` to temporarily forbid one of them while the other is active.
+- **Keep read-only tools parallel-ready**: state explicitly in the description that the tool is safe to call concurrently.
+- **Collapse dependent calls into one tool**: if tool B always needs tool A's result, expose a merged `get_user_and_orders(user_id)` instead. The model now sees it as a single parallelizable unit.
+
+## Designing for Partial Failure
+
+Concurrency makes "two out of three succeeded" a first-class case. A naive implementation either crashes on the first failure or silently drops it and answers with incomplete data. In production I combine three patterns.
+
+### Pattern 1: Per-tool timeouts and retries
+
+Each tool gets its own timeout and retry policy, and failures surface to the model as structured error payloads.
+
+```python
+# pip install tenacity
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter
+
+class ToolError(Exception): ...
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential_jitter(initial=0.2, max=2.0),
+    reraise=True,
+)
+async def fetch_shipping_with_retry(zip: str) -> dict[str, Any]:
+    try:
+        return await asyncio.wait_for(fetch_shipping(zip), timeout=2.0)
+    except asyncio.TimeoutError as exc:
+        raise ToolError(f"fetch_shipping timeout for zip={zip}") from exc
+
+async def safe_dispatch(fc: types.FunctionCall) -> types.Part:
+    impl = RETRY_REGISTRY.get(fc.name) or TOOL_REGISTRY[fc.name]
+    try:
+        result = await impl(**(fc.args or {}))
+    except Exception as exc:
+        result = {
+            "error": "tool_unavailable",
+            "message": str(exc),
+            "retry_allowed": False,
+        }
+    return types.Part.from_function_response(name=fc.name, response=result)
+```
+
+When you return `{"error": ...}` instead of raising, Gemini 2.5 Pro will compose answers like "We couldn't reach the shipping service, but your order shipped yesterday and there are 42 units in stock." That graceful degradation is the single biggest reason I return errors to the model instead of hiding them.
+
+### Pattern 2: Distinguish critical from optional tools
+
+Not all tools are equally important. Classify them and let non-critical failures pass through.
+
+```python
+CRITICAL_TOOLS = {"search_orders"}
+OPTIONAL_TOOLS = {"get_inventory", "fetch_shipping"}
+
+async def run_parallel_with_criticality(calls: list[types.FunctionCall]) -> list[types.Part]:
+    results = await asyncio.gather(*(safe_dispatch(c) for c in calls))
+    for c, r in zip(calls, results):
+        if c.name in CRITICAL_TOOLS:
+            resp = r.function_response.response if r.function_response else {}
+            if "error" in resp:
+                raise RuntimeError(f"critical tool {c.name} failed: {resp}")
+    return results
+```
+
+Agreeing with your product team on what is critical vs. optional ahead of time makes SLAs and incident response much easier. It also lets you answer "should we apologize and escalate, or serve a partial answer?" with code, not a debate.
+
+### Pattern 3: Cached stale fallback
+
+For high-read tools, a tiny cache can save you during upstream hiccups.
+
+```python
+import time
+
+_CACHE: dict[str, tuple[float, dict]] = {}
+TTL_SECONDS = 60
+
+async def get_inventory_cached(sku: str) -> dict[str, Any]:
+    key = f"inv:{sku}"
+    now = time.time()
+    cached = _CACHE.get(key)
+    try:
+        fresh = await asyncio.wait_for(get_inventory(sku), timeout=1.5)
+        _CACHE[key] = (now, fresh)
+        return fresh
+    except Exception:
+        if cached and now - cached[0] < TTL_SECONDS * 10:
+            return {**cached[1], "stale": True, "cached_at": cached[0]}
+        raise
+```
+
+Passing `stale: True` back to the model lets Gemini explain the situation honestly: "Live inventory is temporarily unavailable, but a minute ago we had 42 units in stock." This kind of candor is what separates trustworthy agents from guessers.
+
+## Rate Limits and Cost Control
+
+Parallelization helps latency, but it also concentrates load. I layer three controls on top.
+
+### Layer 1: Per-tool semaphores
+
+Bound the concurrency per tool to avoid overwhelming fragile downstream services.
+
+```python
+SEMAPHORES = {
+    "fetch_shipping": asyncio.Semaphore(5),
+    "get_inventory":  asyncio.Semaphore(20),
+    "search_orders":  asyncio.Semaphore(20),
+}
+
+async def bounded_dispatch(fc: types.FunctionCall) -> types.Part:
+    sem = SEMAPHORES.get(fc.name, asyncio.Semaphore(10))
+    async with sem:
+        return await safe_dispatch(fc)
+```
+
+### Layer 2: Per-turn parallelism cap
+
+Cap how many tools can run in one agent turn. This also protects against a runaway model emitting ten calls in one shot.
+
+```python
+MAX_PARALLEL_PER_TURN = 5
+
+async def run_bounded(calls: list[types.FunctionCall]) -> list[types.Part]:
+    if len(calls) > MAX_PARALLEL_PER_TURN:
+        return [
+            types.Part.from_function_response(
+                name=c.name,
+                response={"error": "too_many_parallel_calls",
+                          "limit": MAX_PARALLEL_PER_TURN},
+            )
+            for c in calls[MAX_PARALLEL_PER_TURN:]
+        ] + [await safe_dispatch(c) for c in calls[:MAX_PARALLEL_PER_TURN]]
+    return await asyncio.gather(*(safe_dispatch(c) for c in calls))
+```
+
+### Layer 3: Budget metering
+
+Parallel execution does not inflate input tokens directly, but large tool responses feed back into the next turn and can blow up your bill. Cap tool response sizes (e.g., summarize RAG results beyond 2 KB), and flip your agent from parallel to sequential when your per-user token budget nears its limit.
+
+## Three Bugs You Will Only See in Production
+
+These are not in the docs. They come from owning parallel agents on-call.
+
+### Pitfall 1: Duplicate calls to the same tool
+
+Models occasionally call the same tool twice with the same arguments, especially when a prompt contains words like "definitely" or "to be sure." For read-only tools this is merely wasteful. For billing or notifications it's a production incident.
+
+Fix: deduplicate calls by `(name, args)` before dispatching.
+
+```python
+def dedupe_calls(calls: list[types.FunctionCall]) -> list[types.FunctionCall]:
+    seen: set[tuple] = set()
+    uniq: list[types.FunctionCall] = []
+    for c in calls:
+        key = (c.name, tuple(sorted((c.args or {}).items())))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
+    return uniq
+```
+
+### Pitfall 2: Result ordering scrambled
+
+If you switch from `asyncio.gather` to `asyncio.as_completed` to process results as they finish, the ordering of response parts no longer matches the ordering of the original `functionCall` parts. Gemini uses the ordering as a strong signal for binding results back to calls; scramble it and you get hallucinated summaries.
+
+Fix: keep `asyncio.gather` (or track indexes yourself) so that "call index N ↔ response index N" holds.
+
+### Pitfall 3: Forced-mode kills parallelism
+
+Setting `tool_config.function_calling_config.mode = ANY` with a single `allowed_function_names` is a great debugging tool, but it disables parallelism. If you flipped on forced mode during development and noticed your agent got slower, that's expected.
+
+Fix: use forced mode only during the "first turn onboarding" of an agent, and switch back to `AUTO` for subsequent turns. I call this "gripping the wheel during takeoff" and let the agent fly itself once it's airborne.
+
+## Worked Example: A Financial Report Agent
+
+To ground all of this, here's the design of a financial report agent I helped build. It answers user questions by pulling from an internal P&L DB, BigQuery, a news API, and internal RAG, then optionally drafting an email.
+
+Tool inventory, tagged by side effect and parallelism:
+
+- `fetch_pl(period)` — read-only, parallel-safe
+- `run_bq_query(sql)` — read-only, parallel-safe (but costly — rate-limited)
+- `search_news(keywords)` — read-only, parallel-safe with semaphore
+- `search_internal_docs(query)` — read-only, parallel-safe
+- `draft_email(recipient, body)` — side-effecting, **sequential only**
+
+Turn 1 runs the four read tools in parallel. Turn 2 produces an answer. Turn 3 optionally drafts the email. Measured latency:
+
+- Sequential: ~6.8 s (each read tool 1.5–2.0 s)
+- Parallel: ~2.1 s (bounded by the slowest tool plus model overhead)
+
+That is the "it feels like a product, not a demo" threshold. Users stop noticing the wait.
+
+If you are building something in this space, I'd pair this with the [Gemini 3 Pro × LangGraph data-analysis agent guide](/en/articles/gemini-api/gemini-3-pro-langgraph-data-analysis-agent), which goes deeper on parallel node execution inside LangGraph. And if you are still shaking out the basics of tool calls, the [Gemini API Function Calling complete guide](/en/articles/gemini-api/gemini-api-function-calling-complete-guide) is a good warm-up.
+
+For prompt and control-flow intuition across LLM-native applications, I often recommend John Berryman's book [Prompt Engineering for LLMs](https://www.amazon.co.jp/dp/4814401507/?tag=pinocchio-22). The mental models it offers are useful well beyond Gemini.
+
+## Doing the Same Thing in TypeScript
+
+Not every team ships Python. The `@google/genai` Node.js SDK has the same primitives, and the same parallel patterns translate cleanly to a TypeScript backend.
+
+```typescript
+// npm install @google/genai p-limit p-retry
+import { GoogleGenAI, Type, type FunctionCall, type Part } from "@google/genai";
+import pLimit from "p-limit";
+import pRetry from "p-retry";
+
+const client = new GoogleGenAI({ apiKey: process.env.YOUR_GEMINI_API_KEY! });
+
+const tools = [{
+  functionDeclarations: [
+    {
+      name: "search_orders",
+      description:
+        "Look up orders for a user. Safe to run in parallel with get_inventory and fetch_shipping.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: { user_id: { type: Type.STRING } },
+        required: ["user_id"],
+      },
+    },
+    {
+      name: "get_inventory",
+      description:
+        "Return stock for a SKU. Safe to run in parallel with search_orders and fetch_shipping.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: { sku: { type: Type.STRING } },
+        required: ["sku"],
+      },
+    },
+    {
+      name: "fetch_shipping",
+      description:
+        "Return shipping ETA. Safe to run in parallel with search_orders and get_inventory.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: { zip: { type: Type.STRING } },
+        required: ["zip"],
+      },
+    },
+  ],
+}];
+
+type Impl = (args: Record<string, string>) => Promise<Record<string, unknown>>;
+const impls: Record<string, Impl> = {
+  search_orders: async ({ user_id }) => ({
+    orders: [{ id: "o_9001", sku: "ABC-001", status: "shipped", user_id }],
+  }),
+  get_inventory: async ({ sku }) => ({ sku, stock: 42 }),
+  fetch_shipping: async ({ zip }) => ({ zip, carriers: ["JP Post"], eta_days: 2 }),
+};
+
+// Per-tool concurrency caps map cleanly to p-limit instances.
+const limits: Record<string, ReturnType<typeof pLimit>> = {
+  fetch_shipping: pLimit(5),
+  get_inventory: pLimit(20),
+  search_orders: pLimit(20),
+};
+
+async function dispatch(call: FunctionCall): Promise<Part> {
+  const limit = limits[call.name] ?? pLimit(10);
+  return limit(async () => {
+    try {
+      const impl = impls[call.name];
+      if (!impl) throw new Error(`unknown tool: ${call.name}`);
+      const result = await pRetry(() => impl(call.args as Record<string, string>), {
+        retries: 2,
+        factor: 2,
+        minTimeout: 200,
+      });
+      return { functionResponse: { name: call.name, response: result } };
+    } catch (err) {
+      return {
+        functionResponse: {
+          name: call.name,
+          response: { error: "tool_unavailable", message: String(err) },
+        },
+      };
+    }
+  });
+}
+
+export async function runAgent(userMessage: string): Promise<string> {
+  const history: { role: "user" | "model"; parts: Part[] }[] = [
+    { role: "user", parts: [{ text: userMessage }] },
+  ];
+  for (let turn = 0; turn < 4; turn++) {
+    const resp = await client.models.generateContent({
+      model: "gemini-2.5-pro",
+      contents: history,
+      config: { tools, temperature: 0.2 },
+    });
+    const parts = resp.candidates?.[0]?.content?.parts ?? [];
+    const calls = parts
+      .map((p) => (p as { functionCall?: FunctionCall }).functionCall)
+      .filter((c): c is FunctionCall => Boolean(c));
+    if (calls.length === 0) {
+      return parts.map((p) => (p as { text?: string }).text ?? "").join("");
+    }
+    history.push({ role: "model", parts });
+    const toolParts = await Promise.all(calls.map(dispatch));
+    history.push({ role: "user", parts: toolParts });
+  }
+  return "Conversation looped without convergence; escalating.";
+}
+```
+
+Two small notes for Node users. First, `Promise.all` preserves ordering the same way `asyncio.gather` does, so the "pitfall #2" warning about result ordering applies identically — never migrate to `Promise.race` or `Promise.allSettled` without re-binding indexes. Second, if you deploy to Cloudflare Workers, be aware that aggressive parallel fan-out can hit the subrequest limit; batch accordingly or move the tool calls to a durable object.
+
+## Testing Parallel Tools Without Burning Tokens
+
+One thing I learned the hard way: you cannot reliably test parallel agents by calling the real Gemini API every time. Responses are non-deterministic, and you will burn your monthly quota on CI. What has worked for me is a two-layer test strategy.
+
+### Layer A: unit-test the dispatcher
+
+Feed fake `FunctionCall` objects into your dispatcher and assert the behavior.
+
+```python
+import pytest
+import asyncio
+from agent import run_parallel_tools, TOOL_REGISTRY
+from google.genai import types
+
+@pytest.mark.asyncio
+async def test_one_tool_failure_does_not_cancel_others(monkeypatch):
+    async def failing(**_): raise RuntimeError("boom")
+    monkeypatch.setitem(TOOL_REGISTRY, "fetch_shipping", failing)
+
+    calls = [
+        types.FunctionCall(name="search_orders", args={"user_id": "u_1"}),
+        types.FunctionCall(name="get_inventory", args={"sku": "A"}),
+        types.FunctionCall(name="fetch_shipping", args={"zip": "150-0001"}),
+    ]
+    results = await run_parallel_tools(calls)
+    assert len(results) == 3
+    errors = [r.function_response.response for r in results if
+              "error" in r.function_response.response]
+    assert len(errors) == 1
+```
+
+This is the test I have gotten the most value from. It takes one failure and proves the other two calls still complete.
+
+### Layer B: golden-trace replay
+
+Record a handful of real Gemini responses (as JSON fixtures), then replay them through the agent loop with the live model client mocked. This lets you change tool code freely while keeping the model-side logic pinned.
+
+```python
+@pytest.mark.asyncio
+async def test_agent_uses_all_three_tools_in_first_turn(gemini_fake):
+    gemini_fake.queue_response(fixture="triple_parallel_call.json")
+    gemini_fake.queue_response(fixture="final_answer.json")
+    reply = await agent_turn("Status of my order, please")
+    assert "shipped" in reply
+    assert gemini_fake.call_count == 2   # 1 tool turn, 1 answer turn
+```
+
+A pair of fixtures per agent flow is usually enough. The goal is not to test the model — it's to test that your dispatcher uses the model's output correctly.
+
+## Composing Streaming Answers with Parallel Tool Calls
+
+One question I get after every talk I give on this topic: can we stream the final answer to the user while tools are still executing in parallel? The short answer is yes, with a caveat. Gemini needs all tool results back before it can compose the final response, but you can stream the response once it starts. The user-visible effect is:
+
+1. User sends a message.
+2. Tools fan out in parallel (400–800 ms of silence on the UI).
+3. The model starts streaming the answer word-by-word.
+
+That 400–800 ms pause is a fine place to render a small "Looking things up…" indicator. I advise against faking token streaming during the tool phase; users notice the trick once the real stream arrives at a different cadence. Be honest: "Checking three systems…" followed by a real stream feels more professional than a synthesized fake stream.
+
+A practical pattern I use with server-sent events:
+
+```python
+async def sse_agent(user_message: str):
+    tools = declare_tools()
+    history = [types.Content(role="user", parts=[types.Part.from_text(user_message)])]
+
+    yield "event: status\ndata: searching\n\n"
+    for _ in range(4):
+        resp = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=history,
+            config=types.GenerateContentConfig(tools=tools),
+        )
+        parts = resp.candidates[0].content.parts
+        fcalls = [p.function_call for p in parts if p.function_call]
+        if fcalls:
+            history.append(types.Content(role="model", parts=parts))
+            # While tools run in parallel, keep the connection alive
+            yield f"event: status\ndata: calling_{len(fcalls)}_tools\n\n"
+            tool_parts = await run_parallel_tools(fcalls)
+            history.append(types.Content(role="user", parts=tool_parts))
+            continue
+
+        # Final turn: switch to streaming
+        stream = client.models.generate_content_stream(
+            model="gemini-2.5-pro",
+            contents=history,
+            config=types.GenerateContentConfig(tools=tools),
+        )
+        for chunk in stream:
+            for p in chunk.candidates[0].content.parts:
+                if p.text:
+                    yield f"event: token\ndata: {p.text}\n\n"
+        yield "event: done\ndata: ok\n\n"
+        return
+```
+
+The two separate model calls (one non-streaming while tools run, then a streaming one for the answer) feel slightly wasteful, but in practice the first call is short because it only produces `functionCall` parts, and the streaming payoff on the second call is worth it.
+
+## Monitoring: What to Watch After You Parallelize
+
+Once your agents run tools in parallel, the median latency hides a lot. I always instrument these five signals:
+
+- **Turn-count distribution** — fraction of conversations resolved in one turn vs. three or more
+- **Parallelism per turn** — average tools per turn (>2 means parallelism is actually kicking in)
+- **Per-tool error rate** — fraction of `function_response` parts carrying `error`
+- **Per-tool p95 latency** — so you know if your semaphores or cache are effective
+- **Stale fallback rate** — how often cached stale values were returned
+
+Feed these into the OpenTelemetry setup described in the [Gemini API observability and production monitoring guide](/en/articles/gemini-api/gemini-api-observability-production-monitoring). That lets you tell at a glance whether the bottleneck is Gemini or your own infrastructure.
+
+## Closing
+
+Give yourself one hour this week. Pick an agent, rewrite the tool dispatcher to use `asyncio.gather`, and add "safe to call in parallel with X" to each tool's description. The moment your latency drops in half is genuinely fun. From there, the two rules you must never break are: let the model see the errors you recover from, and keep write-side effects out of the parallel batch.
+
+I've come to think of parallelization less as a performance optimization and more as an agent-design discipline. Tool independence, idempotency, and side-effect containment — the questions distributed systems engineers have been chewing on for decades — turn out to be exactly the right vocabulary for building reliable LLM applications too.
+
+If you build agents long enough, you notice that "the model is slow" is almost never the bottleneck. It is your orchestration layer deciding what to do next, and whether to wait for three things or one. Parallel Function Calling is the feature that most rewards careful engineering on that layer. The payoff shows up in every conversation your users have, forever, in the form of shorter waits and answers that feel considered rather than guessed. That compounding effect is why I keep coming back to this as the first thing I optimize in any new agent.
+
+Try it on one agent this week. Measure the median latency before and after. Write down the two or three things that surprised you. That small experiment has a way of reshaping how you think about everything else you build on top of the Gemini API.

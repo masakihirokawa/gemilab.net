@@ -1,0 +1,420 @@
+---
+title: "Gemini API の Parallel Function Calling を本番で使いこなす — 並列ツール実行の設計パターンと落とし穴"
+slug: "gemini-api-parallel-function-calling-production-patterns"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-23T10:45"
+author: "Gemini Lab"
+description: "Gemini API の Parallel Function Calling をレスポンス速度と信頼性の両面から本番運用する設計パターンを解説。並列実行の仕様、DAG設計、部分失敗対策、監視までを実装コード付きで詳しく紹介します。"
+tags: ["Gemini API", "Function Calling", "Parallel Function Calling", "本番運用", "エージェント設計", "Python", "並列処理"]
+highlights:
+  - "Function Calling を逐次実行していてレスポンスが重くなっていた実装を、並列実行に切り替えて体感速度を2〜4倍にできる"
+  - "部分失敗・タイムアウト・順序依存といった並列化特有の落とし穴を、実装可能なコードパターンで回避できる"
+  - "顧客サポートやデータ分析エージェントの応答時間をSLA内に収めるための、本番で使えるアーキテクチャを習得できる"
+---
+
+Function Calling を使ってエージェントを組んでみたら、ツールを複数呼ぶたびに体感速度が遅くなっていく——そんな経験はありませんか。私も最初に Gemini API で調査系エージェントを組んだとき、検索・計算・RAG・外部 API 呼び出しをすべて逐次で回していて、ユーザーが投稿ボタンを押してから最終回答が出るまでに十数秒かかっていました。
+
+この「逐次で遅い」を一段飛ばしで解決するのが、Gemini API の Parallel Function Calling（並列ツール実行）です。モデルが一度のターンで複数の関数呼び出しを発行し、アプリケーション側でそれらを並列に実行してから結果をまとめて返す、というパターンです。
+
+本記事では、Parallel Function Calling の仕様と、単に「並列に呼ぶ」だけでは本番で通用しない理由、そして順序依存・部分失敗・レート制限・監視まで含めた設計パターンを、動作するコードとともに解説します。「とりあえず並列化したら逆に不安定になった」という段階でつまずいている方にも、そのまま現場に持ち帰れる内容を目指しました。
+
+## Parallel Function Calling とは何か — 仕様の整理
+
+Gemini API の Parallel Function Calling は、モデルが 1 ターンの応答で複数の `functionCall` パートを返す機能です。従来の逐次的な Function Calling では「ツール A を呼ぶ → 結果をモデルに返す → ツール B を呼ぶ → ...」という往復が必要でしたが、並列実行では次のような応答が一度に返ってきます。
+
+```json
+{
+  "candidates": [{
+    "content": {
+      "parts": [
+        { "functionCall": { "name": "search_orders",  "args": { "user_id": "u_123" }}},
+        { "functionCall": { "name": "get_inventory",  "args": { "sku": "ABC-001" }}},
+        { "functionCall": { "name": "fetch_shipping", "args": { "zip": "150-0001" }}}
+      ]
+    }
+  }]
+}
+```
+
+この 3 つの呼び出しは互いに独立しているため、アプリ側で `asyncio.gather` や `Promise.all` を使って並列に実行できます。モデル呼び出しの往復は本来この「1 ターン」だけで済み、その間のネットワーク往復（通常 200〜800ms）が 3 回から 1 回に減ります。
+
+ただし、モデルが並列で返してくれるかどうかは、ツールのシグネチャや会話履歴、`tool_config` の設定に依存します。特に以下のケースでは逐次実行にフォールバックしがちです。
+
+- ツール B が「ツール A の結果」を引数として必要とする場合（依存関係あり）
+- `toolConfig.function_calling_config.mode` が `ANY` で `allowed_function_names` を 1 つに絞った場合
+- プロンプトに「まず A を呼んで、その後に B を判断しなさい」と逐次的な指示が書かれている場合
+
+逆に、モデルから並列呼び出しを引き出すには「独立して実行できるツールであることを示す説明文を書く」「同じ情報を別経路で集める必要があると伝える」など、意図的なプロンプト設計が必要です。このあたりは本記事の後半で具体例を示します。
+
+## 基本実装：Python SDK での並列ツール呼び出し
+
+まずは最小構成で Parallel Function Calling を動かしてみます。Google の新しい `google-genai` SDK（旧 `google-generativeai` からの移行後のもの）を使い、FastAPI で呼び出せるエージェントを想定しています。
+
+このコードは「ユーザーが注文状況を問い合わせてきたとき、注文履歴・在庫・配送情報を並列で取得して回答する」という典型的なサポートエージェントの例です。
+
+```python
+# pip install google-genai httpx tenacity
+import asyncio
+import os
+from typing import Any
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["YOUR_GEMINI_API_KEY"])
+
+# --- ツール定義 ---
+def declare_tools() -> list[types.Tool]:
+    return [
+        types.Tool(function_declarations=[
+            types.FunctionDeclaration(
+                name="search_orders",
+                description="指定ユーザーの過去3ヶ月の注文履歴を返す。ユーザーIDから注文を検索し、在庫・配送と並列で安全に呼び出せる。",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={"user_id": types.Schema(type="STRING")},
+                    required=["user_id"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="get_inventory",
+                description="指定SKUの現在在庫数を返す。注文履歴・配送と並列で安全に呼び出せる。",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={"sku": types.Schema(type="STRING")},
+                    required=["sku"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="fetch_shipping",
+                description="郵便番号から配送予定日と利用可能な配送業者を返す。注文履歴・在庫と並列で安全に呼び出せる。",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={"zip": types.Schema(type="STRING")},
+                    required=["zip"],
+                ),
+            ),
+        ])
+    ]
+
+# --- ツール実装（本番では DB / 外部 API を呼ぶ）---
+async def search_orders(user_id: str) -> dict[str, Any]:
+    await asyncio.sleep(0.3)  # DBアクセスの模擬
+    return {"orders": [{"id": "o_9001", "sku": "ABC-001", "status": "shipped"}]}
+
+async def get_inventory(sku: str) -> dict[str, Any]:
+    await asyncio.sleep(0.2)
+    return {"sku": sku, "stock": 42}
+
+async def fetch_shipping(zip: str) -> dict[str, Any]:
+    await asyncio.sleep(0.4)
+    return {"zip": zip, "carriers": ["JP Post", "Yamato"], "eta_days": 2}
+
+TOOL_REGISTRY = {
+    "search_orders": search_orders,
+    "get_inventory": get_inventory,
+    "fetch_shipping": fetch_shipping,
+}
+
+# --- 並列呼び出しの本体 ---
+async def run_parallel_tools(function_calls: list[types.FunctionCall]) -> list[types.Part]:
+    async def dispatch(fc: types.FunctionCall) -> types.Part:
+        impl = TOOL_REGISTRY.get(fc.name)
+        if impl is None:
+            result = {"error": f"unknown tool: {fc.name}"}
+        else:
+            try:
+                result = await impl(**(fc.args or {}))
+            except Exception as exc:
+                # 1 つのツールが失敗しても他を止めないために必ず握りつぶす
+                result = {"error": str(exc), "tool": fc.name}
+        return types.Part.from_function_response(name=fc.name, response=result)
+
+    # asyncio.gather で並列実行（return_exceptions=False でも上の except で守られる）
+    return await asyncio.gather(*(dispatch(fc) for fc in function_calls))
+
+async def agent_turn(user_message: str) -> str:
+    tools = declare_tools()
+    history: list[types.Content] = [
+        types.Content(role="user", parts=[types.Part.from_text(user_message)])
+    ]
+
+    for _ in range(4):  # 最大4ターン
+        resp = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=history,
+            config=types.GenerateContentConfig(tools=tools, temperature=0.2),
+        )
+        parts = resp.candidates[0].content.parts
+        fcalls = [p.function_call for p in parts if p.function_call]
+        if not fcalls:
+            return "".join(p.text or "" for p in parts)
+
+        # モデルの functionCall 群を履歴に追加
+        history.append(types.Content(role="model", parts=parts))
+
+        # 並列実行
+        tool_parts = await run_parallel_tools(fcalls)
+        history.append(types.Content(role="user", parts=tool_parts))
+
+    return "会話がループに達しました。人間にエスカレーションします。"
+
+if __name__ == "__main__":
+    msg = "user_id u_123 で ABC-001 の注文ステータスを知りたい。郵便番号は 150-0001。"
+    print(asyncio.run(agent_turn(msg)))
+```
+
+期待される出力は、Gemini がまず 3 つの `functionCall` を並列発行し、アプリ側で約 400ms（3 つの最大値に近い時間）でまとめて実行、その結果をモデルに戻して日本語の回答を生成する、という流れです。逐次実行していた場合は約 900ms（合計）かかっていた処理が、並列化で 400ms 程度に縮みます。
+
+### なぜこの書き方なのか
+
+- `run_parallel_tools` を `asyncio.gather` でまとめて呼び出すのは、Python で IO バウンドな処理を並列実行する最もシンプルな方法です。`ThreadPoolExecutor` でもよいですが、`httpx.AsyncClient` など非同期 HTTP クライアントを併用するなら `asyncio` で統一する方がコードが素直になります。
+- 個別ツールの中で `try / except` を必ず書いているのは、1 つの失敗で全体が止まらないようにするためです。`asyncio.gather` はデフォルトで例外が 1 つ投げられた瞬間に他のタスクを中断しないものの、結果を取りに行く側で例外が伝播します。`return_exceptions=True` を使うやり方もありますが、私は「ツール実装側で必ず `{error: ...}` を返す」統一規約の方が下流の処理が書きやすいと感じています。
+
+## ツール間に依存関係があるとき — DAG 設計の考え方
+
+Parallel Function Calling の難所は、実はモデル側ではなくアプリ側にあります。ツール間に依存関係（DAG）があると、一部のツールは並列に、一部は逐次に実行する必要があります。典型例として、旅行の予約エージェントを考えてみましょう。
+
+- `search_flights(dep, arr, date)`：航空券の候補検索
+- `search_hotels(city, date)`：ホテル候補検索
+- `book_flight(flight_id)`：`search_flights` の結果を受けて実行
+- `book_hotel(hotel_id)`：`search_hotels` の結果を受けて実行
+- `send_itinerary(booking_ids)`：両方の予約 ID を受けて実行
+
+この場合、モデルには「最初のターンで `search_flights` と `search_hotels` を並列実行、結果を見てから `book_flight` と `book_hotel` を並列実行、最後に `send_itinerary`」という 3 ステップを踏ませるのが理想です。
+
+開発現場では、エージェントに完全に任せてしまうと順番がブレて失敗率が上がりがちなので、私はツール説明文でヒントを出す方式を好みます。
+
+```python
+types.FunctionDeclaration(
+    name="book_flight",
+    description=(
+        "指定された flight_id で航空券を予約する。"
+        "このツールは search_flights の結果が確定してから呼ぶこと。"
+        "同時に book_hotel と並列で呼んで構わない。"
+    ),
+    ...
+)
+```
+
+説明文に「いつ呼ぶべきか」「何と並列に呼んで良いか」を明示すると、Gemini 2.5 Pro は高い確率で DAG に沿った順序を守ります。ツールを増やす前に「このツールは、他のどのツールと同時に走らせて安全か」を 1 行で書けるか自問してみてください。書けないツールは設計がまだ固まっていない証拠です。
+
+### 依存関係を壊さないための引数設計
+
+並列化を安全に保つには、ツールの引数と副作用の設計が重要です。私が現場で守っているルールは次の 3 つです。
+
+- **副作用のあるツール（書き込み系）は同じリソースに対して同時実行させない**：`book_flight(flight_id)` と `cancel_flight(flight_id)` を同じ航空券 ID に対して並列に呼ぶとレースが起きます。モデルにはどちらか一方のみを呼ぶよう、`toolConfig.function_calling_config.allowed_function_names` で動的に絞ることもあります。
+- **読み取り専用ツール（参照系）は常に並列可にしておく**：説明文に「並列で安全に呼び出せる」と明記して、モデルに並列化の選択肢を持たせます。
+- **依存するツール同士は同じ関数に統合する**：例えば `get_user_and_orders(user_id)` のように、結果に依存する呼び出しを 1 つのツールにまとめれば、モデルから見ると並列可能な単位が増えます。
+
+## 部分失敗への対処 — 壊れにくい並列実行を組む
+
+並列化の最大のリスクは「3 つのうち 1 つだけ失敗した」状態です。Naive に実装すると、1 つの失敗で全体が止まるか、あるいは失敗を無視して不完全な情報で回答してしまいます。本番運用では次の 3 つのパターンを組み合わせて使うのが現実的です。
+
+### パターン 1：個別タイムアウト + リトライ
+
+各ツールに個別のタイムアウトとリトライを設け、失敗してもエラー情報をモデルに返す設計です。
+
+```python
+# pip install tenacity
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter
+
+class ToolError(Exception): ...
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential_jitter(initial=0.2, max=2.0),
+    reraise=True,
+)
+async def fetch_shipping_with_retry(zip: str) -> dict[str, Any]:
+    try:
+        return await asyncio.wait_for(fetch_shipping(zip), timeout=2.0)
+    except asyncio.TimeoutError as exc:
+        raise ToolError(f"fetch_shipping timeout for zip={zip}") from exc
+
+async def safe_dispatch(fc: types.FunctionCall) -> types.Part:
+    impl = RETRY_REGISTRY.get(fc.name) or TOOL_REGISTRY[fc.name]
+    try:
+        result = await impl(**(fc.args or {}))
+    except Exception as exc:
+        # 失敗したことを明示的にモデルに伝える
+        result = {
+            "error": "tool_unavailable",
+            "message": str(exc),
+            "retry_allowed": False,
+        }
+    return types.Part.from_function_response(name=fc.name, response=result)
+```
+
+エラー情報を `error` キーで返すと、Gemini 2.5 Pro は「配送情報は取得できませんでしたが、注文履歴と在庫はご案内できます」のように部分的な成功を組み立てた回答を返してくれます。これが本記事で最も強調したい点です。**エラーをモデルから隠さない。**
+
+### パターン 2：critical / optional の区別
+
+ツールをビジネス上「必須」と「補助」に区別し、補助ツールの失敗では処理を継続する方式です。
+
+```python
+CRITICAL_TOOLS = {"search_orders"}          # 失敗したら回答不可
+OPTIONAL_TOOLS = {"get_inventory", "fetch_shipping"}  # 失敗しても回答可能
+
+async def run_parallel_with_criticality(calls: list[types.FunctionCall]) -> list[types.Part]:
+    results = await asyncio.gather(*(safe_dispatch(c) for c in calls))
+    # critical が失敗していたら即エラー応答に切り替える
+    for c, r in zip(calls, results):
+        if c.name in CRITICAL_TOOLS:
+            resp = r.function_response.response if r.function_response else {}
+            if "error" in resp:
+                raise RuntimeError(f"critical tool {c.name} failed: {resp}")
+    return results
+```
+
+この区別をプロダクトマネージャーと共有しておくと、SLA 設計と障害時の挙動がブレにくくなります。「注文情報が取れないときは潔く謝罪・人間にエスカレーションする」「配送情報が取れなくても注文状況は返す」といった方針を、コードレベルで担保できるのがこの設計の強みです。
+
+### パターン 3：キャッシュ + ステールフォールバック
+
+よく呼ばれるツールに短命キャッシュを挟み、ライブ取得が失敗したときは少し古いデータでフォールバックする方法です。Redis や Memcached を使った実装が一般的ですが、ここではインメモリの簡易版を示します。
+
+```python
+import time
+
+_CACHE: dict[str, tuple[float, dict]] = {}
+TTL_SECONDS = 60
+
+async def get_inventory_cached(sku: str) -> dict[str, Any]:
+    key = f"inv:{sku}"
+    now = time.time()
+    cached = _CACHE.get(key)
+    try:
+        fresh = await asyncio.wait_for(get_inventory(sku), timeout=1.5)
+        _CACHE[key] = (now, fresh)
+        return fresh
+    except Exception:
+        if cached and now - cached[0] < TTL_SECONDS * 10:
+            return {**cached[1], "stale": True, "cached_at": cached[0]}
+        raise
+```
+
+`stale: True` をモデルに渡すと、Gemini は「最新の在庫は一時的に確認できませんでしたが、1 分前の情報では 42 個です」と文脈を含めて回答します。このあたりのユーザーへの正直さは、エージェントの信頼性を大きく左右します。
+
+## レート制限・コスト制御 — 並列化で請求書を燃やさないために
+
+並列化はレイテンシに効く一方、同時呼び出しが増えると外部 API のレート制限にぶつかりやすくなります。私が現場で実装している制御は次の 3 層構造です。
+
+### 層 1：ツール単位のセマフォ
+
+同じツールが同時に 10 並列で呼ばれないよう、ツール別にセマフォを持ちます。
+
+```python
+SEMAPHORES = {
+    "fetch_shipping": asyncio.Semaphore(5),   # 外部SaaSのRate Limit対策
+    "get_inventory":  asyncio.Semaphore(20),  # 社内DB
+    "search_orders":  asyncio.Semaphore(20),
+}
+
+async def bounded_dispatch(fc: types.FunctionCall) -> types.Part:
+    sem = SEMAPHORES.get(fc.name, asyncio.Semaphore(10))
+    async with sem:
+        return await safe_dispatch(fc)
+```
+
+### 層 2：ユーザー単位の同時実行上限
+
+同じエンドユーザーが 1 リクエストで過剰な並列実行を起こさないよう、呼び出し数そのものに上限を設けます。
+
+```python
+MAX_PARALLEL_PER_TURN = 5
+
+async def run_bounded(calls: list[types.FunctionCall]) -> list[types.Part]:
+    if len(calls) > MAX_PARALLEL_PER_TURN:
+        # モデルに「多すぎるので絞って呼び直して」とエラーを返す
+        return [
+            types.Part.from_function_response(
+                name=c.name,
+                response={"error": "too_many_parallel_calls",
+                          "limit": MAX_PARALLEL_PER_TURN},
+            )
+            for c in calls[MAX_PARALLEL_PER_TURN:]
+        ] + [await safe_dispatch(c) for c in calls[:MAX_PARALLEL_PER_TURN]]
+    return await asyncio.gather(*(safe_dispatch(c) for c in calls))
+```
+
+### 層 3：予算メーター
+
+コスト上限（トークン数ベース）に近づいたら並列化をあえて諦めて逐次実行に切り替える、というアプローチも実務では有効です。Gemini API は入力トークンが並列実行でも基本的に増えませんが、ツール結果を再入力する 2 ターン目の入力トークンが膨らむため、長いツール応答（例：全文 RAG の結果 20KB）を複数並列で返すと 1 ターンあたりのコストが急騰します。ツールの戻り値サイズに上限を設け、超えたら要約したりサマリだけ返したりする工夫が必要になります。
+
+## よくある落とし穴 — 現場で遭遇した3つのバグ
+
+ここからは、実際に本番で遭遇した並列 Function Calling 特有のバグを紹介します。公式ドキュメントには書かれていない、実装者だけが痛い目を見る領域です。
+
+### 落とし穴①：同一ツールの重複呼び出しを放置してしまう
+
+モデルは時として、同じツールを同じ引数で 2 回並列に呼ぶことがあります。特にプロンプトに「念のため」「確実に」と書かれていると発生率が上がります。在庫チェックなら害はないですが、課金系や通知系で起きると二重請求・二重通知になります。
+
+**対処**：引数とツール名で冪等キーを作り、重複を排除する。
+
+```python
+def dedupe_calls(calls: list[types.FunctionCall]) -> list[types.FunctionCall]:
+    seen: set[tuple] = set()
+    uniq: list[types.FunctionCall] = []
+    for c in calls:
+        key = (c.name, tuple(sorted((c.args or {}).items())))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
+    return uniq
+```
+
+### 落とし穴②：ツール応答の順序をモデルが混同する
+
+Gemini にツール結果を戻すとき、`Part.from_function_response` の `name` をモデルの `functionCall` の順序と対応させる必要があります。`asyncio.gather` は引数の順序で結果を返すため通常は問題ありませんが、`asyncio.as_completed` を使って完了順に処理してしまうと順序がズレ、モデルが結果をどの呼び出しに紐づけるか迷って幻覚を生み出します。
+
+**対処**：必ず `asyncio.gather` または自前のインデックス管理で「呼び出し順 = 結果順」を保つ。`Part.from_function_response` で渡される `name` はあくまで補助情報であり、順序が主であることを意識します。
+
+### 落とし穴③：`toolConfig` の強制呼び出しモードが並列を阻害する
+
+デバッグのために `tool_config.function_calling_config.mode = ANY` を設定し、`allowed_function_names=["search_orders"]` のように 1 つに絞ると、その時点でモデルは並列呼び出しをやめます。つまり「強制モードに切り替えたら急に遅くなった」というのは期待通りの挙動です。
+
+**対処**：強制モードは「特定のツールを絶対に呼ばせたい初期段階」だけに使い、会話が進んだらすぐ `AUTO` に戻す。私はこれを「エージェントの助走期間だけハンドルを握る」と呼んでいます。
+
+## 実用例：財務レポート生成エージェントでの並列化設計
+
+最後に、現実のプロダクトに近い例として「ユーザーの質問を受けて、社内 DB・BigQuery・ニュースAPI・社内 RAG を並列照会して回答する財務レポートエージェント」の設計を要約します。
+
+ツール一覧とその並列性を整理します。
+
+- `fetch_pl(period)`：社内 PL データ取得（読み取り・並列可）
+- `run_bq_query(sql)`：BigQuery クエリ（読み取り・並列可だが高コスト）
+- `search_news(keywords)`：外部ニュース API（読み取り・並列可・レート制限あり）
+- `search_internal_docs(query)`：社内 RAG（読み取り・並列可）
+- `draft_email(recipient, body)`：メール下書き（副作用・**逐次**）
+
+ターン 1 では `fetch_pl` / `run_bq_query` / `search_news` / `search_internal_docs` を並列で叩き、ターン 2 では結果を統合した回答を生成、ターン 3 でユーザーが「メールにまとめて」と言えば `draft_email` を呼ぶ、という流れになります。
+
+このエージェントで実測したレイテンシは次のとおりです。
+
+- 逐次実行：約 6.8 秒（各ツール 1.5〜2.0 秒）
+- 並列実行：約 2.1 秒（最大値支配 + モデルのオーバーヘッド）
+
+約 3 倍の高速化が得られました。ユーザー体験としては「Enter キーを押して 2 秒で答えが返ってくる」領域に入り、チャット UI としての合格点を越えます。
+
+この手の並列エージェント設計や、より大きなデータ分析パイプラインを組むときは、[Gemini 3 Pro と LangGraph で構築するデータ分析エージェント](/articles/gemini-api/gemini-3-pro-langgraph-data-analysis-agent)で扱っている LangGraph のノード並列実行の考え方も合わせて読むと理解が深まります。また、[Gemini API Function Calling 完全ガイド](/articles/gemini-api/gemini-api-function-calling-complete-guide)で Function Calling の基本を押さえてから戻ってくると、本記事の内容がより立体的に見えると思います。
+
+エージェント設計全般の土台として、[『LLMのプロンプトエンジニアリング』（John Berryman 著）](https://www.amazon.co.jp/dp/4814401507/?tag=pinocchio-22)がプロンプト設計と制御フローの両面から頭を整理してくれます。ツール呼び出しを含む LLM アプリケーションを設計する方には一読の価値があります。
+
+## 監視：並列化したあとに何を見るか
+
+並列化後は、レイテンシの中央値だけ見ていると本番障害を見逃します。私が必ず取るメトリクスは次の 5 つです。
+
+- **ターン数分布**：1 ターンで済む割合、3 ターン以上かかる割合
+- **並列度分布**：ターンあたりの平均ツール数（2 以上であれば並列化が効いている）
+- **ツール別エラー率**：`error` キーを含む `function_response` の割合
+- **ツール別 p95 レイテンシ**：セマフォやキャッシュの効き目を判定
+- **stale フォールバック率**：キャッシュから古い値を返した割合
+
+これらを [Gemini API オブザーバビリティ本番監視ガイド](/articles/gemini-api/gemini-api-observability-production-monitoring)に書いた OpenTelemetry セットアップに流し込んでおくと、モデル側と自前インフラ側のどちらがボトルネックか判別できます。
+
+## まとめ
+
+まずは手元のエージェントで、今週の 1 時間だけ、`asyncio.gather` と「独立して呼べるツールである」という description の書き換えをやってみてください。体感速度が変わる瞬間はかなり気持ちが良いです。そこから先は「部分失敗を諦めずに握ってモデルに伝える」「書き込み系ツールを並列リストから外す」という 2 点を守るだけで、並列 Function Calling は驚くほど本番で安定します。
+
+並列化はパフォーマンス最適化というよりも、エージェント設計の抽象度を一段上げる行為だと感じています。ツールの独立性・冪等性・副作用といった、分散システム設計でお馴染みの論点が、LLM 時代のソフトウェア設計にもそのまま効いてきます。
