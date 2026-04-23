@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLOUDNEXT — Google Cloud Next 2026 ラスベガス開催、TPU v7 と Gemini 3.2、Agentic AI を企業向けコア機能として発表（4/22）",
-    "TTS31 — Gemini 3.1 Flash TTS プレビュー公開、70 以上の言語と audio tags、SynthID ウォーターマーク対応（4月）",
-    "MACAPP — Gemini ネイティブ macOS アプリが macOS 15 以上で全世界無料公開、gemini.google/mac から入手可能（4月）",
-    "AISTUDIO — Google AI Studio が AI Pro／Ultra 向けに利用上限を拡張、Nano Banana Pro と Gemini Pro モデルへのアクセスも追加（4月）",
-    "GEMMA4 — Gemma 4 が AI Studio と Gemini API に到着、次世代 Gemini Nano の基盤モデル（4月）",
-    "CHROME7 — Gemini in Chrome がアジア太平洋 7 カ国へ展開（日本含む）、Agentic Features は AI Pro／Ultra 向けに US でテスト中（4月）",
+    "EMBED2 — Gemini Embedding 2 が GA、Gemini API と Vertex AI の両方で提供開始（4月）",
+    "FLASH3 — Gemini 3 Flash が Gemini アプリの新デフォルトに、2.5 Flash から大幅アップグレード（4月）",
+    "DEEPRESEARCH — Interactions API に Deep Research / Deep Research Max、3.1 Pro × MCP × ネイティブチャート対応（4月）",
+    "AISTUDIO — Google AI Studio が AI Pro／Ultra 向けに利用上限を拡張、Nano Banana Pro と Gemini Pro へアクセス（4月）",
+    "VPCSC — Gemini Cloud Assist 調査機能が VPC Service Controls 内で非対応に（4/13 開始）",
+    "ERSUN — gemini-robotics-er-1.5-preview が 4/30 にシャットダウン、Robotics-ER 1.6 へ移行を（4/30）",
   ],
   en: [
-    "CLOUDNEXT — Google Cloud Next 2026 opens in Las Vegas spotlighting TPU v7, Gemini 3.2 and Agentic AI as enterprise pillars (4/22)",
-    "TTS31 — Gemini 3.1 Flash TTS preview launches with 70+ languages, audio tags and SynthID watermarking (Apr)",
-    "MACAPP — Gemini native macOS app rolls out free to all users on macOS 15+, globally at gemini.google/mac (Apr)",
+    "EMBED2 — Gemini Embedding 2 is generally available across the Gemini API and Vertex AI (Apr)",
+    "FLASH3 — Gemini 3 Flash becomes the new default model in the Gemini app, a major jump over 2.5 Flash (Apr)",
+    "DEEPRESEARCH — Deep Research & Deep Research Max land in the Interactions API with 3.1 Pro, MCP and native charts (Apr)",
     "AISTUDIO — Google AI Studio raises limits for AI Pro/Ultra subscribers and unlocks Nano Banana Pro & Gemini Pro access (Apr)",
-    "GEMMA4 — Gemma 4 arrives on AI Studio & Gemini API as foundation for next-gen Gemini Nano (Apr)",
-    "CHROME7 — Gemini in Chrome expands to seven APAC countries; agentic features in US test for AI Pro/Ultra (Apr)",
+    "VPCSC — Gemini Cloud Assist investigations no longer supported inside VPC Service Controls perimeters from 4/13 (4/13)",
+    "ERSUN — gemini-robotics-er-1.5-preview shuts down 4/30 — migrate to Gemini Robotics-ER 1.6 (4/30)",
   ],
 };
 
