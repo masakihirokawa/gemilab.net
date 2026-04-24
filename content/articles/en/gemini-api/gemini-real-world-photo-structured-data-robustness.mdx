@@ -1,0 +1,157 @@
+---
+title: "Extract Structured Data from Real-World Photos with Gemini — Surviving Tilt, Shadows, and Occlusion in Production"
+slug: "gemini-real-world-photo-structured-data-robustness"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-24T06:15"
+author: "Gemini Lab"
+description: "Getting Gemini to return JSON from clean sample images is easy. Making it work reliably on the messy photos your users actually take is a different problem. Here's how I classify the failures and fix each layer — with the code I run in production."
+tags: ["Gemini API", "multimodal", "structured output", "production", "image processing"]
+highlights:
+  - "Five categories of real-world photo failure, each with its own correct layer to fix"
+  - "Client preprocessing, prompt contracts, and schema validation stacked for stability"
+  - "Rejecting the hardest 1–2% on purpose — why chasing 100% accuracy is the wrong goal"
+---
+
+Hand Gemini a clean sample photo and ask for structured JSON — the first ten images return beautifully. Then you open the floodgates to real user photos: skewed, dim, finger in the frame, a second piece of paper overlapping the target. Accuracy drops off a cliff, JSON comes back malformed, fields get hallucinated, types break.
+
+This post is a working note on running "extract structured data from real-world photos" with the Gemini API in production. Which failures happen, where to fix them, and what to stop trying to fix. The code and design are from a solo-developer app I actively run. This is not about reaching 100% — it is about getting to 99% reliably, then deciding how to handle the remaining 1% honestly.
+
+## Split Failures Into Five Categories
+
+Stop treating "bad photo" as one problem. I split them five ways, and each category has a different right answer.
+
+1. Geometric distortion (tilt, perspective, rotation)
+2. Optical noise (shadows, glare, extreme exposure)
+3. Partial occlusion (finger, another paper, object shadow)
+4. Text quality (low resolution, handwriting, faded, smudged)
+5. Wrong subject entirely (the target document isn't in the frame)
+
+Each belongs in a different layer. 1 is client preprocessing. 2 is mostly preprocessing. 3 is prompt + validation. 4 trusts the model but guards with validation. 5 should be rejected early. Attributing everything to "the model isn't accurate enough" is how you waste a weekend. Classify first, then intervene at the right layer.
+
+## Layer 1: Client-Side Preprocessing for Geometry and Optics
+
+Three preprocessing steps before Gemini ever sees the image remove roughly half the failures.
+
+### Step A: Auto-crop and deskew
+
+Phone-captured documents are always tilted. OpenCV contour detection finds the paper edges, and a perspective transform squares it up. In Python:
+
+```python
+import cv2
+import numpy as np
+
+def deskew_document(image_bytes: bytes) -> bytes:
+    arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    contours, _ = cv2.findContours(
+        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return image_bytes
+
+    largest = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(largest, True)
+    approx = cv2.approxPolyDP(largest, 0.02 * peri, True)
+    if len(approx) != 4:
+        return image_bytes
+
+    pts = np.array([p[0] for p in approx], dtype="float32")
+    # order points and four-point perspective transform
+    warped = four_point_transform(img, pts)
+    ok, buf = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return buf.tobytes() if ok else image_bytes
+```
+
+If you cannot find four edges (paper clipped out of frame, for example), return the original silently. Forcing a transform makes it worse, not better.
+
+### Step B: Normalize brightness and contrast
+
+Strong shadows or underexposed photos benefit from histogram equalization or CLAHE. Only apply when luminance variance is below a threshold — over-correcting adds noise and hurts the model.
+
+### Step C: Resolution normalization
+
+Photos below 500px on the long edge carry too little information. Preprocessing them does not help. Tell the user to retake instead. Resizing to 2000–3000px on the long edge balances Gemini token cost and latency well; anything bigger returns diminishing value.
+
+## Layer 2: A Prompt That States the Extraction Contract
+
+The prompt wrapping the preprocessed image needs four elements:
+
+1. What the task is ("extract structured data from a receipt photo")
+2. The field list, types, and required-vs-optional
+3. Realistic per-field constraints (amounts in JPY integers, dates as YYYY-MM-DD)
+4. Explicit behavior when information is not visible ("do not guess — return null")
+
+The fourth is load-bearing. Without it, Gemini will hallucinate plausible values for fields it could not read. A hallucinated amount that enters your database is the kind of bug that stays silent for weeks.
+
+```text
+This image is a photo of a receipt. Return JSON matching the schema below.
+
+Schema:
+{
+  "merchant": { "value": string | null, "confidence": 0-1 },
+  "total_amount": { "value": integer | null, "confidence": 0-1 },
+  "purchased_at": { "value": "YYYY-MM-DD" | null, "confidence": 0-1 },
+  "items": [
+    { "name": string, "price": integer, "confidence": 0-1 }
+  ],
+  "rejection_reason": string | null
+}
+
+Rules:
+- If a field cannot be read from the image, set value to null and
+  confidence below 0.3.
+- Never guess values to fill in missing data.
+- If the image is not a receipt, set all fields to null and write
+  the reason in rejection_reason.
+- All amounts are JPY integers.
+```
+
+The `confidence` field is for the validator downstream. Gemini's self-reported confidence is not perfect, but there is a strong correlation between "Gemini marked this low" and "this field is actually wrong," and that correlation is enough to prioritize human review.
+
+## Layer 3: Schema and Business-Rule Validation
+
+Type-strictness belongs to the model. From Gemini 2.5 onward, pass a JSON Schema via `response_schema` and most type breakage disappears. But well-typed values can still be nonsense. I always run a second validator on the returned JSON.
+
+Typical rules:
+
+- If `total_amount` differs from `sum(items[].price)` by more than 10%, flag for review.
+- If `purchased_at` is a future date, reject.
+- If `merchant` or `items[].name` contains obvious junk (all symbols, repeated letters), reject.
+- If the mean `confidence` across fields is below 0.5, treat as "unreadable."
+
+Only data that passes both layers enters the production database. Everything else goes to a manual-review queue or is returned to the user with a retry prompt.
+
+## Layer 4: Design for Rejection on the Hard 1–2%
+
+After all three layers, 1–2% of photos remain unreadable. Chasing 100% here is where costs explode — swapping models, layering in a second OCR, bringing in human review. I decided early to reject those photos honestly.
+
+UX rules around rejection:
+
+1. Frame it as "please retake" rather than "failed."
+2. Explain briefly (too much shadow, resolution too low).
+3. Provide an always-available fallback (e.g., "enter it manually") so the user never hits a wall.
+
+Done carefully, rejection preserves user trust far better than silently emitting a wrong value. The blast radius of bad data entering the DB is much worse than a user retaking a photo.
+
+## Cost and Latency Design
+
+A production realism. I run a tiered model strategy:
+
+- First extraction runs on Gemini Flash. The prompt asks only for needed fields to minimize tokens.
+- If mean confidence is below threshold, retry on Gemini Pro. About a third of those improve enough to pass. Beyond two attempts it stops converging — cut off there.
+- Preprocess to ~2000px on the long edge. Larger images cost tokens without returning proportional accuracy.
+
+This tiered approach cuts total cost about 30% versus always-Pro while actually improving accuracy. In production, accuracy and cost are dual variables — measure both on the same dashboard.
+
+## Smallest First Step
+
+If you do not want to overhaul everything, two changes deliver most of the gain:
+
+1. Add "if not visible, null, do not guess" to your prompt, and make the model return `confidence`.
+2. Reject responses with mean confidence under 0.5 by asking for a retake.
+
+That alone shifts user-visible quality noticeably. Preprocessing and tiered fallback can come later, guided by real operational numbers. For solo dev, reaching "honestly rejects bad inputs" quickly beats building a perfect pipeline over six weeks.
