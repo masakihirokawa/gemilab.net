@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "EMBED2 — Gemini Embedding 2 が GA、Gemini API と Vertex AI の両方で提供開始（4月）",
-    "FLASH3 — Gemini 3 Flash が Gemini アプリの新デフォルトに、2.5 Flash から大幅アップグレード（4月）",
-    "DEEPRESEARCH — Interactions API に Deep Research / Deep Research Max、3.1 Pro × MCP × ネイティブチャート対応（4月）",
-    "AISTUDIO — Google AI Studio が AI Pro／Ultra 向けに利用上限を拡張、Nano Banana Pro と Gemini Pro へアクセス（4月）",
-    "VPCSC — Gemini Cloud Assist 調査機能が VPC Service Controls 内で非対応に（4/13 開始）",
-    "ERSUN — gemini-robotics-er-1.5-preview が 4/30 にシャットダウン、Robotics-ER 1.6 へ移行を（4/30）",
+    "DROPS10 — Gemini Drops第10弾: macOSネイティブアプリ・Lyria 3 Pro音楽生成・Personal Intelligenceグローバル展開（4/25）",
+    "CHROME — Gemini in Chrome が日本を含むAPAC 7カ国へ展開、デスクトップ・iOS対応（4/20）",
+    "GEMINI3 — Gemini 3 Flash が Geminiアプリの新デフォルトモデルに、次世代の高速インテリジェンスを実現",
+    "SIRI — Siri を Gemini で再構築とGoogleが確認、2026年中にGemini搭載Siriが登場（4/22）",
+    "EMBEDDING2 — Gemini Embedding 2 GA: 高精度RAG・検索向け次世代埋め込みモデルが一般提供開始",
+    "CLOUDNEXT — Google Cloud Next 2026開催、TPU v7・Gemini 3.2・エージェントAIがエンタープライズを加速（4/22）",
   ],
   en: [
-    "EMBED2 — Gemini Embedding 2 is generally available across the Gemini API and Vertex AI (Apr)",
-    "FLASH3 — Gemini 3 Flash becomes the new default model in the Gemini app, a major jump over 2.5 Flash (Apr)",
-    "DEEPRESEARCH — Deep Research & Deep Research Max land in the Interactions API with 3.1 Pro, MCP and native charts (Apr)",
-    "AISTUDIO — Google AI Studio raises limits for AI Pro/Ultra subscribers and unlocks Nano Banana Pro & Gemini Pro access (Apr)",
-    "VPCSC — Gemini Cloud Assist investigations no longer supported inside VPC Service Controls perimeters from 4/13 (4/13)",
-    "ERSUN — gemini-robotics-er-1.5-preview shuts down 4/30 — migrate to Gemini Robotics-ER 1.6 (4/30)",
+    "DROPS10 — Gemini Drops #10: native macOS app, Lyria 3 Pro music creation & Personal Intelligence goes global (4/25)",
+    "CHROME — Gemini in Chrome expands to Japan and 6 other APAC countries on desktop & iOS (4/20)",
+    "GEMINI3 — Gemini 3 Flash becomes the new default in the Gemini app with next-gen speed and intelligence",
+    "SIRI — Google confirms Gemini-powered context-aware Siri is coming to iPhone in 2026 (4/22)",
+    "EMBEDDING2 — Gemini Embedding 2 now GA: next-gen semantic embeddings for RAG and search applications",
+    "CLOUDNEXT — Google Cloud Next 2026: TPU v7, Gemini 3.2 & agentic AI accelerate enterprise transformation (4/22)",
   ],
 };
 
@@ -35,7 +35,7 @@ export function NewsTicker() {
         width: "100%",
         zIndex: 99,
         height: 35,
-        background: "color-mix(in srgb, var(--accent-coral) 4%, transparent)",
+        background: "color-mix(in srgb, var(--accent-teal) 4%, transparent)",
         borderBottom: "1px solid var(--border-subtle)",
         display: "flex",
         alignItems: "center",
@@ -58,9 +58,13 @@ export function NewsTicker() {
               fontSize: 11,
               color: "var(--text-muted)",
               fontFamily: "'DM Mono', monospace",
-              letterSpacing: "0.02em",
+              letterSpacing: "0.03em",
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
             }}
           >
+            <span style={{ color: "var(--accent-teal)", fontSize: 8 }}>●</span>
             {text}
           </span>
         ))}
