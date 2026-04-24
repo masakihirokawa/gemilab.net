@@ -1,0 +1,383 @@
+---
+title: "Gemini API のシャドウトラフィックで新モデル移行を安全に進める — 出力差分を本番で測る実装パターン"
+slug: "gemini-api-shadow-traffic-model-migration-production"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-04-24T12:00"
+author: "Gemini Lab"
+description: "Gemini のモデル移行を「デプロイしてみないと分からない」から卒業するためのシャドウトラフィック設計。本番入力をコピーして新モデルに流し、出力差分を定量評価してから段階的にカットオーバーする実装パターンを、Python と Cloud Tasks のコード付きで解説します。"
+tags: ["gemini", "model-migration", "shadow-traffic", "production", "sre", "canary"]
+highlights:
+  - "Gemini のモデル移行で「本番に出してから品質劣化に気づく」事故を未然に防ぐ、シャドウトラフィック基盤を今日設計できるようになります"
+  - "ユーザーレイテンシを一切悪化させずに新モデルの出力を収集する非同期シャドウ実行パターンと、コストを抑えるサンプリング戦略のコードを手に入れられます"
+  - "1% → 10% → 50% → 100% の段階的カットオーバーと、即時ロールバックを両立させる Feature Flag ベースのルーティング実装を持ち帰れます"
+---
+
+Gemini 2.0 Flash が 2026 年 6 月に非推奨になる、という Google のアナウンスが出たとき、私の手元で動いていた本番アプリは 3 本ありました。真っ先に頭をよぎったのは「動作確認はしたけれど、本当に同じ品質が出るのか確信がない」という不安です。ステージング環境で数十件のテストケースを流すだけでは、実ユーザーの多様な入力に対する振る舞いは見えません。「デプロイして様子を見る」という賭けに出るのは、個人開発だとしても避けたいところです。
+
+この不安を構造的に解消してくれるのが「シャドウトラフィック」という設計パターンです。本番の入力を新旧両方のモデルに送り、ユーザーには旧モデルの出力を返しつつ、新モデルの出力は裏側で収集して差分を計測します。すると「どのくらいの割合で品質が変わるのか」「どのケースで劣化が起きやすいのか」を、実トラフィックのデータで定量評価できます。
+
+私は個人で複数の Gemini 製品を運用していますが、移行のたびにこの仕組みを組み直すのは大変なので、4 サイト共通で使える汎用的な実装パターンに落とし込みました。本番で運用しながら得た知見を、コードと一緒に共有していきます。
+
+## なぜモデル移行は「当たって砕けろ」になりがちなのか
+
+LLM のモデル移行が Web API の移行と決定的に違うのは、「契約（API スキーマ）」と「挙動（応答品質）」が独立している点です。エンドポイントやリクエスト形式は互換があっても、同じ入力に対する出力が微妙に違う、ということが頻繁に起こります。
+
+たとえば私が実際に遭遇したケースでは、旧モデルでは日本語で返ってきていた要約が、新モデルでは時折英語混じりで返るようになりました。システムインストラクションを少し強化すれば直るのですが、それに気づくのは本番ユーザーからのフィードバックを受けてから、というのでは遅すぎます。
+
+ユニットテストや回帰テストで検出できるのは「想定したケース」だけで、実ユーザーが投入する自由入力の多様性まではカバーしきれません。ここに、実トラフィックで新モデルを試すシャドウトラフィックの価値があります。
+
+## シャドウトラフィックの基本設計
+
+シャドウトラフィックの構造はシンプルです。プロダクション側のコード（以下「フロントエンド」と呼びます）は、ユーザーリクエストを受け取ると旧モデル（プライマリ）を呼び出し、その応答をユーザーに返します。ここまでは従来通りです。追加するのは「同じリクエストを新モデル（シャドウ）にも送る」という非同期パスです。
+
+このときに絶対に守るべき原則が 3 つあります。
+
+1つ目は「シャドウ呼び出しがユーザーのレイテンシに影響しないこと」です。シャドウを同期的に待つと、2 回の API 呼び出しが直列になって遅延が倍増します。私は最初これで失敗しました。
+
+2つ目は「シャドウ呼び出しが失敗してもユーザー体験を損なわないこと」です。シャドウ側のエラーがプライマリの応答を汚染する設計は論外です。
+
+3つ目は「シャドウの出力がユーザーに絶対に届かないこと」です。特に複数のワーカーやプロセスが絡む構成だと、応答が混線する事故が起こりやすいので注意します。
+
+これらを満たす最小実装を示します。
+
+```python
+# shadow_traffic.py
+# プライマリ応答を返しつつ、同じ入力を非同期でシャドウへ送る最小実装。
+# ユーザーのレイテンシに影響を与えず、シャドウ側の失敗はプライマリ応答に一切影響しない。
+
+import asyncio
+import logging
+from google import genai
+
+logger = logging.getLogger(__name__)
+
+class ShadowTrafficClient:
+    def __init__(
+        self,
+        primary_model: str = "gemini-2.5-pro",
+        shadow_model: str = "gemini-3-pro",
+        shadow_sample_rate: float = 0.1,  # 本番トラフィックの10%だけシャドウへ送る
+    ):
+        self.client = genai.Client()
+        self.primary_model = primary_model
+        self.shadow_model = shadow_model
+        self.shadow_sample_rate = shadow_sample_rate
+
+    async def generate(self, prompt: str, request_id: str) -> str:
+        # 1. プライマリをまず呼び出してユーザーに返す準備をする
+        primary_task = asyncio.create_task(
+            self._call_model(self.primary_model, prompt, request_id, "primary")
+        )
+        primary_response = await primary_task
+
+        # 2. サンプリング判定後、シャドウは「ファイア・アンド・フォーゲット」で実行
+        import random
+        if random.random() < self.shadow_sample_rate:
+            asyncio.create_task(
+                self._shadow_execute(prompt, request_id, primary_response)
+            )
+
+        return primary_response  # ユーザーへはプライマリのみを返す
+
+    async def _call_model(self, model: str, prompt: str, req_id: str, role: str) -> str:
+        try:
+            response = await self.client.aio.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+            return response.text
+        except Exception as e:
+            # プライマリが失敗したら例外を投げる。シャドウは呼び出し元で握りつぶす。
+            logger.warning(f"[{req_id}] {role} call failed: {e}")
+            raise
+
+    async def _shadow_execute(self, prompt: str, req_id: str, primary_response: str):
+        # シャドウの失敗はユーザー体験に影響させない（例外を握りつぶして記録する）
+        try:
+            shadow_response = await self._call_model(
+                self.shadow_model, prompt, req_id, "shadow"
+            )
+            await self._log_comparison(req_id, prompt, primary_response, shadow_response)
+        except Exception as e:
+            logger.warning(f"[{req_id}] shadow failed (ignored): {e}")
+
+    async def _log_comparison(self, req_id, prompt, primary, shadow):
+        # BigQuery / Firestore / S3 などへ差分記録。詳細は後述のセクションで実装。
+        pass
+```
+
+ポイントは `asyncio.create_task` で作ったシャドウのタスクを `await` しないことです。これで「ユーザーへの応答速度はプライマリのみで決まる」という性質が保証されます。
+
+私はこのパターンを初めて書いたとき、うっかり `await shadow_task` と書いて全ユーザーのレイテンシを倍にしてしまいました。fire-and-forget の実装は、言語仕様の癖を理解していないと意外と間違えるので、ここはレビューで必ず見るポイントにしています。
+
+## 非同期シャドウをフレームワークに統合する
+
+実際のプロダクションでは、上記の fire-and-forget だけでは不十分なケースがあります。典型的には次のような要件です。
+
+- シャドウの呼び出しがプロダクションプロセスの終了時に打ち切られないようにしたい
+- シャドウの呼び出し失敗をメトリクスで把握したい
+- シャドウ呼び出しのコストを別カウンタで管理したい
+
+これらを満たすには、シャドウを独立したジョブキュー（Cloud Tasks / SQS / Cloud Pub/Sub など）に切り出すのが安定します。プロダクションプロセスはキューにジョブを投げるだけで済み、シャドウワーカーが別プロセスで実行する形です。
+
+```python
+# shadow_enqueue.py
+# プロダクション側: シャドウの実行をキューに投げるだけ
+
+from google.cloud import tasks_v2
+import json
+
+class ShadowQueueClient:
+    def __init__(self, project: str, location: str, queue: str, worker_url: str):
+        self.client = tasks_v2.CloudTasksClient()
+        self.parent = self.client.queue_path(project, location, queue)
+        self.worker_url = worker_url
+
+    def enqueue_shadow(self, request_id: str, prompt: str, primary_response: str):
+        # 入力と旧モデルの応答をまとめてシャドウワーカーへ渡す。
+        # 本番レスポンスには一切影響せず、ms 単位でリターンできる。
+        task = {
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": self.worker_url,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "request_id": request_id,
+                    "prompt": prompt,
+                    "primary_response": primary_response,
+                }).encode(),
+            },
+            "dispatch_deadline": {"seconds": 60},  # シャドウは 60 秒以内に終わる想定
+        }
+        return self.client.create_task(parent=self.parent, task=task)
+```
+
+私は Cloud Tasks を採用していますが、個人プロダクトなら Cloud Pub/Sub + Cloud Run Worker の組み合わせでも問題ありません。選び方の基準は「プロダクションプロセスの終了とシャドウ実行が切り離せるか」の一点です。Web リクエストのプロセス内で `asyncio.create_task` した場合、リクエスト終了時にタスクがキャンセルされる構成だと、シャドウが途中で落ちてデータが不完全になります。
+
+## 出力差分の計測 — 何を数値化するか
+
+シャドウから集めた旧モデル・新モデルの応答ペアを、そのまま人間の目で全件見るのは現実的ではありません。私は現在 1 日あたり数千件のシャドウ出力を集めていますが、全件目視するのは不可能です。そこで、機械的に「差分が大きいペアだけを抽出する」仕組みを用意します。
+
+差分の測り方は大きく 3 種類に分けています。
+
+1つ目はセマンティック類似度です。埋め込みベクトルのコサイン類似度を取り、0.85 を下回ったペアを要注意としてフラグ付けしています。Gemini Embedding API を使うと、旧モデル・新モデルの出力の意味的な距離を 1 回の API 呼び出しで測れます。
+
+2つ目はタスク固有メトリクスです。たとえば要約タスクなら「キーワードカバレッジ」、翻訳タスクなら「文字数比」、Function Calling なら「同じツールを選んだか」といった、タスクごとに意味のある指標を定義します。
+
+3つ目は構造的メトリクスです。JSON 出力を期待するタスクでは、スキーマが両方とも合致するか、キーの欠損がないか、型が一致しているかを機械的に比較します。ここで差が出るケースは「そもそも機能が壊れる」ことを意味するので、最優先でレビューします。
+
+```python
+# diff_metrics.py
+# 旧モデル・新モデルの応答差分を数値化する。
+# しきい値を超えたペアだけ後で人間がレビューする。
+
+from google import genai
+import numpy as np
+import json
+
+client = genai.Client()
+
+async def semantic_similarity(text_a: str, text_b: str) -> float:
+    # Gemini Embedding API で両方の応答をベクトル化してコサイン類似度を取る
+    try:
+        embedding = client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=[text_a, text_b],
+        )
+        a, b = np.array(embedding.embeddings[0].values), np.array(embedding.embeddings[1].values)
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+    except Exception as e:
+        # 埋め込み計算が失敗してもシャドウ全体を止めない
+        return float("nan")
+
+def schema_match(primary_json: str, shadow_json: str, required_keys: list[str]) -> dict:
+    # JSON 応答のスキーマ互換性を比較する
+    result = {"primary_ok": False, "shadow_ok": False, "missing_in_shadow": []}
+    try:
+        p = json.loads(primary_json)
+        result["primary_ok"] = all(k in p for k in required_keys)
+    except json.JSONDecodeError:
+        pass
+    try:
+        s = json.loads(shadow_json)
+        result["shadow_ok"] = all(k in s for k in required_keys)
+        result["missing_in_shadow"] = [k for k in required_keys if k not in s]
+    except json.JSONDecodeError:
+        pass
+    return result
+
+# 期待出力: {"primary_ok": True, "shadow_ok": False, "missing_in_shadow": ["tags"]}
+# → シャドウ側で tags キーが欠落していると即座に分かる
+```
+
+このしきい値を超えたペアを BigQuery などに書き戻して、集計ダッシュボードで「類似度の分布」「スキーマ不一致率」「タスク別のブレ」を眺めると、移行の意思決定がグッと楽になります。
+
+## コスト試算と予算管理
+
+シャドウトラフィックには隠れたコストがあります。旧モデルの API 呼び出しに加えて、新モデルの API 呼び出しが同じトラフィック分だけ発生するので、素朴に実装すると料金が 2 倍になる可能性があるからです。
+
+私がたどり着いた運用は次の組み合わせです。
+
+サンプリングレートは最初 10% にしておき、主要なタスクのシャドウが一通り揃ったら段階的に下げます。モデル移行の評価は統計なので、全件シャドウする必要はありません。
+
+シャドウ先を軽量モデルの場合は、100% シャドウでも問題ないケースが多いです。たとえば 2.5 Pro → 3.0 Pro のような同階層モデル間ではサンプリングしますが、Flash 系の軽量モデルなら倍のコストも許容範囲に収まります。
+
+大きな入力（1 MB 超のコンテキスト）はシャドウから除外します。ここは旧モデル・新モデルで同じ結果が出やすい領域なので、シャドウの価値が低く、コストばかりかかります。
+
+毎週「シャドウ専用の予算」を別枠で切っておき、週次でダッシュボードを見る習慣を作ると事故を防げます。私は Google Cloud の予算アラートを使って、シャドウタスクのコストが月額予算の 50% を超えたら Slack に通知が飛ぶようにしています。
+
+技術選定の土台になる考え方は[Googleのサイトリライアビリティエンジニアリング（SREチーム）](https://www.amazon.co.jp/dp/4873117917/?tag=pinocchio-22)のエラーバジェットや段階的ロールアウトの章とも重なります。リスクを予算として扱う感覚を持てると、シャドウトラフィックの設計判断が格段に楽になります。
+
+## 段階的カットオーバー戦略
+
+シャドウで品質が確認できたら、いよいよ本番トラフィックを新モデルに寄せていきます。ここで一気に 100% 切り替えるのは危険です。シャドウで見えていなかった問題が、実ユーザーのレスポンスフローで初めて顕在化することがあります。
+
+私が採用している段階的カットオーバー手順は次の通りです。
+
+**Week 1（Canary 1%）**: 本番トラフィックの 1% だけ新モデルに切り替えます。この段階はテストよりも「リアルユーザーのフィードバックパス」を開通させることが目的です。Slack のサポート部屋で「応答がおかしい」という声が増えないかを監視します。
+
+**Week 2（Canary 10%）**: 問題がなければ 10% へ。ここから CTR・継続率・エラー率といったビジネス指標を本格的に比較します。A/B テストと同じ統計的手法で、新モデル側の指標が優位に改善しているか（あるいは悪化していないか）を判断します。
+
+**Week 3（Canary 50%）**: 50% まで広げます。この段階で「ユーザーごとのスティッキー性」が重要になります。同じユーザーが新旧モデルで行き来する構成は UX を壊します。ユーザー ID ベースの決定的なハッシュで振り分けましょう。
+
+**Week 4（100%）**: 問題がなければ完全移行です。移行後も 1 週間は旧モデルへのロールバックパスを残しておきます。
+
+```python
+# rollout_router.py
+# Feature Flag + ユーザー ID ハッシュでスティッキーな振り分けを実装する。
+# 同じユーザーは 1 週間同じモデルに固定される。
+
+import hashlib
+
+class RolloutRouter:
+    def __init__(self, new_model_share: float = 0.01):
+        # 0.01 = 1% が新モデル、残り 99% が旧モデル
+        self.new_model_share = new_model_share
+
+    def choose_model(self, user_id: str) -> str:
+        # user_id を 0〜1 の決定的な数値に変換
+        digest = hashlib.sha256(user_id.encode()).hexdigest()
+        bucket = int(digest[:8], 16) / 0xffffffff
+        return "gemini-3-pro" if bucket < self.new_model_share else "gemini-2.5-pro"
+
+# 運用例:
+# router = RolloutRouter(new_model_share=0.1)  # 10%へ拡大するときは share だけ更新
+# model = router.choose_model(user_id)
+```
+
+ユーザー ID ベースのハッシュでバケット分割すると、同じユーザーは Feature Flag の値が変わらない限り同じモデルに当たり続けます。セッションをまたいでも挙動が一貫するので、ユーザーから「さっきと応答のキャラが違う」と言われる事故を防げます。
+
+## 即時ロールバック可能な設計
+
+カットオーバー期間中に問題が検知されたら、即座に全ユーザーを旧モデルに戻せる設計にしておきます。具体的には、Feature Flag を中央管理し、環境変数の変更＋プロセス再起動なしで反映できる仕組みが理想です。
+
+私は Firestore の 1 ドキュメントを Feature Flag のストアにしています。更新はコンソールから数秒でできますし、リアルタイムリスナーを使えばプロセス再起動なしで新値が反映されます。
+
+```python
+# firestore_flag.py
+# Firestore のドキュメントを Feature Flag として使い、
+# プロセス再起動なしでロールアウト比率を変更可能にする。
+
+from google.cloud import firestore
+
+class LiveFlagClient:
+    def __init__(self, project_id: str):
+        self.db = firestore.Client(project=project_id)
+        self.doc_ref = self.db.collection("feature_flags").document("gemini_model_rollout")
+        self._cache = {"new_model_share": 0.0}
+        # リアルタイムリスナーで変更を即時反映
+        self.doc_ref.on_snapshot(self._on_snapshot)
+
+    def _on_snapshot(self, doc_snapshot, changes, read_time):
+        for doc in doc_snapshot:
+            self._cache = doc.to_dict() or self._cache
+
+    def new_model_share(self) -> float:
+        # 中央管理された現在のロールアウト比率を返す
+        return float(self._cache.get("new_model_share", 0.0))
+
+# ロールバック手順:
+# 1. Firestore コンソールで new_model_share を 0 に変更
+# 2. 1〜2秒以内に全インスタンスへ反映
+# 3. 新モデルへのトラフィックは即座に 0 になる
+```
+
+ロールバックを「コマンド 1 つ・プロセス再起動なし」で済ませる設計は、夜中に障害が起きたときの精神的な余裕を作ります。個人開発でも、未来の自分のために必ず用意しておく価値があります。
+
+## よくある落とし穴
+
+実際にシャドウトラフィック運用をしていて、私がこれまで踏んできた地雷を共有します。
+
+**落とし穴 1: 副作用のあるツールをシャドウでも実行してしまう**
+
+Function Calling を使っていると、モデルが「メールを送信する」「データベースに書き込む」といった副作用のあるツールを呼ぶ場合があります。シャドウ側でこれを実行すると、ユーザーに 2 通メールが届く、データが 2 回書き込まれるなどの事故が起こります。シャドウ実行時はツール呼び出しをドライラン（モック）に差し替えるべきで、必ず設計段階で分離しておきます。
+
+**落とし穴 2: システムインストラクションの更新忘れ**
+
+旧モデル用に調整したシステムインストラクションを、そのまま新モデルに渡すと差分が大きく出ます。実はモデル側の変更ではなく「プロンプト側の最適化不足」というケースです。シャドウ結果を解釈する際、プロンプトも新モデル向けに同時に調整した結果を見ているか、それとも単純比較なのかを明確に区別する必要があります。
+
+**落とし穴 3: 長時間のバイアス**
+
+シャドウを 1 日だけ回して「問題なさそう」と判断するのは危険です。曜日変動・時間帯変動・キャンペーンの影響などで、入力分布は 1 日のうちで大きく変わります。最低 1 週間はシャドウを回し、週次レポートを作るのを徹底しましょう。私は火曜の昼と土曜の夜で全く違うパフォーマンスが出たケースを何度か経験しています。
+
+**落とし穴 4: PII の二重ログ**
+
+シャドウの差分ログには、入力プロンプトも含まれています。ここにユーザーの個人情報が含まれていると、監査可能なログが 2 系統できてしまい、データ保護の観点で不利になります。差分ログを保存する前に必ず PII マスキングを挟むか、プロンプトそのものはハッシュだけ保存して本文は保持しない設計にすべきです。
+
+**落とし穴 5: シャドウ側のレート制限ヒット**
+
+新モデルは通常、旧モデルよりレート制限が厳しかったり、Quota が別枠だったりします。シャドウを 100% で回すと新モデル側の Quota を先に使い果たし、段階的カットオーバーに入れないという本末転倒な事態が起こり得ます。シャドウ用の Quota を事前に Google Cloud コンソールで見積もっておくのが肝心です。
+
+## 実際の移行シナリオ — 2.5 Pro から次世代モデルへ
+
+ここまでの要素を組み合わせて、実際の移行フローをなぞってみます。たとえば 2.5 Pro から次世代の 3.x Pro へ移行すると想定します。
+
+**Day 1〜3: シャドウインフラを構築**
+
+Cloud Tasks のキューを作成し、シャドウワーカーの Cloud Run サービスをデプロイします。フロントエンドのコードに `ShadowQueueClient.enqueue_shadow` の呼び出しを追加し、10% サンプリングで新モデルの呼び出しを開始します。
+
+**Day 4〜10: シャドウデータを蓄積**
+
+差分ログが BigQuery に蓄積され始めます。この期間は数値をいじらず、ひたすらデータを集めます。期間の終わりにセマンティック類似度・スキーマ一致率・タスク固有メトリクスを集計したダッシュボードを作り、移行判断の材料にします。
+
+**Day 11: 意思決定**
+
+「類似度 0.85 以上のペアが 98% 以上」「スキーマ不一致が 0.5% 未満」「タスク固有の評価指標が同等以上」の 3 条件を満たせば Go を判断します。満たさないなら、システムインストラクションを新モデル向けに最適化し、シャドウ期間を追加で 3 日延長します。
+
+**Day 12〜14: Canary 1%**
+
+`RolloutRouter` の share を 0.01 に設定。ユーザーからのフィードバックチャンネルを注視します。
+
+**Day 15〜21: Canary 10%**
+
+問題なければ share を 0.10 に。ビジネスメトリクス（CTR、継続率、エラー率）を A/B テスト相当の厳密さで比較します。
+
+**Day 22〜28: Canary 50%**
+
+share を 0.50 に。ここまで来ればほぼ本番移行です。ロードバランサ側のキャパシティが新モデル側で十分確保できているかも確認します。
+
+**Day 29: 100% カットオーバー**
+
+share を 1.0 に。ただしフロントエンドのコードには旧モデル呼び出しパスを残しておき、Firestore の Feature Flag 一変更でロールバック可能な状態を 1 週間維持します。
+
+**Day 36: 旧コードパスの削除**
+
+ロールバック猶予期間が無事に終わったら、旧モデル呼び出しコードとシャドウ基盤を段階的に削除します。次の移行時に再利用したい共通部分は `shadow-traffic-toolkit` のような社内ライブラリに昇格させます。
+
+この「4 週間フルコース」は、軽量なプロンプトタスクなら 2 週間程度に圧縮可能です。判断軸は「ビジネス影響度」と「プロンプトの複雑さ」です。本当に壊れると困る中核機能ほど、シャドウ期間を長く取ることをおすすめします。
+
+関連する実装パターンは [Gemini API の Prompt Injection 対策：本番運用で必要なマルチレイヤー防御アーキテクチャ](/articles/gemini-advanced/gemini-api-prompt-injection-multi-layer-defense-production) や [Gemini API 本番の耐障害性設計完全ガイド — Circuit Breaker・Bulkhead・フォールバックモデルで AI サービスを落とさない実装パターン](/articles/gemini-api/gemini-api-resilience-circuit-breaker-bulkhead-production-guide) でも触れているので、合わせて読むと本番運用の地図が繋がりやすくなります。
+
+SRE 的な視点をさらに深めたい方は、[SREサイトリライアビリティエンジニアリング — Googleの信頼性を支えるエンジニアリングチーム](https://www.amazon.co.jp/dp/4873117917/?tag=pinocchio-22) や [入門 監視 ―モダンなモニタリングのためのデザインパターン](https://www.amazon.co.jp/dp/4873118646/?tag=pinocchio-22) にも当たっておくと、シャドウトラフィック以外の観測・運用パターンに考え方を応用できます。
+
+## まとめにかえて — 今日から始める 3 つの一歩
+
+モデル移行は「デプロイしてみないと分からない」という博打から、「データを見て判断する」エンジニアリング作業に変えることができます。そのための最小の一歩を 3 つ挙げてみます。
+
+まず、次の移行対象のモデルと現在のプライマリをペアで決めます。2026 年 6 月の 2.0 Flash 非推奨のように、明確な期限のある移行を最初のターゲットにすると取り組みやすいです。
+
+次に、サンプリング 10% ・fire-and-forget の最小シャドウを 1 本のエンドポイントにだけ仕込みます。いきなり全サービスへ展開すると運用が崩壊するので、最もトラフィックの多い 1 機能でまず回します。
+
+最後に、差分ログを BigQuery に 3 日貯めてみます。たった 3 日でも、初回は必ず「想定外の差分」が見つかります。そこで学んだことを社内ドキュメント（個人プロジェクトなら自分用メモ）に残し、次の移行で再利用できる共通資産にしていく。この積み重ねが、将来の大型モデル移行を大事故から救ってくれます。

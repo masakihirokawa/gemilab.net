@@ -1,0 +1,496 @@
+---
+title: "Safely Migrating Gemini Model Versions with Shadow Traffic — A Production Pattern for Measuring Output Drift"
+slug: "gemini-api-shadow-traffic-model-migration-production"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-04-24T12:00"
+author: "Gemini Lab"
+description: "Stop treating Gemini model migrations as a coin flip. This guide walks through a production-ready shadow traffic architecture — duplicate real inputs to the new model, quantify output drift, and cut over progressively. Includes Python and Cloud Tasks code you can ship today."
+tags: ["gemini", "model-migration", "shadow-traffic", "production", "sre", "canary"]
+highlights:
+  - "You'll walk away with a shadow traffic blueprint you can deploy this week, so Gemini model migrations stop being a 'ship-and-pray' exercise"
+  - "You'll learn a fire-and-forget async shadow pattern that keeps user latency unchanged, plus a sampling strategy to keep costs from doubling"
+  - "You'll be able to implement a Feature Flag–driven 1% → 10% → 50% → 100% rollout with sub-second rollback — without redeploying the app"
+---
+
+When Google announced that Gemini 2.0 Flash would be deprecated in June 2026, I had three production apps running on it. My first reaction was not "time to migrate" but "I have no confidence the new model will behave the same way on real traffic." Running a few dozen staged test cases never tells you how a model behaves against the long tail of real user inputs. Rolling the dice on a deploy is not a strategy I'm willing to take, even for a side project.
+
+Shadow traffic solves this structurally. You send each production request to both the old and new models in parallel, return the old model's response to the user, and quietly collect the new model's response for later comparison. Over a few days of real traffic, you accumulate enough data to ask concrete questions: "On what percentage of inputs do the outputs materially diverge?" and "Which categories of input are most at risk?" Those answers replace gut feel with evidence.
+
+I run several Gemini-powered products, and reinventing this plumbing every time a model deprecates has gotten old. What follows is the pattern I've distilled across four sites, with the code and the operational details that made it survive contact with real traffic.
+
+## Why LLM migrations default to "deploy and hope"
+
+Migrating between LLM versions differs from migrating between API versions in one critical way: the wire-level contract (request/response shapes) and the behavioral contract (what the model actually says) move independently. You can keep every endpoint identical and still break users, because the same prompt can produce a subtly different answer.
+
+One migration I lived through had the old model replying in Japanese and the new model occasionally mixing English phrases into the output. A small system-instruction tweak fixed it, but if the first signal had been customer complaints, the damage would already be done. Unit tests and regression suites only cover the cases you already thought of — which is precisely the set of cases that never break in production. The long tail of real inputs is exactly what shadow traffic lets you examine before flipping the switch.
+
+## The core shadow traffic architecture
+
+The idea is straightforward. Your frontend (the production path) receives a user request, calls the primary (old) model, returns that response to the user, and — in parallel and asynchronously — fires the same input at the shadow (new) model. The user never sees the shadow output; it exists only to measure drift.
+
+Three invariants must hold, or the whole exercise becomes dangerous.
+
+First, shadow calls must not affect user-visible latency. If you `await` the shadow, you've effectively serialised two API calls and doubled p95. I made exactly this mistake on my first attempt.
+
+Second, shadow failures must not leak into the user path. An exception from the shadow call should never, under any circumstance, alter what the user receives.
+
+Third, the shadow response must be incapable of being served to a user. In multi-worker setups, it's surprisingly easy to accidentally cross-contaminate responses. Treat that as a correctness issue, not a race condition to chase later.
+
+Here is the minimal implementation that honors all three.
+
+```python
+# shadow_traffic.py
+# Returns the primary response to the user, then dispatches the same input to
+# the shadow asynchronously. User latency is unaffected; shadow failures are
+# logged and swallowed.
+
+import asyncio
+import logging
+from google import genai
+
+logger = logging.getLogger(__name__)
+
+class ShadowTrafficClient:
+    def __init__(
+        self,
+        primary_model: str = "gemini-2.5-pro",
+        shadow_model: str = "gemini-3-pro",
+        shadow_sample_rate: float = 0.1,  # shadow 10% of production traffic
+    ):
+        self.client = genai.Client()
+        self.primary_model = primary_model
+        self.shadow_model = shadow_model
+        self.shadow_sample_rate = shadow_sample_rate
+
+    async def generate(self, prompt: str, request_id: str) -> str:
+        # 1. Call the primary and prepare to return its response
+        primary_response = await self._call_model(
+            self.primary_model, prompt, request_id, "primary"
+        )
+
+        # 2. Sample, then fire-and-forget into the shadow path
+        import random
+        if random.random() < self.shadow_sample_rate:
+            asyncio.create_task(
+                self._shadow_execute(prompt, request_id, primary_response)
+            )
+
+        return primary_response  # user only ever sees the primary
+
+    async def _call_model(self, model: str, prompt: str, req_id: str, role: str) -> str:
+        try:
+            response = await self.client.aio.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+            return response.text
+        except Exception as e:
+            # Primary failures bubble up; shadow failures are caught below.
+            logger.warning(f"[{req_id}] {role} call failed: {e}")
+            raise
+
+    async def _shadow_execute(self, prompt: str, req_id: str, primary_response: str):
+        # Any shadow failure is swallowed to prevent contaminating user experience.
+        try:
+            shadow_response = await self._call_model(
+                self.shadow_model, prompt, req_id, "shadow"
+            )
+            await self._log_comparison(req_id, prompt, primary_response, shadow_response)
+        except Exception as e:
+            logger.warning(f"[{req_id}] shadow failed (ignored): {e}")
+
+    async def _log_comparison(self, req_id, prompt, primary, shadow):
+        # Write to BigQuery / Firestore / S3. Implementation comes later.
+        pass
+```
+
+The operative detail: `asyncio.create_task` returns immediately, so the user's response time depends solely on the primary. If you ever catch yourself about to type `await shadow_task`, step away from the keyboard — I promise, I've been there.
+
+## Promoting shadow calls to a dedicated queue
+
+For anything beyond a proof of concept, the fire-and-forget inside the request handler has sharp edges. In particular:
+
+- If the request handler exits (process shutdown, timeout, container preemption), the shadow task gets cancelled and data is lost.
+- Shadow failures need their own metrics and alerting, separate from user-path errors.
+- Shadow costs need their own budget line — not co-mingled with production spend.
+
+The cleanest solution is to hand shadow execution off to a dedicated job queue (Cloud Tasks, SQS, Pub/Sub) processed by a separate worker. The frontend is now responsible only for enqueueing.
+
+```python
+# shadow_enqueue.py
+# Frontend side: hand the shadow job off to a Cloud Tasks queue and return.
+
+from google.cloud import tasks_v2
+import json
+
+class ShadowQueueClient:
+    def __init__(self, project: str, location: str, queue: str, worker_url: str):
+        self.client = tasks_v2.CloudTasksClient()
+        self.parent = self.client.queue_path(project, location, queue)
+        self.worker_url = worker_url
+
+    def enqueue_shadow(self, request_id: str, prompt: str, primary_response: str):
+        # Ship the input and the primary response to the shadow worker.
+        # This returns in milliseconds and has zero effect on the user path.
+        task = {
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": self.worker_url,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "request_id": request_id,
+                    "prompt": prompt,
+                    "primary_response": primary_response,
+                }).encode(),
+            },
+            "dispatch_deadline": {"seconds": 60},  # shadow must complete in 60s
+        }
+        return self.client.create_task(parent=self.parent, task=task)
+```
+
+I default to Cloud Tasks, but Pub/Sub plus a Cloud Run worker is just as viable. The decision axis is a single question: "Can the shadow execution complete after the user's request has returned?" If your runtime cancels background tasks on request completion (many serverless platforms do this by default), you need an external queue.
+
+## Quantifying output drift: what to actually measure
+
+Once shadow data is flowing, you cannot manually review thousands of response pairs a day. I tried. It doesn't scale. The job of the measurement layer is to surface only the pairs that deserve a human's attention.
+
+I bucket drift into three metric families.
+
+Semantic similarity: compute embeddings for both responses and take the cosine similarity. Pairs below 0.85 get flagged for review. The Gemini embedding API handles both responses in a single batched call.
+
+Task-specific metrics: define what drift means for your use case. For summarisation it might be keyword coverage against a reference. For translation, ratio of character counts. For Function Calling, whether both models chose the same tool. These metrics catch regressions that semantic similarity alone can miss.
+
+Structural metrics: for JSON-typed outputs, check that both responses parse, that required keys exist, and that types match. Regressions here are existential — the feature breaks, period — so they jump the queue for manual review.
+
+```python
+# diff_metrics.py
+# Quantify the drift between primary and shadow responses.
+# Only pairs exceeding thresholds proceed to human review.
+
+from google import genai
+import numpy as np
+import json
+
+client = genai.Client()
+
+async def semantic_similarity(text_a: str, text_b: str) -> float:
+    # Embed both responses and compute cosine similarity.
+    try:
+        embedding = client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=[text_a, text_b],
+        )
+        a = np.array(embedding.embeddings[0].values)
+        b = np.array(embedding.embeddings[1].values)
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+    except Exception:
+        # Embedding failures must not stop the overall shadow pipeline.
+        return float("nan")
+
+def schema_match(primary_json: str, shadow_json: str, required_keys: list[str]) -> dict:
+    # Compare JSON-shaped outputs for schema compatibility.
+    result = {"primary_ok": False, "shadow_ok": False, "missing_in_shadow": []}
+    try:
+        p = json.loads(primary_json)
+        result["primary_ok"] = all(k in p for k in required_keys)
+    except json.JSONDecodeError:
+        pass
+    try:
+        s = json.loads(shadow_json)
+        result["shadow_ok"] = all(k in s for k in required_keys)
+        result["missing_in_shadow"] = [k for k in required_keys if k not in s]
+    except json.JSONDecodeError:
+        pass
+    return result
+
+# Example output: {"primary_ok": True, "shadow_ok": False, "missing_in_shadow": ["tags"]}
+# Immediately tells you the shadow model is dropping a required key.
+```
+
+Write the annotated pairs back to BigQuery (or any columnar store you can query) and build a single dashboard: similarity distribution, schema mismatch rate, and task-specific metrics broken down by input category. That dashboard becomes the basis for the go/no-go conversation.
+
+## Cost control is part of the design
+
+Shadow traffic doubles your inference volume on the sampled slice. Without discipline, you can surprise yourself on the next bill. Here is what works in practice.
+
+Start at a 10% sampling rate. Lower it once you have coverage across your important input categories. Migration decisions are statistical; you never needed 100%.
+
+Exception: when the shadow target is a much cheaper model (say, Flash-tier), 100% shadow is often affordable. The extra spend on a cheap model is small relative to the primary path.
+
+Exclude large inputs (above ~1MB of context) from shadow. These tend to behave similarly across versions and are expensive to shadow.
+
+Carve out a separate budget line for shadow cost. I use a Google Cloud budget alert that pings my Slack when shadow tasks consume more than 50% of the monthly shadow allowance.
+
+The mental model underneath all of this — treating risk as a budget — is the same one SRE practitioners use for error budgets. If you haven't already, [Site Reliability Engineering (O'Reilly)](https://www.amazon.com/dp/149192912X) is the canonical reference and the chapters on progressive rollouts apply directly.
+
+## Progressive cutover: one dial, five stops
+
+Once shadow data supports the migration, the cutover itself should be boring. Cutting directly from 0% to 100% is the category of decision that ends in a Saturday-night rollback.
+
+My standard schedule looks like this.
+
+**Week 1 — Canary 1%.** Flip 1% of production traffic to the new model. The goal is not testing; it's opening the feedback channel. You're watching for the first "something feels off" signals from real users.
+
+**Week 2 — Canary 10%.** Only advance if Week 1 is clean. At 10% you have enough volume to compare business metrics (CTR, retention, error rate) with real statistical power, like an A/B test.
+
+**Week 3 — Canary 50%.** The key concern at 50% is stickiness. Users bouncing between models across sessions produces a jarring UX ("why does the assistant sound different today?"). Route deterministically using a hash of the user ID.
+
+**Week 4 — 100%.** If the metrics are clean, move the dial to 1.0. Keep the rollback path alive for at least another week.
+
+```python
+# rollout_router.py
+# Feature-flag-driven, deterministic-by-user-id routing. The same user
+# sees the same model across sessions until the rollout ratio changes.
+
+import hashlib
+
+class RolloutRouter:
+    def __init__(self, new_model_share: float = 0.01):
+        # 0.01 = 1% on the new model, 99% on the primary
+        self.new_model_share = new_model_share
+
+    def choose_model(self, user_id: str) -> str:
+        # Turn the user id into a deterministic bucket in [0, 1)
+        digest = hashlib.sha256(user_id.encode()).hexdigest()
+        bucket = int(digest[:8], 16) / 0xffffffff
+        return "gemini-3-pro" if bucket < self.new_model_share else "gemini-2.5-pro"
+
+# Usage:
+# router = RolloutRouter(new_model_share=0.1)  # just change this to widen the canary
+# model = router.choose_model(user_id)
+```
+
+A hash-based router guarantees the same user lands in the same bucket across sessions, which eliminates the "why does this feel different from yesterday?" class of complaints.
+
+## Rollback should be one click, not one deploy
+
+During the cutover window, you need a single operator action that routes 100% of traffic back to the primary — without a code deploy. The canonical way to get this is a central Feature Flag with live reload.
+
+I keep a single Firestore document as the flag store. Editing it in the console is seconds, and a real-time snapshot listener pushes the new value to every running instance within ~1 second.
+
+```python
+# firestore_flag.py
+# Use a Firestore document as a live-reload Feature Flag store.
+# No process restart required to change rollout ratios.
+
+from google.cloud import firestore
+
+class LiveFlagClient:
+    def __init__(self, project_id: str):
+        self.db = firestore.Client(project=project_id)
+        self.doc_ref = self.db.collection("feature_flags").document("gemini_model_rollout")
+        self._cache = {"new_model_share": 0.0}
+        # Real-time listener propagates changes to all running instances.
+        self.doc_ref.on_snapshot(self._on_snapshot)
+
+    def _on_snapshot(self, doc_snapshot, changes, read_time):
+        for doc in doc_snapshot:
+            self._cache = doc.to_dict() or self._cache
+
+    def new_model_share(self) -> float:
+        # Current rollout ratio, managed centrally.
+        return float(self._cache.get("new_model_share", 0.0))
+
+# Rollback procedure:
+# 1. Open Firestore console and set new_model_share to 0
+# 2. Within ~1s, every instance sees the new value
+# 3. All traffic reverts to the primary model
+```
+
+The psychological value of "rollback is one console edit" is hard to overstate. When something goes wrong at 2am, you want the minimum-effort action to be the safe one.
+
+## Failure modes you only learn the hard way
+
+A few traps I've actually hit while running shadow traffic in anger.
+
+**Trap 1: re-executing side-effectful tools in the shadow path.** If your app uses Function Calling to send emails, write to a database, or charge a card, naively replaying the turn on the shadow model will re-execute those tools — and users will receive two emails. Shadow executions must replace tool bindings with dry-run stubs. Design this in from the start, not after the first incident.
+
+**Trap 2: forgetting to tune prompts for the new model.** A prompt optimised for Gemini 2.5 Pro may not be optimal for 3.x Pro. When you observe drift, be explicit about whether you're comparing (old model + old prompt) vs (new model + old prompt), or (old model + old prompt) vs (new model + new prompt). Those are different experiments and the decision rules differ.
+
+**Trap 3: sampling over too short a window.** A single day of shadow data has strong weekday, hour-of-day, and campaign effects. Run the shadow for at least a full week before calling it representative. I've seen entirely different drift patterns between Tuesday noon and Saturday night on the same service.
+
+**Trap 4: doubling your PII exposure.** Shadow diff logs contain prompts, and prompts contain user data. You now have two audit-able stores of the same sensitive data, which is worse from a compliance perspective. Mask or hash prompts before writing them to the comparison store.
+
+**Trap 5: quota starvation on the shadow target.** The new model typically ships with tighter quotas than the incumbent. Running shadow at 100% can exhaust the new model's quota and block the very cutover you're preparing for. Request quota ahead of time in the Google Cloud console based on expected shadow volume.
+
+## A concrete migration timeline
+
+Putting the pieces together, here's what a 2.5 Pro → next-gen Pro migration looks like end to end.
+
+**Days 1–3: Build the shadow plumbing.** Create the Cloud Tasks queue, deploy the shadow worker on Cloud Run, and wire `ShadowQueueClient.enqueue_shadow` into the production path. Start at 10% sampling.
+
+**Days 4–10: Let data accumulate.** Don't touch the knobs. Let BigQuery fill up with comparison pairs. At the end of the week, compute similarity distributions, schema-mismatch rates, and task-specific metrics. Build a dashboard.
+
+**Day 11: Go/no-go decision.** Criteria I use: ≥98% of pairs score 0.85+ semantic similarity, <0.5% schema mismatch rate, task-specific metrics at parity or better. Miss any of the three? Optimise the prompt for the new model and extend the shadow window by 3–5 days.
+
+**Days 12–14: Canary at 1%.** Flip `new_model_share` to 0.01. Watch support channels and error dashboards closely.
+
+**Days 15–21: Canary at 10%.** Advance if Week 1 is clean. Compare business metrics with statistical rigor.
+
+**Days 22–28: Canary at 50%.** At this scale, confirm your infrastructure (rate limits, autoscaling, observability) is provisioned for the new model.
+
+**Day 29: 100% cutover.** Flip `new_model_share` to 1.0. Leave the primary code path intact for at least a week so a single Firestore edit can revert everything.
+
+**Day 36: Clean up.** Delete the primary model code path and archive the shadow infrastructure. Extract anything reusable into a shared library for the next migration.
+
+You can compress this to two weeks for simple prompt-only workloads. Keep the full four weeks for anything business-critical or structurally complex.
+
+For adjacent production concerns, pair this with [Gemini API Prompt Injection: Multi-Layer Defense Architecture for Production](/en/articles/gemini-advanced/gemini-api-prompt-injection-multi-layer-defense-production) and [The Complete Guide to Resilience in Gemini API Production — Circuit Breakers, Bulkheads, and Fallback Models](/en/articles/gemini-api/gemini-api-resilience-circuit-breaker-bulkhead-production-guide) — together they cover the three axes (security, reliability, migration safety) that real Gemini-backed services need.
+
+For broader SRE intuition, [Site Reliability Engineering](https://www.amazon.com/dp/149192912X) and [Observability Engineering](https://www.amazon.com/dp/1492076449) will extend these ideas well beyond shadow traffic.
+
+## The shadow worker: keeping it honest under load
+
+The enqueueing side is the easy part. The worker that actually runs the shadow call needs its own set of discipline. Over a year of running this pattern, I've found three production-grade requirements that are worth getting right the first time.
+
+**Concurrency control.** The worker should cap the number of concurrent shadow calls so a traffic spike doesn't exhaust the new model's rate limit. A semaphore sized to "expected shadow RPS × target p95 latency" is the simplest correct thing.
+
+**Idempotent dedup.** Cloud Tasks (and every good queue) will retry. If your worker writes to BigQuery, the same request_id can be written multiple times. Include the request_id in the BQ row key or use a streaming insert with dedup.
+
+**Timeout discipline.** Any single shadow call should respect a strict timeout — typically 2× the primary's p95 latency. Leaking timeouts cause slow workers to accumulate and eventually stall the queue.
+
+```python
+# shadow_worker.py
+# Production shadow worker with concurrency cap, timeout, and dedup.
+
+import asyncio
+import logging
+from google import genai
+from google.cloud import bigquery
+
+logger = logging.getLogger(__name__)
+client = genai.Client()
+bq = bigquery.Client()
+
+SHADOW_SEMAPHORE = asyncio.Semaphore(32)  # cap concurrent shadow calls
+SHADOW_TIMEOUT = 30.0  # seconds
+
+async def handle_shadow(request_id: str, prompt: str, primary_response: str,
+                        shadow_model: str = "gemini-3-pro"):
+    async with SHADOW_SEMAPHORE:
+        try:
+            shadow_response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=shadow_model, contents=prompt
+                ),
+                timeout=SHADOW_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[{request_id}] shadow timed out after {SHADOW_TIMEOUT}s")
+            return {"status": "timeout"}
+        except Exception as e:
+            logger.warning(f"[{request_id}] shadow error: {e}")
+            return {"status": "error", "reason": str(e)}
+
+    # Idempotent insert: request_id is the primary key in the shadow_pairs table.
+    # BigQuery MERGE protects against duplicates from queue retries.
+    row = {
+        "request_id": request_id,
+        "prompt_hash": _sha256(prompt),
+        "primary_response": primary_response,
+        "shadow_response": shadow_response.text,
+        "shadow_model": shadow_model,
+        "ts": "AUTO",
+    }
+    errors = bq.insert_rows_json("analytics.shadow_pairs", [row],
+                                  row_ids=[request_id])
+    if errors:
+        logger.error(f"[{request_id}] bq insert error: {errors}")
+    return {"status": "ok"}
+
+def _sha256(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode()).hexdigest()
+
+# Expected behavior:
+# - Concurrent shadow calls cap at 32; surges past that queue up naturally in Cloud Tasks.
+# - Any call taking longer than 30s is abandoned, keeping the worker responsive.
+# - Duplicate Cloud Tasks retries land on the same request_id and are deduped by BQ.
+```
+
+Notice that the worker never touches the user-facing code path. That separation is what lets the whole system be safely modified, tested, and torn down without production risk.
+
+## Alerting on drift, not just on errors
+
+Standard APM catches errors (500s, timeouts, quota exhaustion). Shadow traffic adds a new failure mode worth alerting on: "the new model is drifting further from the old one than expected." You want to know before the canary, not during it.
+
+I set up two alerts backed by scheduled BigQuery queries.
+
+First: rolling 24-hour average semantic similarity dropping below 0.85. This is the "something fundamentally changed" signal — usually a prompt mismatch or a model behavior change.
+
+Second: rolling 24-hour schema mismatch rate rising above 1%. This is the "the new model is breaking the contract" signal — usually a JSON-mode or tool-call regression.
+
+```sql
+-- scheduled_alert_similarity.sql
+-- Runs every hour; triggers if the 24h rolling similarity dips below 0.85.
+
+SELECT
+  AVG(similarity_score) AS similarity_24h,
+  COUNT(*) AS pairs_24h
+FROM `analytics.shadow_pairs`
+WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+  AND similarity_score IS NOT NULL
+HAVING similarity_24h < 0.85
+   AND pairs_24h >= 500;  -- require sample size to avoid noise
+```
+
+Wiring this into a Cloud Monitoring alert policy gives you a paging channel that ignores routine production errors and only fires when migration-specific risk rises. That's far more useful during the cutover window than any generic error-rate alert.
+
+## Handling streaming responses
+
+Streaming responses deserve their own paragraph because they don't work with the default shadow pattern. You cannot straightforwardly compare two streams — you would need to accumulate both, at which point you've lost the point of streaming.
+
+Two viable approaches:
+
+**Option A: post-hoc comparison.** Let the user-facing stream complete normally, buffer the full text, and run the shadow call as a non-streaming request against the same prompt. Compare completed texts. This loses information about token timing but preserves the data you actually care about: final output quality.
+
+**Option B: token-level similarity.** For latency-sensitive comparisons, compute similarity on prefixes. After each token from the shadow, compare its running prefix against the primary's running prefix. This is expensive and probably overkill for migration decisions, but invaluable for diagnosing latency regressions.
+
+I default to Option A for all migration work. Option B is reserved for niche latency investigations.
+
+## When to not use shadow traffic
+
+Shadow traffic is not free. It requires queue infrastructure, diff logic, and engineering time. A few cases where the value is low enough that simpler approaches win:
+
+**Tiny traffic volumes.** If you process under 100 requests per day, a few hours of manual review of old-vs-new pairs over a weekend will tell you more than shadow infrastructure would.
+
+**Deterministic tasks.** If your prompt is essentially "extract this field from this structured text," the behavior is unlikely to drift meaningfully. Unit tests plus a small regression suite is enough.
+
+**Same model family, same generation.** Migrating from `gemini-2.5-pro-preview-03-01` to `gemini-2.5-pro-preview-04-01` is a minor patch and rarely justifies a week of shadow. Still, a one-day shadow at 10% is a cheap insurance policy.
+
+The sweet spot for shadow traffic is: non-trivial traffic volume, prompts where meaning can shift in subtle ways, and a major version bump in the model. That describes most migrations worth worrying about.
+
+## Integrating shadow into your release workflow
+
+The single biggest improvement I made after shipping this pattern was giving it a place in my release workflow. Shadow used to be an ad-hoc "we should probably do this" effort. Now it's a checklist item that blocks migration PRs from merging.
+
+My release gate looks like:
+
+1. The shadow infrastructure is either live or the migration PR explicitly opts out with a reason.
+2. The migration PR description links to a shadow dashboard showing at least 7 days of data.
+3. The go/no-go criteria (similarity, schema match, task metrics) are met on the dashboard.
+4. The rollback procedure is tested — I literally flip `new_model_share` to 0 on the canary environment and confirm traffic rerouting completes within 5 seconds.
+
+These gates are not ceremony. Each one corresponds to a class of incident I have lived through and would prefer not to live through again.
+
+
+
+## Why the effort is worth it
+
+Every engineer building on an LLM-backed product eventually faces this question: "Do I trust the new model enough to ship?" Without a system for producing that answer from real data, the decision defaults to gut feel, anecdote, or a few days of panicked testing right before the deprecation deadline.
+
+Shadow traffic replaces that with something far better: a recurring production capability you can spin up at will, point at any candidate model, and use to produce evidence. The first time you run it is the hardest; by the third migration, you have a library, a dashboard, and a mental model of where models usually diverge for your specific workload.
+
+In my experience, the compounding value is substantial. The first migration took me roughly two weeks of engineering time to set up the shadow system. The second migration took two days. The third took a few hours — mostly copy-paste and parameter tweaks. That arc is available to anyone who builds this once and keeps the pieces reusable.
+
+## Three things to do this week
+
+If you're staring at a looming Gemini model deprecation, the smallest useful step is not "build the whole pipeline." It's "make the first comparison."
+
+Pick one endpoint — ideally the highest-traffic one — and wire up a 10% fire-and-forget shadow to the target model. Don't worry about dashboards yet.
+
+Let shadow data accumulate in BigQuery for three days. Manually eyeball ten pairs. You'll find at least one surprising divergence — that's the learning.
+
+Write what you found in a short note (for me, a memory file in my dev notes). The next migration will feel far less like a gamble, because you'll start it with pattern recognition instead of a blank slate.
