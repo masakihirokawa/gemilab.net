@@ -6,6 +6,21 @@ const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 const nextConfig: NextConfig = {
   compress: true,
   poweredByHeader: false,
+  async redirects() {
+    return [
+      // Legacy/orphan URL surfaced in GSC (2026-04-25): non-existent article slug, redirect to closest match
+      {
+        source: "/articles/gemini-api/gemini-api-multimodal-guide",
+        destination: "/articles/gemini-api/multimodal-api-guide",
+        permanent: true,
+      },
+      {
+        source: "/:locale(ja|en)/articles/gemini-api/gemini-api-multimodal-guide",
+        destination: "/:locale/articles/gemini-api/multimodal-api-guide",
+        permanent: true,
+      },
+    ];
+  },
   async headers() {
     return [
       {
