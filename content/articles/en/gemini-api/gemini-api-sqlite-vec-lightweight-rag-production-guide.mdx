@@ -1,0 +1,517 @@
+---
+title: "A Tiny RAG Stack With Gemini + sqlite-vec — Production Patterns for Solo Developers"
+slug: "gemini-api-sqlite-vec-lightweight-rag-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-24T19:45"
+author: "Gemini Lab"
+description: "If you have been holding off on adding RAG to your personal app because Pinecone's monthly fee or Qdrant's memory footprint felt like overkill, this guide is for you. We walk through a production-grade design that runs on a single server, pairing Gemini's embedding API with sqlite-vec, with working code you can lift straight into your project."
+tags:
+  - "gemini-api"
+  - "sqlite-vec"
+  - "rag"
+  - "embedding"
+  - "lightweight-rag"
+  - "indie-dev"
+highlights:
+  - "You can stop postponing RAG because of Pinecone or Qdrant bills — today you will have a production-capable setup that runs for near zero cost on a small VPS"
+  - "You will walk away with working hybrid-search code that combines Gemini embeddings with FTS5, so your recall on proper nouns and IDs improves noticeably over pure vector search"
+  - "You will learn the chunking, indexing, and backup patterns that prevent the 'it worked on day one, broke at 10k notes' failure mode that most indie RAGs hit"
+---
+
+## For Indie Developers Who Got Stuck at "Pinecone Feels Expensive"
+
+Most RAG guides start with a hosted vector database. Pinecone, Qdrant Cloud, or Weaviate all ship with excellent documentation and a comforting sense of "it will scale." But when you are running a side project with a three-figure user count, the question that stops you in your tracks is: "Is this really worth $20 to $50 every month, forever?"
+
+I have hit that wall several times. I wanted note search inside my own app, a smarter FAQ for readers, semantic search across my blog posts. None of them have anything like webscale requirements. Yet committing to a managed vector database felt less like a technical decision and more like shrinking the zone where I am allowed to experiment.
+
+This article walks through an alternative I have been running in production for about half a year: sqlite-vec. It is a SQLite extension that gives you vector search as a virtual table. There is no separate service to run. Your backup strategy is "copy a single file." The whole thing ships inside your application process. Paired with Gemini's embedding API, you can have semantic search over your own notes in a couple of hours, and the result stays manageable by a single person.
+
+I use this exact setup for internal memo search across this site network and for searching my Obsidian vault. The code below is distilled from that experience, with the edges that matter in production.
+
+## Why sqlite-vec Earns a Default Slot in Solo Projects
+
+sqlite-vec matured rapidly through 2024 and 2025 and is now a realistic first choice when these conditions hold.
+
+- Your corpus lives in the tens of thousands to low millions of vectors
+- A single-region, single-instance deployment is fine
+- Reads dominate writes by a wide margin
+- Operational simplicity is worth more to you than headroom
+
+When you need cross-region replication, sustained write rates of hundreds per second, or tight integration with an MLOps pipeline, reach for Pinecone or Qdrant directly. The earlier guides on [building a production RAG with Gemini and Pinecone](/en/articles/gemini-api/gemini-api-pinecone-rag-production-guide) and [running a hybrid RAG on Qdrant](/en/articles/gemini-api/gemini-api-qdrant-hybrid-rag-production-system) explain those trade-offs in detail.
+
+Three technical properties make sqlite-vec a good citizen in small shops. First, you inherit SQLite's ACID guarantees. Second, backups and migrations are just file operations. Third, you can combine vector search with FTS5 full-text search in a single SQL statement and a single transaction.
+
+For solo developers, the ability to diagnose and fix problems without leaving `sqlite3` on the command line is a practical edge. If something goes wrong at 11 PM on a Friday, you can see and fix it.
+
+## A Working Skeleton in Roughly 150 Lines
+
+Let's start from something that runs. This Python module indexes documents with Gemini embeddings and stores them in sqlite-vec. The embedding model used here is `text-embedding-001`; we will revisit model choice later.
+
+```python
+# app/indexer.py
+# Purpose: embed notes with Gemini and store them in sqlite-vec.
+# Install: pip install google-genai sqlite-vec numpy python-dotenv
+
+import os
+import sqlite3
+import struct
+from pathlib import Path
+
+import sqlite_vec
+from google import genai
+from dotenv import load_dotenv
+
+load_dotenv()
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+DB_PATH = "notes.db"
+EMBED_MODEL = "text-embedding-001"
+EMBED_DIM = 768  # dimensionality for text-embedding-001
+
+def serialize(vec: list[float]) -> bytes:
+    """Pack a list of floats into sqlite-vec's binary format."""
+    return struct.pack(f"{len(vec)}f", *vec)
+
+def open_db(path: str = DB_PATH) -> sqlite3.Connection:
+    """Load the sqlite-vec extension and return a connection."""
+    con = sqlite3.connect(path)
+    con.enable_load_extension(True)
+    sqlite_vec.load(con)
+    con.enable_load_extension(False)
+    con.execute("PRAGMA journal_mode=WAL")  # reader/writer concurrency
+    return con
+
+def init_schema(con: sqlite3.Connection) -> None:
+    con.executescript(f"""
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            body  TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS note_vec USING vec0(
+            id INTEGER PRIMARY KEY,
+            embedding float[{EMBED_DIM}]
+        );
+    """)
+
+def embed(text: str) -> list[float]:
+    if not text.strip():
+        return [0.0] * EMBED_DIM
+    resp = client.models.embed_content(model=EMBED_MODEL, contents=text)
+    return resp.embeddings[0].values
+
+def upsert_note(con: sqlite3.Connection, title: str, body: str) -> int:
+    """Write a note and its embedding in a single transaction."""
+    vec = embed(f"{title}\n{body}")
+    with con:
+        cur = con.execute(
+            "INSERT INTO notes(title, body) VALUES (?, ?)", (title, body)
+        )
+        note_id = cur.lastrowid
+        con.execute(
+            "INSERT INTO note_vec(id, embedding) VALUES (?, ?)",
+            (note_id, serialize(vec)),
+        )
+    return note_id
+
+if __name__ == "__main__":
+    con = open_db()
+    init_schema(con)
+    upsert_note(con, "Morning run", "5 km in 28 minutes. Breathing finally smoothed out.")
+    upsert_note(con, "Gemini API notes", "embed_content returns 768 floats. No need to normalize.")
+    print("OK")
+```
+
+And the read path:
+
+```python
+# app/search.py
+# Purpose: embed the query with Gemini and return similar notes.
+
+import sqlite3
+from typing import Any
+from app.indexer import open_db, embed, serialize
+
+def search(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    q_vec = embed(query)
+    con = open_db()
+    rows = con.execute(
+        """
+        SELECT n.id, n.title, n.body, v.distance
+        FROM note_vec v
+        JOIN notes n ON n.id = v.id
+        WHERE v.embedding MATCH ? AND k = ?
+        ORDER BY v.distance
+        """,
+        (serialize(q_vec), limit),
+    ).fetchall()
+    return [
+        {"id": r[0], "title": r[1], "body": r[2], "distance": r[3]} for r in rows
+    ]
+
+if __name__ == "__main__":
+    for hit in search("training in the morning"):
+        print(f"{hit['distance']:.3f}  {hit['title']}")
+```
+
+Running `python -m app.indexer && python -m app.search` gives you ranked semantic matches. It is unglamorous, but at this point you have met the core RAG requirement — retrieving the best chunks for a user query. From here we harden it for real traffic.
+
+## Designing the Chunking Layer Around Gemini's Embeddings
+
+The minimal example embeds "title plus body" directly. That works for toy notes but breaks the moment any document goes past a thousand characters. One vector carrying a thousand characters ends up too averaged — narrow sub-topics get blurred out, and queries about a specific sentence stop ranking the right document first.
+
+From running this pattern on my own notes, these rules held up:
+
+- Meeting notes and short memos: fixed 400 to 600 character chunks with 100 character overlap
+- Blog posts and technical docs: split at H2 headings, fall back to 1500 characters per chunk
+- Code-heavy content: separate code blocks from surrounding prose into different chunks
+
+That maps cleanly to splitting the schema into a `notes` table and a `chunks` table.
+
+```python
+# app/chunking.py
+from dataclasses import dataclass
+
+@dataclass
+class Chunk:
+    text: str
+    start: int
+    end: int
+
+def chunk_by_length(text: str, size: int = 500, overlap: int = 100) -> list[Chunk]:
+    if not text:
+        return []
+    step = max(1, size - overlap)
+    out: list[Chunk] = []
+    i = 0
+    while i < len(text):
+        j = min(len(text), i + size)
+        out.append(Chunk(text=text[i:j], start=i, end=j))
+        if j == len(text):
+            break
+        i += step
+    return out
+```
+
+Extend the schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS chunks (
+    id INTEGER PRIMARY KEY,
+    note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    ord INTEGER NOT NULL,        -- order within the note
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS chunks_note_id ON chunks(note_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
+    id INTEGER PRIMARY KEY,
+    embedding float[768]
+);
+```
+
+Embed at the chunk level and resolve hits back to their parent note. Keeping this layer separate pays off the day you decide to swap the embedding model — you rebuild `chunk_vec` without touching the source notes.
+
+As chunk counts rise, remember that Gemini's embedding endpoint accepts batch inputs. Sending a list of chunks per call rather than one-at-a-time cuts latency and effective cost by nearly an order of magnitude.
+
+## Hybrid Search — Pair FTS5 With Vectors
+
+Pure vector search has a known weakness: proper nouns, dates, IDs, and other "match this exact string" queries often fail to rank the right document first. SQLite ships with FTS5 for full-text search, so it is natural to hold both indexes side by side in the same database and combine their results.
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    text,
+    content='chunks',
+    content_rowid='id',
+    tokenize='trigram'
+);
+
+-- Use triggers so the FTS index stays in sync with the base table.
+CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+    DELETE FROM chunks_fts WHERE rowid = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+    DELETE FROM chunks_fts WHERE rowid = old.id;
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+END;
+```
+
+For ranking, Reciprocal Rank Fusion (RRF) is the least fragile choice at this scale. Fetch the top 50 from each side and combine by inverse rank.
+
+```python
+# app/hybrid_search.py
+from collections import defaultdict
+from app.indexer import open_db, embed, serialize
+
+def hybrid_search(query: str, k: int = 10, pool: int = 50) -> list[dict]:
+    con = open_db()
+    # 1) Vector side: ascending distance, top `pool`
+    vec_rows = con.execute(
+        """
+        SELECT c.id, c.note_id, c.text, v.distance
+        FROM chunk_vec v
+        JOIN chunks c ON c.id = v.id
+        WHERE v.embedding MATCH ? AND k = ?
+        ORDER BY v.distance
+        """,
+        (serialize(embed(query)), pool),
+    ).fetchall()
+
+    # 2) FTS side: lower BM25 is better
+    fts_rows = con.execute(
+        """
+        SELECT c.id, c.note_id, c.text, bm25(chunks_fts) AS score
+        FROM chunks_fts
+        JOIN chunks c ON c.id = chunks_fts.rowid
+        WHERE chunks_fts MATCH ?
+        ORDER BY score
+        LIMIT ?
+        """,
+        (query, pool),
+    ).fetchall()
+
+    # 3) RRF merge
+    rr: dict[int, float] = defaultdict(float)
+    meta: dict[int, dict] = {}
+    for rank, row in enumerate(vec_rows):
+        cid = row[0]
+        rr[cid] += 1 / (60 + rank)
+        meta[cid] = {"id": cid, "note_id": row[1], "text": row[2]}
+    for rank, row in enumerate(fts_rows):
+        cid = row[0]
+        rr[cid] += 1 / (60 + rank)
+        meta.setdefault(cid, {"id": cid, "note_id": row[1], "text": row[2]})
+
+    ranked = sorted(rr.items(), key=lambda x: x[1], reverse=True)[:k]
+    return [meta[c] | {"score": s} for c, s in ranked]
+```
+
+RRF has only one mild parameter (the constant 60), and tuning rarely helps or hurts. In practice, hybrid recall for queries containing model numbers, user handles, or dates jumps noticeably compared to vectors alone.
+
+## SQLite PRAGMAs That Actually Matter in Production
+
+A few SQLite settings are the difference between "works on the laptop" and "survives real traffic." None of them are exotic, but each of them has caught me out at least once.
+
+### WAL Mode Is Essentially Mandatory
+
+The earlier snippet already sets `journal_mode=WAL`. With WAL, readers do not block writers and vice versa. RAG workloads are read-heavy with bursty writes, which is exactly where WAL shines.
+
+### synchronous=NORMAL Is the Practical Default
+
+`PRAGMA synchronous=NORMAL` gives you several times the write throughput of FULL. It sounds like you are giving up safety, but combined with WAL the crash-durability story is strong enough for solo-developer use cases.
+
+### busy_timeout Saves You From "database is locked"
+
+Any moment you run multiple workers, you will meet contention. Set `PRAGMA busy_timeout=5000` (5 seconds) so brief contention auto-resolves instead of bubbling up as an error.
+
+### mmap_size Accelerates Reads
+
+`PRAGMA mmap_size=268435456` (256 MB) lets the OS keep hot pages in a memory-mapped region, which is where vector search reads spend most of their time.
+
+Running this on every connection start-up is enough:
+
+```python
+def tune(con: sqlite3.Connection) -> None:
+    con.executescript("""
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA busy_timeout=5000;
+        PRAGMA mmap_size=268435456;
+        PRAGMA temp_store=MEMORY;
+    """)
+```
+
+## The Pitfalls I Actually Hit
+
+These are the mistakes I have made (or watched others make) with sqlite-vec, in order of how often they recur.
+
+**1) Dimension mismatch between the virtual table and the embedding model.**  
+`text-embedding-001` outputs 768 floats, while `gemini-embedding-001` returns 3072. Swap the model without rebuilding the `vec0` table and inserts silently fail or searches return nothing. When you change models, rebuild the virtual table and reindex.
+
+**2) Normalizing embeddings you should not normalize.**  
+Gemini embeddings are intended to be used directly with L2 distance; you do not need to divide by the norm. If you port code from another vector store that normalizes by default, you distort ranking without any warning.
+
+**3) Stacking equality predicates with the `MATCH` clause.**  
+Writing `WHERE v.embedding MATCH ? AND note_id = ?` against the virtual table yields fewer than `k` rows because filtering happens after the top-k. The idiom is: take a wider vector search, `JOIN` the base table, then filter in application or outer SQL.
+
+**4) Ignoring file-lock contention.**  
+Without `busy_timeout`, running multiple web workers against the same database will produce "database is locked" errors during peak hours. Always set it during connection setup.
+
+**5) Tuning against vector similarity alone.**  
+Evaluation sets that only test semantic queries will hide the weakness around proper nouns and IDs. Build in queries that specifically require lexical matching so you know when hybrid retrieval is worth its complexity.
+
+## Backups and Model-Migration Strategy
+
+The cleanest reason to like sqlite-vec is that the entire dataset fits in a single file. There is a subtlety with WAL mode, though: you also have `notes.db-wal` and `notes.db-shm`, so `cp` alone is not a consistent snapshot. Use `VACUUM INTO` to write out a transactionally clean copy.
+
+```python
+def backup(src_path: str = "notes.db", dst_path: str = "backup.db") -> None:
+    con = open_db(src_path)
+    con.execute(f"VACUUM INTO ?", (dst_path,))
+    con.close()
+```
+
+Run this in a daily cron, ship the resulting file to object storage (Cloudflare R2 or S3), and your disaster recovery is "download the file and rename it."
+
+For embedding-model migrations, design for them from the start. Assume `chunks` is immutable and that `chunk_vec` will be rebuilt under a new name and renamed into place.
+
+```python
+def reindex(new_dim: int, new_table: str = "chunk_vec_v2") -> None:
+    con = open_db()
+    con.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS {new_table} USING vec0(id INTEGER PRIMARY KEY, embedding float[{new_dim}])")
+    rows = con.execute("SELECT id, text FROM chunks").fetchall()
+    for cid, text in rows:
+        vec = embed(text)  # new model
+        con.execute(f"INSERT INTO {new_table}(id, embedding) VALUES (?, ?)", (cid, serialize(vec)))
+    con.commit()
+```
+
+At cut-over time, rename `chunk_vec` to `chunk_vec_old`, promote `chunk_vec_v2` to `chunk_vec`, and drop the old table once the new one has been validated.
+
+## When to Graduate to Pinecone or Qdrant
+
+sqlite-vec is not the right choice forever. I treat two of these three signals, sustained over two or three weeks, as the point where I actually weigh a managed vector database.
+
+- Vector count passes roughly three million and search latency crosses 200 ms often
+- You need more than one application instance to read concurrently (replication required)
+- Sustained writes climb above roughly ten per second
+
+Until then, sqlite-vec keeps giving you runway. If you expect to migrate, keep your retrieval layer behind a thin `VectorStore` interface from day one, similar to the design in [building production semantic search with Gemini embeddings](/en/articles/gemini-api/gemini-embeddings-semantic-search-production). Swapping implementations becomes a dependency-injection change rather than a rewrite.
+
+## Choosing the Right Gemini Embedding Model
+
+The embedding model you pick shapes the rest of the system more than any other single decision. Gemini currently offers two mainstream embedding models worth comparing for an sqlite-vec setup.
+
+The older `text-embedding-001` returns 768-dimensional vectors. It is cheap, fast, and generous on the free tier. For general semantic search over prose, the quality has been more than adequate for every project I have shipped so far. At roughly two hundred tokens per embedding on average and the current pricing, indexing a hundred thousand chunks costs less than a coffee and takes a few minutes if you batch the calls.
+
+The newer `gemini-embedding-001` returns 3072-dimensional vectors by default. The quality step-up is real on specialized domains — code search, scientific text, non-English corpora — but the storage cost is four times higher. Each vector is also four times the bytes on disk, and nearest-neighbor search gets slower proportionally. The model does support Matryoshka-style truncation (you can keep the first 1024 or 1536 dimensions), which is a useful lever if you want the quality ceiling but can live with a slightly worse embedding.
+
+My rule of thumb is to start every project with `text-embedding-001`, measure the recall on your own evaluation set (we will build one in a moment), and only upgrade when the lower model is clearly holding you back. Many of the RAG complaints I see from solo developers are rooted in chunking or query rewriting, not embedding quality. Upgrading the model rarely solves those problems on its own.
+
+One more choice: when you embed documents, call the model with `task_type="retrieval_document"`, and when you embed queries use `task_type="retrieval_query"`. Gemini's embeddings are asymmetric for retrieval — treating queries and documents symmetrically measurably hurts recall. A single-line change in your embedding helper can add several percentage points of top-5 accuracy.
+
+## Building a Small Evaluation Set You Actually Use
+
+An evaluation set is the difference between "I think this works" and "I know this works." For solo projects, the bar is far lower than the academic benchmarks you will find in papers. What you need is a list of realistic queries, each paired with the document IDs that should appear in the top results.
+
+```python
+# eval/dataset.py
+# A lightweight eval format: JSONL with query + expected note_ids.
+
+EVAL_CASES = [
+    {"query": "what did I decide about caching in March", "expected_ids": [104]},
+    {"query": "Stripe webhook signature errors fix", "expected_ids": [218, 221]},
+    {"query": "iPhone wallpaper app revenue spike", "expected_ids": [33]},
+    # add 30 to 60 of these total
+]
+```
+
+Thirty to sixty handcrafted examples are usually enough to notice real changes. Run them against `hybrid_search` and compute recall@5 and mean reciprocal rank:
+
+```python
+def evaluate(cases: list[dict], k: int = 5) -> dict:
+    hits = 0
+    rr_sum = 0.0
+    for case in cases:
+        results = hybrid_search(case["query"], k=k)
+        found_rank = None
+        for i, r in enumerate(results, start=1):
+            if r["note_id"] in case["expected_ids"]:
+                found_rank = i
+                break
+        if found_rank is not None:
+            hits += 1
+            rr_sum += 1 / found_rank
+    n = len(cases)
+    return {"recall@k": hits / n, "mrr": rr_sum / n}
+```
+
+Check in this evaluation set alongside your code. Run it any time you change chunking strategy, swap embedding models, or adjust the RRF constant. When a change moves recall@5 up by a few percentage points, you now know it helped; when it does not move, you have avoided a false sense of progress.
+
+## Concrete Cost and Capacity Expectations
+
+It helps to see real numbers before committing to this architecture. The figures below come from actual deployments I have maintained.
+
+For a corpus of 20,000 chunks embedded with `text-embedding-001`, the database file settles around 90 MB. A single-core VPS with 1 GB of RAM serves vector queries in 20 to 40 ms including Gemini's embedding round-trip for the query itself — most of that time is the network call, not the SQL. Hybrid search with RRF adds another 15 to 25 ms because of the parallel FTS scan.
+
+At 200,000 chunks, the same database grows to around 900 MB. On a 2 vCPU / 4 GB RAM VPS, median vector query latency is 60 to 90 ms. This is still comfortable for interactive user-facing features. Indexing throughput with batch embedding is around 200 chunks per second when you keep batches small enough to stay under Gemini's per-request size limit.
+
+At 1,000,000 chunks, sqlite-vec starts showing strain on a modest VPS. Median latency crosses 150 ms, p95 can exceed 400 ms, and the database file approaches 5 GB. This is the corridor where you should benchmark aggressively and decide, by data, whether to upgrade the server or move to a dedicated vector database.
+
+Monthly costs break down roughly as follows for a 200,000-chunk deployment serving a thousand daily queries:
+
+- VPS: $6 to $12 on Hetzner or DigitalOcean
+- Storage: included with the VPS
+- Gemini embeddings (queries only, documents already indexed): under $2 if you use `text-embedding-001`
+- Backups to S3 or R2: under $1
+
+The total is roughly one tenth of what a managed vector database with equivalent capacity would cost, and you retain full control of the data.
+
+## Deployment Patterns That Work on a Small Box
+
+I deploy this stack in two shapes depending on what the surrounding application looks like.
+
+The first is the "monolith with a file" pattern. The sqlite-vec database lives next to the application binary, the application process opens it directly, and a sidecar cron job handles the daily `VACUUM INTO` backup. This is what I run for my own side projects on a single Hetzner VPS. It is boring, and boring is exactly what you want from storage.
+
+The second is the "read replica via Litestream" pattern. Litestream continuously streams SQLite writes to object storage, which lets a second instance hydrate a copy on startup. You do not get true multi-writer replication, but for read-mostly RAG workloads this is often enough to achieve simple active-passive failover. The failover target restores from the most recent Litestream segment, warms its page cache, and takes over if the primary disappears.
+
+Avoid putting sqlite-vec behind a serverless function that recreates the connection for every request. SQLite's strengths come from long-lived processes with warmed caches. If your stack is serverless-first — say, Cloudflare Workers or Vercel — use a lightweight container platform for the retrieval service instead. A $5 per month Fly.io machine with a persistent volume is a natural home for this.
+
+## Keeping Embeddings Fresh Without Rebuilding Everything
+
+When the underlying documents change, you need to update only the affected chunks. A practical way to structure this is to store a content hash alongside each chunk and reuse embeddings when the hash has not changed.
+
+```python
+import hashlib
+
+def chunk_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def upsert_chunk(con, note_id: int, ord: int, text: str) -> int:
+    h = chunk_hash(text)
+    existing = con.execute(
+        "SELECT id FROM chunks WHERE note_id = ? AND ord = ? AND text = ?",
+        (note_id, ord, text),
+    ).fetchone()
+    if existing:
+        return existing[0]
+    vec = embed(text)
+    cur = con.execute(
+        "INSERT INTO chunks(note_id, ord, text) VALUES (?, ?, ?)",
+        (note_id, ord, text),
+    )
+    chunk_id = cur.lastrowid
+    con.execute(
+        "INSERT INTO chunk_vec(id, embedding) VALUES (?, ?)",
+        (chunk_id, serialize(vec)),
+    )
+    return chunk_id
+```
+
+When a note is edited, rechunk the new body and diff against the existing chunks by `(note_id, ord)`. Only chunks whose text changed need re-embedding. On a typical blog where edits touch a few paragraphs, this keeps the incremental indexing cost close to zero. The difference between "embed everything every time" and "embed only what changed" is often the difference between a responsive authoring workflow and a frustrating one.
+
+## Security and Privacy Considerations
+
+Running RAG on a single file makes privacy much easier to reason about. You know exactly where the data lives, nothing leaves your VPS unless you ship it somewhere yourself, and the Gemini API only sees the raw text of queries and documents you explicitly send for embedding.
+
+Two gotchas to keep in mind. First, if your application handles multi-tenant data, you have to enforce tenant scoping at the application layer. sqlite-vec does not have row-level security. The usual pattern is to include `tenant_id` on the `chunks` table, fetch `k * 3` top results from vector search, then filter by tenant before returning the top `k`. Over-fetching keeps the final result size accurate.
+
+Second, think carefully before sending user-generated content to the embedding API if privacy is a selling point of your product. The Gemini API terms allow commercial use and do not retain content for training by default on the paid tier, but your users may still want explicit disclosure. Have a clear statement in your privacy policy and, when possible, let users opt out of search indexing for individual documents.
+
+## A Short Roadmap to Production Readiness
+
+If you give yourself one focused week, here is the order that tends to work.
+
+Day one: stand up the minimal indexer and search from this article against a real corpus you care about — your notes, your blog, your FAQ. Day two: rework chunking to 400–600 characters with overlap, and switch to batch embedding. Day three: add FTS5 and hybrid search with RRF. Day four: build a thirty-case evaluation set and write the SQL PRAGMA tuning block. Day five: write the backup script, wire it into cron, and test restore on a staging database.
+
+By the end of that week, you have an RAG system that is defensible enough for a small paid product, costs roughly the same as a cup of coffee to operate, and requires no external service dependency beyond the Gemini API itself. When real scale arrives and you decide to graduate to Pinecone or Qdrant, the `VectorStore` abstraction means the migration affects exactly one module, not the entire application.
+
+The important part is not the particular stack — it is that you no longer need a $50 monthly commitment to try a RAG idea. Build the rough version today, instrument it, and let the data tell you when it is time to move on.
