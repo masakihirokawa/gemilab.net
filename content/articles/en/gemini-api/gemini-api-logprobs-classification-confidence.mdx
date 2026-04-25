@@ -1,0 +1,159 @@
+---
+title: "Measuring Classification Confidence with Gemini API Logprobs — A Practical Walkthrough"
+slug: "gemini-api-logprobs-classification-confidence"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-26T12:00"
+author: "Gemini Lab"
+description: "Use the Gemini API responseLogprobs option to extract per-token confidence scores, then turn them into an auto-vs-review gate for classification — with working Python code and the threshold thinking behind it."
+tags: ["gemini-api", "logprobs", "classification", "confidence-scoring", "python", "prompt-engineering"]
+---
+
+Picture a simple classification task: you ask Gemini to label an incoming email as "inquiry", "complaint", or "other". You get back a single word. It looks fine on the surface — but you have no idea whether the model picked it with 0.99 confidence or with 0.42, neck-and-neck with another option. The first time I shipped this kind of pipeline as a solo developer, the lack of visibility into that confidence was the single biggest source of stress.
+
+Turning on `responseLogprobs` puts that confidence number in your hands. In this article I'll walk through how to enable logprobs in the Gemini API and, more importantly, how to turn the raw values into an "auto-process or send to a human reviewer" gate that actually holds up in production. The flag itself is one boolean; the design decisions around it are where almost all the leverage lives, and that's what I want to spend most of the words on.
+
+## The problem logprobs solves
+
+When Gemini answers "inquiry", was that the safe top choice — or did "complaint" come in a close second? The downstream system you trust to act on the label looks very different in those two worlds.
+
+Logprobs are the natural-log probabilities Gemini assigned to each generated token. With them you can:
+
+- Route only low-confidence cases to human review, like an active-learning loop
+- Compare prompt A vs. prompt B by looking at confidence on the same inputs
+- Detect "almost right" failures in A/B tests with a real number, not a hunch
+- Auto-process whatever clears your quality gate, and only spend human time on the rest
+
+The implementation cost is surprisingly small for how much it changes downstream design — that was my honest first impression after a few days of using it.
+
+## Enabling logprobs in the Gemini API
+
+Here's the smallest useful setup using the `google-genai` Python SDK. `response_logprobs=True` turns logprobs on, and `logprobs=N` asks for the top-N alternatives at each position (1–5).
+
+```python
+# pip install google-genai
+from google import genai
+from google.genai import types
+import os
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+config = types.GenerateContentConfig(
+    response_logprobs=True,    # return logprobs for chosen tokens
+    logprobs=3,                # also return top-3 alternatives per position
+    max_output_tokens=4,       # one or two tokens is plenty for classification
+    temperature=0,             # determinism so confidence values are comparable
+)
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=(
+        "Classify the following email into exactly one of "
+        "{inquiry, complaint, other}.\n"
+        "Email: My order hasn't arrived. Order number 12345.\n"
+        "Answer (one word only):"
+    ),
+    config=config,
+)
+
+print(resp.text)
+print(resp.candidates[0].logprobs_result)
+```
+
+Three things matter here. First, `temperature=0`. We want to compare confidence as "how strongly the model preferred this token", and randomness destroys that interpretation. Second, cap `max_output_tokens` low. Most classification answers fit in one or two tokens, and longer outputs just add noise. Third, `logprobs=3` is plenty — even when you ask for ten alternatives, you'll mostly look at the top two or three.
+
+## Reading the response
+
+The `logprobs_result` field has two parts: `chosen_candidates` (the tokens actually emitted) and `top_candidates` (the top-N alternatives at each step). For classification, you usually only care about the first meaningful token.
+
+```python
+import math
+
+def label_confidence(resp):
+    """Return the chosen label and its probability in [0, 1]."""
+    chosen = resp.candidates[0].logprobs_result.chosen_candidates
+    if not chosen:
+        return None, 0.0
+    first = chosen[0]
+    prob = math.exp(first.log_probability)
+    return first.token, prob
+
+label, p = label_confidence(resp)
+print(f"label={label!r}  confidence={p:.3f}")
+# Example: label='inquiry'  confidence=0.987
+```
+
+`log_probability` is a natural log, so `math.exp()` gives you a probability between 0 and 1. Anything around 0.99 is essentially "the model is sure"; once you drop below 0.5, you're in territory where another label was a serious contender.
+
+## A practical gate: auto-process when confident, review when not
+
+This is the pattern that paid for itself fastest in my own work. One threshold, one decision, and your automated share goes up or down accordingly.
+
+```python
+def classify_with_gate(text: str, threshold: float = 0.85):
+    """Auto-accept if confidence >= threshold; otherwise queue for review."""
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=(
+            "Classify the following email into exactly one of "
+            "{inquiry, complaint, other}.\n"
+            f"Email: {text}\nAnswer (one word only):"
+        ),
+        config=config,
+    )
+    label, prob = label_confidence(resp)
+
+    if label is None:
+        return {"status": "ERROR", "reason": "empty response"}
+
+    if prob >= threshold:
+        return {"status": "AUTO", "label": label, "confidence": prob}
+
+    # Surface the alternatives so the review UI has something useful to show
+    top = resp.candidates[0].logprobs_result.top_candidates
+    alternatives = [
+        (c.token, math.exp(c.log_probability))
+        for c in (top[0].candidates if top else [])
+    ]
+    return {
+        "status": "REVIEW",
+        "label": label,
+        "confidence": prob,
+        "alternatives": alternatives,
+    }
+```
+
+I'd recommend not picking `threshold` out of thin air. Run a week or two of real traffic, log every `(label, confidence)` pair, and look at the distribution. Once you can say "at threshold 0.85 we auto-accept 78% and humans correct 4% of those", every threshold tweak becomes a number, not a vibe.
+
+This pairs nicely with [type-safe structured output via Pydantic](/en/articles/gemini-api/gemini-api-pydantic-structured-output-type-safe-production) and the patterns in [production rate-limiting for the Gemini API](/en/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide). Logprobs give you the gate; structured output gives you the schema; rate-limit design keeps the lights on.
+
+## Calibrating the threshold with 100 examples
+
+"Should I just set the threshold to 0.85?" — the honest answer is that it depends on your domain. What I actually do is pull 100 historical inputs and build a small spreadsheet:
+
+- **Ground truth**: the label a human eventually confirmed
+- **Model label**: what `classify_with_gate` returned
+- **Confidence**: the probability of the chosen token
+
+Sort by confidence descending and you'll usually see something like "above 0.95 the error rate is zero", "0.85–0.94 has 2% errors", "0.70–0.84 has 9% errors". Pick the highest confidence band where the error rate is still acceptable for your use case (say, 2%) and you have a defensible threshold backed by your own data — not a number you copied from a blog post.
+
+If no threshold gives you an acceptable error rate, the issue is almost never logprobs. It's usually that the prompt is ambiguous about where one label ends and the next begins. Tighten the label definitions, add a few canonical examples, and retest. Logprobs are a useful instrument on top of a well-defined prompt, not a fix for a fuzzy one.
+
+## When logprobs aren't reliable
+
+Logprobs are useful, but they're not a universal "trust this number" knob. Three places I've personally been burned:
+
+First, long generations. Logprobs are per-token, so once your output is ten or more tokens, no single number captures "confident at the start, drifting later". In practice, lean on logprobs only when the answer fits in one to a few tokens.
+
+Second, loose prompts. If your prompt says "classify this casually", the model often emits filler words and your label slips to token two or three. End the prompt with a tight constraint like `Answer (one word only):` so the first chosen token actually is the label.
+
+Third, non-zero temperature. As soon as you sample, the chosen token can change between runs and the probability you read out reflects sampling, not the model's stable preference. If you're going to make decisions based on a threshold, keep `temperature=0`.
+
+A fourth pitfall worth flagging: tokenizer surprises. Gemini's tokenizer doesn't always split on the boundaries you expect. A label like "complaint" might actually be one token in English but split into multiple subword tokens for Japanese labels such as "苦情". When that happens, the "first chosen token" is a fragment, not the full label. The fix is straightforward — read more than the first chosen token if your label can span subwords, or constrain output to a small set of single-token labels (e.g., A/B/C with a legend) so that one position equals one label.
+
+## A concrete next step
+
+Before designing anything elaborate, run `response_logprobs=True` over 100 representative inputs from your actual domain and dump `(label, confidence)` to a CSV. Plot the histogram. The point where "below this is risky" lives is usually obvious within a few minutes of looking. Once you have that number, drop it into a `classify_with_gate`-style function and you've meaningfully raised your pipeline's quality without changing models. Logprobs are quiet and unglamorous, but in my experience they're one of the highest-leverage flags in the Gemini API.
+
+One last note from experience: don't try to interpret confidence in absolute terms across models. A 0.92 from `gemini-2.5-flash` and a 0.92 from `gemini-2.5-pro` are not directly comparable — different models have different temperature-zero distributions. If you upgrade the model under your gate, recalibrate the threshold against the same 100-example set.

@@ -1,0 +1,157 @@
+---
+title: "Gemini API の logprobs で分類タスクの信頼度を測る — 動くコードと判断軸"
+slug: "gemini-api-logprobs-classification-confidence"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-26T12:00"
+author: "Gemini Lab"
+description: "Gemini API の logprobs を使って分類タスクの信頼度スコアを取り出す方法を、Python の動作するコードと『閾値以下は人間レビューに回す』設計パターンとともに解説します。"
+tags: ["gemini-api", "logprobs", "classification", "信頼度スコア", "Python", "プロンプトエンジニアリング"]
+---
+
+Gemini にメール本文を「問い合わせ／苦情／その他」に振り分けてもらう、というシンプルな分類タスクを想像してみてください。返ってくるのは1語のラベルだけ。表面的には正しく見えても、モデル内部での確信度がどれくらいだったのかは分かりません。私が個人開発でこの種の分類を本番に組み込んだとき、いちばんのストレスはこの「自信のなさが見えない」ことでした。
+
+`responseLogprobs` を有効化すると、その自信度が数字で手元に来ます。本記事では、Gemini API で logprobs を取り出す具体的な手順と、得られた値を「人間レビューに回すべきか／自動処理してよいか」の判断にどう使うかを、動くコードとともに解説します。
+
+## logprobs が解決してくれる困りごと
+
+Gemini が「問い合わせ」と返してきたとき、それは確率 0.99 で選ばれたのか、それとも 0.42 で苦情と僅差だったのか。前者と後者では、後段の処理を信じてよいかが大きく変わります。
+
+logprobs は、モデルが各トークンを生成したときの対数確率（log probability）を返してくれる機能です。これを使えば次のような判断ができるようになります。
+
+- 信頼度が低い分類だけを人間のレビュー対象に回す（Active Learning 的な運用）
+- 同じ入力に対するプロンプトAとBを、出力ラベルの確信度で比較する
+- A/Bテスト中の「微妙に間違っている」ケースを定量的に検出する
+- LLM の推論コストを抑えながら、品質ゲートを通せた分だけ自動化する
+
+実装上の負担は驚くほど小さいわりに、後段の運用設計に与える効果が大きい — これが logprobs を使い始めて最初に感じた印象です。
+
+## Gemini API で logprobs を有効にする
+
+Python SDK（`google-genai`）での最小構成はこちらです。`response_logprobs=True` で対数確率の返却を有効化し、`logprobs=N` で「各位置で上位 N 個まで返す」を指定します（1〜5 の範囲）。
+
+```python
+# pip install google-genai
+from google import genai
+from google.genai import types
+import os
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+config = types.GenerateContentConfig(
+    response_logprobs=True,    # ← logprobs の返却を有効化
+    logprobs=3,                # ← 上位3候補までを返す
+    max_output_tokens=4,       # 1〜2トークンで済む分類なので短く絞る
+    temperature=0,             # 確信度を比較したいので決定論寄りに
+)
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=(
+        "次のメールを {問い合わせ, 苦情, その他} のいずれか1語に分類してください。\n"
+        "メール本文: 商品が届きません。注文番号は12345です。\n"
+        "回答（1語のみ）:"
+    ),
+    config=config,
+)
+
+print(resp.text)
+print(resp.candidates[0].logprobs_result)
+```
+
+ポイントは3つあります。第1に `temperature=0` にすること。確信度を「モデルがどれだけそのトークンを支持したか」として比較したいので、ランダム性は外しておきます。第2に `max_output_tokens` を絞ること。分類なら1〜2トークンで済むケースが多く、余計なトークンが返ってくるとノイズが増えます。第3に `logprobs=3` ぐらいで十分なこと。10件返しても実務で使うのは上位2〜3件です。
+
+## レスポンスの構造を読み解く
+
+`logprobs_result` には `chosen_candidates`（実際に採用されたトークン列）と `top_candidates`（各位置での上位候補）が入ります。Python から扱うときは、最初の意味のあるトークンだけを取り出すのが基本です。
+
+```python
+import math
+
+def label_confidence(resp):
+    """採用ラベルの確率（0〜1）を返す。"""
+    chosen = resp.candidates[0].logprobs_result.chosen_candidates
+    if not chosen:
+        return None, 0.0
+    first = chosen[0]                  # 1トークン目を分類ラベルとみなす
+    prob = math.exp(first.log_probability)
+    return first.token, prob
+
+label, p = label_confidence(resp)
+print(f"label={label!r}  confidence={p:.3f}")
+# 例: label='問い合わせ'  confidence=0.987
+```
+
+`log_probability` は自然対数なので、`math.exp()` で 0〜1 の確率に戻して使います。0.99 ならほぼ確信、0.5 を切るあたりから「他の候補と僅差」の領域です。
+
+## 実践: 信頼度しきい値で「自動 / 人間レビュー」を分ける
+
+これが個人的にいちばん効いた使い方です。閾値を1つ決めるだけで、自動処理できる分量が変わってきます。
+
+```python
+def classify_with_gate(text: str, threshold: float = 0.85):
+    """信頼度が閾値以上なら自動採用、未満ならレビューに回す。"""
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=(
+            "次のメールを {問い合わせ, 苦情, その他} のいずれか1語に分類してください。\n"
+            f"メール本文: {text}\n回答（1語のみ）:"
+        ),
+        config=config,
+    )
+    label, prob = label_confidence(resp)
+
+    if label is None:
+        return {"status": "ERROR", "reason": "empty response"}
+
+    if prob >= threshold:
+        return {"status": "AUTO",   "label": label, "confidence": prob}
+    else:
+        # 上位候補を一緒に渡しておくとレビュー画面が作りやすい
+        top = resp.candidates[0].logprobs_result.top_candidates
+        alternatives = [
+            (c.token, math.exp(c.log_probability))
+            for c in (top[0].candidates if top else [])
+        ]
+        return {
+            "status": "REVIEW",
+            "label": label,
+            "confidence": prob,
+            "alternatives": alternatives,
+        }
+```
+
+実運用では `threshold` を最初から固定せず、過去 1〜2 週間の分類ログを元にキャリブレーションするのがおすすめです。「閾値 0.85 で自動採用率 78%、人間レビューでの修正率 4%」のように見える化できると、閾値の上げ下げが感覚論ではなく数値判断になります。
+
+関連する設計のパターンは [Gemini API の Pydantic で型安全に構造化出力を扱う](/articles/gemini-api/gemini-api-pydantic-structured-output-type-safe-production) や [本番で使う Gemini API のレートリミット設計](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) でも触れています。logprobs と組み合わせると、品質ゲートを通った分だけ自動化、という設計が自然に組み立てられます。
+
+## 100件で閾値をキャリブレーションする
+
+「閾値 0.85 にすればいいですか？」と聞かれることがありますが、答えはドメインによって違います。私が実際にやっているのは、過去ログから 100 件ぶんを抜き出して以下のようなテーブルを作ることです。
+
+- **正解ラベル**: 過去に人間が確認した結果
+- **モデルラベル**: `classify_with_gate` の出力
+- **confidence**: その採用ラベルの確率
+
+このペアを confidence 順にソートすると、「confidence 0.95 以上は誤りゼロ」「0.85〜0.94 は誤り 2%」「0.7〜0.84 は誤り 9%」のように、自分のデータでの誤り率が confidence ごとに見えてきます。許容できる誤り率（たとえば 2% 以下）に対応する confidence をそのまま閾値にすれば、感覚ではなく数値で運用が始められます。
+
+逆にここで「どの閾値でも誤り率が高止まり」する場合、原因はだいたいプロンプトの曖昧さです。logprobs を上げる前に、まずプロンプトの定義（ラベルの境界、含めるべき例、出力形式）を見直してください。logprobs はプロンプトの足りないところを埋めてくれる魔法ではなく、ちゃんと設計されたプロンプトの上で初めて意味を持つ指標です。
+
+## 落とし穴 — logprobs が当てにならない場面
+
+logprobs は便利ですが、「いつでも信用できる確率」ではありません。私が実際にハマった3つを挙げておきます。
+
+第1に、長文生成では役に立ちません。logprobs はトークンごとの確率なので、出力が10語以上になると「最初のトークンは自信があったけど後半は揺らいだ」といった状況を1つの数字で表現できません。logprobs を素直に使えるのは、出力が1〜数トークンに収まるタスクに限ると割り切るのが現実的です。
+
+第2に、プロンプトが緩いと数値が貼り付きます。たとえば「カジュアルに分類してください」と書くと、モデルは余計な装飾語を生成しに行き、肝心のラベルが2トークン目以降にずれます。プロンプト末尾を `回答（1語のみ）:` のように強く制約しておくのが基本です。
+
+第3に、`temperature` を 0 以外にすると比較できなくなります。同じ入力でも実行ごとに採用トークンが変わり、確率の意味が「サンプリング後の値」に変わってしまいます。閾値運用するなら `temperature=0` を厳守してください。
+
+第4に、トークナイザの分割が直感と違うことがあります。「苦情」のような日本語ラベルは1トークンに収まらず複数のサブワードに分割される場合があり、その場合「最初の chosen トークン」はラベルの一部分でしかありません。回避策はシンプルで、ラベルがサブワードをまたぐ可能性があるなら最初の数トークンを連結して読む、もしくは出力を A/B/C のような1トークンに収まる記号に固定して凡例で対応づける、のどちらかにすると安定します。
+
+## 次の一歩
+
+まずは手元の分類タスク 100 件ぶんで `response_logprobs=True` を回し、`(label, confidence)` のペアを CSV に書き出してみてください。ヒストグラムを描くと、自分のドメインで「ここから下は危ない」という閾値が驚くほどはっきり見えてきます。閾値が決まれば、後はそれを `classify_with_gate` のような関数に組み込むだけ。logprobs はモデルを差し替えなくても運用品質を一段引き上げられる、地味だけれど効果の大きい一手だと思っています。
+
+ひとつだけ補足すると、confidence の絶対値はモデル間で直接比較できません。`gemini-2.5-flash` の 0.92 と `gemini-2.5-pro` の 0.92 は同じ意味ではないので、モデルを差し替えたときは同じ 100 件のセットで閾値を必ず再キャリブレーションしてください。
