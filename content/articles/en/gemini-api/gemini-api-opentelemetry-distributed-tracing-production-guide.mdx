@@ -1,0 +1,422 @@
+---
+title: "Tracing Gemini API in Production with OpenTelemetry: See Every Step of a Single Request"
+slug: "gemini-api-opentelemetry-distributed-tracing-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-25T19:45"
+author: "Gemini Lab"
+description: "After three months of running Gemini API in production, plain logs stop telling you why latency, cost, or failures spike. This guide walks through wrapping Gemini in OpenTelemetry — Python and Node.js code, GenAI semantic conventions, sampling, and Grafana/Datadog wiring — so you can see the full anatomy of every request."
+tags: ["gemini-api", "opentelemetry", "tracing", "observability", "production"]
+highlights:
+  - "Engineers stuck debugging Gemini latency, runaway cost, or silent retries can stand up span-level tracing today and see exactly where a request spends its time"
+  - "You will learn the OpenTelemetry GenAI semantic conventions and a concrete pattern for emitting tokens, model choice, cache hits, and finish reasons consistently across every call"
+  - "Streaming responses and Function Calling loops included — you can wire the same setup to Grafana Tempo, Jaeger, or Datadog APM without changing application code"
+---
+
+Three months into running Gemini API in production, the access log stopped being enough. Average latency looked fine, error rates looked fine, but real users kept hitting "the spinner just sat there for nine seconds" or "this user's bill jumped 8x overnight." Once I caught myself spending more time crafting Cloud Logging filters than actually finding the bottleneck, I finally introduced OpenTelemetry distributed tracing — and within a week I could explain every awkward request my service made.
+
+This guide is the version of that journey I wish I had read before starting. We will wrap Gemini API calls in OpenTelemetry spans, follow the official GenAI Semantic Conventions, instrument streaming and Function Calling loops, and set up the whole thing so you can swap Grafana Tempo, Jaeger, and Datadog APM behind a single config flag — no vendor lock-in.
+
+## Why distributed tracing matters more for Gemini than for ordinary APIs
+
+A backend that calls Gemini behaves quite differently from a CRUD API. A single user request usually fans out into retrieval, vector search, model calls, possible Function Calling loops, and post-processing. Each leg has its own failure mode and latency profile, and aggregate dashboards systematically hide the worst experiences.
+
+Three real failure cases I have personally hit:
+
+- Average latency stayed at 1.8s, but `gemini-2.5-pro` calls with long prompts pinned at 12s, leaving the UI spinner running long enough that users thought the page had crashed.
+- Function Calling that was supposed to terminate in one hop occasionally looped to five hops on certain inputs, burning roughly 8x the tokens of a normal request.
+- Vector retrieval flipped between 200ms and 4 seconds depending on the day, and I wasted a week blaming Gemini before realizing the retriever was the problem.
+
+You cannot chase any of these from a histogram. Distributed tracing reframes the problem: each user request becomes a single trace, and every internal step (model call, retrieval, JSON repair, guardrail) becomes a span you can lay out on a timeline. The moment you can replay a slow request frame by frame, the diagnostics conversation goes from speculation to evidence.
+
+## OpenTelemetry concepts, framed for a Gemini backend
+
+You only need a handful of concepts before writing code:
+
+- **Trace**: the full record of one user request, identified by a single `trace_id`.
+- **Span**: the smallest unit inside a trace. Make one per measurable step — a Gemini call, a Pinecone lookup, a JSON validation pass.
+- **Context propagation**: the wiring that keeps spans nested across services. The HTTP `traceparent` header is what carries it.
+- **Span attributes**: key-value tags on each span (token counts, model name, end-user ID).
+- **Span events**: discrete in-span markers (streaming chunk arrivals, guardrail trips).
+
+OpenTelemetry now publishes **GenAI Semantic Conventions** that standardize attribute names. Sticking to them is the cheapest insurance you can buy against future migration pain. The ones you will use constantly:
+
+- `gen_ai.system` — vendor identifier (`google.gemini` for our purposes)
+- `gen_ai.request.model` — the model you asked for (e.g., `gemini-2.5-pro`)
+- `gen_ai.response.model` — the model that actually answered (Google occasionally routes)
+- `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` — token usage
+- `gen_ai.request.temperature`, `gen_ai.request.top_p`, etc. — sampling parameters
+- `gen_ai.response.finish_reasons` — array of completion reasons
+
+Once every span carries these consistently, your dashboards do not care which backend you ship traces to. You will thank yourself for the discipline six months from now when the on-call rotation changes hands.
+
+## Python: a minimal traced Gemini wrapper
+
+The official `google-genai` SDK uses `httpx` under the hood, so HTTP-level spans appear automatically. What it does not do is emit GenAI semantic attributes — you still have to set them. I keep a single thin wrapper file in every project so the rest of the codebase only ever calls `generate_traced(...)`.
+
+```python
+# gemini_traced.py
+# Wrap Gemini calls in an OpenTelemetry span and attach
+# attributes that follow GenAI Semantic Conventions.
+# Goal: every call carries model, tokens, finish_reasons consistently
+# so cost/latency/failure correlation is one query away.
+
+from google import genai
+from google.genai import types
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
+tracer = trace.get_tracer("gemini.client", "1.0.0")
+client = genai.Client()  # GOOGLE_API_KEY or GEMINI_API_KEY in env
+
+def generate_traced(
+    *,
+    model: str,
+    contents: str | list,
+    config: types.GenerateContentConfig | None = None,
+    user_id: str | None = None,
+):
+    """Gemini call wrapped in an OTel span."""
+    with tracer.start_as_current_span(
+        name=f"gemini.generate_content {model}",
+        attributes={
+            "gen_ai.system": "google.gemini",
+            "gen_ai.request.model": model,
+            "gen_ai.operation.name": "generate_content",
+            **({"enduser.id": user_id} if user_id else {}),
+        },
+    ) as span:
+        try:
+            cfg = config or types.GenerateContentConfig()
+            if cfg.temperature is not None:
+                span.set_attribute("gen_ai.request.temperature", cfg.temperature)
+            if cfg.max_output_tokens is not None:
+                span.set_attribute("gen_ai.request.max_tokens", cfg.max_output_tokens)
+
+            res = client.models.generate_content(
+                model=model, contents=contents, config=cfg
+            )
+
+            # Persist usage with conventional names so aggregations stay vendor-agnostic.
+            if res.usage_metadata:
+                u = res.usage_metadata
+                span.set_attribute("gen_ai.usage.input_tokens", u.prompt_token_count or 0)
+                span.set_attribute("gen_ai.usage.output_tokens", u.candidates_token_count or 0)
+                if getattr(u, "cached_content_token_count", None):
+                    span.set_attribute("gen_ai.usage.cached_input_tokens", u.cached_content_token_count)
+
+            # finish_reasons must be an array per the spec (multi-candidate aware).
+            if res.candidates:
+                fr = [c.finish_reason.name for c in res.candidates if c.finish_reason]
+                if fr:
+                    span.set_attribute("gen_ai.response.finish_reasons", fr)
+
+            span.set_attribute("gen_ai.response.model", res.model_version or model)
+            span.set_status(Status(StatusCode.OK))
+            return res
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR, str(e)[:200]))
+            raise
+```
+
+If you open Jaeger or Tempo after deploying this wrapper, you will see spans named `gemini.generate_content gemini-2.5-pro` lined up under the request span, each carrying token counts, finish reasons, and model version. The single most useful tag I recommend keeping turned on in production is `enduser.id` — it is the fastest way to answer "who is responsible for this cost spike?" months later via a TraceQL or Datadog query.
+
+## Wiring up the OpenTelemetry SDK at startup
+
+The wrapper alone is not enough; you need to point the SDK at a destination. Sending OTLP/HTTP to a Collector is the most portable choice.
+
+```python
+# tracing_setup.py
+# Call once at application startup. Resource attributes pin every
+# span to "this service, this version, this environment" so you can
+# slice traces by deployment later.
+
+import os
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+def setup_tracing():
+    resource = Resource.create({
+        "service.name": os.getenv("OTEL_SERVICE_NAME", "gemini-app"),
+        "service.version": os.getenv("APP_VERSION", "0.1.0"),
+        "deployment.environment": os.getenv("APP_ENV", "production"),
+    })
+    provider = TracerProvider(resource=resource)
+    exporter = OTLPSpanExporter(
+        endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318/v1/traces"),
+    )
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+```
+
+Point `OTEL_EXPORTER_OTLP_ENDPOINT` at Grafana Cloud's Tempo, Datadog OTLP Ingest, or your own OpenTelemetry Collector — the application code stays the same. That single insertion point is the headline benefit of getting tracing in early; **swapping observability vendors becomes a config change instead of a refactor.**
+
+## Node.js: Express plus the GenAI SDK
+
+The Node side mirrors the Python setup. Auto-instrumentation handles HTTP and Express; you only hand-instrument the Gemini boundary.
+
+```typescript
+// telemetry.ts
+// Import this *first*, before any other application code.
+// It wires HTTP/Express auto-instrumentation alongside our manual Gemini tracer.
+
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
+import { Resource } from "@opentelemetry/resources";
+import { SemanticResourceAttributes } from "@opentelemetry/semantic-conventions";
+
+const sdk = new NodeSDK({
+  resource: new Resource({
+    [SemanticResourceAttributes.SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? "gemini-app",
+    [SemanticResourceAttributes.SERVICE_VERSION]: process.env.APP_VERSION ?? "0.1.0",
+  }),
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "http://localhost:4318/v1/traces",
+  }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+sdk.start();
+process.on("SIGTERM", () => sdk.shutdown());
+```
+
+```typescript
+// geminiTraced.ts
+// Wrap generateContent in a span. On SDK errors, leave a recordException
+// event behind and mark the span ERROR so dashboards can filter on status.
+
+import { GoogleGenAI } from "@google/genai";
+import { trace, SpanStatusCode } from "@opentelemetry/api";
+
+const tracer = trace.getTracer("gemini.client", "1.0.0");
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+export async function generateTraced(opts: {
+  model: string;
+  contents: string;
+  userId?: string;
+  temperature?: number;
+}) {
+  return tracer.startActiveSpan(`gemini.generate_content ${opts.model}`, async (span) => {
+    span.setAttributes({
+      "gen_ai.system": "google.gemini",
+      "gen_ai.request.model": opts.model,
+      "gen_ai.operation.name": "generate_content",
+      ...(opts.temperature != null ? { "gen_ai.request.temperature": opts.temperature } : {}),
+      ...(opts.userId ? { "enduser.id": opts.userId } : {}),
+    });
+    try {
+      const res = await ai.models.generateContent({
+        model: opts.model,
+        contents: opts.contents,
+        config: { temperature: opts.temperature },
+      });
+      const u = res.usageMetadata;
+      if (u) {
+        span.setAttribute("gen_ai.usage.input_tokens", u.promptTokenCount ?? 0);
+        span.setAttribute("gen_ai.usage.output_tokens", u.candidatesTokenCount ?? 0);
+      }
+      const fr = res.candidates?.map((c) => c.finishReason).filter(Boolean) as string[] | undefined;
+      if (fr?.length) span.setAttribute("gen_ai.response.finish_reasons", fr);
+      span.setStatus({ code: SpanStatusCode.OK });
+      return res;
+    } catch (e: any) {
+      span.recordException(e);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: String(e?.message ?? e).slice(0, 200) });
+      throw e;
+    } finally {
+      span.end();
+    }
+  });
+}
+```
+
+Call this from your Express handlers and you get a clean parent-child structure: `HTTP GET /api/chat → gemini.generate_content gemini-2.5-pro` shows up in Jaeger without any extra context plumbing.
+
+## Tracing strategies for streaming and Function Calling
+
+Anyone running Gemini in production runs into streaming and Function Calling almost immediately, and both need a slightly different span shape than a one-shot call.
+
+For streaming, I cover the entire stream with a single span and emit `span.add_event("first_token")` when the first chunk arrives. The first-token timestamp is the closest proxy to perceived latency, and you almost always want to chart it next to total duration.
+
+```python
+# Streaming wrapper (essence only). Goal: TTFT, chunk count, and total bytes
+# all live on one span so the UX-perceived metric matches what the server saw.
+
+with tracer.start_as_current_span("gemini.generate_content_stream") as span:
+    span.set_attribute("gen_ai.request.model", model)
+    first = True
+    chunks = 0
+    for chunk in client.models.generate_content_stream(model=model, contents=contents):
+        chunks += 1
+        if first:
+            span.add_event("first_token")
+            first = False
+        # Emitting a span event per chunk explodes cardinality.
+        # Sampling progress markers every 100 chunks is a reasonable middle ground.
+        if chunks % 100 == 0:
+            span.add_event("chunk_progress", attributes={"chunks": chunks})
+        yield chunk.text or ""
+    span.set_attribute("gen_ai.response.chunk_count", chunks)
+```
+
+For Function Calling, the right pattern is a parent span that wraps the entire loop, with one child span per hop. Add `gen_ai.tool.name` to each tool span and the question "which tool was called on which hop, and how many tokens did it cost?" becomes a single query. In my experience, runaway Function Calling loops have always been diagnosable in under five minutes once this structure was in place.
+
+## Cost attributes and a sane sampling strategy
+
+Tracing alone does not surface dollars. In my services, I attach `gen_ai.cost.usd` at span end via a custom Span Processor that looks up the model's price-per-token. With this in place I get a `(user × model × day)` cost heatmap in Grafana, which has caught more billing surprises than any alert ever did.
+
+For sampling, do not even try to keep 100%. The combination that has worked well for me:
+
+- `ParentBased(TraceIdRatioBased(0.1))` for a 10% baseline.
+- Tail-based sampling that retains traces whose `gen_ai.response.finish_reasons` includes `SAFETY` or `MAX_TOKENS` — these are the bug-prone outcomes.
+- 100% retention on exceptions.
+- 100% retention for internal QA accounts (filter on `enduser.id` or a custom `enduser.role`).
+
+Tail-based sampling is built into the OpenTelemetry Collector via the `tail_sampling` processor. Once it is in place, "always keep the weird ones" cuts storage bills by roughly an order of magnitude while leaving every diagnostic trace intact.
+
+## Backend-by-backend gotchas
+
+OTLP keeps you portable, but each destination still has quirks worth knowing.
+
+- **Grafana Tempo plus Grafana**: cheap and accepts OTLP/HTTP natively. You will need to learn TraceQL — `{ name = "gemini.generate_content" && span.gen_ai.usage.output_tokens > 1000 }` is a reasonable starting query for slow generations.
+- **Datadog APM via OTLP Ingest**: GenAI attributes are recognized automatically and surface in the LLM Observability view without dashboard work. The catch is the bill — high traffic without aggressive Collector-side sampling will hurt.
+- **Jaeger**: easy to self-host for development and small-scale production. Attribute search is weaker than the alternatives, so for serious analysis I would graduate to Tempo or Datadog once cardinality grows.
+
+For my own setups I use Jaeger in development and Grafana Tempo plus Loki in production. Datadog earns its keep at scale, but for a small SaaS or a single-developer service, the Grafana stack is the better starting point.
+
+## Common pitfalls
+
+A few traps everyone seems to hit. Knowing them ahead of time saves a week each:
+
+**Lost context propagation.** If your reverse proxy (Cloud Run, Cloudflare Workers, Vercel, an ALB) strips the `traceparent` header, your frontend traces and your Gemini calls show up as separate, unrelated traces. Confirm the header is forwarded before debugging anything else.
+
+**Putting PII in span attributes.** It is tempting to store the full prompt in `gen_ai.prompt`, but that is essentially never safe in production. Store a hash, the token count, and at most the first 32 characters; keep raw prompts in a dedicated encrypted store. The OpenTelemetry GenAI conventions explicitly mark `gen_ai.prompt` as **opt-in** for exactly this reason.
+
+**Cardinality explosions.** Adding `enduser.id` directly can blow up your bill in Datadog because each unique value becomes a metric dimension. Hash the user ID and split high-cardinality info into structured attributes (`enduser.id` for the hashed identifier, `enduser.plan` for the billing tier) so the metrics layer stays sane.
+
+**Streaming spans that close too early.** Combining Python generators with `start_as_current_span` naively leads to spans ending before the generator is consumed, so TTFT is recorded as 0ms and nothing else looks wrong. Switch to `tracer.start_span()` and call `span.end()` in a `finally` block at the end of generator consumption.
+
+**Sampler logic in the wrong place.** If you write filtering inside a Span Processor, you have already paid the cost of recording the span. Sampling decisions belong in the Sampler stage; reserve Span Processors for attribute enrichment and PII masking. This separation of concerns matters once your trace volume scales.
+
+## A minimal production dashboard
+
+Once tracing is in, you need surprisingly few panels to feel in control. The four I keep on the wall:
+
+- **P95 / P99 latency by model** (split by `gen_ai.request.model`).
+- **Tokens per hour by model** (sum of `gen_ai.usage.output_tokens`).
+- **Finish reason ratio** (how much traffic ends in `SAFETY`, `MAX_TOKENS`, `STOP`).
+- **Time to first token distribution** (`first_token` event timestamp minus span start).
+
+Wire each panel to a "drill into trace" link. Cost, perceived performance, and safety end up on a single screen, and every anomaly is one click away from a full request replay. That tight feedback loop is, to me, what it really means to be running an LLM service in production rather than just deploying one.
+
+## Propagating trace context across services
+
+A Gemini call is rarely the end of the story. In a typical setup, the browser hits an API gateway, the gateway calls an internal `chat` service, the chat service hits a vector database and Gemini, and a worker process later runs follow-up summarization. If you want to see all of that as one timeline, every hop has to forward the W3C `traceparent` header faithfully.
+
+For a Cloud Run setup behind a global load balancer, this generally works out of the box because the load balancer leaves untouched headers alone. The places I have seen it fail are these:
+
+- A reverse proxy with an aggressive default header allowlist (some Nginx configs strip anything that is not on a small list).
+- A middleware layer that rebuilds the request object and forgets to copy custom headers across.
+- A queue worker that does not extract `traceparent` from the inbound message and start a child span — the worker's spans become orphans.
+
+For asynchronous boundaries, `propagator.inject(carrier)` and `propagator.extract(carrier)` are the two functions to learn. On the publishing side, inject the current trace context into a queue message header. On the consumer side, extract it before doing any work and start the new span as a child of the extracted context. After this, even a request that traverses Pub/Sub or SQS still shows up as a single trace.
+
+```python
+# Inject trace context into a Pub/Sub message at publish time.
+from opentelemetry.propagate import inject
+
+attrs: dict[str, str] = {}
+inject(attrs)  # attrs now contains traceparent, tracestate
+publisher.publish(topic, data=payload, **attrs)
+```
+
+```python
+# On the worker side, extract before doing any work.
+from opentelemetry.propagate import extract
+
+ctx = extract(message.attributes or {})
+with tracer.start_as_current_span("worker.process_message", context=ctx):
+    handle(message)
+```
+
+The day a single trace successfully spans browser → API → worker → Gemini is the day every "this works on my machine" debugging session shortens from hours to minutes.
+
+## Anatomy of one real incident, debugged in under fifteen minutes
+
+To make the abstract value concrete, here is a real incident I worked through last quarter, with timestamps shortened for the article.
+
+The pager fired around 23:40 JST: P95 latency on the `/api/chat` endpoint had crossed 8 seconds. The error rate was unchanged. Cost telemetry was also flat. With only a logs-and-metrics setup I would have started by reading the application log around the spike, then maybe sampled a few slow requests by hand. With tracing, the path was much more direct.
+
+I opened Grafana and ran a TraceQL query: `{ name = "HTTP POST /api/chat" && duration > 5s }`. Within seconds I had a list of slow traces from the last hour. Clicking the slowest one, the timeline showed:
+
+1. `HTTP POST /api/chat` — 9.2s total
+2. `gemini.generate_content gemini-2.5-pro` — 8.7s
+3. Inside it, `httpx POST` — 8.6s
+4. Adjacent `pinecone.query` spans — 90ms each
+
+That single timeline ruled out the retriever, the reverse proxy, and the application logic. The bottleneck was Gemini itself, and only on long-context requests. A quick scan of `gen_ai.usage.input_tokens` across the slow traces showed values north of 800,000 tokens — far above our normal load. From there it took two minutes to confirm a recently shipped feature had started feeding entire knowledge-base PDFs into the prompt instead of selectively retrieving sections, and a config rollback closed the incident.
+
+The point is not that distributed tracing magically solves problems. It is that the time from "alert fired" to "I know which subsystem is responsible" collapses from a multi-hour archaeology session into a single query. That delta is what makes on-call sustainable.
+
+## Expanding the cost dashboard with span-derived metrics
+
+Once `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, and `gen_ai.cost.usd` are riding on every span, you can derive an entire cost ops practice from traces alone. The dashboards that have earned their keep for me:
+
+- **Cost per active user, last 24 hours.** Aggregate `gen_ai.cost.usd` grouped by `enduser.id` (hashed). The top five users are usually responsible for 60% of spend; this view tells you whether that distribution is healthy or whether someone is abusing the service.
+- **Cost per feature.** I attach `app.feature.name` (a custom attribute) at every entry point. The resulting view shows whether a new feature is paying its way.
+- **Cached vs uncached input ratio.** When using context caching, divide `gen_ai.usage.cached_input_tokens` by total input tokens. A drop in this ratio is your earliest signal that cache hits are degrading — usually before user-visible regressions.
+- **Cost per finish reason.** Plotting cost across `STOP`, `MAX_TOKENS`, and `SAFETY` finish reasons makes it obvious when a feature is wasting tokens hitting the max-output limit, suggesting a prompt or post-processing change is overdue.
+
+These are not vanity metrics. Each one has, at some point in my own operations, surfaced an issue I would not have caught from logs alone.
+
+## A practical migration plan from "no tracing" to "fully observed"
+
+Bringing OpenTelemetry into an existing production service can sound intimidating. The plan I would give my past self looks like this, and it has worked across three projects so far:
+
+**Day 1.** Add the SDK setup file and one wrapped Gemini call. Send to a Jaeger container running locally via `docker run`. Convince yourself the data flows end-to-end. This step usually takes a couple of hours.
+
+**Week 1.** Replace every Gemini call site with the wrapper. Add an `enduser.id` attribute and a `service.version` resource attribute. Pick one production destination (Tempo or Datadog) and point the existing OTLP endpoint at it. Resist the urge to add more attributes yet — boring uniform spans are worth more than clever differentiated ones.
+
+**Week 2.** Stand up the four core dashboards described above. Add a tail-based sampling pipeline in the Collector so you keep 10% of normal traffic and 100% of `SAFETY` / `MAX_TOKENS` traffic. Confirm the storage cost is reasonable.
+
+**Week 3.** Wire context propagation into your queue workers and any cross-service hops you have. Add `gen_ai.cost.usd` enrichment in the Span Processor. Document one sample TraceQL or Datadog query for each common debugging task and pin them in the team's wiki.
+
+**Week 4 onward.** Use traces to drive feature decisions, not just incident response. The first time you see a heatmap of cost per feature and decide to redesign a prompt because of it, you have crossed the line from "we have observability" to "observability informs our roadmap."
+
+Adopting it gradually like this, every step is an obvious incremental win and you never end up in a state where you have a half-instrumented service that nobody trusts.
+## Designing meaningful span names and hierarchies
+
+The name you give a span is not cosmetic. It is the primary key your future-self will type into a query box at 2am, and the value that anchors most aggregations. The naming conventions that have held up well for me, after a few false starts:
+
+- For HTTP entry points, use the route template, not the literal path: `HTTP POST /api/chat/:conversationId`, never `HTTP POST /api/chat/abc-123`. Auto-instrumentation in most frameworks gets this right; double-check yours.
+- For Gemini calls, use a verb-noun pattern that includes the model: `gemini.generate_content gemini-2.5-pro`. Keeping the model in the name makes filtering easy in any backend, even those with weak attribute search.
+- For internal helpers, prefix with the layer: `repo.user_lookup`, `tool.web_search`, `guardrail.toxicity_check`. The prefix gives you a free way to slice traces by architectural layer.
+
+A common mistake is to embed user-controlled values into span names. If you ever name a span `tool.${userInput}`, congratulations — you have created an unbounded cardinality dimension that will torch your bill. Keep span names from a finite enum and put variable data in attributes.
+
+The hierarchy matters too. The default for many SDKs is to make every Gemini call a child of the HTTP span, which is correct. But for a Function Calling loop you want a synthetic parent span — call it `agent.run` — that contains every hop. Without that wrapping span, hop spans float at the same level as the HTTP span and you cannot answer "how many hops did this conversation take?" with a single TraceQL filter. Adding the wrapper is one extra `with tracer.start_as_current_span("agent.run")` block, and the analytical payoff is large.
+
+## What good looks like, twelve weeks in
+
+If you adopt the plan above, here is what your operations should look like roughly three months later. I share this not as a brag but as a calibration target — when you hit it, you can stop adding observability and start using it.
+
+- Every Gemini call in production is wrapped. Spans carry consistent `gen_ai.*` attributes and a hashed `enduser.id`. The wrapper file is single-source-of-truth, so adding new attributes is a one-line change.
+- A daily cost report is generated from trace data, not from the Stripe invoice. You already know what the bill will be three weeks before it arrives.
+- On-call playbooks for every common alert reference a specific TraceQL or Datadog query that surfaces the relevant traces in under 30 seconds. New on-call rotations come up to speed in days, not weeks.
+- When you ship a new feature, you watch a per-feature cost panel for the first 48 hours after launch and either confirm the assumed economics or roll back early. Half of the time, the surprise data leads to a small prompt rewrite that cuts cost by 30% with no loss in quality.
+- When Gemini ships a new model variant, your migration plan is "shadow traffic 10% to the new model under the same wrapper, watch P95 and `gen_ai.cost.usd` and quality eval results side by side, decide in 48 hours." This is the kind of agility tracing buys you.
+
+You do not need all of this on day one. You need a habit of always asking "would this be visible in our traces?" whenever you ship something new, and the discipline to wrap any new model integration in the same shape. Everything else compounds.
+## Closing — your single next step
+
+Tomorrow morning, do exactly one thing: create a single `gemini_traced.py` (or `geminiTraced.ts`) file and route one Gemini call through it. Do not try to migrate every call site at once. Once one path is wrapped, your real production data will tell you which attributes are useful, which sampling rate makes sense, and which backend fits your team. That single small step is the one I personally regret not taking sooner — by a wide margin.
+
+If you have already built metric-centric monitoring around [Gemini API production observability](/en/articles/gemini-api/gemini-api-observability-production-monitoring), aligning Resource attributes between metrics and traces is enough to make them mutually navigable. For prompt-level history, pair this guide with [Gemini API plus Langfuse for production observability](/en/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide); traces (OTel), metrics (Prometheus), and prompts (Langfuse) become three complementary layers. If cost is still the open question, [the Gemini API cost optimization complete guide](/en/articles/gemini-api/gemini-api-cost-optimization-complete-guide) plus the `gen_ai.cost.usd` span attribute described here gives you a single substrate for cost governance and tracing.
+
+For a deeper grounding in the design decisions behind OpenTelemetry itself — semantic conventions, SDK architecture, and Collector pipelines — I found [Learning OpenTelemetry by Ted Young and Austin Parker](https://www.amazon.co.jp/dp/1098147189/?tag=pinocchio-22) especially helpful when sharpening the production-readiness judgments this article relies on.
