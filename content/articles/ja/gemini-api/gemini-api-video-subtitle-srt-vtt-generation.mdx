@@ -1,0 +1,204 @@
+---
+title: "Gemini API で動画から多言語字幕（SRT/VTT）を生成する実装パターン"
+slug: "gemini-api-video-subtitle-srt-vtt-generation"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-26T12:30"
+author: "Gemini Lab"
+description: "Gemini API のマルチモーダル動画入力を使い、SRT/VTT 形式の多言語字幕を生成する実装パターンをまとめました。タイムスタンプ精度と翻訳品質を両立させるプロンプト設計を解説します。"
+tags: ["gemini-api", "video", "subtitle", "srt", "vtt", "multimodal"]
+---
+
+自分で撮影したショート動画に字幕を付けたい、というだけの単純な要件なのですが、いざ自動化しようとすると意外と手間がかかります。Whisper で音声を文字起こしして、それを別の翻訳 API に投げて、最後にタイムスタンプを SRT 形式に整える ... と、3〜4 個のステップを連結することになります。
+
+Gemini API のマルチモーダル動画入力を使うと、この一連の流れを 1 リクエストで完結できます。ただし「動く実装」と「実用に耐える実装」の差は意外と大きく、特にタイムスタンプ精度と翻訳品質の両立で何度かつまずきました。本記事では、5 分前後の動画を想定して、私自身が辿り着いた実装パターンをまとめます。
+
+## Gemini API への動画入力 — 2 つの渡し方を使い分ける
+
+Gemini API に動画を渡す方法は、大きく 2 つあります。
+
+- **インライン送信**: Base64 エンコードして `parts` に直接埋め込む方法。20 MB 程度までの短い動画向けです
+- **File API 経由**: `client.files.upload()` でアップロードしてから参照する方法。最大 2 GB まで、48 時間キャッシュされます
+
+5 分のスマホ動画で 50〜80 MB になりますので、実用上はほぼ File API の出番になります。ただしアップロードが完了してから `state` が `ACTIVE` になるまで数秒〜十数秒かかるので、ポーリングを入れる必要があります。
+
+```python
+from google import genai
+from google.genai import types
+import time
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+# 動画ファイルをアップロード
+video_file = client.files.upload(file="meeting.mp4")
+print(f"Uploaded: {video_file.name}, state: {video_file.state}")
+
+# state が ACTIVE になるまでポーリング
+while video_file.state == "PROCESSING":
+    time.sleep(2)
+    video_file = client.files.get(name=video_file.name)
+print(f"Ready: {video_file.state}")  # 期待値: ACTIVE
+```
+
+`PROCESSING` のまま投げると `400 INVALID_ARGUMENT` で弾かれますので、必ず `ACTIVE` を待ってからリクエストを送ってください。
+
+## タイムスタンプ精度を上げる 3 つのコツ
+
+字幕生成で最初にぶつかる壁は「タイムスタンプがずれる」問題です。Gemini はおおまかな時刻を返してくれますが、何も指示しないと 1〜3 秒のずれが普通に出ます。
+
+私が試した中で効果が高かったのは、次の 3 つです。
+
+1. **動画のサンプリング fps を明示する**: デフォルトでは 1 fps でサンプリングされます。`video_metadata.fps` で 2〜4 fps を指定すると、短いセリフの取りこぼしが減ります
+2. **プロンプトで「MM:SS.mmm 形式で」と指示する**: ミリ秒精度で書くよう明示すると、Gemini は内部的に細かく時刻を管理してくれます
+3. **1 字幕あたりの最大文字数を指定する**: 「1 字幕は最大 35 文字、2 行まで」のように制約を入れると、長すぎる字幕で表示時間が破綻するのを防げます
+
+```python
+config = types.GenerateContentConfig(
+    response_mime_type="application/json",
+    response_schema={
+        "type": "ARRAY",
+        "items": {
+            "type": "OBJECT",
+            "properties": {
+                "start": {"type": "STRING", "description": "MM:SS.mmm format"},
+                "end": {"type": "STRING", "description": "MM:SS.mmm format"},
+                "ja": {"type": "STRING"},
+                "en": {"type": "STRING"},
+            },
+            "required": ["start", "end", "ja", "en"]
+        }
+    }
+)
+
+prompt = """この動画の話者音声を聞き取り、字幕データを生成してください。
+要件:
+- タイムスタンプは MM:SS.mmm 形式（例: 01:23.450）
+- 1字幕は最大35文字、2行まで（改行は \\n で表現）
+- ja は日本語の話者発話そのまま、en は自然な英語訳
+- 沈黙・BGMのみの区間は出力しない
+"""
+
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents=[video_file, prompt],
+    config=config,
+)
+
+import json
+captions = json.loads(response.text)
+print(f"生成字幕数: {len(captions)}")
+```
+
+`response_schema` を使うと出力が JSON として保証されるため、後段の SRT 変換が楽になります。
+
+## SRT / VTT への構造化出力
+
+SRT と VTT はほぼ同じ構造ですが、タイムスタンプの区切り文字（`,` か `.`）と先頭の `WEBVTT` ヘッダの有無が違います。
+
+```python
+def to_srt(captions: list[dict]) -> str:
+    """captions は [{start, end, ja, en}, ...] 形式"""
+    lines = []
+    for i, c in enumerate(captions, 1):
+        start = c["start"].replace(".", ",")  # SRT は ms を , で区切る
+        end = c["end"].replace(".", ",")
+        # MM:SS,mmm を HH:MM:SS,mmm に揃える
+        start = f"00:{start}" if start.count(":") == 1 else start
+        end = f"00:{end}" if end.count(":") == 1 else end
+        lines.append(f"{i}\n{start} --> {end}\n{c['ja']}\n")
+    return "\n".join(lines)
+
+def to_vtt(captions: list[dict], lang: str = "ja") -> str:
+    """VTT はヘッダ付き、ms は . 区切り"""
+    body = []
+    for c in captions:
+        start = f"00:{c['start']}" if c['start'].count(":") == 1 else c['start']
+        end = f"00:{c['end']}" if c['end'].count(":") == 1 else c['end']
+        body.append(f"{start} --> {end}\n{c[lang]}")
+    return "WEBVTT\n\n" + "\n\n".join(body)
+
+with open("output_ja.srt", "w") as f:
+    f.write(to_srt(captions))
+with open("output_en.vtt", "w") as f:
+    f.write(to_vtt(captions, lang="en"))
+```
+
+YouTube は SRT と VTT どちらもアップロードできますが、自前 Web 配信であれば HTML5 の `<track>` タグが要求する VTT のほうが扱いやすいです。
+
+## 多言語字幕を 1 リクエストで完結させる
+
+字幕用途では、聴覚障害者向けに同じ言語の字幕を出しつつ、海外向けに英語字幕も用意する、というケースがよくあります。
+
+「先に日本語字幕を生成 → 別途翻訳 API に投げる」という 2 段階構成にすると、タイムスタンプの整合性が取れず、字幕が画面に出るタイミングと音声がずれてしまいます。
+
+そこで、`response_schema` の中に複数言語のフィールドを入れて 1 リクエストで両方とも生成させるパターンが効きます。先ほどのコード例では `ja` と `en` を同時に出力していましたが、ここに `zh-Hans`、`ko`、`es` などを追加するだけで多言語字幕が一気に揃います。
+
+ただし言語数を増やすほど出力トークンが増え、コストが線形に上がっていきますので、現実的には 2〜3 言語までが扱いやすいラインです。私は基本「ja + en の 2 本立て」にしておき、必要に応じて他言語を後段で追加生成するようにしています。
+
+## モデル選び — Flash と Pro の使い分け
+
+実験してみたところ、Gemini 2.5 Flash は 5 分の動画を 2.5 Pro の約半分の時間、コストもおおよそ 10〜15% 程度で処理してくれます。個人用の軽いコンテンツで自分でチェックできる範囲なら、Flash から始めるのが現実的です。
+
+Pro が効くのは、訛りの強い話者・複数言語が混ざる動画・BGM や環境音が大きい素材など、音声分離が難しいケースです。同じ `response_schema` とプロンプトがそのまま動くので、モデル名を変えるだけで切り替えられます。
+
+```python
+# まずは Flash で叩き台を生成
+response = client.models.generate_content(model="gemini-2.5-flash", contents=[video_file, prompt], config=config)
+# ノイズが多い素材は Pro で再生成
+response = client.models.generate_content(model="gemini-2.5-pro", contents=[video_file, prompt], config=config)
+```
+
+Flash で全件処理 → 一部サンプリングして手直し → ダメな素材だけ Pro に回す、という二段構えにしておくと、コストとクオリティのバランスを取りやすくなります。
+
+## 公開前の軽量 QA パス
+
+プロンプトを詰めても、機械生成字幕はそのまま視聴者に出すと細かい違和感が残ります。次の 3 つを自動チェックするだけで、致命的な問題はだいたい拾えます。
+
+1. **読みやすさ（CPS）**: 1 秒あたり 17 文字を超える字幕は人間がまず追いつけません。`len(text) / (end - start)` で算出して閾値オーバーをマークします
+2. **オーバーラップ検出**: 隣接する字幕の `end` が次の `start` より後ろに来ていると、両方が画面に重なって表示されます。線形スキャンですぐ拾えます
+3. **空白区間の検出**: 隣接字幕の間が 10 秒以上空いている場合、無音検出が誤動作したか、モデルが発話を取りこぼした可能性があります
+
+```python
+def qa_captions(captions: list[dict]) -> list[str]:
+    issues = []
+    def to_seconds(ts: str) -> float:
+        # MM:SS.mmm -> 秒
+        m, rest = ts.split(":", 1)
+        return int(m) * 60 + float(rest)
+    prev_end = 0.0
+    for i, c in enumerate(captions):
+        s, e = to_seconds(c["start"]), to_seconds(c["end"])
+        cps = len(c["ja"]) / max(e - s, 0.1)
+        if cps > 17:
+            issues.append(f"cue {i}: 速すぎ ({cps:.1f} cps)")
+        if s < prev_end:
+            issues.append(f"cue {i}: 前の字幕と重複")
+        if s - prev_end > 10:
+            issues.append(f"cue {i}: 直前と {s - prev_end:.1f}s の空白")
+        prev_end = e
+    return issues
+
+for problem in qa_captions(captions):
+    print(problem)
+```
+
+私はこのチェックを生成スクリプトの最後に挟んでおき、問題リストが空でないときだけ手動レビューに回しています。クリーンに収録された素材であればたいていリストは空で返ってきて、SRT はそのままアップロード可能です。
+
+## 本番運用で気づいた落とし穴
+
+- **1 時間超の動画は分割が必須**: Gemini 2.5 Pro でも 1 時間の動画は処理時間が長く、タイムアウトしやすいです。15〜20 分単位でカットして並列処理し、後段で時刻オフセットを足し込むほうが安定します
+- **無音区間で誤検出が出ることがある**: BGM だけで話し声がない区間でも、Gemini が「えーっと」「うーん」のような相槌を勝手に入れてくることがあります。プロンプトに「沈黙・BGM のみの区間は出力しない」と明記してください
+- **固有名詞が認識されにくい**: 自社サービス名や人名は何度試しても正しく拾えないことがあるので、プロンプトの末尾に「以下の固有名詞は正確に表記すること: Dolice, gemilab.net, ...」のように単語リストを与えるのがおすすめです
+
+## 関連コンテンツ
+
+字幕生成の前提となる動画入力の基本仕様は、[Gemini File API完全ガイド：ファイルのアップロードと活用](/articles/gemini-api/file-api-guide) と [Gemini 2.5 Pro 動画理解の実践ガイド](/articles/gemini-api/gemini-25-pro-video-understanding-practical-guide) で詳しく扱っています。構造化出力（response_schema）の応用パターンを深掘りしたい方は [JSON モードと構造化出力の基本](/articles/gemini-api/json-mode-structured-output) も併読すると理解が深まります。
+
+書籍で映像配信の周辺技術を体系的に押さえたい場合は、[ITエンジニアのための機械学習理論入門（中井悦司 著）](https://www.amazon.co.jp/dp/4774173282/?tag=pinocchio-22) のような技術書をベースに、コーデック・フレームレート・字幕標準をひとまわり眺めておくと、Gemini に渡す前処理の判断が早くなります。
+
+## まとめ — まず 30 秒の動画で試してみる
+
+動画字幕の自動化は、いきなり長尺で試すと「どこで失敗しているか分からない」状態に陥りがちです。30 秒の自撮り動画で `response_schema` 付きの最小構成を動かして、SRT として再生できるところまで確認してから、本番動画にスケールするのがおすすめです。
+
+最初の 1 本が動けば、あとはプロンプトのチューニングだけで品質が伸びていきます。Google AI Studio の無料枠でも十分に試せますので、ぜひ手元の素材で動かしてみてください。
