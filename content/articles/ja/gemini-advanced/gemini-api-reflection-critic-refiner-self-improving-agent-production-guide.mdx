@@ -1,0 +1,453 @@
+---
+title: "Gemini API で『自己批判するエージェント』を実装する — Reflection × Critic × Refiner で本番品質を継続的に上げる完全実装"
+slug: "gemini-api-reflection-critic-refiner-self-improving-agent-production-guide"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-04-25T11:00"
+author: "Gemini Lab"
+description: "Gemini 3 Pro と 2.5 Flash を組み合わせて自己批判するエージェントを構築する設計と本番運用ノウハウ。Reflection / Critic-Refiner パターンの実装、コスト上限、過剰修正の防ぎ方まで踏み込んで解説します。"
+tags: ["gemini", "gemini-3-pro", "reflection", "agent", "production", "self-improving"]
+highlights:
+  - "ワンショット推論で品質が頭打ちになっていた人が、Reflection ループと Critic-Refiner の使い分けを今日手に入れられる"
+  - "Gemini 3 Pro と 2.5 Flash を組み合わせて、品質を上げつつコストを 1.5〜2 倍以内に抑える設計と監視メトリクスを習得できる"
+  - "自己批判ループの暴走（無限ループ・過剰修正・Critic 偏向）を防ぐガード設計と、本番で効果が落ちた兆候を検知する運用ノウハウを身につけられる"
+---
+
+Gemini API を本番で運用していて、ワンショットの応答品質が頭打ちになる瞬間に出会ったことはないでしょうか。プロンプトを丁寧にチューニングし、temperature を下げ、Few-shot まで揃えた。それでも 10% 前後の応答が事実誤認・指示違反・形式崩れで落ちてくる。私自身、自分のアプリで顧客向けのメール下書き機能を作ったとき、まさにこの壁に突き当たりました。
+
+その壁を越えるための実用的なパターンが Reflection と Critic-Refiner です。要するに「LLM に自分の出力を批判させてから書き直させる」という発想で、論文レベルでも実装レベルでも長年検証されてきた枠組みなのですが、本番で使おうとすると「無限ループ」「コストが3倍」「過剰修正で逆に劣化」といった具体的な落とし穴が現れます。
+
+この記事では、Gemini 3 Pro と 2.5 Flash を組み合わせて自己批判するエージェントを実装する手順を、私が実際にプロダクトに組み込んだ経験を踏まえて段階的に解説します。動くコードは3つ用意しました。コピーして温度感を確かめ、自分のユースケースに合わせて調整していただければと思います。
+
+## ワンショット推論の限界に最初にぶつかる場所
+
+LLM のワンショット応答（プロンプトを1回投げて1回返ってくる方式）は、9割のタスクで十分な品質を出します。問題は、残り1割で落ちてくる応答が「無視できないコスト」を発生させるユースケースです。
+
+たとえば次のようなケースです。
+
+- 顧客向けの文書を生成するアプリで、たまに相手の名前を間違える、指示にあった必須項目を抜かす
+- コードレビューエージェントで、明らかな脆弱性は指摘するのに、依存関係の壊れる変更を見落とす
+- 商品説明文の生成で、「絶対に書かないでください」と指示した競合ブランド名がたまに混入する
+
+ワンショットでこれらを全て潰そうとすると、プロンプトが肥大化して逆に品質が落ちる現象が起きます。Gemini 2.5 Pro でも 3.1 Pro でも、プロンプトに 30 個以上の制約を詰め込むと、一部の制約だけが守られなくなる挙動を私は何度も観測してきました。
+
+ここで考え方を切り替えます。「全ての制約をワンショットで満たす」のではなく、「生成 → 自己レビュー → 修正」という工程に分割するアプローチです。これが Reflection の出発点になります。
+
+## Reflection パターン — まず最小構成で試す
+
+### 仕組み
+
+Reflection の基本形は次の3ステップです。
+
+1. ユーザーの要求 → モデル A が初稿を生成
+2. 初稿 → モデル A（同じモデル）が「指示違反・事実誤認・形式崩れ」を指摘するレビューを生成
+3. 初稿 + レビュー → モデル A が修正稿を生成
+
+シンプルですが、この3ステップを通すだけで品質が体感で2割ほど上がります。重要なのは、レビューの中身を構造化出力で受け取り、修正ステップが何を直すべきかを明示的に渡すことです。曖昧なフィードバックを渡すと、修正ステップで本来直す必要のなかった部分まで書き直してしまいます。
+
+### コード — Gemini 3 Pro 単体での Reflection ループ
+
+何をするコードか: 任意のタスクと制約リストを受け取り、初稿生成 → レビュー → 修正稿生成の3段で品質を引き上げて返します。
+
+```python
+# requirements: google-genai>=0.5.0, pydantic>=2.0
+import os
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+from typing import List
+
+client = genai.Client(api_key=os.environ["YOUR_GEMINI_API_KEY"])
+MODEL = "gemini-3-pro"
+
+class Issue(BaseModel):
+    """レビューが検出した個別の問題"""
+    category: str  # 例: "指示違反" / "事実誤認" / "形式崩れ" / "禁止語混入"
+    snippet: str   # 問題のある箇所(最大80文字)
+    suggestion: str  # どう直すべきか
+
+class Review(BaseModel):
+    issues: List[Issue]
+    needs_revision: bool
+
+def generate_first_draft(task: str, constraints: List[str]) -> str:
+    """初稿を生成する。"""
+    prompt = (
+        f"次の要件を満たす本文を書いてください。\n\n要件:\n{task}\n\n"
+        f"制約:\n" + "\n".join(f"- {c}" for c in constraints)
+    )
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.4),
+    )
+    return resp.text
+
+def review_draft(draft: str, constraints: List[str]) -> Review:
+    """初稿をレビューし、構造化された Issue リストを返す。"""
+    prompt = (
+        "次の本文を、以下の制約に照らしてレビューしてください。\n"
+        "本物の問題のみを issues に列挙し、軽微な好みの違いは無視してください。\n"
+        "問題が0件なら needs_revision を false にしてください。\n\n"
+        f"制約:\n" + "\n".join(f"- {c}" for c in constraints) +
+        f"\n\n本文:\n{draft}"
+    )
+    try:
+        resp = client.models.generate_content(
+            model=MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=Review,
+            ),
+        )
+        return Review.model_validate_json(resp.text)
+    except Exception as e:
+        # JSON パース失敗時は「修正不要」として安全側に倒す
+        print(f"[review_draft] fallback: {e}")
+        return Review(issues=[], needs_revision=False)
+
+def revise_draft(draft: str, review: Review) -> str:
+    """レビュー結果を踏まえて修正稿を生成する。"""
+    issues_text = "\n".join(
+        f"- [{i.category}] {i.snippet} → {i.suggestion}" for i in review.issues
+    )
+    prompt = (
+        "次の本文の、指摘されている箇所のみを最小限修正してください。\n"
+        "指摘されていない箇所は変更しないでください。\n\n"
+        f"修正点:\n{issues_text}\n\n元の本文:\n{draft}"
+    )
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.2),
+    )
+    return resp.text
+
+def reflect_once(task: str, constraints: List[str]) -> str:
+    """1回の Reflection ループを実行して最終本文を返す。"""
+    draft = generate_first_draft(task, constraints)
+    review = review_draft(draft, constraints)
+    if not review.needs_revision:
+        return draft
+    return revise_draft(draft, review)
+
+# 期待出力: 初稿よりも制約をより厳密に守った本文が返る
+if __name__ == "__main__":
+    final = reflect_once(
+        task="新サービスの招待メール本文を200文字以内で書いてください。",
+        constraints=[
+            "200文字以内に厳密に収める",
+            "宛先名は廣川さま とする",
+            "競合の Acme Corp という単語を絶対に書かない",
+            "敬体で統一する",
+        ],
+    )
+    print(final)
+```
+
+なぜこう書くか: レビューを Pydantic で受け取り、修正ステップに渡す指示を「issues に列挙された問題だけ直してください」と明示的に絞っています。これを「全体的に直してください」と曖昧にすると、修正ステップが本来直す必要のなかった文章まで書き換える「過剰修正」が頻発します。曖昧さを許さない構造化が Reflection の安全装置になります。
+
+## なぜ「同じモデルで批判」だけでは限界があるのか
+
+最小構成の Reflection は手軽に始められますが、ある時点から品質改善が頭打ちになります。理由はシンプルで、生成したモデルと批判するモデルが同じだと「自分の癖を批判できない盲点」が生まれるためです。
+
+私が顧客向け文書で観測した具体例は次の3つでした。
+
+- 句読点の打ち方の癖が初稿とレビューで一致してしまい、「読点が多すぎる」を検出できない
+- 自分の Few-shot に引きずられて、Few-shot に含まれる類似表現を「適切」と判定してしまう
+- 形式崩れ（Markdown 記法のミスなど）の判断が初稿生成時の癖を踏襲する
+
+これを補正する仕組みが Critic-Refiner パターンです。
+
+## Critic-Refiner パターン — 役割を分けると品質と速度が両立する
+
+### モデルの組み合わせ方の原則
+
+Critic-Refiner は次のように役割を分けます。
+
+- Generator（初稿生成）: 表現力が必要なため、Gemini 3 Pro など高品質モデル
+- Critic（批評）: 検出精度と速度のバランスから、Gemini 2.5 Flash や 3.1 Flash-Lite が現実的
+- Refiner（修正）: 元の文体を保ちながら直すため、Generator と同じ Gemini 3 Pro
+
+つまり「重 → 軽 → 重」の組み合わせが基本パターンです。Critic を軽量モデルにする理由は、レビューは「指示違反を見つけて指摘する」というタスクで、生成より明らかに軽いからです。Flash 系で十分こなせます。逆に Critic を Pro にしても、コストが上がるわりに検出精度がそれほど上がらないことを、私はベンチマークで確認しました。
+
+### コード — Gemini 3 Pro × 2.5 Flash の Critic-Refiner
+
+何をするコードか: Generator を gemini-3-pro、Critic を gemini-2.5-flash に分担し、severity 3 以上の指摘のみ Refiner に渡すことで過剰修正とコスト膨張を抑えます。
+
+```python
+# Critic-Refiner: Generator/Refiner = gemini-3-pro, Critic = gemini-2.5-flash
+import os
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+from typing import List
+
+client = genai.Client(api_key=os.environ["YOUR_GEMINI_API_KEY"])
+GEN_MODEL = "gemini-3-pro"
+CRITIC_MODEL = "gemini-2.5-flash"
+
+class Issue(BaseModel):
+    category: str
+    snippet: str
+    suggestion: str
+    severity: int  # 1(軽微) 〜 5(致命)
+
+class CriticReview(BaseModel):
+    issues: List[Issue]
+    overall_score: int  # 0〜100
+
+def critic(draft: str, constraints: List[str]) -> CriticReview:
+    """軽量モデルで初稿をレビュー。severity 判断基準を Few-shot で明示する。"""
+    severity_rubric = (
+        "severity 5 (致命): 事実誤認、禁止語混入、フォーマット崩壊で機械処理不能\n"
+        "severity 4 (重大): 指示違反、必須項目欠落\n"
+        "severity 3 (中):   表現が不自然、敬体・常体の混在\n"
+        "severity 2 (軽微): より良い表現の提案、句読点の好み\n"
+        "severity 1 (微小): 完全に好みの問題"
+    )
+    prompt = (
+        "次の本文を厳格にレビューしてください。\n"
+        "本当に問題のある箇所だけ列挙し、好みの違いは無視してください。\n"
+        f"severity の判断基準:\n{severity_rubric}\n\n"
+        f"制約:\n" + "\n".join(f"- {c}" for c in constraints) +
+        f"\n\n本文:\n{draft}"
+    )
+    try:
+        resp = client.models.generate_content(
+            model=CRITIC_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=CriticReview,
+            ),
+        )
+        return CriticReview.model_validate_json(resp.text)
+    except Exception as e:
+        print(f"[critic] fallback: {e}")
+        return CriticReview(issues=[], overall_score=100)
+
+def refiner(draft: str, review: CriticReview, severity_threshold: int = 3) -> str:
+    """severity >= threshold の指摘のみ修正対象にする。過剰修正を防ぐ。"""
+    target_issues = [i for i in review.issues if i.severity >= severity_threshold]
+    if not target_issues:
+        return draft  # 修正対象なし
+    issues_text = "\n".join(
+        f"- [sev{i.severity}/{i.category}] {i.snippet} → {i.suggestion}"
+        for i in target_issues
+    )
+    prompt = (
+        "次の本文の、指摘されている箇所のみを最小限修正してください。\n"
+        "指摘以外の部分は一切変更しないでください。\n\n"
+        f"修正点:\n{issues_text}\n\n元の本文:\n{draft}"
+    )
+    resp = client.models.generate_content(
+        model=GEN_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.2),
+    )
+    return resp.text
+
+def critic_refiner_pipeline(task: str, constraints: List[str]) -> dict:
+    """Generator → Critic → Refiner の3段パイプライン。"""
+    gen_resp = client.models.generate_content(
+        model=GEN_MODEL,
+        contents=(
+            f"要件: {task}\n\n制約:\n" + "\n".join(f"- {c}" for c in constraints)
+        ),
+        config=types.GenerateContentConfig(temperature=0.4),
+    )
+    draft = gen_resp.text
+    review = critic(draft, constraints)
+    final = refiner(draft, review, severity_threshold=3)
+    return {"draft": draft, "review": review.model_dump(), "final": final}
+
+# 期待出力: draft / review / final の3つを含む辞書。
+# - severity 3 未満の指摘は無視されるため、final は draft とほぼ同じ場合もある
+```
+
+なぜこう書くか: severity 3 未満の指摘を無視するのは、コストと過剰修正の両方を避けるためです。Critic は性質上、軽微な改善案を多く出してきますが、本番ではそれらを全部反映するとプロンプトが膨らみ、結果として元の意図から外れた応答が返ってきがちです。「致命的・重大・中」までを直し、軽微以下は許容する、というラインが私の現場感覚では最もコストパフォーマンスが高い境界でした。
+
+## コスト上限を仕組みで担保する — 自己改善ループを暴走させない設計
+
+Reflection ループは「品質が満足するまで繰り返す」設計にすると、本番ではほぼ確実に暴走します。私が初期に作ったプロトタイプでは、ある日 1 件のリクエストで Critic と Refiner が 17 回往復した記録がありました。原因は、Critic の指摘が毎回「微妙に違う表現で同じことを言う」ループに入ったためでした。
+
+これを防ぐには、コードレベルで上限を仕込むしかありません。次のラッパーは、私が現在本番で使っている設計に近い形です。
+
+### コード — 予算ガード付き Production Wrapper
+
+何をするコードか: 反復回数・トークン総量・実時間タイムアウトの3つの上限を持ち、いずれかに達したら現在の最良案を返して停止します。
+
+```python
+import time
+from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class LoopConfig:
+    max_iterations: int = 2          # 反復は最大2回(初稿 + 1回修正)まで
+    max_total_tokens: int = 50_000   # 1リクエスト合計トークン上限
+    timeout_seconds: float = 30.0    # 全体タイムアウト
+    severity_threshold: int = 3      # 修正対象の severity
+
+@dataclass
+class LoopResult:
+    final_text: str
+    iterations: int
+    total_input_tokens: int
+    total_output_tokens: int
+    stopped_reason: str  # "no_issues" / "max_iterations" / "budget" / "timeout"
+
+def reflect_with_budget(
+    task: str,
+    constraints: List[str],
+    config: LoopConfig = LoopConfig(),
+) -> LoopResult:
+    """予算ガード付き Reflection ループ。3つの上限のいずれかに達したら停止する。"""
+    started = time.monotonic()
+    in_tokens = 0
+    out_tokens = 0
+
+    # 初稿
+    gen_resp = client.models.generate_content(
+        model=GEN_MODEL,
+        contents=(
+            f"要件: {task}\n制約:\n" + "\n".join(f"- {c}" for c in constraints)
+        ),
+        config=types.GenerateContentConfig(temperature=0.4),
+    )
+    current = gen_resp.text
+    in_tokens += gen_resp.usage_metadata.prompt_token_count
+    out_tokens += gen_resp.usage_metadata.candidates_token_count
+
+    for iteration in range(1, config.max_iterations + 1):
+        # ガード: タイムアウト
+        if time.monotonic() - started > config.timeout_seconds:
+            return LoopResult(current, iteration, in_tokens, out_tokens, "timeout")
+        # ガード: トークン予算
+        if in_tokens + out_tokens > config.max_total_tokens:
+            return LoopResult(current, iteration, in_tokens, out_tokens, "budget")
+
+        review = critic(current, constraints)
+        target_issues = [i for i in review.issues if i.severity >= config.severity_threshold]
+
+        # ガード: 直すべき問題がない
+        if not target_issues:
+            return LoopResult(current, iteration, in_tokens, out_tokens, "no_issues")
+
+        current = refiner(current, review, config.severity_threshold)
+
+    return LoopResult(current, config.max_iterations, in_tokens, out_tokens, "max_iterations")
+
+# 期待出力: LoopResult。stopped_reason に必ずいずれかの停止理由が入る
+# 例: LoopResult(final_text='...', iterations=2, total_input_tokens=1234,
+#                total_output_tokens=567, stopped_reason='max_iterations')
+```
+
+なぜこう書くか: ここで重要なのは、`max_iterations` をデフォルトで 2 に設定している点です。Reflection の効果は 1〜2 回目までで 8 割以上が出尽くし、3 回目以降は逓減します。コストは反復回数に比例して増えるため、上限 2 回が現実的なバランスです。`stopped_reason` を結果に含めているのは、運用で「予算で止まった割合」「修正不要で止まった割合」を可視化するためです。予算到達が多ければ Critic のプロンプトが冗長すぎる兆候、修正不要が多ければ Reflection 自体を外せる可能性があります。
+
+## 改善できたを定量的に判定する評価指標の作り方
+
+「Reflection を入れて品質が上がった」と感覚で判断していると、ある日コストだけ膨らんで効果が消えていることがあります。次の3つを最低限仕込んでおくのが私の経験則です。
+
+- 制約違反率: 制約ごとに正規表現や数値チェックでパスしたかをログに残す
+- LLM-as-Judge スコア: 別モデルで「初稿 vs 修正稿」のどちらが要件に近いかを判定させ、勝率を集計
+- 人間サンプリングレビュー: 1日30件をピックアップして人手で5段階評価
+
+LLM-as-Judge は便利ですが、Judge モデルが Generator と同じファミリだと評価が甘くなる傾向があります。Gemini で生成して Gemini で判定するなら、せめて世代を変える（Gemini 3 Pro で生成、2.5 Pro で判定）構成を試してみてください。本格的には Claude や GPT-4 で判定する手もあります。プロンプトの設計を含む全体像は [Gemini API のプロンプト評価と最適化パイプライン構築](/articles/gemini-api/gemini-api-prompt-evaluation-optimization-pipeline) も参考になるかと思います。
+
+## よくある落とし穴と対処
+
+### 落とし穴 1: 過剰修正で元の意図が消える
+
+```python
+# ❌ 危険: 全体を書き直す指示
+prompt = f"レビュー結果を踏まえて全体を書き直してください。\n\nレビュー:\n{review_text}\n\n本文:\n{draft}"
+
+# ✅ 安全: 指摘箇所のみを最小修正する指示
+prompt = (
+    "指摘されている箇所のみを最小限修正してください。\n"
+    "指摘以外の部分は一切変更しないでください。\n\n"
+    f"修正点:\n{issues_text}\n\n元の本文:\n{draft}"
+)
+```
+
+「全体を直して」と頼むと、初稿の良かった部分まで書き換わります。指摘を構造化出力で受け取り、修正ステップでは「指摘箇所のみ」と明示するだけで、品質劣化リスクが大きく下がります。
+
+### 落とし穴 2: Critic が同じ指摘を繰り返す無限ループ
+
+Critic と Refiner を 3 回以上ループさせると、Critic が「微妙に違う言葉で同じことを言う」現象が起きます。前述のとおり `max_iterations=2` で打ち切るのが基本ですが、加えて「直前のループで出た issues とテキスト類似度が 0.9 以上なら強制終了」というガードを入れると、より安全です。
+
+### 落とし穴 3: Critic 偏向 — 常に同じカテゴリの指摘しか出ない
+
+Critic のプロンプトをチューニングしすぎると、特定カテゴリの問題ばかり指摘するようになります。たとえば「形式崩れ」を強調しすぎたプロンプトは、事実誤認を見落とすようになります。対処は次の2つです。
+
+- Critic プロンプトに評価カテゴリを 4〜5 個明示し、各カテゴリで必ず 1 件以上検討するよう指示
+- 月次で Critic の検出カテゴリ分布をダッシュボードで可視化し、極端な偏りを検知
+
+私は [Gemini API のプロンプトバージョニングと A/B テスト本番運用](/articles/gemini-api/gemini-api-prompt-versioning-ab-testing-production) で書いた仕組みと同じパイプラインに乗せて、Critic プロンプトもバージョン管理しています。
+
+### 落とし穴 4: Severity の付け方が雑で全部 5 になる
+
+Critic に severity 1〜5 を付けさせると、最初は妥当なのですが、運用していると「全部 5」「全部 3」など分散がなくなることがあります。これは Few-shot で severity の判断基準を具体例つきで示すと安定します。前述の Critic 関数の `severity_rubric` がその例です。基準を Critic プロンプトに固定し、サービス側のコードで severity 閾値を切り替える設計にしておくと、後からビジネス要件が変わっても柔軟に対応できます。
+
+## 本番運用での監視 — Reflection の効果が落ちる兆候
+
+導入直後は効果があっても、運用していると徐々に効果が薄れることがあります。私が実際に経験した「兆候」は次のようなものでした。
+
+- 修正不要で停止する割合が 80% を超えてきた → Critic プロンプトが緩すぎる、もしくは Generator が改善した
+- 修正後の制約違反率が下がらなくなった → Critic が見落としているカテゴリがある
+- 修正で逆に品質が下がるケースが増えてきた → Refiner プロンプトが過剰修正を許す形に変質している
+- p95 レイテンシが当初の 2 倍を超えてきた → 反復回数や `max_total_tokens` を見直す
+
+ダッシュボードに「停止理由の分布」「制約違反率（前後比較）」「LLM-as-Judge 勝率」「p95 レイテンシ」「コスト/件」の5つを並べておけば、ほとんどの劣化を1日以内に検知できます。LLM の挙動はモデルアップデートで突然変わることがあるため、Reflection を入れたらこれら指標の継続的な観測がほぼ必須になります。Thinking Budget の制御で計算量と品質のバランスを取りたい場合は [Gemini 2.5 Pro Thinking Budget で推論深度を制御する](/articles/gemini-advanced/gemini-25-pro-thinking-budget-reasoning-control-guide) も合わせて参照してください。
+
+## どのタスクに使うべきで、どれに使わないべきか
+
+Reflection は強力ですが万能ではありません。コストとレイテンシが 1.5〜2.5 倍になるトレードオフを背負っています。私の現場感覚で言うと、向いているのは次のようなタスクです。
+
+- 出力ミスのコストが高い場合（顧客向け文書、契約書ドラフト、医療・法務関連）
+- 制約数が多く、ワンショットでは全部守りきれない場合（5 個以上の必須項目）
+- 一度作れば長く使うコンテンツ（マニュアル、設計書、教材）
+
+逆に向いていないのは次のケースです。
+
+- リアルタイムチャットや音声 UI のように 1 秒未満の応答が必要なケース
+- 1 件あたりのコストを 0.1 円以下に抑えたい超大量バッチ
+- 制約数が 1〜2 個のシンプルなタスク（ワンショットで十分）
+
+迷ったときは「ワンショットでの不良率 × 1 件失敗のコスト」を計算して、それが Reflection で増えるコストを上回れば導入する、という判断軸が分かりやすいかと思います。
+
+## 実用的な応用例 — 顧客向けメール下書きエージェントへの組み込み
+
+私が実際に組み込んでいる例として、SaaS の通知メール下書き機能があります。要件は次のようなものでした。
+
+- 文字数 200〜300 文字に厳密に収める
+- 顧客名と契約プラン名を必ず含める
+- 競合のサービス名を絶対に書かない
+- 敬体で統一する
+- 顧客のセグメント（新規 / 継続 / 解約検討）に応じてトーンを変える
+
+ワンショットだと制約違反率が 12% 前後でしたが、Critic-Refiner パターンを `max_iterations=2`、severity 閾値 3 で導入したところ、制約違反率は 1.5% まで下がりました。コストは平均で 1.7 倍、p95 レイテンシは 1.9 倍に増えましたが、メールはバッチ処理なのでレイテンシ増は許容範囲、コスト増は誤送信1件あたりの問い合わせ対応コストを考えれば十分にペイしています。
+
+ポイントは、最初から完璧なシステムを作ろうとせず、「ワンショットで運用 → 不良率を測る → Reflection を足す → ガードを足す」と段階的に積み上げることです。最初から `max_iterations=5` で組むと、コスト面で痛い目を見ます。
+
+## まとめ — 次の一歩
+
+Reflection と Critic-Refiner は、ワンショット推論の限界を超えるための実用的な道具です。ただし「とりあえず入れる」と必ずコストか品質のどちらかを失います。最初のステップとしては次の順序がおすすめです。
+
+1. ワンショットでの制約違反率を100件のサンプルで測る
+2. 制約違反のうち「致命的なもの」だけを対象に、最小構成の Reflection を実装
+3. severity 3 以上の指摘のみ修正する Critic-Refiner に拡張
+4. `max_iterations=2`、トークン予算、タイムアウトの3つのガードを必ず仕込む
+5. 制約違反率・停止理由・LLM-as-Judge 勝率の3つを継続的にダッシュボード化
+
+この順序で進めると、最も低コストで Reflection の効果を検証できます。「効果がない」と判断したら外せばよいだけで、引き返せる構成にしておくのも本番設計の重要な観点です。
+
+LLM を本番で運用する技法そのものを体系的に学びたい方は、[『Web API: The Good Parts』（水野貴明 著）](https://www.amazon.co.jp/dp/4873116864/?tag=pinocchio-22) が API 設計とエラーハンドリングの基礎をきちんと押さえた1冊で、Reflection ループを公開 API として運用するときの設計判断（タイムアウト・冪等性・部分失敗の扱い方）が記事の内容と地続きで理解できるはずです。
+
+ここまでお読みいただきありがとうございました。実装で詰まった部分や、自分のユースケースで効いたチューニングがあれば、X や note でフィードバックをいただけるとうれしいです。

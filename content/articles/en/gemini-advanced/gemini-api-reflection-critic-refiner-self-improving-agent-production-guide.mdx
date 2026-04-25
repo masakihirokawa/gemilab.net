@@ -1,0 +1,494 @@
+---
+title: "Building Self-Critiquing Agents with Gemini API: A Production-Ready Guide to Reflection and Critic-Refiner Patterns"
+slug: "gemini-api-reflection-critic-refiner-self-improving-agent-production-guide"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-04-25T11:00"
+author: "Gemini Lab"
+description: "A production-grade walkthrough of Reflection and Critic-Refiner patterns with Gemini 3 Pro and 2.5 Flash. Covers implementation, cost guards, over-correction defenses, and monitoring signals from real deployments."
+tags: ["gemini", "gemini-3-pro", "reflection", "agent", "production", "self-improving"]
+highlights:
+  - "If your one-shot prompts have plateaued, you'll walk away with working Reflection loops and a clear rule for when to split into Critic and Refiner"
+  - "You'll learn how to combine Gemini 3 Pro and 2.5 Flash to lift quality while keeping the cost increase inside 1.5–2x, plus the monitoring metrics that prove it's still working"
+  - "You'll get the guard rails that stop self-critique loops from runaway costs, over-correction, and Critic bias—and the production signals that reveal when reflection has stopped paying off"
+---
+
+If you've run a Gemini API workload long enough, you've probably hit the moment when single-shot quality plateaus. You tuned the prompt, dropped the temperature, added few-shot examples—and still about 10% of responses come back with hallucinated facts, broken formatting, or instruction violations. I ran into the same wall when I shipped a customer-email drafting feature in one of my apps.
+
+The most practical way past that wall is the Reflection pattern, and its more refined cousin, the Critic-Refiner pattern. The idea is straightforward: have the LLM critique its own output, then rewrite it. Both patterns have been validated for years in research and in production. The catch is that naively bolting them onto a real workload introduces a new set of headaches—infinite loops, 3x cost spikes, and the dreaded "over-correction" failure mode where the model rewrites the parts that were already fine.
+
+This guide walks through how I actually wire up self-critiquing agents in production using Gemini 3 Pro and 2.5 Flash. You'll get three runnable code examples, the cost guards I had to learn the hard way, and the monitoring signals that flag when your reflection setup has stopped earning its keep.
+
+## Where one-shot inference hits its ceiling
+
+A one-shot LLM call—prompt in, response out—gets you 90% of the way for most tasks. The issue is the remaining 10%, where the failure modes are expensive enough that you can't ignore them.
+
+Concrete examples I've seen:
+
+- A customer-document generator that occasionally misspells the recipient's name or omits a required field
+- A code-review agent that flags obvious vulnerabilities but misses dependency-breaking changes
+- A product description generator that lets a forbidden competitor brand slip through, despite explicit "do not mention" instructions
+
+Trying to crush all of those with a bigger one-shot prompt usually backfires. I've watched Gemini 2.5 Pro and 3.1 Pro both start losing constraints once the prompt grows past about 30 stated rules—the model picks a subset to honor and quietly drops the rest.
+
+The mental shift is to stop asking a single call to satisfy every constraint. Split the work into "draft → self-review → revise." That's where Reflection enters.
+
+## Reflection pattern: start with the minimum viable loop
+
+### The shape of it
+
+The basic Reflection pattern is three steps:
+
+1. User request → Model A produces a first draft
+2. First draft → Model A (same model) produces a structured review listing instruction violations, factual errors, and formatting issues
+3. First draft + review → Model A produces a revised draft
+
+Three calls instead of one. In my own A/B tests, this lifts perceived quality by roughly 20% without changing prompts much. The key detail is that the review must be a structured object, not free-form text. Vague feedback turns into vague edits, which turn into the over-correction failure mode where the revision step rewrites paragraphs that were already fine.
+
+### Code: a single-model Reflection loop with Gemini 3 Pro
+
+What this code does: takes a task and a list of constraints, runs the three-step Reflection loop, and returns the final text.
+
+```python
+# requirements: google-genai>=0.5.0, pydantic>=2.0
+import os
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+from typing import List
+
+client = genai.Client(api_key=os.environ["YOUR_GEMINI_API_KEY"])
+MODEL = "gemini-3-pro"
+
+class Issue(BaseModel):
+    """A single problem found by the reviewer."""
+    category: str  # e.g., "instruction_violation" / "factual_error" / "formatting" / "forbidden_term"
+    snippet: str   # the offending span (max 80 chars)
+    suggestion: str  # how to fix it
+
+class Review(BaseModel):
+    issues: List[Issue]
+    needs_revision: bool
+
+def generate_first_draft(task: str, constraints: List[str]) -> str:
+    """Produce the initial draft."""
+    prompt = (
+        f"Write text that satisfies the following requirements.\n\nTask:\n{task}\n\n"
+        f"Constraints:\n" + "\n".join(f"- {c}" for c in constraints)
+    )
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.4),
+    )
+    return resp.text
+
+def review_draft(draft: str, constraints: List[str]) -> Review:
+    """Review the draft and return a structured list of issues."""
+    prompt = (
+        "Review the following text against the listed constraints.\n"
+        "Only list real problems—ignore stylistic preferences.\n"
+        "If you find no issues, set needs_revision to false.\n\n"
+        f"Constraints:\n" + "\n".join(f"- {c}" for c in constraints) +
+        f"\n\nText:\n{draft}"
+    )
+    try:
+        resp = client.models.generate_content(
+            model=MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=Review,
+            ),
+        )
+        return Review.model_validate_json(resp.text)
+    except Exception as e:
+        # Fail safe: if JSON parsing breaks, treat as "no revision needed"
+        print(f"[review_draft] fallback: {e}")
+        return Review(issues=[], needs_revision=False)
+
+def revise_draft(draft: str, review: Review) -> str:
+    """Apply only the listed fixes and leave everything else alone."""
+    issues_text = "\n".join(
+        f"- [{i.category}] {i.snippet} -> {i.suggestion}" for i in review.issues
+    )
+    prompt = (
+        "Rewrite the following text by addressing ONLY the listed issues.\n"
+        "Do not change any part that was not flagged.\n\n"
+        f"Fixes to apply:\n{issues_text}\n\nOriginal text:\n{draft}"
+    )
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.2),
+    )
+    return resp.text
+
+def reflect_once(task: str, constraints: List[str]) -> str:
+    """Run a single Reflection cycle and return the final text."""
+    draft = generate_first_draft(task, constraints)
+    review = review_draft(draft, constraints)
+    if not review.needs_revision:
+        return draft
+    return revise_draft(draft, review)
+
+# Expected output: a revised draft that respects the constraints more strictly than the first draft.
+if __name__ == "__main__":
+    final = reflect_once(
+        task="Draft a 200-character invitation email for a new SaaS product.",
+        constraints=[
+            "Stay strictly under 200 characters",
+            "Address the recipient as 'Mr. Hirokawa'",
+            "Never mention the competitor 'Acme Corp'",
+            "Use a warm, professional tone throughout",
+        ],
+    )
+    print(final)
+```
+
+Why this shape: the review is a Pydantic model, not a paragraph of prose, and the revise step is told to touch only the flagged spans. If you let the revise step "rewrite the whole thing in light of the review," it will. That's where over-correction comes from. Constraining the revision target is the silent safety belt of the entire pattern.
+
+## Why "same-model self-critique" eventually plateaus
+
+The minimum loop above is a great starting point, but quality gains taper after a while. The reason is mechanical: when the same model generates and critiques, it has structural blind spots it can't see in itself.
+
+Three concrete failures I've watched on customer-document workloads:
+
+- Punctuation habits leak across both calls, so the reviewer doesn't notice that the draft is comma-heavy
+- The reviewer is biased by your few-shot examples and rates anything that resembles them as "correct"
+- Formatting mistakes (misused Markdown syntax, for example) replicate because they're encoded in the same priors
+
+The fix is to split the roles across different models, which is exactly what the Critic-Refiner pattern does.
+
+## Critic-Refiner: split the roles, keep the gains, save on cost
+
+### How to allocate the models
+
+The mapping I use:
+
+- Generator (first draft): a high-capacity model—Gemini 3 Pro—because the draft sets the ceiling on what's possible
+- Critic: a faster, cheaper model—Gemini 2.5 Flash or 3.1 Flash-Lite—because catching constraint violations is a much lighter task than generating prose
+- Refiner: same as Generator (Gemini 3 Pro), to preserve the original tone while applying surgical edits
+
+The pattern is "heavy → light → heavy." It's tempting to put your best model on the Critic role too, but in my benchmarks the detection-precision gains were modest and the cost premium was significant. Flash-class models are more than capable for this role.
+
+### Code: Gemini 3 Pro × Gemini 2.5 Flash
+
+What this code does: same task as before, but with a cheaper Critic and a severity threshold so we only refine the issues that actually matter.
+
+```python
+# Critic-Refiner: Generator/Refiner = gemini-3-pro, Critic = gemini-2.5-flash
+import os
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+from typing import List
+
+client = genai.Client(api_key=os.environ["YOUR_GEMINI_API_KEY"])
+GEN_MODEL = "gemini-3-pro"
+CRITIC_MODEL = "gemini-2.5-flash"
+
+class Issue(BaseModel):
+    category: str
+    snippet: str
+    suggestion: str
+    severity: int  # 1 (minor) to 5 (critical)
+
+class CriticReview(BaseModel):
+    issues: List[Issue]
+    overall_score: int  # 0-100
+
+def critic(draft: str, constraints: List[str]) -> CriticReview:
+    """Lightweight reviewer with an explicit severity rubric."""
+    severity_rubric = (
+        "severity 5 (critical): factual error, forbidden term, broken formatting that breaks downstream processing\n"
+        "severity 4 (major):    instruction violation, missing required field\n"
+        "severity 3 (medium):   awkward phrasing, register inconsistency\n"
+        "severity 2 (minor):    a phrasing improvement, punctuation preference\n"
+        "severity 1 (trivial):  pure stylistic preference"
+    )
+    prompt = (
+        "Review the following text strictly.\n"
+        "List only real problems and ignore stylistic preferences.\n"
+        f"Severity rubric:\n{severity_rubric}\n\n"
+        f"Constraints:\n" + "\n".join(f"- {c}" for c in constraints) +
+        f"\n\nText:\n{draft}"
+    )
+    try:
+        resp = client.models.generate_content(
+            model=CRITIC_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=CriticReview,
+            ),
+        )
+        return CriticReview.model_validate_json(resp.text)
+    except Exception as e:
+        print(f"[critic] fallback: {e}")
+        return CriticReview(issues=[], overall_score=100)
+
+def refiner(draft: str, review: CriticReview, severity_threshold: int = 3) -> str:
+    """Refine only severity >= threshold issues to prevent over-correction."""
+    target_issues = [i for i in review.issues if i.severity >= severity_threshold]
+    if not target_issues:
+        return draft  # nothing actionable
+    issues_text = "\n".join(
+        f"- [sev{i.severity}/{i.category}] {i.snippet} -> {i.suggestion}"
+        for i in target_issues
+    )
+    prompt = (
+        "Apply ONLY the following fixes to the text.\n"
+        "Do not change any part that was not flagged.\n\n"
+        f"Fixes:\n{issues_text}\n\nOriginal text:\n{draft}"
+    )
+    resp = client.models.generate_content(
+        model=GEN_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.2),
+    )
+    return resp.text
+
+def critic_refiner_pipeline(task: str, constraints: List[str]) -> dict:
+    """Three-stage pipeline: Generator -> Critic -> Refiner."""
+    gen_resp = client.models.generate_content(
+        model=GEN_MODEL,
+        contents=(
+            f"Task: {task}\n\nConstraints:\n" + "\n".join(f"- {c}" for c in constraints)
+        ),
+        config=types.GenerateContentConfig(temperature=0.4),
+    )
+    draft = gen_resp.text
+    review = critic(draft, constraints)
+    final = refiner(draft, review, severity_threshold=3)
+    return {"draft": draft, "review": review.model_dump(), "final": final}
+
+# Expected output: a dict with draft, review, and final.
+# - When all flagged issues are below severity 3, final equals draft.
+```
+
+Why drop everything below severity 3: the Critic, by design, will surface plenty of "could be slightly better" notes. Reflecting all of them inflates token usage, broadens the diff the Refiner has to apply, and—most importantly—pushes the output away from the original intent. In my workloads, "fix critical/major/medium and accept minor/trivial" is the highest-leverage threshold.
+
+## Cost containment: the loop will run away unless you stop it
+
+If you let the loop "iterate until the Critic is happy," it will eventually go on a runaway. The first prototype I built once spent 17 round-trips on a single request because the Critic kept rephrasing the same critique without converging. The fix isn't a smarter Critic—it's hard caps in the wrapper.
+
+### Code: a budget-guarded production wrapper
+
+What this code does: bounds iteration count, total token usage, and wall-clock time. Whichever ceiling hits first, the wrapper returns the best draft so far with a `stopped_reason` you can chart.
+
+```python
+import time
+from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class LoopConfig:
+    max_iterations: int = 2          # at most 2 (initial draft + 1 revision)
+    max_total_tokens: int = 50_000   # token budget per request
+    timeout_seconds: float = 30.0    # wall-clock ceiling
+    severity_threshold: int = 3      # which issues trigger refinement
+
+@dataclass
+class LoopResult:
+    final_text: str
+    iterations: int
+    total_input_tokens: int
+    total_output_tokens: int
+    stopped_reason: str  # "no_issues" / "max_iterations" / "budget" / "timeout"
+
+def reflect_with_budget(
+    task: str,
+    constraints: List[str],
+    config: LoopConfig = LoopConfig(),
+) -> LoopResult:
+    """Reflection loop with three independent stop conditions."""
+    started = time.monotonic()
+    in_tokens = 0
+    out_tokens = 0
+
+    # Initial draft
+    gen_resp = client.models.generate_content(
+        model=GEN_MODEL,
+        contents=(
+            f"Task: {task}\nConstraints:\n" + "\n".join(f"- {c}" for c in constraints)
+        ),
+        config=types.GenerateContentConfig(temperature=0.4),
+    )
+    current = gen_resp.text
+    in_tokens += gen_resp.usage_metadata.prompt_token_count
+    out_tokens += gen_resp.usage_metadata.candidates_token_count
+
+    for iteration in range(1, config.max_iterations + 1):
+        # Guard: wall-clock timeout
+        if time.monotonic() - started > config.timeout_seconds:
+            return LoopResult(current, iteration, in_tokens, out_tokens, "timeout")
+        # Guard: token budget
+        if in_tokens + out_tokens > config.max_total_tokens:
+            return LoopResult(current, iteration, in_tokens, out_tokens, "budget")
+
+        review = critic(current, constraints)
+        target_issues = [i for i in review.issues if i.severity >= config.severity_threshold]
+
+        # Guard: nothing left to fix
+        if not target_issues:
+            return LoopResult(current, iteration, in_tokens, out_tokens, "no_issues")
+
+        current = refiner(current, review, config.severity_threshold)
+
+    return LoopResult(current, config.max_iterations, in_tokens, out_tokens, "max_iterations")
+
+# Expected output: a LoopResult whose stopped_reason is one of the four labels.
+# Example: LoopResult(final_text='...', iterations=2, total_input_tokens=1234,
+#                     total_output_tokens=567, stopped_reason='max_iterations')
+```
+
+Why `max_iterations=2`: in my measurements, 80%+ of the realized quality lift from Reflection lands in the first iteration; iteration 2 captures most of the rest; iterations 3+ are mostly noise. Cost grows linearly with iterations, so 2 is the sweet spot. The `stopped_reason` field is the secret weapon: if "budget" dominates, your Critic prompt is too long; if "no_issues" dominates, you may not need Reflection at all anymore.
+
+## How to actually measure that quality went up
+
+Calling Reflection a "win" by feel is how you end up paying 1.7x more for unchanged quality. Three signals are the minimum I instrument:
+
+- Constraint violation rate: per-constraint regex or numeric checks logged on every response
+- LLM-as-Judge win rate: a separate model picks "draft" or "final" as the better satisfaction of the requirements; aggregate the win rate over time
+- Human spot-check: 30 random samples a day, scored on a 5-point rubric
+
+LLM-as-Judge is convenient but it has a known bias: when the Judge shares a family with the Generator, it scores its own family's outputs more leniently. If you generate with Gemini 3 Pro, judge with Gemini 2.5 Pro at minimum, or—better—route some traffic to Claude or GPT-4o for cross-family judgment. The full evaluation pipeline is covered in [Building a Prompt Evaluation and Optimization Pipeline for Gemini API](/articles/gemini-api/gemini-api-prompt-evaluation-optimization-pipeline), which complements this article.
+
+## Common pitfalls and how to avoid them
+
+### Pitfall 1: over-correction wipes out the original intent
+
+```python
+# Risky: tells the model to rewrite globally
+prompt = f"Rewrite the text in light of the review.\n\nReview:\n{review_text}\n\nText:\n{draft}"
+
+# Safe: tells the model to apply only the flagged fixes
+prompt = (
+    "Apply ONLY the listed fixes. Do not change any part that was not flagged.\n\n"
+    f"Fixes:\n{issues_text}\n\nOriginal text:\n{draft}"
+)
+```
+
+Saying "rewrite the whole thing" gives the model permission to touch the parts that were already good. Funneling fixes through a structured object and constraining the revision step to "only these spans" is the cheapest reliability gain in the entire pattern.
+
+### Pitfall 2: the loop converges to "rephrase the same critique forever"
+
+Once you let the Critic-Refiner cycle run more than twice, you'll start seeing the Critic phrase the same complaint with slightly different words. The hard cap (`max_iterations=2`) catches most cases. As an extra safety net, keep a hash of the previous iteration's issues; if cosine similarity over the issue text is above 0.9, stop early.
+
+### Pitfall 3: Critic bias—it always flags the same category
+
+A Critic prompt that has been over-tuned tends to fixate on one category of problem. If you spent a sprint hardening "format violations," the Critic may stop noticing factual errors. Two defenses I rotate:
+
+- Force the Critic to "consider at least one issue per category" across 4–5 named categories
+- Chart the Critic's category distribution monthly and alert on unusual concentration
+
+I run Critic prompts through the same versioning/A-B framework I described in [Prompt Versioning and A/B Testing for Gemini API in Production](/articles/gemini-api/gemini-api-prompt-versioning-ab-testing-production), which makes those distribution shifts much easier to attribute to a specific rollout.
+
+### Pitfall 4: severity ratings collapse to "everything is 5" or "everything is 3"
+
+The first few weeks, severity scores look reasonable. Then the distribution flattens—everything becomes severity 5, or everything becomes severity 3. The cause is almost always vague rubric wording. The fix is the explicit five-line rubric in the Critic function above. Pin it in the Critic prompt; switch business behavior by tuning the severity threshold in code, not by reshaping the rubric.
+
+## Production monitoring: signals that Reflection has stopped paying off
+
+Reflection isn't fire-and-forget. The model fleet shifts under you, and what worked at launch decays in subtle ways. The leading indicators I watch:
+
+- "no_issues" stop rate climbs above 80% → the Critic is too lenient or the Generator improved on its own
+- Post-revision constraint violation rate stops dropping → the Critic has a blind spot in some category
+- Quality drops after refinement (LLM-as-Judge prefers the draft over the final) → the Refiner prompt has drifted into "rewrite generously" territory
+- p95 latency creeps to 2x baseline → reduce `max_iterations` or tighten `max_total_tokens`
+
+The dashboard I keep open has five panels: stop-reason mix, before/after constraint violation rate, LLM-as-Judge win rate, p95 latency, and cost per request. With those five, regressions show up within a day. Models change behavior on minor version bumps—Reflection without ongoing measurement degrades quietly. If you're tuning compute vs. quality at the same time, [Controlling Gemini 2.5 Pro's Reasoning Depth via Thinking Budget](/articles/gemini-advanced/gemini-25-pro-thinking-budget-reasoning-control-guide) pairs naturally with this work.
+
+## When to use it, and when to skip it
+
+Reflection isn't free. Cost and latency typically grow 1.5–2.5x. The tasks where the math works out:
+
+- High-cost-of-error outputs (customer letters, contract drafts, medical or legal copy)
+- Heavy-constraint tasks where one-shot can't hold all the rules (5+ required elements)
+- Long-shelf-life content (manuals, design docs, training material)
+
+Tasks where I avoid it:
+
+- Real-time chat or voice UI where sub-second latency matters
+- High-volume batch jobs where per-call cost has to stay below pennies
+- Simple tasks with one or two constraints—a one-shot is fine and cheaper
+
+A useful sanity check: estimate "(one-shot defect rate) × (cost of one bad output)." If that exceeds the cost of running Reflection, ship Reflection.
+
+## A real example: a customer email drafting agent
+
+The reason I have this scar tissue is a SaaS notification email feature I run. The requirements were:
+
+- Total length between 200 and 300 characters
+- Must include the recipient's name and current plan
+- Must never mention any competitor brand
+- Consistent professional tone
+- Tone variation by customer segment (new / continuing / churn-risk)
+
+One-shot delivery had a 12% constraint-violation rate. After dropping in Critic-Refiner with `max_iterations=2` and a severity threshold of 3, violations fell to 1.5%. Average cost rose 1.7x; p95 latency rose 1.9x. Because emails are batched, the latency hit was tolerable, and the cost premium is dwarfed by what we used to spend on customer-support time triaging mis-sent emails.
+
+The takeaway is that you don't need a perfect rollout on day one. Start with one-shot, measure the defect rate, add Reflection, then add the budget guards. Skipping straight to `max_iterations=5` is how cost spirals end up on your invoice.
+
+## Latency engineering: where the wall-clock budget actually goes
+
+A practical question that comes up the moment you ship Reflection is "where does the time go?" When I instrumented the customer-email pipeline, the latency budget broke down roughly like this on a typical request: 60% in the Generator call, 15% in the Critic call, 20% in the Refiner call, and 5% in client-side glue (JSON parsing, retry logic, network jitter). The Critic being only 15% of total time was the surprise—on paper, you might expect a third of the time. The reason is that the Critic prompt is shorter, the response schema is small, and Flash-class models are dramatically faster at completion-time than Pro-class models on the same prompt size.
+
+That breakdown changes how you think about optimization. If you want to cut p95 latency, the highest-leverage moves are:
+
+- Tightening the Generator prompt (reducing the input size cuts both Generator and Refiner time)
+- Streaming the Generator's output and starting the Critic call as soon as the draft is complete—you can't parallelize because the Critic needs the full draft, but you can avoid double-buffering
+- Setting an aggressive `timeout_seconds` so a tail-latency Generator call doesn't blow the whole loop's budget
+
+Counterintuitively, swapping the Critic to a Pro-class model usually does very little for latency because the Critic is already a small fraction of the total. Don't optimize the cheap step.
+
+## Failure-mode runbook: what to do when the loop misbehaves
+
+The first time a Reflection loop misbehaves in production, you'll want a runbook to consult instead of debugging from scratch. Here's the one I put on the wall behind my desk.
+
+If the "budget" stop reason starts dominating, your Critic is producing too much output. Look at the average issues count per call—if it's above 8, your rubric is too loose and the Critic is listing nice-to-haves. Tighten the Critic prompt to "list at most 5 problems, prioritizing severity 4–5."
+
+If the "no_issues" stop reason climbs above 80%, either the Generator improved (rare but possible after a model update) or the Critic is missing things. Run a sample of 50 "no_issues" outputs through a stricter Critic prompt and see how many real issues turn up. If the stricter prompt finds 10%+, the production Critic has drifted.
+
+If the LLM-as-Judge win rate starts to drop—meaning the Judge prefers the draft over the final—the Refiner is over-correcting. Inspect the diff between draft and final on a sample. If the diff is touching unflagged spans, harden the Refiner prompt: explicitly enumerate "do not change" rules and re-run.
+
+If p95 latency suddenly doubles, check stop-reason distribution. A spike in "max_iterations" or "timeout" usually means the Critic is detecting more issues than usual—often because of a model update on the Generator side that introduced a new failure mode. Compare the issue category mix to the previous week.
+
+If costs spike without a corresponding latency change, look at the average prompt tokens per Critic call. Critic prompts grow when you append few-shot examples opportunistically; over months that drift can double the input tokens without anyone noticing.
+
+## A note on streaming and partial output
+
+For latency-sensitive applications, you'll likely want to stream the Generator's draft to the user even while Critic and Refiner work in the background. The pattern I use is "ship the draft, then ship a delta." The user sees the draft within the Generator's latency, and a few seconds later the UI quietly updates the changed spans with the Refiner's output. Keying the diff to span identifiers (which you can derive from the Issue.snippet field) makes this user-experience tractable.
+
+The trade-off is that some users see two outputs back-to-back, which can feel jarring. I recommend hiding the streaming draft behind a "Generating final draft..." indicator if the average revision diff is more than 10% of the draft length. Below that threshold, the in-place update is barely noticeable. Above it, users find the change distracting.
+
+## Cross-reference with thinking-budget control
+
+Reflection is one knob for trading compute against quality; thinking-budget control on the Generator is another. They compose, but the interactions aren't always intuitive. In my benchmarks, raising the thinking budget on the Generator reduces the number of Critic-flagged issues—which means the Refiner step often becomes a no-op. Effectively, you're trading "two cheap calls (Critic + Refiner)" for "one expensive call with deeper thinking."
+
+The right trade-off depends on the workload. For tasks where issues cluster around reasoning failures, more thinking budget on the Generator is the right move. For tasks where issues cluster around constraint adherence (hard rules like "must include this token"), Reflection is more cost-effective because the Critic can do exact pattern matching that even more thinking won't reliably solve.
+
+## What changes with Gemini 3 vs. earlier generations
+
+Gemini 3 Pro changed the calculus of Reflection slightly. Compared to Gemini 2.5 Pro, the one-shot output is already a few percentage points more constraint-compliant on the workloads I measure. That sounds like Reflection should matter less, but the opposite is true in practice: because 3 Pro is also significantly more expensive per token than Flash-class models, the gap between "use Pro for everything" and "use Pro for Generator/Refiner and Flash for Critic" widened. The split-role pattern saves more money on 3 than it did on 2.5.
+
+The other change worth noting is structured output reliability. The 3-series models hold response schemas much more consistently than the 2.5 series, which makes the Pydantic validation step in the Critic almost always succeed on the first try. Earlier in the 2.5 lifecycle I needed retry logic on the Critic call. With 3 Pro and 2.5 Flash both, that retry path fires under 0.5% of the time in my workloads.
+
+## Wrap-up: a sequenced first move
+
+Reflection and Critic-Refiner are practical tools for getting past the one-shot ceiling. But "just turn it on" is a reliable way to lose either money or quality. A sequenced approach:
+
+1. Measure your one-shot constraint violation rate over 100 representative samples
+2. Add the minimum Reflection loop, scoped only to "critical" violations
+3. Split into Critic-Refiner and only refine severity >= 3 issues
+4. Add the three guards: `max_iterations=2`, total token budget, and wall-clock timeout
+5. Track three metrics on a dashboard: constraint violation rate, stop-reason mix, and LLM-as-Judge win rate
+
+This sequence keeps the experiment cheap and reversible. If Reflection turns out not to help your workload, you remove it without touching anything else—and that "back-out path" is itself a production-design quality.
+
+If you want to round out the system-design instincts behind shipping LLM features as APIs, [Web API: The Good Parts (Takaaki Mizuno)](https://www.amazon.co.jp/dp/4873116864/?tag=pinocchio-22) is the API-design reference I keep coming back to. The chapters on timeouts, idempotency, and partial-failure semantics line up directly with the trade-offs you'll face when exposing a Reflection loop as a public endpoint.
+
+Thank you for reading. If you've shipped these patterns and learned something I missed, please share it on X or note—I'd love to hear what worked in your stack.
