@@ -1,0 +1,565 @@
+---
+title: "Architecting a Multi-Tenant SaaS on Gemini API — Tenant Isolation, Usage Metering, and Runaway Cost Defense in Production"
+slug: "gemini-api-multi-tenant-saas-architecture-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-26T04:30"
+author: "Gemini Lab"
+description: "A field-tested blueprint for serving Gemini API to multiple tenants on a single backend — covering tenant isolation choices, per-tenant rate limiting in Redis, request-level usage metering for billing, and runaway-cost defenses."
+tags: ["Gemini API", "Multi-Tenant", "SaaS", "Production", "Billing", "Architecture"]
+highlights:
+  - "Engineers stuck on noisy-neighbor problems will get a working per-tenant rate limiter and a clear plan for which isolation tier to pick"
+  - "You'll walk away with a Postgres schema and Python recorder that capture every single Gemini call at billing-grade precision"
+  - "Teams who've already had a runaway-cost scare will get the budget guard and circuit-breaker patterns that stop a 4-figure overnight bill before it lands"
+---
+
+The first time I sweated over a Gemini-backed SaaS was the night a single tenant ran an infinite loop against my endpoint, and my Cloud Billing dashboard hit a four-digit USD figure before sunrise.
+
+The thing that caught it wasn't a Cloud Billing alert. It was a per-request cost log I'd been streaming to Slack on a hunch. The official alert showed up the next morning. This article is the multi-tenant blueprint I wish I'd had that night.
+
+Multi-tenant SaaS on top of an LLM API is meaningfully different from running a single-tenant service. You have to keep one tenant's runaway from taking down everyone else, you need per-tenant usage records that line up with your monthly invoice, and you need a hard stop the moment costs explode. How you design those three things determines whether your SaaS survives its first real customer.
+
+This guide assumes the Python `google-genai` SDK against `generativelanguage.googleapis.com`, but the design ideas translate to any language and to Vertex AI just as well.
+
+## Why Gemini multi-tenancy is harder than ordinary multi-tenancy
+
+If you've sharded a Postgres database or shared a Redis cluster across tenants before, the multi-tenancy patterns you know don't fully transfer. Three things make LLM APIs different.
+
+First, **the unit cost of one request varies wildly across tenants**. The same "send message" endpoint might receive a 300-token quick question from Tenant A and an 800,000-token long-document summarization from Tenant B in the same second. You can't measure tenant load by request count alone — you need to record input tokens, output tokens, and the model used for every call.
+
+Second, **a single API key (project) means one tenant's runaway hurts every other tenant**. Both Google AI Studio keys and Vertex AI projects enforce rate limits at the project level. If Tenant B floods you with 100 RPS, Tenant A starts getting silent 429s and `DEADLINE_EXCEEDED` errors. Without app-level fairness, you've built a noisy-neighbor disaster.
+
+Third, **cost runaway turns into financial loss instantly**. If you forward user input straight to the LLM and a user writes an infinite-loop script, Gemini 2.5 Pro will rack up four-digit USD bills within a few hours. Failsafes have to live in your code, not in your billing dashboard.
+
+## Decision 1: pick a tenant isolation model
+
+The very first thing to decide is where you draw the tenant boundary. Three patterns I've used:
+
+- **Plan A — full sharing (one project, one API key)**: cheapest and easiest to ship. The downside is that one tenant exhausting the project quota affects everyone. Rate limiting and metering are entirely your application's responsibility.
+- **Plan B — one Google Cloud project per tenant**: physical quota isolation, the most robust setup. The downside is the operational weight of provisioning projects and wiring up billing accounts. It stops being practical past ten tenants.
+- **Plan C — BYOK (Bring Your Own Key)**: tenants generate their own Google AI Studio key and you safely store it. Their bill comes directly from Google, so the cost responsibility shifts off your books. The trade-off is that you now own a secrets management story (encryption, rotation, revocation).
+
+**My recommendation is Plan A plus strict app-level isolation while you're under ~50 tenants, then offer Plan C (BYOK) to large customers as you grow.** Plan B is overkill for nearly every startup-sized SaaS.
+
+## Decision 2: tenant authentication and the request context
+
+Every Gemini call should carry a "which tenant, which user, which plan" context. If you push this into a `TenantContext` value object at the entry point and thread it through the call stack, your billing, audit, and budget code all fall out naturally later.
+
+```python
+# tenant_context.py
+from dataclasses import dataclass
+from typing import Literal
+
+PlanTier = Literal["free", "starter", "pro", "enterprise"]
+
+
+@dataclass(frozen=True)
+class TenantContext:
+    """Per-request tenant info, created in the auth middleware
+    and threaded down to the Gemini call sites."""
+
+    tenant_id: str            # e.g. "tnt_01HX..."
+    user_id: str              # e.g. "usr_01HX..."
+    plan: PlanTier            # billing plan
+    monthly_token_budget: int # remaining token budget for this billing month
+    request_id: str           # unique trace id
+
+    @property
+    def has_budget(self) -> bool:
+        return self.monthly_token_budget > 0
+```
+
+Expose this through `Depends` in FastAPI, `g` in Flask, or `c.set()` in Hono so every endpoint can read it. **The unbreakable rule is: no Gemini call may bypass authentication.** A common mistake is "this internal cron job doesn't need auth" — that one cron job ends up emitting cost that you can't attribute to any tenant.
+
+## Decision 3: per-tenant rate limiting with token buckets
+
+Gemini's own quota lives at the project level, so you need an app-side rate limiter that **guarantees Tenant A's success rate and latency don't degrade just because Tenant B is misbehaving**.
+
+I like to implement this with a Redis token bucket: it gives sub-millisecond decisions, holds up under multi-instance API servers, and a Lua script lets us refill and consume atomically.
+
+```python
+# tenant_rate_limiter.py
+import time
+import redis.asyncio as redis
+
+# Lua: atomically refill, read, and decrement the bucket.
+# Returns remaining tokens, or -1 to signal "deny".
+LUA_TOKEN_BUCKET = """
+local key = KEYS[1]
+local rate_per_sec = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local cost = tonumber(ARGV[4])
+
+local data = redis.call('HMGET', key, 'tokens', 'last_refill')
+local tokens = tonumber(data[1]) or capacity
+local last_refill = tonumber(data[2]) or now
+
+local elapsed = math.max(0, now - last_refill)
+tokens = math.min(capacity, tokens + elapsed * rate_per_sec)
+
+local allowed = tokens >= cost
+if allowed then
+  tokens = tokens - cost
+end
+
+redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+redis.call('EXPIRE', key, 3600)
+return allowed and tokens or -1
+"""
+
+
+class TenantRateLimiter:
+    # plan -> (rate tokens/sec, burst capacity)
+    PLAN_LIMITS = {
+        "free":       (1.0,   10),
+        "starter":    (5.0,   50),
+        "pro":        (20.0,  200),
+        "enterprise": (100.0, 1000),
+    }
+
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+        self._sha: str | None = None
+
+    async def _ensure_loaded(self) -> str:
+        if self._sha is None:
+            self._sha = await self.redis.script_load(LUA_TOKEN_BUCKET)
+        return self._sha
+
+    async def try_acquire(self, ctx, cost: int = 1) -> bool:
+        """Should this tenant be allowed to send one more request right now?
+        Pass a non-1 cost when you want heavy requests to consume more tokens."""
+        rate, capacity = self.PLAN_LIMITS[ctx.plan]
+        sha = await self._ensure_loaded()
+        key = f"ratelimit:tenant:{ctx.tenant_id}"
+        result = await self.redis.evalsha(
+            sha, 1, key, rate, capacity, time.time(), cost
+        )
+        return result != -1
+```
+
+Two things matter here. First, **the limits must differ by plan**. SaaS plans usually charge more for higher rate limits, but if you store the plan only in Stripe and never read it from the rate limiter, "I'm on Pro but my throughput is the same as Free" is a complaint you will absolutely receive.
+
+Second, **decide the deny-path UX in advance**. When `try_acquire` returns False, you can (a) immediately return 429, (b) queue briefly and serve later, or (c) return 429 with a `Retry-After` header. For chat UIs I prefer (c). For webhook-style consumers, (a) is more honest because the caller knows how to retry.
+
+## Decision 4: request-level token metering for billing
+
+Equal in importance to rate limiting is **recording exactly how much each tenant used, at request granularity, so your monthly invoices are defensible**. A SaaS that can't answer "how much did Tenant X spend last month?" loses trust quickly.
+
+Gemini returns `usage_metadata` on every response with `prompt_token_count`, `candidates_token_count`, and `total_token_count`. Capture them every time.
+
+```python
+# usage_recorder.py
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from google import genai
+from google.genai import types
+
+# Per-model pricing in USD per 1M tokens (sample values, April 2026)
+MODEL_PRICING = {
+    "gemini-2.5-pro":         {"input": 1.25, "output": 10.00},
+    "gemini-2.5-flash":       {"input": 0.10, "output": 0.40},
+    "gemini-2.5-flash-lite":  {"input": 0.05, "output": 0.20},
+}
+
+
+@dataclass
+class UsageRecord:
+    tenant_id: str
+    user_id: str
+    request_id: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    created_at: datetime
+    success: bool
+    error_code: str | None = None
+
+
+def _calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    p = MODEL_PRICING.get(model, {"input": 1.0, "output": 5.0})
+    return (input_tokens * p["input"] + output_tokens * p["output"]) / 1_000_000
+
+
+class GeminiClientWithMetering:
+    """Wraps a Gemini client so every call also persists a usage record.
+    The caller just provides ctx and prompt."""
+
+    def __init__(self, client: genai.Client, recorder, budget_guard):
+        self.client = client
+        self.recorder = recorder
+        self.budget_guard = budget_guard
+
+    async def generate(self, ctx, model: str, prompt: str) -> str:
+        if not await self.budget_guard.allow(ctx):
+            raise PermissionError(f"tenant {ctx.tenant_id} over monthly budget")
+
+        record = UsageRecord(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            request_id=ctx.request_id,
+            model=model,
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=0.0,
+            created_at=datetime.now(timezone.utc),
+            success=False,
+        )
+
+        try:
+            resp = await self.client.aio.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+            usage = resp.usage_metadata
+            record.input_tokens = usage.prompt_token_count
+            record.output_tokens = usage.candidates_token_count
+            record.cost_usd = _calc_cost(
+                model, record.input_tokens, record.output_tokens
+            )
+            record.success = True
+            return resp.text
+
+        except Exception as e:
+            record.error_code = type(e).__name__
+            raise
+        finally:
+            # Always persist — even on failure. Some failures still incur charges
+            # (for example, a network drop during streaming output).
+            await self.recorder.persist(record)
+```
+
+The non-obvious detail here is **always calling `recorder.persist()` from the `finally` block**. Even when an exception fires, you may have been charged for input tokens already (especially with streaming, where the network can drop mid-output). Implementations that "only record on success" reliably under-report by a few percent, and that's the few percent that turns into dispute calls at the end of the month.
+
+A reasonable Postgres schema for `usage_records` looks like this:
+
+```sql
+-- migrations/001_usage_records.sql
+CREATE TABLE usage_records (
+    id              BIGSERIAL PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    user_id         TEXT NOT NULL,
+    request_id      TEXT NOT NULL UNIQUE,  -- prevents double-charging on retry
+    model           TEXT NOT NULL,
+    input_tokens    INTEGER NOT NULL,
+    output_tokens   INTEGER NOT NULL,
+    cost_usd        NUMERIC(10, 6) NOT NULL,
+    success         BOOLEAN NOT NULL,
+    error_code      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_usage_tenant_created
+    ON usage_records (tenant_id, created_at DESC);
+
+-- For monthly billing rollups
+CREATE MATERIALIZED VIEW usage_monthly AS
+SELECT
+    tenant_id,
+    date_trunc('month', created_at) AS month,
+    SUM(input_tokens) AS input_tokens,
+    SUM(output_tokens) AS output_tokens,
+    SUM(cost_usd) AS cost_usd,
+    COUNT(*) FILTER (WHERE success) AS ok_count,
+    COUNT(*) FILTER (WHERE NOT success) AS error_count
+FROM usage_records
+GROUP BY tenant_id, date_trunc('month', created_at);
+```
+
+The `UNIQUE` constraint on `request_id` is the unsung hero of this schema. If a retry fires the same logical request twice and both INSERTs succeed, the customer gets billed twice. Generate `request_id` once at the request entry point and carry it all the way through.
+
+If you start to feel write contention as you scale past ~10K requests/day, move the writes to Cloud Pub/Sub or Kafka and let a downstream consumer load BigQuery. Reads (rollups) will keep working off the same source of truth.
+
+## Decision 5: monthly budget guard and circuit breaker
+
+Rate limiting protects you from short-term runaways. **A budget guard protects you from medium-term ones**. A tenant sending one request per second isn't fast — but if they keep that up for 24 hours a day, the bill at the end of the month is real.
+
+I run two layers of defense.
+
+```python
+# budget_guard.py
+import asyncio
+from datetime import datetime, timezone
+
+import asyncpg
+
+
+class TenantBudgetGuard:
+    """Keeps a per-tenant 'spend so far this month' number cached briefly,
+    and warns/blocks at 80% and 100% of plan budget."""
+
+    PLAN_BUDGETS = {
+        "free":       0.50,
+        "starter":    20.0,
+        "pro":        200.0,
+        "enterprise": 2000.0,  # hard cap; negotiated up-front per contract
+    }
+
+    GRACE_RATIO = 1.05  # allow a tiny overshoot for accounting precision
+
+    def __init__(self, pool: asyncpg.Pool, alerter):
+        self.pool = pool
+        self.alerter = alerter
+        self._cache: dict[str, tuple[float, datetime]] = {}
+        self._lock = asyncio.Lock()
+
+    async def _current_spend(self, tenant_id: str) -> float:
+        # 60-second cache. We trade strict freshness for many fewer DB hits.
+        async with self._lock:
+            cached = self._cache.get(tenant_id)
+            now = datetime.now(timezone.utc)
+            if cached and (now - cached[1]).total_seconds() < 60:
+                return cached[0]
+
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            row = await self.pool.fetchrow(
+                "SELECT COALESCE(SUM(cost_usd), 0) AS spend "
+                "FROM usage_records "
+                "WHERE tenant_id = $1 AND created_at >= $2",
+                tenant_id, month_start,
+            )
+            spend = float(row["spend"])
+            self._cache[tenant_id] = (spend, now)
+            return spend
+
+    async def allow(self, ctx) -> bool:
+        budget = self.PLAN_BUDGETS[ctx.plan]
+        spend = await self._current_spend(ctx.tenant_id)
+
+        if spend >= budget * self.GRACE_RATIO:
+            await self.alerter.notify_blocked(ctx.tenant_id, spend, budget)
+            return False
+
+        if spend >= budget * 0.80 and spend < budget * 0.85:
+            # Fire one warning when we cross 80%. Naive, but it works.
+            await self.alerter.notify_warning(ctx.tenant_id, spend, budget)
+
+        return True
+```
+
+Computing `_current_spend` from Postgres on every request will cook your DB if any tenant gets hot. **The 60-second cache is the realistic compromise: nearly real-time, but not pretending to be exact.** If you really need exact, push a Redis `INCRBYFLOAT` counter alongside the persistence layer and reconcile it against the DB nightly.
+
+In addition, run a **service-wide circuit breaker**. When you detect sustained Gemini 5xx bursts or your Cloud Billing alarm fires, flip a Redis health key to `down` and short-circuit every Gemini call to a graceful error response. The detailed cost-spike playbook is in [Defending Gemini API costs against runaway spend](/articles/gemini-api/gemini-api-cost-spike-defense-budget-guardrails) — it pairs nicely with the budget guard above.
+
+## Pitfalls I personally walked into
+
+This isn't theory. Each of these cost me a real evening.
+
+### Pitfall 1: losing token counts in streaming responses
+
+`generate_content_stream()` only puts `usage_metadata` on the **final** chunk. If you `break` early, or you accidentally drop the last chunk, your token counter is permanently zero. I noticed only when reconciling Cloud Billing against my DB at month-end.
+
+```python
+# Wrong
+async for chunk in client.aio.models.generate_content_stream(...):
+    yield chunk.text
+    if some_condition:
+        break  # last chunk discarded; usage_metadata gone
+
+# Right
+last_chunk = None
+async for chunk in client.aio.models.generate_content_stream(...):
+    last_chunk = chunk
+    yield chunk.text
+if last_chunk and last_chunk.usage_metadata:
+    record.input_tokens = last_chunk.usage_metadata.prompt_token_count
+    record.output_tokens = last_chunk.usage_metadata.candidates_token_count
+```
+
+### Pitfall 2: forgetting to attach tenant_id to logs
+
+A stack trace alone doesn't tell you which tenant is misbehaving. Make `tenant_id`, `user_id`, and `request_id` mandatory fields in your `logging.extra`. I use `contextvars` to bind them at the request boundary and a `logging.Filter` to inject them automatically, so every line is searchable by tenant.
+
+### Pitfall 3: leaking BYOK keys
+
+When you graduate to Plan C (BYOK), storing tenant API keys in plaintext columns is the most common breach pattern in the industry. Use Cloud KMS at minimum, ideally HashiCorp Vault, and never let the encryption key live in your application repo. Even with that, breaches happen — pair the technical control with a customer-facing rule that says "the key you give us must be locked to read-only with a strict monthly budget cap from your side."
+
+### Pitfall 4: never deciding the retention period for usage_records
+
+Leaving `usage_records` to grow forever ends in a multi-terabyte table that no one wants to migrate. Decide upfront: (a) keep 24 months hot then archive, (b) roll up into monthly summary tables, or (c) ETL into BigQuery. Local tax law may also dictate a minimum retention (seven years for Japan's accounting records, for example).
+
+## The minimum viable observability dashboard
+
+Once the writes are in place, you have everything you need to graph. Five panels are usually enough:
+
+- **Per-tenant monthly spend (USD)**, with the top 10 tenants and a column showing how close they are to plan cap.
+- **Model mix (input vs output tokens)** to understand the shape of your cost.
+- **Error rate per tenant and overall**, broken down by 429 / 5xx / timeout.
+- **Average latency per tenant** — drift here is your earliest signal of noisy-neighbor pain.
+- **Budget alerts fired**, listing the tenants that crossed 80% or 100% and when.
+
+I run this on Grafana over Postgres, but Looker Studio over BigQuery works equally well. So does a Google Sheet, honestly. **Decide what "anomaly looks like" first, then build the smallest dashboard that reveals it.**
+
+## Wiring it all together in FastAPI
+
+To make the moving parts concrete, here is a minimal FastAPI service that authenticates a tenant, applies the rate limiter and budget guard, and serves a single chat endpoint backed by Gemini.
+
+```python
+# app.py
+from fastapi import FastAPI, Depends, HTTPException, Request
+from contextvars import ContextVar
+import uuid
+
+from tenant_context import TenantContext
+from tenant_rate_limiter import TenantRateLimiter
+from usage_recorder import GeminiClientWithMetering
+from budget_guard import TenantBudgetGuard
+
+# Globally, you would build these once at startup.
+limiter: TenantRateLimiter
+gemini: GeminiClientWithMetering
+guard: TenantBudgetGuard
+
+# Bind tenant context to the current request for logging convenience.
+current_ctx: ContextVar[TenantContext | None] = ContextVar("current_ctx", default=None)
+
+
+async def get_tenant_context(request: Request) -> TenantContext:
+    api_key = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not api_key:
+        raise HTTPException(401, "missing bearer token")
+
+    # Look up your own tenant table — never call Gemini before this point.
+    row = await app.state.db.fetchrow(
+        "SELECT tenant_id, user_id, plan FROM api_keys WHERE token_hash = $1",
+        sha256_hex(api_key),
+    )
+    if row is None:
+        raise HTTPException(401, "invalid token")
+
+    ctx = TenantContext(
+        tenant_id=row["tenant_id"],
+        user_id=row["user_id"],
+        plan=row["plan"],
+        monthly_token_budget=10**9,  # rough — guard enforces real spend cap
+        request_id=str(uuid.uuid4()),
+    )
+    current_ctx.set(ctx)
+    return ctx
+
+
+app = FastAPI()
+
+
+@app.post("/v1/chat")
+async def chat(payload: dict, ctx: TenantContext = Depends(get_tenant_context)):
+    if not await limiter.try_acquire(ctx, cost=1):
+        # 429 with a hint so well-behaved clients back off correctly.
+        raise HTTPException(429, "tenant rate limit exceeded", headers={"Retry-After": "1"})
+
+    try:
+        text = await gemini.generate(ctx, model=payload["model"], prompt=payload["prompt"])
+    except PermissionError as e:
+        raise HTTPException(402, str(e))  # 402 Payment Required for budget overruns
+
+    return {"text": text, "request_id": ctx.request_id}
+```
+
+A few things worth highlighting in this glue code. The `Depends(get_tenant_context)` makes it impossible for any new endpoint author to "forget" to identify the tenant — they must accept the dependency or skip authentication explicitly. The `current_ctx` `ContextVar` lets your logging filter inject `tenant_id` automatically. Returning **402 Payment Required** for budget overruns instead of 429 makes the error class distinguishable on the client side, which is useful when your dashboard differentiates "throttled" from "out of budget."
+
+## Testing multi-tenant code without spending real Gemini credits
+
+Production multi-tenant code has subtle bugs that only show up under contention. Two test patterns have saved me grief.
+
+The first is a fake `genai.Client` that returns deterministic token counts so you can write rate-limit and budget assertions without burning real money:
+
+```python
+# tests/fakes.py
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+
+@dataclass
+class FakeUsage:
+    prompt_token_count: int
+    candidates_token_count: int
+    total_token_count: int
+
+
+class FakeGeminiAio:
+    def __init__(self, prompt_tokens=100, output_tokens=200):
+        self.prompt_tokens = prompt_tokens
+        self.output_tokens = output_tokens
+        self.calls = 0
+
+    @property
+    def models(self):
+        outer = self
+
+        class _Models:
+            async def generate_content(self, model, contents):
+                outer.calls += 1
+                return SimpleNamespace(
+                    text="ok",
+                    usage_metadata=FakeUsage(outer.prompt_tokens, outer.output_tokens, outer.prompt_tokens + outer.output_tokens),
+                )
+
+        return _Models()
+
+
+class FakeGeminiClient:
+    def __init__(self):
+        self.aio = FakeGeminiAio()
+```
+
+Plug `FakeGeminiClient()` into `GeminiClientWithMetering` in tests, and you can assert "after 100 calls Tenant A's recorded cost equals 100 × per-call cost" without ever touching Google.
+
+The second pattern is a `pytest` fixture that replays an adversarial workload — a "good" tenant doing 1 RPS while a "bad" tenant tries to send 100 RPS. Your test asserts that the good tenant's success rate stays at 100% while the bad tenant gets cleanly throttled. This is how you discover that a Lua script you copied has a subtle off-by-one or that your token bucket capacity isn't large enough to absorb expected bursts.
+
+## Edge case: sub-tenants and teams
+
+Larger customers will eventually want their tenant subdivided into teams or projects, each with its own visible spend. The good news is the design above scales gracefully: add a `team_id` column to `usage_records` and the same materialized view rolls up by `(tenant_id, team_id)`. Rate limiting can stay at the tenant level (since you're protecting Gemini quota that lives on a single project) while billing visibility goes finer.
+
+Where this gets tricky is when a team wants its **own** budget cap separate from the parent tenant. Two designs work:
+
+- **Hierarchical**: each team has a budget, and the parent tenant has a hard cap that overrides team caps. Conceptually clean but takes one extra DB read in the budget guard.
+- **Flat with hard cap**: only the tenant has a budget. Teams see their share of spend in the dashboard but cannot enforce their own ceiling. Easier to implement, satisfies most customers.
+
+Start with the flat model. Move to hierarchical only when a real customer escalates.
+
+## Handling PII before it ever reaches Gemini
+
+A multi-tenant SaaS that sends raw user input to Gemini will eventually receive a request containing personally identifiable information that the customer assumed you'd handle responsibly. The safe default is to assume PII is in every prompt and act accordingly.
+
+A lightweight approach that has held up for me is to run a fast pre-filter that detects high-confidence PII patterns (email addresses, phone numbers, credit-card numbers, government IDs by region) and either redacts them in-place or rejects the request with a clear error. The redaction model is friendlier; you replace `john@example.com` with `[email]` before forwarding the prompt, and you log the original count of replacements (but never the originals) into the usage record.
+
+For tenants on regulated plans (healthcare, finance), make the pre-filter mode part of the plan definition: `enterprise` plans can set `pii_mode = "block"` to reject any prompt containing detected PII, while `pro` plans default to `pii_mode = "redact"`. Persisting this in `tenant_config` lets you reason about it consistently across endpoints.
+
+A subtler PII risk is the **response**. If your tenants build chatbots that stream LLM output back to end-users, an LLM occasionally hallucinates names, emails, or addresses that look plausible. Provide an opt-in output filter that scrubs the same patterns from responses before they leave your service. It's a small amount of extra latency for a large amount of legal calm.
+
+## Why request_id deserves a section of its own
+
+Among all the IDs in this design, `request_id` is the one that quietly determines whether your system is debuggable. Every layer needs to log it, every retry must reuse it, and every storage row must reference it.
+
+I generate `request_id` as a ULID at the API gateway (or the FastAPI middleware as shown above) before any business logic runs. From there:
+
+- The Gemini call wrapper writes it into `usage_records.request_id`.
+- The structured logger emits it as `request_id=...` on every line via `contextvars`.
+- The 429/402 error response includes it in the body so a customer support ticket can paste one ID and you find every related log line.
+- Idempotency-aware retries reuse the same `request_id` so the `UNIQUE` constraint on `usage_records` deduplicates them automatically.
+
+Once `request_id` is the spine of your observability, post-incident analysis time drops from hours to minutes. The first incident you trace cleanly through this ID will pay back the time you spent threading it through the call stack.
+
+## A staged migration plan
+
+You don't ship all of this on day one. Here's the order I'd take if I were starting fresh.
+
+1. **Week 1 — TenantContext and the usage_records table**: emit a context from the auth middleware and persist tokens around every Gemini call. The "who used how much" question becomes a SQL query immediately.
+2. **Week 2 — per-tenant token-bucket rate limiter**: stand up Redis and split free vs pro for now. Refine plans later.
+3. **Week 3 — budget guard with 80%/100% alerts**: wire alerts to Slack and email at the same time.
+4. **Week 4 — the five dashboard panels**: tune thresholds against real numbers. Many of your initial guesses will be wrong, and that's the point.
+5. **Week 5+ — BYOK, PII masking, and a richer circuit breaker**: drive these by what real customers ask for, not by what you imagine they'll ask for.
+
+For the API-side companion patterns (project-level quota, retry budgets, Rate-Limit headers), [Gemini API rate limiting and quota management for production](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) is the right next read. If your runtime is Cloud Run, [Building a usage-based SaaS on Gemini API + Cloud Run](/articles/gemini-api/gemini-api-cloud-run-usage-based-saas-complete-guide) walks through the deployment shape that pairs well with this design.
+
+## Where to start
+
+Stand up the `usage_records` table this week. Just one table. Wire your Gemini calls so that every request — successful or not — appends a row. Even with a single tenant, having "last month's usage in one SQL query" makes every later design decision faster.
+
+If you want to deepen the SaaS billing side of this with a book in parallel, I find [The Subscription Economy (Tien Tzuo)](https://www.amazon.co.jp/dp/0735213658/?tag=pinocchio-22) helps frame why metering granularity matters commercially, and [Designing Data-Intensive Applications (Martin Kleppmann)](https://www.amazon.co.jp/dp/1449373321/?tag=pinocchio-22) is the long-form companion for the data-pipeline choices above — even just the chapter on stream processing is worth the cost.
+

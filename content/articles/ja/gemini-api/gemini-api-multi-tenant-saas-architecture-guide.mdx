@@ -1,0 +1,419 @@
+---
+title: "マルチテナント SaaS で Gemini API を安全に提供する設計 — テナント分離・課金計測・暴走防止の本番アーキテクチャ"
+slug: "gemini-api-multi-tenant-saas-architecture-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-26T04:30"
+author: "Gemini Lab"
+description: "Gemini API を複数テナントに販売する SaaS で、APIキー漏洩・無限ループによる暴走・他テナントの巻き添え障害を防ぐための実装パターンを、Python のコード付きでまとめました。"
+tags: ["Gemini API", "マルチテナント", "SaaS", "本番運用", "課金", "アーキテクチャ"]
+highlights:
+  - "他テナントの暴走に巻き込まれない、テナントごとのレート制限の実装手順を手に入れられる"
+  - "ユーザーごとの利用量を1リクエスト単位で正確に記録し、月末の請求や上限制御に使えるテーブル設計を習得できる"
+  - "AIコストが青天井で吹き飛ぶ事故を、サーキットブレーカーと予算ガードで未然に止められる構成に切り替えられる"
+---
+
+Gemini API をバックエンドに使った SaaS を作っていて、最初に冷や汗をかいたのは「ある1社が無限ループで自分のテナントを叩き続けた結果、その日のうちに私の Cloud Billing が4桁ドルに到達した」夜のことでした。
+
+幸い検知できたのは、Cloud Billing アラートではなく、Slack に流していた1リクエストごとのコストログでした。アラートは翌朝届きました。本記事は、あの夜の自分に渡したかったマルチテナント設計の地図です。
+
+シングルテナント（1社1インスタンス、1社1APIキー）の運用とは、考えるべきことが大きく変わります。「テナントを跨いだ巻き添え障害を起こさない」「テナントごとの利用量を、月末の請求と紐づくレベルで正確に取る」「想定外のトラフィックでコストが指数関数的に膨らんだ瞬間に止める」——この3点をどう設計するかが、SaaS としての耐久力を決めます。
+
+なお、本記事は Gemini API の REST 呼び出しを Python の `google-genai` SDK 経由で行う前提で書きますが、設計思想はどの言語でも変わりません。
+
+## なぜ Gemini API のマルチテナント化は難しいのか
+
+「自前のキャッシュサーバーを複数テナントで共有する」程度のマルチテナント化と、AI API のマルチテナント化には決定的な違いがあります。
+
+第一に、**1リクエストの単価がテナントごとに大きくぶれる**ことです。同じ「メッセージ送信API」でも、テナントAは300トークンの問い合わせ、テナントBは80万トークンの長文要約を投げてくる、ということが普通に起こります。テナントごとの「トラフィック量（リクエスト数/秒）」だけでは利用量を測れません。「投入トークン数」「出力トークン数」「使用モデル」の3軸で記録する必要があります。
+
+第二に、**APIキー（プロジェクト）が単一であるため、ある1テナントの暴走が全テナントに波及する**ことです。Google AI Studio キー（`generativelanguage.googleapis.com`）の場合は1分あたりのRPM制限が、Vertex AI の場合は1分あたりのトークン上限が、プロジェクト全体に対して効いてきます。テナントBが秒間100リクエストを撃ち続けると、テナントAは静かに 429（または DEADLINE_EXCEEDED）を返され続けることになります。
+
+第三に、**コストの暴走が即座に金銭的損失になる**ことです。たとえばユーザー入力をそのまま LLM に渡す素朴な実装で、ユーザーが「無限ループするスクリプト」を書いた瞬間、Gemini 2.5 Pro なら数時間で4桁ドル、Gemini 2.5 Flash でも油断はできません。「フェイルセーフはコード側でやるしかない」のが現実です。
+
+## 設計判断その1: テナント分離モデルの選択
+
+最初に決めるのは「どこでテナントを分けるか」です。私が経験した3パターンを比較します。
+
+- **Aプラン: 完全共有（1プロジェクト・1APIキー）** — もっとも安価でデプロイも簡単。ただし、ある1テナントが Gemini API のクオータを食い尽くすと、全テナントが影響を受ける。レート制限・課金計測は完全にアプリ側の責任。
+- **Bプラン: テナントごとに Google Cloud プロジェクトを分ける** — クオータが物理的に分離される最も堅牢な構成。ただし、プロジェクトの自動プロビジョニングや課金アカウントの紐付けが運用上重い。テナント数が10を超え始めると現実的でない。
+- **Cプラン: BYOK（Bring Your Own Key）** — テナント自身に Google AI Studio キーを発行してもらい、預かる構成。テナントの請求書は Google から直接届くため、サービス提供側のコスト責任が消える。ただし、APIキーの暗号化保管・ローテーション機構が別途必要。
+
+**私の推奨は、立ち上げ期は A プラン＋アプリ側で厳密なテナント別レート制限・課金計測、月間利用額が一定を超えるテナントには C プラン（BYOK）を提案、です。** 多くの SaaS で B プランは過剰な投資になります。
+
+## 設計判断その2: テナント認証とリクエストコンテキスト
+
+すべての Gemini API 呼び出しは「どのテナント・どのユーザー・どのプランか」というコンテキストを持つべきです。これを実装の入口で `TenantContext` 型に押し込み、後続のすべての関数に伝搬させると、後の課金計測・監査ログ・予算チェックがすべて自然に書けます。
+
+```python
+# tenant_context.py
+from dataclasses import dataclass
+from typing import Literal
+
+PlanTier = Literal["free", "starter", "pro", "enterprise"]
+
+
+@dataclass(frozen=True)
+class TenantContext:
+    """1リクエストのライフサイクル中だけ生きるテナント情報。
+    認証ミドルウェアで生成し、Gemini 呼び出し関数まで引き回す。"""
+
+    tenant_id: str            # 例: "tnt_01HX..."
+    user_id: str              # 例: "usr_01HX..."
+    plan: PlanTier            # 課金プラン
+    monthly_token_budget: int # この月の残り使用可能トークン数
+    request_id: str           # トレース用の一意ID
+
+    @property
+    def has_budget(self) -> bool:
+        return self.monthly_token_budget > 0
+```
+
+この `TenantContext` を、FastAPI なら `Depends`、Flask なら `g`、TypeScript の Hono なら `c.set()` で全エンドポイントから取得できるようにします。**「無認証で Gemini API を叩く経路」を1つでも残さないこと**が、後で出てくるすべての制御の前提になります。よくある事故は「内部スクリプトだから認証スキップ」したエンドポイントが、本番のテナント請求と紐づかずにコストだけ垂れ流す、というパターンです。
+
+## 設計判断その3: テナント別レート制限（トークンバケット）
+
+Gemini API そのもののクオータはプロジェクト全体に対して効くため、**「テナントBが暴走しても、テナントAの応答時間と成功率が落ちない」を保証するレートリミッタをアプリ側に置きます。**
+
+私はこれを Redis のトークンバケットで実装するのが好きです。理由は、(1) サブミリ秒で判定できる、(2) スケールアウト時に複数の API サーバーから一貫した制御ができる、(3) Lua スクリプトで原子的に補充と消費ができる、の3点です。
+
+```python
+# tenant_rate_limiter.py
+import time
+import redis.asyncio as redis
+
+# Lua: 1呼び出しの中で「補充→残量取得→残ってれば1減らす」を原子的に行う
+# return: 残りトークン（負なら拒否すべき）
+LUA_TOKEN_BUCKET = """
+local key = KEYS[1]
+local rate_per_sec = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local cost = tonumber(ARGV[4])
+
+local data = redis.call('HMGET', key, 'tokens', 'last_refill')
+local tokens = tonumber(data[1]) or capacity
+local last_refill = tonumber(data[2]) or now
+
+-- 経過時間ぶん補充
+local elapsed = math.max(0, now - last_refill)
+tokens = math.min(capacity, tokens + elapsed * rate_per_sec)
+
+local allowed = tokens >= cost
+if allowed then
+  tokens = tokens - cost
+end
+
+redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+redis.call('EXPIRE', key, 3600)
+return allowed and tokens or -1
+"""
+
+
+class TenantRateLimiter:
+    # プランごとに rate(tokens/sec) と burst(capacity) を分ける
+    PLAN_LIMITS = {
+        "free":       (1.0,   10),   # 1 req/sec、burst 10
+        "starter":    (5.0,   50),
+        "pro":        (20.0,  200),
+        "enterprise": (100.0, 1000),
+    }
+
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+        self._sha: str | None = None
+
+    async def _ensure_loaded(self) -> str:
+        if self._sha is None:
+            self._sha = await self.redis.script_load(LUA_TOKEN_BUCKET)
+        return self._sha
+
+    async def try_acquire(self, ctx, cost: int = 1) -> bool:
+        """このテナントが今すぐ1リクエスト送ってよいかを判定する。
+        cost を可変にすると「重いリクエストは2消費」のような重み付けも可能。"""
+        rate, capacity = self.PLAN_LIMITS[ctx.plan]
+        sha = await self._ensure_loaded()
+        key = f"ratelimit:tenant:{ctx.tenant_id}"
+        result = await self.redis.evalsha(
+            sha, 1, key, rate, capacity, time.time(), cost
+        )
+        return result != -1
+```
+
+ポイントは2つあります。1つ目は **「プランごとに上限が違う」ことをコードに刻む**ことです。SaaS の課金プランは差別化のためにレート制限が効くべきですが、これを Stripe や DB だけで管理して Gemini 呼び出し側で参照しないと、「Pro プランなのに Free と同じ速度しか出ない」というクレームが必ず来ます。
+
+2つ目は **拒否時の挙動を決めておく**ことです。`try_acquire` が False を返したとき、(a) 即 429 を返す、(b) 短いキューに入れて少し待たせる、(c) `Retry-After` ヘッダー付きで丁寧にリトライ依頼する、のどれを取るかは UX 次第です。私はチャット UI なら (c)、Webhook 経由なら (a) を推奨します。
+
+## 設計判断その4: 1リクエスト単位のトークン課金計測
+
+レート制限と並んで重要なのが、**「テナントが今月いくら使ったかを、リクエスト粒度で正確に記録する」**ことです。月末になって「請求は何ドル？」と聞かれて答えられない SaaS は、信用を失います。
+
+Gemini API は応答の `usage_metadata` に `prompt_token_count` / `candidates_token_count` / `total_token_count` を返してきます。ここを必ず拾います。
+
+```python
+# usage_recorder.py
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from google import genai
+from google.genai import types
+
+# モデル別の単価（2026年4月時点・USD / 1M tokens、サンプル値）
+MODEL_PRICING = {
+    "gemini-2.5-pro":    {"input": 1.25, "output": 10.00},
+    "gemini-2.5-flash":  {"input": 0.10, "output": 0.40},
+    "gemini-2.5-flash-lite": {"input": 0.05, "output": 0.20},
+}
+
+
+@dataclass
+class UsageRecord:
+    tenant_id: str
+    user_id: str
+    request_id: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    created_at: datetime
+    success: bool
+    error_code: str | None = None
+
+
+def _calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    p = MODEL_PRICING.get(model, {"input": 1.0, "output": 5.0})
+    return (input_tokens * p["input"] + output_tokens * p["output"]) / 1_000_000
+
+
+class GeminiClientWithMetering:
+    """Gemini 呼び出しと課金記録を同じトランザクションにまとめるラッパー。
+    呼び出し側は ctx と prompt を渡すだけでよい。"""
+
+    def __init__(self, client: genai.Client, recorder, budget_guard):
+        self.client = client
+        self.recorder = recorder           # 後述: DB 書き込み担当
+        self.budget_guard = budget_guard   # 後述: 月予算チェック担当
+
+    async def generate(self, ctx, model: str, prompt: str) -> str:
+        # 月予算チェック（残り0なら即拒否）
+        if not await self.budget_guard.allow(ctx):
+            raise PermissionError(f"tenant {ctx.tenant_id} over monthly budget")
+
+        record = UsageRecord(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            request_id=ctx.request_id,
+            model=model,
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=0.0,
+            created_at=datetime.now(timezone.utc),
+            success=False,
+        )
+
+        try:
+            resp = await self.client.aio.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+            usage = resp.usage_metadata
+            record.input_tokens = usage.prompt_token_count
+            record.output_tokens = usage.candidates_token_count
+            record.cost_usd = _calc_cost(
+                model, record.input_tokens, record.output_tokens
+            )
+            record.success = True
+            return resp.text
+
+        except Exception as e:
+            record.error_code = type(e).__name__
+            raise
+        finally:
+            # 成功・失敗を問わず必ず記録する。失敗した呼び出しでも、
+            # Gemini 側で課金が発生する場合があるため。
+            await self.recorder.persist(record)
+```
+
+ここで気をつけるべきは、**`finally` の中で必ず `recorder.persist()` を呼ぶ**ことです。エラーで例外が飛んだ場合でも、入力トークンに対する課金は発生していることがあります（特に出力中にネットワークが切れたケースなど）。「成功時だけ記録する」実装は月末に必ずズレを生みます。
+
+`recorder.persist()` の実装は、PostgreSQL の `usage_records` テーブルへの INSERT が無難です。テーブル設計の例を載せます。
+
+```sql
+-- migrations/001_usage_records.sql
+CREATE TABLE usage_records (
+    id              BIGSERIAL PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    user_id         TEXT NOT NULL,
+    request_id      TEXT NOT NULL UNIQUE,  -- 二重課金防止
+    model           TEXT NOT NULL,
+    input_tokens    INTEGER NOT NULL,
+    output_tokens   INTEGER NOT NULL,
+    cost_usd        NUMERIC(10, 6) NOT NULL,
+    success         BOOLEAN NOT NULL,
+    error_code      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_usage_tenant_created
+    ON usage_records (tenant_id, created_at DESC);
+
+-- 月次集計を高速化したいなら以下のような Materialized View を併用
+CREATE MATERIALIZED VIEW usage_monthly AS
+SELECT
+    tenant_id,
+    date_trunc('month', created_at) AS month,
+    SUM(input_tokens) AS input_tokens,
+    SUM(output_tokens) AS output_tokens,
+    SUM(cost_usd) AS cost_usd,
+    COUNT(*) FILTER (WHERE success) AS ok_count,
+    COUNT(*) FILTER (WHERE NOT success) AS error_count
+FROM usage_records
+GROUP BY tenant_id, date_trunc('month', created_at);
+```
+
+`request_id` を UNIQUE 制約付きで持つのが地味に重要です。リトライで同じリクエストが2回 INSERT されると、月末の請求が二重になります。アプリケーションの入口で `request_id` を発行し、最後の INSERT までそれを引き回しましょう。
+
+なお、本番では PostgreSQL に直接 INSERT すると書き込みボトルネックになる可能性があるため、Cloud Pub/Sub または Kafka 経由で非同期に流して BigQuery に蓄積するパターンも有効です。SaaS の規模が日次1万リクエストを超え始めたら検討してください。
+
+## 設計判断その5: 月予算ガードとサーキットブレーカー
+
+レート制限が「短期の暴走」を防ぐ仕組みなら、**予算ガードは「中長期の暴走」を止める仕組み**です。テナントが「秒間1リクエスト」しか送っていなくても、それを24時間365日続けたら月末には大きな額になります。
+
+私が組み込む2層の防御をご紹介します。
+
+```python
+# budget_guard.py
+import asyncio
+from datetime import datetime, timezone
+
+import asyncpg
+
+
+class TenantBudgetGuard:
+    """テナント単位で『今月使ったコスト』をキャッシュし、
+    月予算の80%/100%でアラート/拒否する。"""
+
+    # プランごとの月間予算（USD）
+    PLAN_BUDGETS = {
+        "free":       0.50,
+        "starter":    20.0,
+        "pro":        200.0,
+        "enterprise": 2000.0,  # ハードキャップ。事前合意が必要
+    }
+
+    # ハードキャップを超えてもクラッシュさせず返す残バジェット
+    GRACE_RATIO = 1.05  # 5%だけバッファを許容（請求精度のため）
+
+    def __init__(self, pool: asyncpg.Pool, alerter):
+        self.pool = pool
+        self.alerter = alerter
+        self._cache: dict[str, tuple[float, datetime]] = {}
+        self._lock = asyncio.Lock()
+
+    async def _current_spend(self, tenant_id: str) -> float:
+        # 60秒キャッシュ。完全な厳密性より、頻繁な DB 叩きの抑制を優先。
+        async with self._lock:
+            cached = self._cache.get(tenant_id)
+            now = datetime.now(timezone.utc)
+            if cached and (now - cached[1]).total_seconds() < 60:
+                return cached[0]
+
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            row = await self.pool.fetchrow(
+                "SELECT COALESCE(SUM(cost_usd), 0) AS spend "
+                "FROM usage_records "
+                "WHERE tenant_id = $1 AND created_at >= $2",
+                tenant_id, month_start,
+            )
+            spend = float(row["spend"])
+            self._cache[tenant_id] = (spend, now)
+            return spend
+
+    async def allow(self, ctx) -> bool:
+        budget = self.PLAN_BUDGETS[ctx.plan]
+        spend = await self._current_spend(ctx.tenant_id)
+
+        if spend >= budget * self.GRACE_RATIO:
+            await self.alerter.notify_blocked(ctx.tenant_id, spend, budget)
+            return False
+
+        if spend >= budget * 0.80 and spend < budget * 0.85:
+            # 80%通過時に1度だけアラート（簡易実装）
+            await self.alerter.notify_warning(ctx.tenant_id, spend, budget)
+
+        return True
+```
+
+`_current_spend` をリクエストごとに DB 集計すると、ホットなテナントで DB が焼けます。**60秒キャッシュで「ほぼリアルタイムだが完全リアルタイムではない」精度を許容する**のが現実解です。完全リアルタイムが欲しい場合は Redis に `INCRBYFLOAT` でカウンタを置きますが、整合性管理（DB との差分監査）が別途必要になります。
+
+加えて、**全テナント横断のサーキットブレーカー**も入れておきます。Gemini 側で 5xx が連続している、Cloud Billing が想定外に増えている、といったイベントを検知したら、ヘルスチェック用の Redis キーを `down` にして、すべての呼び出しを即座に短絡させます。これは [Gemini API のコストスパイク防御パターン](/articles/gemini-api/gemini-api-cost-spike-defense-budget-guardrails) で詳しく扱っているので、合わせて参考にしてみてください。
+
+## ありがちな落とし穴（私が踏んだもの）
+
+ここからは、設計図ではなく傷の話です。
+
+### 落とし穴1: ストリーミング応答のトークン数を取り損ねる
+
+`generate_content_stream()` でストリーミング応答を返している場合、`usage_metadata` は **最後のチャンクにしか入っていない**ことがあります。途中で `break` したり、最後のチャンクを破棄するコードを書いてしまうと、トークン数が常に0で記録されます。月末の請求を見て初めて気づきました。
+
+```python
+# 悪い例
+async for chunk in client.aio.models.generate_content_stream(...):
+    yield chunk.text
+    if some_condition:
+        break  # ここで抜けると usage_metadata を取り損ねる
+
+# 良い例
+last_chunk = None
+async for chunk in client.aio.models.generate_content_stream(...):
+    last_chunk = chunk
+    yield chunk.text
+if last_chunk and last_chunk.usage_metadata:
+    record.input_tokens = last_chunk.usage_metadata.prompt_token_count
+    record.output_tokens = last_chunk.usage_metadata.candidates_token_count
+```
+
+### 落とし穴2: テナントID をログに残し忘れる
+
+例外発生時のスタックトレースだけでは、どのテナントの問題か分かりません。`logging` の `extra` に `tenant_id` / `user_id` / `request_id` を必ず含める運用にしないと、本番障害の切り分けが地獄になります。私は `contextvars` でリクエスト全体に貼り付けて、`logging.Filter` で自動付与しています。
+
+### 落とし穴3: BYOK のキー漏洩
+
+C プラン（BYOK）に進化させたとき、テナントから預かった API キーを DB に平文で保存して情報漏洩、というのが業界で繰り返されています。最低でも GCP の Cloud KMS、できれば HashiCorp Vault のような秘密管理基盤を使い、暗号化キーをアプリケーションコードと分離してください。それでも抜かれる可能性は0ではないので、預かったキーは **必ず Google Cloud Console から「読み取り専用 / 月予算上限付き」で発行してもらう運用フロー**にすることをセットで提示します。
+
+### 落とし穴4: 監査ログの保持期間を決めていない
+
+`usage_records` を「保存しているから安心」と思って数年放置すると、テーブルが TB 級になって運用が破綻します。最低でも (a) 24ヶ月保持→アーカイブ、(b) 月次集計テーブルへの転送、(c) BigQuery への ETL、のどれかを最初に決めてください。法令対応上の保管期間（日本なら国税関連の7年など）にも注意します。
+
+## 監査・可視化の最低ライン
+
+ここまで実装すれば、月末に困らない情報が揃います。最低限ダッシュボード化したいのは以下の5指標です。
+
+- **テナント別月間支出（USD）**: 上位10テナントを並べる。プラン超過率も併記する
+- **モデル別使用比率（input/output トークン）**: コスト構造を理解するための基礎データ
+- **エラー率（テナント別 / 全体）**: 429・500・タイムアウトの内訳
+- **平均レイテンシ（テナント別）**: 巻き添え障害の早期検知に効く
+- **予算アラート発火履歴**: 80%/100%通過したテナントの一覧と時刻
+
+私は Grafana + PostgreSQL でこれを組んでいますが、Looker Studio + BigQuery でも同じことが可能です。スプレッドシートでも構いません。**「何を見れば異常がわかるか」を最初に決めて、最低限のグラフだけ作る**のが現実的な始め方です。
+
+## 移行ロードマップ — どの順序で組み込むか
+
+ゼロからこの構成を作るのはオーバーキルです。私が推奨する段階的な導入順序を示します。
+
+1. **第1週: TenantContext と usage_records テーブル**: 認証ミドルウェアでコンテキストを発行し、Gemini 呼び出し前後でトークン数を記録する。これだけで「誰がいくら使っているか」が見える化される
+2. **第2週: テナント別レート制限（トークンバケット）**: Redis を導入して、プランごとの RPS 制限を入れる。最低限 free/pro の2階層から始めて、必要に応じて細分化する
+3. **第3週: 予算ガード（月予算80%/100%でアラート/ブロック）**: メール・Slack 通知も同時に組み込む
+4. **第4週: 監査ダッシュボードの最低5指標**: グラフを見ながら、しきい値や上限を実データに合わせて調整する
+5. **第5週以降: BYOK 対応・PII マスキング・サーキットブレーカーの拡充**: 顧客の声を聞きながら必要なものから
+
+[Gemini API のレート制限とクォータ運用ガイド](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) の内容と組み合わせると、API レイヤーとアプリレイヤーの両側から守る構成になります。Cloud Run でサーバーレス実装する場合は [Gemini API × Cloud Run の使用量課金型 SaaS 構築ガイド](/articles/gemini-api/gemini-api-cloud-run-usage-based-saas-complete-guide) も参考になるはずです。
+
+## 次の一歩
+
+まずは `usage_records` テーブルを1枚作って、Gemini 呼び出しの前後で `input_tokens` と `output_tokens` を記録するところから始めてください。テナントが1社しかないうちでも、月末に「先月いくら使ったか」が SQL 一発で出せる状態を最初に作ると、その後のすべての設計判断が早くなります。
+
+書籍ベースで体系的に学びたい場合は、SaaS の課金モデル設計には [SaaSの科学（角谷 仁）](https://www.amazon.co.jp/dp/4798169293/?tag=pinocchio-22) が、Python による Web API の本番運用全般には [実践Pythonライブラリ開発入門（鈴木たかのり 他）](https://www.amazon.co.jp/dp/4297122995/?tag=pinocchio-22) が、それぞれの章立てだけでも視点が広がります。
+
