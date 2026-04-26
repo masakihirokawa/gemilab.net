@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLOUDNEXT26 — Google Cloud Next '26 で Gemini Enterprise Agent Platform GA、Agent Studio・A2Aプロトコル・第8世代TPU発表（4/22-25）",
-    "GEMINI31PRO — Gemini 3.1 Pro プレビュー公開: 100万トークン・高度推論・マルチモーダル対応の最上位モデル（Vertex AI）",
-    "AGENTSTUDIO — Agent Studio: プロンプトから複雑なエージェントまでローコードで構築・デプロイ可能に",
-    "DROPS10 — Gemini Drops第10弾: macOSネイティブアプリ・Lyria 3 Pro音楽生成・Personal Intelligenceグローバル展開（4/25）",
-    "SIRI — Siri を Gemini で再構築とGoogleが確認、2026年中にGemini搭載Siriが登場（4/22）",
-    "CHROME — Gemini in Chrome が日本を含むAPAC 7カ国へ展開、デスクトップ・iOS対応（4/20）",
+    "GEMINIDROPS — Gemini Drops 4月版公開、Mac版ネイティブアプリ対応＆音楽作成機能追加（4月）",
+    "MACAPP — Gemini for MacがmacOSデスクトップから直接AIサポート、よりスピーディな体験（4月）",
+    "LYRIA3PRO — Lyria 3 Pro登場、高品質オーディオトラックを無料で作成・カスタマイズ可能（4月）",
+    "NOTEBOOKS — NotebookLM統合のNotebooks機能、チャット＆リサーチを一元管理（4月）",
+    "CHROMEAPAC — Gemini in ChromeがAPAC 7か国で展開（日本・韓国・豪州・東南アジア・4/20）",
+    "ENTERPRISE — DeloitteとAccentureがGemini Enterprise提携拡大、25,000名→100,000名にスケール（4/22）",
   ],
   en: [
-    "CLOUDNEXT26 — Google Cloud Next '26: Gemini Enterprise Agent Platform GA, Agent Studio, A2A Protocol & 8th-gen TPU announced (4/22-25)",
-    "GEMINI31PRO — Gemini 3.1 Pro in preview on Vertex AI: 1M-token context, advanced reasoning, full multimodal support",
-    "AGENTSTUDIO — Agent Studio: low-code platform to build and deploy agents from simple prompts to complex workflows",
-    "DROPS10 — Gemini Drops #10: native macOS app, Lyria 3 Pro music creation & Personal Intelligence goes global (4/25)",
-    "SIRI — Google confirms Gemini-powered context-aware Siri is coming to iPhone in 2026 (4/22)",
-    "CHROME — Gemini in Chrome expands to Japan and 6 other APAC countries on desktop & iOS (4/20)",
+    "GEMINIDROPS — Gemini Drops April edition: native Mac app support and music creation features (Apr)",
+    "MACAPP — Gemini for Mac brings AI assistance directly to macOS desktop with faster native experience (Apr)",
+    "LYRIA3PRO — Lyria 3 Pro arrives — create and customize high-fidelity audio tracks for free (Apr)",
+    "NOTEBOOKS — Notebooks with NotebookLM integration unify chats and research in one place (Apr)",
+    "CHROMEAPAC — Gemini in Chrome rolls out to 7 APAC markets including Japan, Korea, Australia (4/20)",
+    "ENTERPRISE — Deloitte & Accenture expand Gemini Enterprise partnerships, scaling to 100K licenses (4/22)",
   ],
 };
 
@@ -35,7 +35,7 @@ export function NewsTicker() {
         width: "100%",
         zIndex: 99,
         height: 35,
-        background: "color-mix(in srgb, var(--accent-teal) 4%, transparent)",
+        background: "color-mix(in srgb, var(--accent-coral) 4%, transparent)",
         borderBottom: "1px solid var(--border-subtle)",
         display: "flex",
         alignItems: "center",
@@ -64,7 +64,7 @@ export function NewsTicker() {
               gap: 12,
             }}
           >
-            <span style={{ color: "var(--accent-teal)", fontSize: 8 }}>●</span>
+            <span style={{ color: "var(--accent-coral)", fontSize: 8 }}>●</span>
             {text}
           </span>
         ))}
