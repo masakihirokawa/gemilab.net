@@ -1,0 +1,131 @@
+---
+title: "Gemini APIの会話履歴をローリングサマリで圧縮する — 数百ターン続くチャットボットの設計"
+slug: "gemini-api-rolling-summary-chat-history-compression"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-27T11:30"
+author: "Gemini Lab"
+description: "Gemini APIで動かしているチャットボットが、会話が長くなるほど料金が膨らみ、ある時点でトークン上限に当たって停止する問題への現実的な対処法をまとめます。ローリングサマリ方式の実装と、要約してはいけない情報の見極め方を解説します。"
+tags: ["gemini-api", "chat", "history", "summary", "rolling-summary", "production"]
+---
+
+Gemini API でチャットボットを運用していると、あるタイミングで「先週まで動いていたのに、特定のユーザーだけ応答が返ってこなくなった」という現象に出会うことがあります。ログを掘ると `Request contains too many tokens` が並んでいて、原因が会話履歴の肥大化だと分かります。
+
+私は個人プロダクトでも Discord ボットでも同じ壁にぶつかってきました。会話履歴を全部送るシンプルな実装は最初の数十ターンまでは美しく動くのですが、ヘビーユーザーが現れた瞬間に料金もレイテンシも崩れていきます。この記事では、ローリングサマリ（rolling summary）と呼ばれる古典的だけれど効果の高い手法を、Gemini API 向けに実装した形でご紹介します。
+
+## なぜ単純なスライディングウィンドウでは足りないのか
+
+最初に思いつく対策は「直近 N 件だけ送る」というスライディングウィンドウ方式です。実装は簡単ですが、ユーザーから見ると「さっき自分が言った名前を覚えていない」という致命的な体験を生みます。N=10 で切ると、11 ターン前に伝えた前提条件は完全に消えてしまうわけです。
+
+ローリングサマリは、この問題を「古い会話は要約して残す、新しい会話は逐語で残す」という二段構えで解決します。要約は固定長に保てるので、トークン総量がほぼ一定値で頭打ちになります。
+
+## アーキテクチャの全体像
+
+実装は3つの関数で十分です。
+
+- `count_tokens(history)`: 会話履歴の現在のトークン数を取得します
+- `should_compress(history, threshold)`: 圧縮すべきかどうかを判定します
+- `compress(history, keep_recent)`: 古い部分を要約に置き換え、直近 N 件は逐語で残します
+
+ポイントは「いつ圧縮するか」と「何を要約に含めるか」です。閾値はモデルの上限ではなく **コスト基準** で決めます。Gemini 2.5 Pro のコンテキストウィンドウは 100 万トークンありますが、毎リクエストで数十万トークンを送り続けるのは料金的に持ちません。
+
+## 実装：Python での最小構成
+
+以下のコードはそのまま動かせる構成にしてあります。`google-genai` SDK を使い、要約も Gemini 自身に任せています。
+
+```python
+# pip install google-genai==1.* tiktoken-style
+from google import genai
+from google.genai import types
+import os
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+MODEL = "gemini-2.5-flash"  # 要約は安くて速い Flash で十分
+
+# 圧縮を発動するトークン閾値（コスト基準で決める）
+COMPRESS_THRESHOLD = 8000
+# 逐語で残す直近メッセージ数（ユーザー＋モデルで2の倍数が扱いやすい）
+KEEP_RECENT = 6
+
+def count_tokens(history: list[types.Content]) -> int:
+    """会話履歴の合計トークン数を返します。"""
+    resp = client.models.count_tokens(model=MODEL, contents=history)
+    return resp.total_tokens
+
+def summarize(messages: list[types.Content]) -> str:
+    """古い会話部分を1段落の要約に変換します。"""
+    # 要約専用プロンプト。「事実」「前提」「未解決の質問」を必ず保持させる
+    transcript = "\n".join(
+        f"{m.role}: {m.parts[0].text}" for m in messages if m.parts
+    )
+    instruction = (
+        "次の会話を、後続のチャットで失ってはいけない情報に絞って5〜8行で要約してください。"
+        "ユーザーが共有した固有名詞・数値・好み・未解決の質問は必ず保持してください。"
+        "会話の雰囲気や挨拶は省略して構いません。\n\n"
+        f"---\n{transcript}\n---"
+    )
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=instruction,
+        config=types.GenerateContentConfig(temperature=0.2),
+    )
+    return resp.text
+
+def compress(history: list[types.Content]) -> list[types.Content]:
+    """履歴を「要約 + 直近 KEEP_RECENT 件」に圧縮します。"""
+    if len(history) <= KEEP_RECENT:
+        return history
+    old, recent = history[:-KEEP_RECENT], history[-KEEP_RECENT:]
+    summary = summarize(old)
+    summary_msg = types.Content(
+        role="user",
+        parts=[types.Part.from_text(text=f"[これまでの会話の要約]\n{summary}")],
+    )
+    return [summary_msg] + recent
+```
+
+期待する出力は、`compress()` を通したあとの履歴がおおむね 1,500〜2,500 トークンに収まることです。これで何百ターン続くセッションでも、毎リクエストの入力コストが安定します。
+
+## いつ圧縮を発動するか
+
+毎ターン圧縮するのは無駄です。要約自体にトークンを消費するためです。私は次のようなループで運用しています。
+
+```python
+def chat_turn(history, user_message):
+    history.append(types.Content(
+        role="user",
+        parts=[types.Part.from_text(text=user_message)],
+    ))
+    if count_tokens(history) > COMPRESS_THRESHOLD:
+        history = compress(history)
+    resp = client.models.generate_content(model="gemini-2.5-pro", contents=history)
+    history.append(resp.candidates[0].content)
+    return history, resp.text
+```
+
+`COMPRESS_THRESHOLD` を一度だけ越えたタイミングで圧縮が走り、その後はしばらく逐語追記で進み、また閾値を越えたら再圧縮、という流れになります。要約コストは 8,000 トークン処理で Flash なら 1 円未満です。
+
+## 要約してはいけない情報
+
+ローリングサマリで失敗しがちなのが、ユーザー名・予約番号・コード片・URL のような「失うと致命的な情報」を要約器が落としてしまうケースです。対策はふたつあります。
+
+ひとつは、要約プロンプトに「固有名詞・数値・URL は原文のまま残してください」と明示することです。Gemini はかなり素直に従ってくれます。
+
+もうひとつは、構造化メモリを別レイヤで持つことです。ユーザープロフィール、現在のタスク状態、コードスニペットなどはアプリ側で抽出して JSON で別管理し、毎リクエストの先頭に必ず差し込みます。要約器の善意に頼らず「絶対に消えない場所」を用意しておくと安心です。これは [Gemini API の長期記憶設計](/articles/gemini-advanced/gemini-api-long-memory-session-persistence-chatbot-architecture) で詳しく扱っています。
+
+## 他のアプローチとの使い分け
+
+- **コンテキストキャッシュが向く場面**: 不変の長文（マニュアル・ドキュメント）を都度添付するケース。会話のように内容が変わり続ける履歴には不向きです。詳しくは [コンテキストキャッシュでコストを下げる方法](/articles/gemini-api/gemini-api-context-caching-cost-optimization) をご覧ください
+- **ベクトル検索が向く場面**: 過去の会話から「この話題に関連する部分だけ」を引き出したいとき。会話が数千ターンに及ぶ場合や、検索可能な記憶がほしい場合に有効です
+- **ローリングサマリが向く場面**: 単一スレッドの会話を中長期で続ける典型的なチャットボット。実装コストと効果のバランスが最も良い選択肢だと感じています
+
+トークン上限エラーそのものへの対症療法は [Gemini API トークン上限超過エラーの対処](/articles/gemini-api/gemini-api-token-limit-exceeded-error-fix) にまとめてあります。本番運用に入る前に一度目を通しておくと、エラーが出た日に慌てずに済みます。
+
+## 運用に入る前のひと工夫
+
+ローリングサマリを入れたあとは、要約品質のサンプリング監視を1日1回でも回しておくことをおすすめします。要約結果を別テーブルに保存し、週に一度ランダムサンプリングで「要約に含まれていない重要情報がないか」を Gemini 自身にレビューさせる、という運用が現実的です。完璧なサマリは存在しないので、欠落を見つけたら要約プロンプトを改善する、という小さなフィードバックループを回し続けることになります。
+
+LLM アプリのアーキテクチャをもう一段深く学びたい方には、[ChatGPT/LangChainによるチャットシステム構築［実践］入門（吉田真吾・大嶋勇樹 著）](https://www.amazon.co.jp/dp/4297138395/?tag=pinocchio-22) が参考になります。書籍は OpenAI 中心ですが、メモリ管理・トークン会計・プロンプト設計の考え方は Gemini にもそのまま応用できます。
+
+まずは手元のチャットボットに `count_tokens` を1行入れて、現在の入力サイズをログに吐かせてみてください。圧縮が必要かどうかは、データを見れば一目で判断できます。
