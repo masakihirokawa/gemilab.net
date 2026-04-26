@@ -1,0 +1,176 @@
+---
+title: "When Gemini API Returns Mojibake: 4 Places to Check First"
+slug: "gemini-api-japanese-response-mojibake-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-26T18:30"
+author: "Gemini Lab"
+description: "Mojibake in Gemini API responses almost never comes from the API itself — it lives in your client code. Walk through the four layers (HTTP decoding, streaming chunks, output encoding, surrogate pairs) where the corruption hides."
+tags: ["gemini-api", "troubleshooting", "encoding", "utf-8", "streaming", "japanese"]
+---
+
+You ship a Gemini API integration to production, and the next morning a user reports: "The screen is filled with `あい` style codes that I can't read at all." If you've ever shipped an API integration in any language, you know the sinking feeling — and you also know you're about to spend half a day chasing an encoding bug.
+
+I had exactly this happen on the first chat app I deployed against Gemini. Locally everything looked fine. In the production logs, the same response showed up as `\xe3\x81\x82\xe3\x81\x84` — raw hex that no user would ever see correctly. It took me half a day of bisecting client layers before I found the culprit.
+
+The interesting part: in nearly every case, Gemini's servers return perfectly valid UTF-8. The mojibake is happening between the wire and your output, not on Google's side. This guide walks through the four client-side layers where the corruption almost always lives, in the order I check them when this lands in my inbox.
+
+## Layer 1: HTTP Client Charset Handling
+
+The first place to look is your HTTP client's response decoding behavior. Gemini API returns `application/json; charset=UTF-8`, but some libraries silently fall back to ISO-8859-1 when their charset detection logic gets confused by header parsing edge cases.
+
+The classic Python example using `requests`:
+
+```python
+import requests
+
+# Wrong: text may be decoded with the wrong charset
+response = requests.post(url, json=payload)
+print(response.text)  # 'ã\x81\x82ã\x81\x84' style garbling
+
+# Right: explicitly set the encoding before reading .text
+response = requests.post(url, json=payload)
+response.encoding = "utf-8"
+print(response.text)
+```
+
+The most reliable pattern is to skip `response.text` entirely and use `response.json()` (which always assumes UTF-8 per the JSON spec), or decode the raw bytes yourself with `response.content.decode("utf-8")`. Both bypass `requests`' apparent_encoding heuristic, which is the actual source of the flakiness.
+
+The same trap exists in JavaScript when you're working at the byte level rather than via `Response.json()`:
+
+```javascript
+const res = await fetch(url, {
+  method: "POST",
+  body: JSON.stringify(payload),
+});
+
+// If you only need the text, this is the safest path
+const data = await res.json();
+console.log(data.candidates[0].content.parts[0].text);
+
+// If you must work with raw bytes, decode explicitly
+const buffer = await res.arrayBuffer();
+const decoded = new TextDecoder("utf-8").decode(buffer);
+```
+
+If you've confirmed the bytes are arriving correctly but the decoded string is still wrong, move to the next layer.
+
+## Layer 2: Streaming Chunks Splitting Multibyte Characters
+
+When mojibake only appears with `generateContentStream`, the cause is almost always chunk boundary alignment.
+
+A single Japanese character takes three bytes in UTF-8 (e.g., `あ` = `E3 81 82`). The streaming transport doesn't care about character boundaries — it ships whatever bytes are available — so the three bytes of one character can land in two separate chunks. Decoding each chunk independently produces partial sequences and the dreaded `?` replacement character.
+
+```python
+# Buggy: decoding each chunk independently
+async for chunk in stream:
+    text = chunk.decode("utf-8")  # breaks on multibyte boundaries
+
+# Correct: use IncrementalDecoder to buffer partial bytes
+import codecs
+decoder = codecs.getincrementaldecoder("utf-8")()
+
+async for chunk in stream:
+    text = decoder.decode(chunk)
+    if text:
+        yield text
+
+# Flush any trailing buffered bytes after the stream ends
+final = decoder.decode(b"", final=True)
+```
+
+The official `google-generativeai` SDK handles this internally, so you typically only see this bug when reading streams manually — most often in Edge Runtime, Cloudflare Workers, or Deno code that pulls bytes from `Response.body.getReader()` directly. In those environments, wrap the reader in a `TextDecoderStream`:
+
+```javascript
+// In Cloudflare Workers / Edge Runtime, prefer TextDecoderStream
+const reader = res.body
+  .pipeThrough(new TextDecoderStream("utf-8"))
+  .getReader();
+
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  process(value);  // value is already a string, not bytes
+}
+```
+
+`TextDecoderStream` is the streaming equivalent of `IncrementalDecoder` and handles cross-chunk multibyte characters for you. For deeper coverage of streaming chunk handling, see our [Gemini API streaming response chunk error and UX guide](/articles/gemini-api/gemini-api-streaming-response-control-chunk-error-ux).
+
+## Layer 3: Encoding at the Output Layer (Console, File, DB)
+
+Even when you've decoded the API response correctly, the next mojibake risk is your output stage. This catches a surprising number of teams in production because local development often hides the bug entirely.
+
+Windows environments are particularly notorious. Python's default stdout encoding can be `cp932` (Shift_JIS) on Japanese Windows installs, which raises `UnicodeEncodeError` or substitutes garbage characters when you print Gemini's response.
+
+```python
+import sys
+import io
+
+# Force UTF-8 on stdout for cross-platform safety
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+print(gemini_response)
+
+# Always specify encoding when writing files
+with open("output.txt", "w", encoding="utf-8") as f:
+    f.write(gemini_response)
+```
+
+If you're persisting responses to MySQL, double-check that your column charset is `utf8mb4` and not the legacy `utf8`. The legacy `utf8` is only three bytes wide and silently truncates four-byte UTF-8 characters — emoji, some kanji like 𠮷 (the variant used in 𠮷野家), and many Unicode 11+ characters disappear or corrupt. Switching is one ALTER TABLE statement, but you have to remember to do it before you have a million rows.
+
+For PostgreSQL the default is already UTF-8, but watch out for connection-level client_encoding settings if you're seeing mojibake only through specific drivers. JDBC and some Go drivers default to a server-side encoding that won't match Gemini's output.
+
+## Layer 4: Surrogate Pairs and Emoji
+
+Gemini frequently sprinkles emoji (🎉, 😊) into casual responses. These live in supplementary Unicode planes and are represented as UTF-16 surrogate pairs in JavaScript strings, which makes them easy to break with naive substring operations.
+
+```javascript
+const text = "Congrats🎉";
+text.length;  // 9 — the emoji counts as 2 code units
+
+// Wrong: slicing in the middle of a surrogate pair leaves a lone half
+text.slice(0, 8);  // ends with an unpaired \uD83C, displays as a box
+
+// Right: split into code points first
+const points = Array.from(text);
+points.slice(0, 7).join("");  // valid string ending with the 'g'
+```
+
+I once truncated Gemini responses to fit a 200-character Web Push notification title using `slice(0, 200)` — and it cut right through an emoji, producing a malformed string that the push gateway rejected entirely. Whenever you trim user-visible Gemini output, work in code points (`Array.from`, `for...of`, or libraries like `grapheme-splitter` for true grapheme support).
+
+The same caution applies to `substring` calls in your database layer — particularly anywhere you implement a "first 100 characters" preview field. If your storage column is UTF-16 and your truncation logic is byte-based, you will eventually hit a corrupted preview. The fix in JavaScript is consistent: convert to a code point array first, slice on that array, then re-join. In Python this is rarely an issue because `str` is code-point native, but the same care matters when interfacing with `len(text.encode("utf-16-le")) // 2` style measurements that some legacy systems still use.
+
+Worth knowing: even `Array.from` doesn't fully solve grapheme-cluster problems for combined emoji like 👨‍👩‍👧‍👦 (a family glyph that contains zero-width joiners). For user-facing trim operations on Gemini chat output, reach for `Intl.Segmenter` (modern browsers and Node 16+) or the `grapheme-splitter` npm package — they handle ZWJ sequences correctly.
+
+If your underlying issue is mixed-language output rather than encoding, the [Gemini API language control fix](/articles/gemini-api/gemini-api-language-control-mixed-output-fix) covers the prompting side. For prompt-level Japanese quality tuning, see the [Gemini API Japanese practical guide](/articles/gemini-api/gemini-api-japanese-language-practical-guide).
+
+## A Practical Bisection Strategy
+
+When you suspect mojibake but can't immediately tell which layer is at fault, treat the problem like a binary search across your pipeline. Add a single instrumentation point at each handoff: where the HTTP response arrives, where the streaming decoder produces text, where you write to disk or DB, and where the user-facing template renders. Capture both `repr(value)` and `len(value)` at each point.
+
+The string length is the secret weapon here. A correctly decoded `"あいうえお"` has length 5 in Python and 5 in JavaScript. The same five characters as raw UTF-8 bytes have length 15. If you see length 15 where you expected 5, you're looking at undecoded bytes. If you see length 7 where you expected 5, you may have surrogate pairs counted as separate code units (this is how JavaScript shows `length` for strings containing supplementary plane characters).
+
+```python
+import logging
+
+def debug_text(label, value):
+    logging.info(
+        "%s: type=%s len=%d repr=%r",
+        label, type(value).__name__, len(value), value[:80]
+    )
+
+debug_text("after_http", response.content)        # bytes
+debug_text("after_decode", response.text)         # str
+debug_text("after_stream_assemble", joined_text)  # str
+debug_text("before_db_write", final_text)        # str
+```
+
+In a CI environment you can promote these to assertions: `assert isinstance(response.text, str)` and `assert "ã" not in response.text` (the `ã` byte that signals UTF-8-as-Latin-1 misdecoding). Both are cheap to add and catch the regression at the layer that caused it, not three hops later.
+
+## A One-Line Log That Will Save You Hours
+
+Mojibake debugging lives or dies by where you can see the raw bytes. Add a `print(repr(response_text))` (or `console.log(JSON.stringify(text))`) at each stage of your pipeline — request, decode, stream, write — and read each line carefully. When you see `'\xe3\x81\x82'` you're looking at undecoded bytes; when you see `'あ'` you have a properly decoded code point.
+
+That single instrumentation line tells you exactly which of the four layers above is corrupting your data — usually within minutes rather than hours. I keep it permanently behind a debug flag in production so I can flip it on the moment a support ticket comes in.
+
+Gemini's servers will not lie to you: they hand back valid UTF-8 every time. The bug is always somewhere in your client. Once you internalize that, mojibake stops feeling like a black box and starts feeling like a four-step checklist.
