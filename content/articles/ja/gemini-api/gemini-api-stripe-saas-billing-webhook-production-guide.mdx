@@ -1,0 +1,499 @@
+---
+title: "Gemini API × Stripe で組む AI SaaS 課金 — 使用量ベースの本番実装ガイド"
+slug: "gemini-api-stripe-saas-billing-webhook-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-26T19:45"
+author: "Gemini Lab"
+description: "Gemini API を使った個人開発 SaaS で「使った分だけ請求する」課金システムを Stripe Metered Billing と Webhook で本番実装する完全ガイド。トークン計測・サブスク同期・ティア別ゲーティング・落とし穴まで網羅します。"
+tags: ["Gemini API", "Stripe", "SaaS", "課金", "Webhook", "Metered Billing", "本番運用"]
+highlights:
+  - "Gemini API の使用量に応じた従量課金システムを、Stripe Metered Billing でつくる手順を、コピペで動くコード付きで持ち帰れる"
+  - "Webhook によるサブスクリプション状態の同期と、ティア別 AI 機能ゲーティングを、本番で安定稼働させる設計パターンを習得できる"
+  - "Idempotency・リトライ・監視まで、個人開発の AI SaaS が事故を起こさず運用できる本番ノウハウを、一通り押さえられる"
+---
+
+Gemini API を組み込んだ SaaS を一人で作っていると、最初に立ち止まるのは「課金をどう設計するか」だと感じています。私自身、無料枠で使い始めた読者がそのまま定着してくれるのは嬉しい一方で、ヘビーユーザーが API コストを上回って赤字になる構造をそのままにしておくのは持続可能ではありません。
+
+定額のサブスクリプションだけだと、月に 1 万トークンしか使わない人と 1,000 万トークン使う人が同じ料金になってしまいます。逆に純粋な従量課金だけにすると「いくら使うか分からない」という不安から、潜在ユーザーが登録自体をためらいます。
+
+そこでこの記事では、**「定額のベースプラン + 一定量を超えた分の従量課金」というハイブリッドモデル**を、Gemini API と Stripe の組み合わせで本番運用できるレベルまで実装する手順を、私が実際に運用している設計を元にまとめます。Webhook ハンドリング・Idempotency・トークン計測の精度・ティア別ゲーティングといった、実運用で必ずぶつかる論点を最初から織り込んだ構成です。
+
+## 個人開発 SaaS で使用量ベース課金を選ぶ判断基準
+
+「定額にすべきか、従量にすべきか」を最初に整理しておきましょう。私の経験では、Gemini API のような LLM をバックエンドに使うサービスでは、純粋な定額制は早晩破綻します。
+
+理由はシンプルで、AI を使うアプリケーションの利用量はユーザー間で 1,000 倍以上の差が出るからです。ライトユーザーが月に数十リクエスト、ヘビーユーザーが月に数十万リクエストというのは珍しくありません。これを単一の月額で吸収しようとすると、ライトユーザーの料金を引き上げるか、ヘビーユーザーで赤字を出すかの二択になります。
+
+私が現在採用しているのは、以下のハイブリッドモデルです。
+
+- **Free**: 月 50,000 トークンまで無料（離脱を防ぐためのオンボーディング枠）
+- **Pro**（月額 ¥980）: 月 500,000 トークンまで含み、超過分は 100,000 トークンあたり ¥150 の従量課金
+- **Team**（月額 ¥4,800）: 月 5,000,000 トークンまで含み、超過分は 100,000 トークンあたり ¥100
+
+このモデルの良い点は、「月額のベースプランで安心感を提供しつつ、ヘビーユーザーからも適切に費用を回収できる」ことです。Stripe ではこれを **Subscription（定額）+ Metered Subscription Item（従量）** として 1 つの請求書にまとめられます。
+
+## システム全体の構成 — トークン使用量から請求書発行までの流れ
+
+実装に入る前に、データの流れを把握しておくと迷子になりません。私が運用している構成は以下の通りです。
+
+1. ユーザーが Gemini API を呼ぶたびに、サーバー側で `usageMetadata.totalTokenCount` を取得して DB に記録する
+2. バックグラウンドジョブが 1 分ごとに、未集計のトークン使用量を Stripe Meter Event API に送信する
+3. Stripe が月末に「ベースプラン + 計測されたトークン量 × 単価」で請求書を自動発行する
+4. Stripe Webhook（`invoice.payment_succeeded` / `customer.subscription.updated`）でアプリ側のユーザー権限を同期する
+
+この設計のポイントは、**Gemini API の呼び出しと Stripe への報告を分離している**ことです。リアルタイムで Stripe に送ろうとするとレイテンシが乗りますし、Stripe 側のレート制限にも引っかかります。一旦自前 DB に貯めてバッチで送るのが本番では現実的です。
+
+## Stripe 側のセットアップ — Meter と Price の作成
+
+まず Stripe ダッシュボードまたは API で、トークンを計測するための Meter と、それに紐づく Price を作成します。Stripe の管理コンソールでも作れますが、IaC として残せるよう CLI スクリプトで作るのをおすすめします。
+
+```bash
+# .env.local
+# STRIPE_SECRET_KEY=sk_test_...
+# stripe-cli を使う場合は事前に stripe login を実行
+
+# 1) トークン用の Meter を作成
+stripe meters create \
+  --display-name "Gemini API Tokens" \
+  --event-name "gemini_api_tokens_used" \
+  --default-aggregation.formula sum \
+  --customer-mapping.event-payload-key stripe_customer_id \
+  --customer-mapping.type by_id \
+  --value-settings.event-payload-key value
+```
+
+`event-name` に指定した `gemini_api_tokens_used` が、後ほどコードから Meter Event を送る際のキーになります。`value-settings.event-payload-key=value` は「ペイロードの `value` フィールドを集計対象にする」という指定で、これがないとトークン数を渡せません。
+
+次に、この Meter を集計単位として参照する Price を作ります。
+
+```bash
+# 2) Pro プランのベース Price（定額）を作成
+PROD_PRO=$(stripe products create -d name="Gemini SaaS Pro" -d type=service -j | jq -r '.id')
+stripe prices create \
+  --product "$PROD_PRO" \
+  --unit-amount 98000 \
+  --currency jpy \
+  --recurring.interval month
+
+# 3) Pro プランの従量課金 Price（Meter 紐付け）を作成
+# 100,000 トークンあたり ¥150 → 1 トークンあたり ¥0.0015 = 1/1000 円単位で 0.15 銭
+# Stripe では「1 単位あたりの価格」を tiered で表現すると分かりやすい
+stripe prices create \
+  --product "$PROD_PRO" \
+  --currency jpy \
+  --billing-scheme tiered \
+  --tiers-mode graduated \
+  --recurring.interval month \
+  --recurring.usage-type metered \
+  --recurring.meter "$METER_ID" \
+  --tiers '[{"up_to":500000,"flat_amount":0},{"up_to":"inf","unit_amount_decimal":"0.0015"}]'
+```
+
+`tiers` の最初の階層で「50 万トークンまでは追加料金なし」を表現し、それを超えた分は 1 トークンあたり ¥0.0015（= 100,000 トークンで ¥150）として設定しています。`unit_amount_decimal` を使うと小数点以下も指定できるため、トークン単位の細かい価格が組めます。
+
+> **なぜ Subscription を 2 つの Price で構成するのか**: Stripe の Subscription は複数の Subscription Item を持てます。1 つを定額の Price、もう 1 つを Metered Price にすることで、月末に「定額分 + 計測量分」の合算で請求書が自動発行されます。プラン変更（Pro→Team 等）時もこの構造のまま Price だけ差し替えれば良いので、本番運用で扱いやすくなります。
+
+## トークン使用量の計測と Stripe への報告
+
+ここからが実装の本丸です。Gemini API からトークン数を取得して、自前 DB に記録し、定期的に Stripe に送る部分を作っていきます。
+
+### 1. Gemini API 呼び出し時のトークン計測
+
+```typescript
+// src/lib/gemini.ts
+import { GoogleGenerativeAI, type GenerativeModel } from "@google/generative-ai";
+import { recordTokenUsage } from "./usage-store";
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+
+export async function generateWithUsage(
+  userId: string,
+  prompt: string,
+  modelName: string = "gemini-2.5-flash"
+): Promise<{ text: string; totalTokens: number }> {
+  const model: GenerativeModel = genAI.getGenerativeModel({ model: modelName });
+
+  try {
+    const result = await model.generateContent(prompt);
+    // usageMetadata は SDK のバージョンによってフィールド名が異なる
+    // 2026 年時点の @google/generative-ai では response.usageMetadata に格納される
+    const usage = result.response.usageMetadata;
+    const totalTokens = usage?.totalTokenCount ?? 0;
+
+    // DB へ非同期で記録（API レスポンスをブロックしないため await しない選択肢もある）
+    await recordTokenUsage({
+      userId,
+      promptTokens: usage?.promptTokenCount ?? 0,
+      completionTokens: usage?.candidatesTokenCount ?? 0,
+      totalTokens,
+      model: modelName,
+      occurredAt: new Date(),
+    });
+
+    return { text: result.response.text(), totalTokens };
+  } catch (err) {
+    // トークン計測に失敗してもユーザーへの応答は返す方針なら、
+    // ここでログに記録するだけにとどめて throw しない選択もある
+    console.error("[gemini] generation failed", { userId, err });
+    throw err;
+  }
+}
+```
+
+このコードのポイントは 2 つあります。1 つ目は **`usageMetadata` を必ず取り出して記録する**こと。これがないと後で Stripe にトークン数を送れません。2 つ目は **DB 書き込みの失敗をユーザーレスポンスに混ぜない設計**にすること。ユーザーは AI からの応答を欲しいだけで、計測失敗の影響を受けるべきではありません。
+
+### 2. usage-store の実装（Postgres を例に）
+
+```typescript
+// src/lib/usage-store.ts
+import { sql } from "./db";
+
+export type UsageRecord = {
+  userId: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  model: string;
+  occurredAt: Date;
+};
+
+export async function recordTokenUsage(rec: UsageRecord): Promise<void> {
+  await sql`
+    INSERT INTO token_usage (
+      user_id, prompt_tokens, completion_tokens,
+      total_tokens, model, occurred_at, reported_to_stripe
+    ) VALUES (
+      ${rec.userId}, ${rec.promptTokens}, ${rec.completionTokens},
+      ${rec.totalTokens}, ${rec.model}, ${rec.occurredAt}, false
+    )
+  `;
+}
+
+// 未報告レコードを取得（バッチジョブ用）
+export async function fetchUnreportedUsage(limit: number = 1000) {
+  return sql<{ id: string; user_id: string; total_tokens: number; occurred_at: Date }[]>`
+    SELECT id, user_id, total_tokens, occurred_at
+    FROM token_usage
+    WHERE reported_to_stripe = false
+    ORDER BY occurred_at ASC
+    LIMIT ${limit}
+  `;
+}
+
+export async function markReported(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await sql`
+    UPDATE token_usage
+    SET reported_to_stripe = true, reported_at = NOW()
+    WHERE id = ANY(${ids})
+  `;
+}
+```
+
+`reported_to_stripe` という boolean フラグで「Stripe に報告済みかどうか」を管理しているのがポイントです。バッチジョブが落ちても、フラグが立っていない行を再度処理するだけで「報告漏れ」を防げます。
+
+### 3. Stripe Meter Event への報告（バッチジョブ）
+
+```typescript
+// src/jobs/report-usage-to-stripe.ts
+import Stripe from "stripe";
+import { fetchUnreportedUsage, markReported } from "../lib/usage-store";
+import { getStripeCustomerId } from "../lib/customer-store";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-09-30.preview",
+});
+
+export async function reportUsageToStripe(): Promise<{
+  reported: number;
+  failed: number;
+}> {
+  const records = await fetchUnreportedUsage(1000);
+  if (records.length === 0) return { reported: 0, failed: 0 };
+
+  const reportedIds: string[] = [];
+  let failed = 0;
+
+  // ユーザーごとにまとめて送る（ペイロードを減らすため）
+  const grouped = new Map<string, typeof records>();
+  for (const r of records) {
+    if (!grouped.has(r.user_id)) grouped.set(r.user_id, []);
+    grouped.get(r.user_id)!.push(r);
+  }
+
+  for (const [userId, rows] of grouped) {
+    const customerId = await getStripeCustomerId(userId);
+    if (!customerId) {
+      // Stripe 顧客と紐付いていないユーザーはスキップ（フリーユーザー等）
+      reportedIds.push(...rows.map((r) => r.id));
+      continue;
+    }
+
+    const totalTokens = rows.reduce((s, r) => s + r.total_tokens, 0);
+
+    try {
+      await stripe.billing.meterEvents.create({
+        event_name: "gemini_api_tokens_used",
+        // identifier を渡すと Stripe 側で重複排除してくれる（Idempotency Key の役割）
+        identifier: `usage-${userId}-${rows[0].id}-${rows.at(-1)!.id}`,
+        payload: {
+          stripe_customer_id: customerId,
+          value: String(totalTokens),
+        },
+        timestamp: Math.floor(rows.at(-1)!.occurred_at.getTime() / 1000),
+      });
+      reportedIds.push(...rows.map((r) => r.id));
+    } catch (err) {
+      console.error("[stripe-meter] report failed", { userId, err });
+      failed += rows.length;
+      // 失敗したバッチは next run でリトライされる（フラグを立てない）
+    }
+  }
+
+  await markReported(reportedIds);
+  return { reported: reportedIds.length, failed };
+}
+```
+
+このバッチジョブの設計で特に意識しているのは、**`identifier` フィールドを使った冪等性の確保**です。同じ識別子で 2 回リクエストしても、Stripe 側で重複排除されるため、二重請求を防げます。私は「対象ユーザーID と最初/最後のレコード ID」を組み合わせて生成していますが、要件に合わせて UUID を使っても構いません。
+
+ジョブの実行は Cloudflare Workers の Cron Trigger でも、Vercel Cron でも、Google Cloud Scheduler でも、何でも構いません。1 分間隔で動かしておけば、ユーザーから見れば「リアルタイムに使用量が反映されている」感覚になります。
+
+## Stripe Webhook でサブスクリプション状態を同期する
+
+請求書の発行や決済の成否、サブスクリプションのキャンセルといったイベントは、Stripe Webhook で受け取ってアプリ側の権限を更新する必要があります。私が必須で処理しているイベントは以下の通りです。
+
+- `customer.subscription.created` — 新規契約時にユーザーをそのプランへ昇格
+- `customer.subscription.updated` — プラン変更（Pro→Team 等）時に権限を切り替え
+- `customer.subscription.deleted` — キャンセル時にフリープランへ降格
+- `invoice.payment_succeeded` — 月次決済成功時に「翌月分の利用権」を付与
+- `invoice.payment_failed` — 決済失敗時にユーザーに通知＋猶予期間に移行
+
+```typescript
+// src/app/api/stripe/webhook/route.ts (Next.js App Router)
+import Stripe from "stripe";
+import { NextResponse } from "next/server";
+import { upsertSubscription, downgradeUser, markPaymentFailed } from "@/lib/billing";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-09-30.preview",
+});
+const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
+
+export async function POST(req: Request): Promise<Response> {
+  const sig = req.headers.get("stripe-signature");
+  const body = await req.text();
+  if (!sig) return new NextResponse("missing signature", { status: 400 });
+
+  let event: Stripe.Event;
+  try {
+    // Cloudflare Workers / Edge では非同期版を使う
+    event = await stripe.webhooks.constructEventAsync(body, sig, webhookSecret);
+  } catch (err) {
+    console.error("[stripe-webhook] signature verify failed", err);
+    return new NextResponse("invalid signature", { status: 400 });
+  }
+
+  // Idempotency: event.id を DB に記録して重複処理を防ぐ
+  if (await isAlreadyProcessed(event.id)) {
+    return NextResponse.json({ received: true, idempotent: true });
+  }
+
+  try {
+    switch (event.type) {
+      case "customer.subscription.created":
+      case "customer.subscription.updated": {
+        const sub = event.data.object as Stripe.Subscription;
+        await upsertSubscription({
+          customerId: sub.customer as string,
+          subscriptionId: sub.id,
+          status: sub.status,
+          // items から定額プラン側の Price ID を取り出してティアを判定
+          tier: detectTierFromItems(sub.items.data),
+          currentPeriodEnd: new Date(sub.current_period_end * 1000),
+        });
+        break;
+      }
+      case "customer.subscription.deleted": {
+        const sub = event.data.object as Stripe.Subscription;
+        await downgradeUser(sub.customer as string);
+        break;
+      }
+      case "invoice.payment_failed": {
+        const invoice = event.data.object as Stripe.Invoice;
+        await markPaymentFailed({
+          customerId: invoice.customer as string,
+          attemptCount: invoice.attempt_count ?? 0,
+        });
+        break;
+      }
+      default:
+        // 想定外のイベントはログだけ残す（200 で返さないと Stripe がリトライし続ける）
+        console.log("[stripe-webhook] unhandled event", event.type);
+    }
+    await markProcessed(event.id);
+    return NextResponse.json({ received: true });
+  } catch (err) {
+    console.error("[stripe-webhook] handler failed", { type: event.type, err });
+    // 5xx を返すと Stripe が指数バックオフで自動リトライしてくれる
+    return new NextResponse("internal error", { status: 500 });
+  }
+}
+```
+
+このハンドラで最重要なのは、**`event.id` を使った Idempotency 制御**です。Stripe は同じイベントを複数回送ってくることがあります（特にネットワーク不調時）。重複処理してしまうと「ユーザーを 2 回昇格させて DB がおかしくなる」といった事故になります。`isAlreadyProcessed(event.id)` で先に弾く設計を必ず入れておきましょう。
+
+もう 1 つの落とし穴は、**未対応イベントでも 200 を返す**ことです。500 を返すと Stripe が延々とリトライしてきて、ログがイベントで埋まります。`default` 句では「ログだけ残して 200 で受ける」のが鉄則です。
+
+## ティア別 AI 機能ゲーティングの実装
+
+「Free ユーザーは GPT-4o 級のモデルが使えない」「Pro ユーザーは Vision に対応」といったティア別の機能制限は、ミドルウェアで一元化しておくと拡張が楽です。
+
+```typescript
+// src/lib/feature-gate.ts
+type Tier = "free" | "pro" | "team";
+
+type FeatureMatrix = {
+  [key in Tier]: {
+    allowedModels: string[];
+    monthlyTokenIncluded: number;
+    visionEnabled: boolean;
+    longContextEnabled: boolean; // 1M トークンコンテキストを使えるか
+  };
+};
+
+export const FEATURES: FeatureMatrix = {
+  free: {
+    allowedModels: ["gemini-2.5-flash-lite"],
+    monthlyTokenIncluded: 50_000,
+    visionEnabled: false,
+    longContextEnabled: false,
+  },
+  pro: {
+    allowedModels: ["gemini-2.5-flash", "gemini-2.5-pro"],
+    monthlyTokenIncluded: 500_000,
+    visionEnabled: true,
+    longContextEnabled: false,
+  },
+  team: {
+    allowedModels: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-3-pro"],
+    monthlyTokenIncluded: 5_000_000,
+    visionEnabled: true,
+    longContextEnabled: true,
+  },
+};
+
+export class FeatureNotAllowedError extends Error {
+  constructor(
+    public readonly feature: string,
+    public readonly currentTier: Tier,
+    public readonly requiredTier: Tier
+  ) {
+    super(`feature "${feature}" requires "${requiredTier}", but user is on "${currentTier}"`);
+  }
+}
+
+export function ensureModelAllowed(tier: Tier, model: string): void {
+  if (!FEATURES[tier].allowedModels.includes(model)) {
+    // 上位ティアで使えるかを判定して、UI に「Pro にアップグレードで利用可能」と返せるようにする
+    const requiredTier = (Object.keys(FEATURES) as Tier[]).find((t) =>
+      FEATURES[t].allowedModels.includes(model)
+    );
+    throw new FeatureNotAllowedError("model", tier, requiredTier ?? "team");
+  }
+}
+```
+
+そして API ルート側で、リクエストの最初にこのゲートを通します。
+
+```typescript
+// src/app/api/generate/route.ts
+import { auth } from "@/lib/auth";
+import { getUserTier } from "@/lib/billing";
+import { ensureModelAllowed, FeatureNotAllowedError } from "@/lib/feature-gate";
+import { generateWithUsage } from "@/lib/gemini";
+
+export async function POST(req: Request) {
+  const session = await auth();
+  if (!session) return new Response("unauthorized", { status: 401 });
+
+  const { prompt, model = "gemini-2.5-flash-lite" } = await req.json();
+  const tier = await getUserTier(session.user.id);
+
+  try {
+    ensureModelAllowed(tier, model);
+  } catch (err) {
+    if (err instanceof FeatureNotAllowedError) {
+      // クライアントが「アップグレードして使う」UI を出せるよう、必要ティアを返す
+      return Response.json(
+        { error: "upgrade_required", required_tier: err.requiredTier, current_tier: err.currentTier },
+        { status: 402 }
+      );
+    }
+    throw err;
+  }
+
+  const { text, totalTokens } = await generateWithUsage(session.user.id, prompt, model);
+  return Response.json({ text, totalTokens });
+}
+```
+
+`402 Payment Required` というステータスコードを使って「課金が必要」を表現するのは古典的な慣習です。クライアント側で `402` を受けたら、アップグレードモーダルを開く実装にしておくと UX が良くなります。
+
+## よくある落とし穴と回避策
+
+### 1. Stripe の月次サイクルとアプリ側の月次集計がズレる
+
+「毎月 1 日に集計をリセット」と素朴に書くと、ユーザーが月の途中（例: 4 月 15 日）に Pro を契約した場合、Stripe の請求サイクル（4/15〜5/14）とアプリ側のリセット日が噛み合いません。**必ず Stripe の `current_period_start` と `current_period_end` を信頼源にする**こと。アプリ側でカレンダー月を独自計算するのは事故の元です。
+
+### 2. Webhook が遅延・重複・順序違いで届く
+
+Stripe Webhook は「最低 1 回配送」を保証していますが、「最大 1 回」は保証しません。同じイベントが複数回届くこと、`subscription.updated` の前に `subscription.deleted` が届く順序逆転、Webhook 全体が数分遅延することはすべて起こり得ます。Idempotency キー（`event.id` の DB 記録）と、`event.created` のタイムスタンプ比較（古いイベントを破棄）を必ず入れましょう。
+
+### 3. `usageMetadata` が `undefined` のレスポンスがある
+
+ストリーミングレスポンスで途中接続が切れた場合、`usageMetadata` が空のことがあります。私は「`undefined` の場合はプロンプト長から推定値を計算して記録する」フォールバックを入れています。完全に 0 にしてしまうとヘビーユーザーの請求漏れになるので注意してください。
+
+### 4. テスト環境と本番環境の Webhook シークレットを取り違える
+
+Stripe では Test mode と Live mode で Webhook シークレットが完全に別です。`.env.production` に Test mode のシークレットを書いてしまうと、Live mode から送られてくる Webhook がすべて署名検証エラーで弾かれます。私は CI で「`STRIPE_WEBHOOK_SECRET` が `whsec_test_` で始まっていたらデプロイを止める」というガードを入れています。
+
+### 5. Meter Event の遅延レポートが集計対象外になる
+
+Stripe の Meter Event は、デフォルトでは「現在の請求期間内」のイベントのみ集計対象になります。バッチジョブが 1 日落ちて、月をまたいでから報告すると、前月の使用量として加算されません。**ジョブの可用性は SLO を切ってアラートを設定する**のが本番では必須です。私は Cloudflare Workers の Cron が 5 分以上失敗したら Discord に通知するようにしています。
+
+## 監視とコスト最適化のベストプラクティス
+
+本番運用に入った後で気をつけるべきポイントを、私が実際に運用していて感じた優先順で並べます。
+
+**監視ダッシュボード**: 「DB に貯まっている未報告レコード数」「直近 1 時間の Stripe Meter Event 成功率」「アクティブサブスクリプション数 vs DAU」を最低限ダッシュボード化します。Grafana でも、シンプルに Notion DB の埋め込みでも構いません。私は最初は Notion で十分だと感じました。
+
+**コストアラート**: Gemini API 側の支出が想定を超えた場合に即座に気付ける仕組みは必須です。Google Cloud の予算アラートを「日次予算の 150%」で設定しておくと、ユーザーの突然のヘビーユース（または攻撃）に気付けます。
+
+**プロンプトのコスト最適化**: Gemini 2.5 Flash と Gemini 2.5 Pro では 1 トークンあたりの価格が大きく違います。同じ品質が出るなら Flash で済ませる、長文の要約は Flash + Context Caching、複雑な推論だけ Pro、と使い分けるだけで原価が劇的に下がります。詳細は [Gemini API のコンテキストキャッシュ完全ガイド](/articles/gemini-api/gemini-api-context-caching-cost-optimization) と [Gemini 2.5 Pro の Thinking Budget 最適化ガイド](/articles/gemini-api/gemini-25-thinking-budget-optimization-guide) でも詳しく解説しています。
+
+**サブスク状態とアプリ DB の整合性チェック**: 月 1 回、Stripe の List Subscriptions API でアクティブな顧客を全件取得して、自前 DB の `tier` と突き合わせる照合バッチを動かしておくと、Webhook の取りこぼしによる権限ズレを早期発見できます。
+
+レート制限・エラーハンドリングの実装パターンを深掘りしたい方は [Gemini API のレート制限・クォータ管理 本番ガイド](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) も参考にしてみてください。
+
+書籍で体系的に学びたい方には、決済設計の古典である [Web API: The Good Parts（水野貴明）](https://www.amazon.co.jp/dp/4873116821/?tag=pinocchio-22) と、SaaS のメトリクス設計を平易に解説した [SaaS の科学（角谷信太郎ほか）](https://www.amazon.co.jp/dp/4798182990/?tag=pinocchio-22) が、API と課金の両面から思考の足場になってくれます。
+
+## 開発初期につまずいた失敗談 — 私が踏んだ 3 つの地雷
+
+ここまでは整理して書きましたが、実際の開発初期に私自身が踏んだ失敗を 3 つ共有します。同じところで時間を溶かさないために、参考にしてみてください。
+
+**1 つ目は、トークン計測の単位を間違えたことです。** Gemini API のレスポンスから `totalTokenCount` を取り出す際、SDK のバージョンによってフィールド名が `totalTokens` だったり `totalTokenCount` だったりします。私は v0.x 系のコードを v1 系にアップグレードした際にここを見落とし、1 週間ほど計測値が常に 0 になっていました。リリース前にダッシュボードで「想定したトークン数が記録されているか」を必ず目視確認することをおすすめします。
+
+**2 つ目は、Stripe の Test mode で動作確認したまま本番デプロイしてしまったことです。** Stripe Webhook は Test/Live で完全に別の URL とシークレットを使います。本番環境の `.env` に Test の `whsec_test_...` が入ったままだったため、初日の決済 Webhook がすべて署名検証で 400 を返してしまいました。Stripe ダッシュボードの「失敗した Webhook」を 24 時間以内であれば手動で再送できるので大事には至りませんでしたが、ヒヤッとしました。
+
+**3 つ目は、サブスクリプションの猶予期間（grace period）を設計に入れていなかったことです。** カード期限切れで決済が失敗した瞬間にユーザーをフリープランへ即降格させると、悪意のないユーザーまで急に機能を失って解約します。Stripe には標準で `past_due` 状態と `unpaid` 状態があり、`past_due` の間は機能を維持しつつメールで再決済を促すのが穏当です。
+
+## まとめ — 今日のうちに動かすべき最初の一歩
+
+ここまで読んでくれて、ありがとうございます。コードと設計を一気にお見せしましたが、いきなり全部を組み込もうとすると詰まります。私のおすすめは「まず計測だけ動かす」ことです。
+
+具体的には、`recordTokenUsage` を Gemini API 呼び出しの直後に挟んで、自前 DB にトークン使用量がきちんと貯まることを確認してください。Stripe との連携や Webhook 処理は、計測データが手元にあれば後からいくらでも追加できます。逆に、リリース後に「過去の使用量データがない」状態になると、適正な課金プラン設計をやり直すのが大変になります。
+
+「使った分だけ請求する」モデルは、個人開発の AI SaaS と非常に相性が良い課金方式です。一度組み立てておけば、ユーザー数が増えるほど自動的に売上が伸びていく構造を、自分の手の中に持てます。

@@ -1,0 +1,532 @@
+---
+title: "Gemini API × Stripe — Production Usage-Based Billing for Indie AI SaaS"
+slug: "gemini-api-stripe-saas-billing-webhook-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-26T19:45"
+author: "Gemini Lab"
+description: "A complete guide to building a usage-based billing system for your Gemini API SaaS using Stripe Metered Billing and webhooks — production patterns included."
+tags: ["Gemini API", "Stripe", "SaaS", "Billing", "Webhook", "Metered Billing", "Production"]
+highlights:
+  - "You'll be able to ship a usage-based billing system that charges users for the Gemini API tokens they actually consume, with copy-paste-ready code"
+  - "You'll learn how to sync Stripe subscription state via webhooks and gate AI features by tier in a way that survives real production traffic"
+  - "You'll walk away with the idempotency, retry, and monitoring patterns indie AI SaaS founders need so the billing system doesn't quietly break"
+---
+
+When you're building a SaaS on top of the Gemini API as a solo developer, the first thing you stall on is usually billing. I love that some readers stick around after starting on the free tier — but letting power users burn more in API costs than they pay you is not a sustainable structure to leave in place.
+
+A pure flat subscription means a person who uses 10K tokens a month pays the same as someone who uses 10M. A pure usage-based plan, on the other hand, scares potential users away because they can't predict their bill. Neither extreme works for an indie AI SaaS.
+
+In this article, I'll walk through the **hybrid model I actually run in production** — a flat base subscription plus metered overage — implemented with the Gemini API and Stripe in a way that survives real traffic. We'll cover webhooks, idempotency, accurate token metering, and tier-based feature gating, all the way through the operational realities you'll bump into the moment you go live.
+
+## Choosing usage-based billing for an indie AI SaaS
+
+Before any code, let's settle when usage-based billing is actually the right call. From my own experience, a pure flat-rate model breaks down quickly when LLMs like Gemini sit on the backend.
+
+The reason is simple: usage of an AI-powered app varies by 1,000× or more across users. Light users do dozens of requests a month; heavy users do hundreds of thousands. If you try to absorb that with a single monthly fee, you're forced into one of two bad choices: charge light users too much, or run your heavy users at a loss.
+
+The hybrid model I currently run looks like this.
+
+- **Free**: Up to 50,000 tokens/month at no cost — an onboarding allowance to keep new users from bouncing
+- **Pro** (¥980/mo): 500,000 tokens included; overage at ¥150 per 100,000 tokens
+- **Team** (¥4,800/mo): 5,000,000 tokens included; overage at ¥100 per 100,000 tokens
+
+The strength of this model is that it gives users a predictable monthly base while still recovering cost from heavy users. In Stripe, you can express this as a single subscription with two subscription items: one flat **Price**, one **Metered Price**. They roll up into one invoice each month.
+
+## System architecture — from a token to an invoice line
+
+Before diving into code, it helps to internalize how data flows through the system. Here's the shape of what I run.
+
+1. Every Gemini API call returns `usageMetadata.totalTokenCount`, which my server stores in a local database
+2. A background job runs every minute and reports any unsynced token usage to Stripe's Meter Event API
+3. At month end, Stripe issues an invoice combining the flat plan and the metered usage automatically
+4. Stripe webhooks (`invoice.payment_succeeded`, `customer.subscription.updated`, etc.) update the user's tier in my application database
+
+The critical decision here is **decoupling the Gemini API call from the Stripe report**. Reporting in real time adds latency to every user request and bumps you into Stripe's API rate limits. Buffering in your own DB and flushing in batches is the realistic production pattern.
+
+## Setting up Stripe — creating the Meter and Prices
+
+Start by creating a Meter (the thing that aggregates token counts) and Prices that reference it. You can do this in the Stripe dashboard, but I prefer a CLI script you can keep in version control.
+
+```bash
+# .env.local
+# STRIPE_SECRET_KEY=sk_test_...
+# Run `stripe login` first if you're using stripe-cli
+
+# 1) Create the Meter for tokens
+stripe meters create \
+  --display-name "Gemini API Tokens" \
+  --event-name "gemini_api_tokens_used" \
+  --default-aggregation.formula sum \
+  --customer-mapping.event-payload-key stripe_customer_id \
+  --customer-mapping.type by_id \
+  --value-settings.event-payload-key value
+```
+
+The `event-name` here (`gemini_api_tokens_used`) is the key your server code will use later to send Meter Events. The `value-settings.event-payload-key=value` line tells Stripe to look at the `value` field of each event payload to know how many tokens to count.
+
+Now create the Prices. The first is the flat monthly fee; the second is metered overage referencing the meter.
+
+```bash
+# 2) Flat-rate Pro Price
+PROD_PRO=$(stripe products create -d name="Gemini SaaS Pro" -d type=service -j | jq -r '.id')
+stripe prices create \
+  --product "$PROD_PRO" \
+  --unit-amount 98000 \
+  --currency jpy \
+  --recurring.interval month
+
+# 3) Metered overage Price for Pro (linked to the Meter)
+# ¥150 per 100,000 tokens → ¥0.0015 per token
+stripe prices create \
+  --product "$PROD_PRO" \
+  --currency jpy \
+  --billing-scheme tiered \
+  --tiers-mode graduated \
+  --recurring.interval month \
+  --recurring.usage-type metered \
+  --recurring.meter "$METER_ID" \
+  --tiers '[{"up_to":500000,"flat_amount":0},{"up_to":"inf","unit_amount_decimal":"0.0015"}]'
+```
+
+The first tier means "the first 500K tokens are free" (covered by the flat fee). After that, each token costs ¥0.0015 — i.e., ¥150 per 100K tokens. `unit_amount_decimal` lets you express prices below one currency unit, which is essential for per-token pricing.
+
+> **Why two Prices for one subscription?** A Stripe subscription holds many subscription items. By giving it one flat Price and one metered Price, the monthly invoice naturally adds the base fee and the measured overage. When you change a user's plan (Pro → Team, etc.), you swap the Prices but keep the structure — much easier to operate than separate subscriptions.
+
+## Metering Gemini API tokens and reporting them to Stripe
+
+This is the meat of the implementation. We capture tokens on each Gemini call, persist them locally, then push them to Stripe in the background.
+
+### 1. Capturing token usage on each Gemini call
+
+```typescript
+// src/lib/gemini.ts
+import { GoogleGenerativeAI, type GenerativeModel } from "@google/generative-ai";
+import { recordTokenUsage } from "./usage-store";
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+
+export async function generateWithUsage(
+  userId: string,
+  prompt: string,
+  modelName: string = "gemini-2.5-flash"
+): Promise<{ text: string; totalTokens: number }> {
+  const model: GenerativeModel = genAI.getGenerativeModel({ model: modelName });
+
+  try {
+    const result = await model.generateContent(prompt);
+    // The exact field name varies by SDK version.
+    // As of @google/generative-ai 2026, it lives at response.usageMetadata.
+    const usage = result.response.usageMetadata;
+    const totalTokens = usage?.totalTokenCount ?? 0;
+
+    // Persist asynchronously. You may also choose not to await this so
+    // a slow DB write doesn't add latency to the user's response.
+    await recordTokenUsage({
+      userId,
+      promptTokens: usage?.promptTokenCount ?? 0,
+      completionTokens: usage?.candidatesTokenCount ?? 0,
+      totalTokens,
+      model: modelName,
+      occurredAt: new Date(),
+    });
+
+    return { text: result.response.text(), totalTokens };
+  } catch (err) {
+    // If you'd rather still return a response when metering fails,
+    // log here and don't rethrow. I prefer to fail loud during early days
+    // so I notice metering bugs early.
+    console.error("[gemini] generation failed", { userId, err });
+    throw err;
+  }
+}
+```
+
+Two things to notice. First, **always pull `usageMetadata` and persist it** — without this you have nothing to bill on later. Second, **don't let metering failures pollute the user response**: users want their AI output, and a flaky DB write shouldn't degrade their experience.
+
+### 2. The usage store (Postgres example)
+
+```typescript
+// src/lib/usage-store.ts
+import { sql } from "./db";
+
+export type UsageRecord = {
+  userId: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  model: string;
+  occurredAt: Date;
+};
+
+export async function recordTokenUsage(rec: UsageRecord): Promise<void> {
+  await sql`
+    INSERT INTO token_usage (
+      user_id, prompt_tokens, completion_tokens,
+      total_tokens, model, occurred_at, reported_to_stripe
+    ) VALUES (
+      ${rec.userId}, ${rec.promptTokens}, ${rec.completionTokens},
+      ${rec.totalTokens}, ${rec.model}, ${rec.occurredAt}, false
+    )
+  `;
+}
+
+// Fetch unreported rows for the batch job
+export async function fetchUnreportedUsage(limit: number = 1000) {
+  return sql<{ id: string; user_id: string; total_tokens: number; occurred_at: Date }[]>`
+    SELECT id, user_id, total_tokens, occurred_at
+    FROM token_usage
+    WHERE reported_to_stripe = false
+    ORDER BY occurred_at ASC
+    LIMIT ${limit}
+  `;
+}
+
+export async function markReported(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await sql`
+    UPDATE token_usage
+    SET reported_to_stripe = true, reported_at = NOW()
+    WHERE id = ANY(${ids})
+  `;
+}
+```
+
+The `reported_to_stripe` boolean is the heart of this design. If the batch job dies mid-run, the next run picks up exactly where the previous left off — no rows are double-reported, no rows are missed.
+
+### 3. Reporting Meter Events to Stripe (the batch job)
+
+```typescript
+// src/jobs/report-usage-to-stripe.ts
+import Stripe from "stripe";
+import { fetchUnreportedUsage, markReported } from "../lib/usage-store";
+import { getStripeCustomerId } from "../lib/customer-store";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-09-30.preview",
+});
+
+export async function reportUsageToStripe(): Promise<{
+  reported: number;
+  failed: number;
+}> {
+  const records = await fetchUnreportedUsage(1000);
+  if (records.length === 0) return { reported: 0, failed: 0 };
+
+  const reportedIds: string[] = [];
+  let failed = 0;
+
+  // Group per user to reduce API calls
+  const grouped = new Map<string, typeof records>();
+  for (const r of records) {
+    if (!grouped.has(r.user_id)) grouped.set(r.user_id, []);
+    grouped.get(r.user_id)!.push(r);
+  }
+
+  for (const [userId, rows] of grouped) {
+    const customerId = await getStripeCustomerId(userId);
+    if (!customerId) {
+      // Free users don't have a Stripe customer record; skip them.
+      reportedIds.push(...rows.map((r) => r.id));
+      continue;
+    }
+
+    const totalTokens = rows.reduce((s, r) => s + r.total_tokens, 0);
+
+    try {
+      await stripe.billing.meterEvents.create({
+        event_name: "gemini_api_tokens_used",
+        // identifier is Stripe's idempotency key — duplicates with the same
+        // identifier are silently dropped on Stripe's side.
+        identifier: `usage-${userId}-${rows[0].id}-${rows.at(-1)!.id}`,
+        payload: {
+          stripe_customer_id: customerId,
+          value: String(totalTokens),
+        },
+        timestamp: Math.floor(rows.at(-1)!.occurred_at.getTime() / 1000),
+      });
+      reportedIds.push(...rows.map((r) => r.id));
+    } catch (err) {
+      console.error("[stripe-meter] report failed", { userId, err });
+      failed += rows.length;
+      // We don't mark these rows reported, so they retry next run.
+    }
+  }
+
+  await markReported(reportedIds);
+  return { reported: reportedIds.length, failed };
+}
+```
+
+The single most important detail in this job is the **`identifier` field for idempotency**. If the same identifier is sent twice, Stripe deduplicates server-side, so your retry loop can't accidentally double-bill anyone. I derive it from the user ID plus the first and last row IDs in the batch, but a UUID per call works fine too.
+
+You can run this on Cloudflare Workers Cron Triggers, Vercel Cron, Cloud Scheduler, or any other scheduler. A 1-minute cadence is a sweet spot — to your users it feels like usage updates in real time, and you stay well under Stripe's API limits.
+
+## Syncing subscription state via Stripe webhooks
+
+Invoices, payment failures, plan changes, and cancellations all need to land in your application database via Stripe webhooks. The events I always handle:
+
+- `customer.subscription.created` — promote the user to the new tier
+- `customer.subscription.updated` — flip them between Pro and Team, etc.
+- `customer.subscription.deleted` — drop them back to Free on cancellation
+- `invoice.payment_succeeded` — grant their next month of access
+- `invoice.payment_failed` — notify the user and enter a grace period
+
+```typescript
+// src/app/api/stripe/webhook/route.ts (Next.js App Router)
+import Stripe from "stripe";
+import { NextResponse } from "next/server";
+import {
+  upsertSubscription,
+  downgradeUser,
+  markPaymentFailed,
+  isAlreadyProcessed,
+  markProcessed,
+  detectTierFromItems,
+} from "@/lib/billing";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-09-30.preview",
+});
+const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
+
+export async function POST(req: Request): Promise<Response> {
+  const sig = req.headers.get("stripe-signature");
+  const body = await req.text();
+  if (!sig) return new NextResponse("missing signature", { status: 400 });
+
+  let event: Stripe.Event;
+  try {
+    // On Cloudflare Workers / Edge runtimes you must use the async variant.
+    event = await stripe.webhooks.constructEventAsync(body, sig, webhookSecret);
+  } catch (err) {
+    console.error("[stripe-webhook] signature verify failed", err);
+    return new NextResponse("invalid signature", { status: 400 });
+  }
+
+  // Idempotency: dedupe by event.id so retries don't double-process.
+  if (await isAlreadyProcessed(event.id)) {
+    return NextResponse.json({ received: true, idempotent: true });
+  }
+
+  try {
+    switch (event.type) {
+      case "customer.subscription.created":
+      case "customer.subscription.updated": {
+        const sub = event.data.object as Stripe.Subscription;
+        await upsertSubscription({
+          customerId: sub.customer as string,
+          subscriptionId: sub.id,
+          status: sub.status,
+          tier: detectTierFromItems(sub.items.data),
+          currentPeriodEnd: new Date(sub.current_period_end * 1000),
+        });
+        break;
+      }
+      case "customer.subscription.deleted": {
+        const sub = event.data.object as Stripe.Subscription;
+        await downgradeUser(sub.customer as string);
+        break;
+      }
+      case "invoice.payment_failed": {
+        const invoice = event.data.object as Stripe.Invoice;
+        await markPaymentFailed({
+          customerId: invoice.customer as string,
+          attemptCount: invoice.attempt_count ?? 0,
+        });
+        break;
+      }
+      default:
+        // Log unknown events but still 200 — anything else makes Stripe retry.
+        console.log("[stripe-webhook] unhandled event", event.type);
+    }
+    await markProcessed(event.id);
+    return NextResponse.json({ received: true });
+  } catch (err) {
+    console.error("[stripe-webhook] handler failed", { type: event.type, err });
+    // 5xx triggers Stripe's exponential-backoff retry, which is what you want.
+    return new NextResponse("internal error", { status: 500 });
+  }
+}
+```
+
+Two things to absolutely get right here. First, **idempotency on `event.id`**. Stripe will sometimes re-deliver an event (especially on transient network issues), and double-processing is how you accidentally promote someone twice or create duplicate database rows. Always dedupe before doing work.
+
+Second, **return 200 even for events you don't care about**. Returning 500 makes Stripe retry forever, drowning your logs in identical events. The `default` branch should log and ack.
+
+## Tier-based AI feature gating
+
+Plan-based limits ("Free can't use Gemini Pro", "Pro gets vision", etc.) are easiest to maintain when centralized in a feature matrix.
+
+```typescript
+// src/lib/feature-gate.ts
+type Tier = "free" | "pro" | "team";
+
+type FeatureMatrix = {
+  [key in Tier]: {
+    allowedModels: string[];
+    monthlyTokenIncluded: number;
+    visionEnabled: boolean;
+    longContextEnabled: boolean; // 1M token context window
+  };
+};
+
+export const FEATURES: FeatureMatrix = {
+  free: {
+    allowedModels: ["gemini-2.5-flash-lite"],
+    monthlyTokenIncluded: 50_000,
+    visionEnabled: false,
+    longContextEnabled: false,
+  },
+  pro: {
+    allowedModels: ["gemini-2.5-flash", "gemini-2.5-pro"],
+    monthlyTokenIncluded: 500_000,
+    visionEnabled: true,
+    longContextEnabled: false,
+  },
+  team: {
+    allowedModels: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-3-pro"],
+    monthlyTokenIncluded: 5_000_000,
+    visionEnabled: true,
+    longContextEnabled: true,
+  },
+};
+
+export class FeatureNotAllowedError extends Error {
+  constructor(
+    public readonly feature: string,
+    public readonly currentTier: Tier,
+    public readonly requiredTier: Tier
+  ) {
+    super(`feature "${feature}" requires "${requiredTier}", but user is on "${currentTier}"`);
+  }
+}
+
+export function ensureModelAllowed(tier: Tier, model: string): void {
+  if (!FEATURES[tier].allowedModels.includes(model)) {
+    // Find the lowest tier that allows this model so the UI can prompt
+    // "Upgrade to Pro to use this model".
+    const requiredTier = (Object.keys(FEATURES) as Tier[]).find((t) =>
+      FEATURES[t].allowedModels.includes(model)
+    );
+    throw new FeatureNotAllowedError("model", tier, requiredTier ?? "team");
+  }
+}
+```
+
+Then your API route gates each request at the top.
+
+```typescript
+// src/app/api/generate/route.ts
+import { auth } from "@/lib/auth";
+import { getUserTier } from "@/lib/billing";
+import { ensureModelAllowed, FeatureNotAllowedError } from "@/lib/feature-gate";
+import { generateWithUsage } from "@/lib/gemini";
+
+export async function POST(req: Request) {
+  const session = await auth();
+  if (!session) return new Response("unauthorized", { status: 401 });
+
+  const { prompt, model = "gemini-2.5-flash-lite" } = await req.json();
+  const tier = await getUserTier(session.user.id);
+
+  try {
+    ensureModelAllowed(tier, model);
+  } catch (err) {
+    if (err instanceof FeatureNotAllowedError) {
+      // Surface the required tier so the client can show an upgrade prompt.
+      return Response.json(
+        { error: "upgrade_required", required_tier: err.requiredTier, current_tier: err.currentTier },
+        { status: 402 }
+      );
+    }
+    throw err;
+  }
+
+  const { text, totalTokens } = await generateWithUsage(session.user.id, prompt, model);
+  return Response.json({ text, totalTokens });
+}
+```
+
+`HTTP 402 Payment Required` is the classic way to communicate "this requires payment". Your client can intercept any 402 response and pop an upgrade modal — clean separation of concerns.
+
+## Production gotchas you'll hit
+
+### 1. Stripe billing cycles don't align with calendar months
+
+A naïve "reset all token counts on the 1st" breaks for users who subscribe mid-month. If a user signs up on April 15, their billing cycle is 4/15 to 5/14 — not the calendar month. **Always source the cycle from `current_period_start` and `current_period_end`** on the subscription object. Calculating it yourself from the calendar will burn you eventually.
+
+### 2. Webhooks arrive late, duplicated, or out of order
+
+Stripe guarantees at-least-once delivery, not at-most-once. The same event will sometimes arrive twice. A `subscription.deleted` can plausibly arrive before the corresponding `subscription.updated`. Whole-system delays of several minutes happen. Defend with both an idempotency key (the `event.id` recorded in your DB) and a `created`-timestamp comparison so older events can be safely discarded.
+
+### 3. `usageMetadata` is sometimes undefined
+
+If a streaming response is interrupted mid-flight, `usageMetadata` can come back empty. Setting it to zero would silently undercount your heaviest users. I fall back to a token estimate based on prompt length when the field is missing — imperfect, but far safer than reporting zero.
+
+### 4. Mixing test-mode and live-mode webhook secrets
+
+Stripe Test mode and Live mode use entirely different webhook signing secrets. Putting a `whsec_test_...` value in `.env.production` means every live webhook fails signature verification. I gate this in CI: if `STRIPE_WEBHOOK_SECRET` starts with `whsec_test_`, the production deploy is rejected.
+
+### 5. Late Meter Event reports get dropped from the current period
+
+Stripe's Meter Events default to including only events within the current billing period. If your batch job dies for a day and you report yesterday's tokens after the period rolls over, those tokens are lost from the previous invoice. **Treat job availability as an SLO** with alerting. Mine alerts on Discord when the Cron stops succeeding for more than five minutes.
+
+## Monitoring and cost optimization in production
+
+These are the operational priorities I've found most useful in actual day-to-day running.
+
+**Dashboards.** At minimum, keep eyes on three numbers: unreported rows in the local DB, success rate of Stripe Meter Event calls in the last hour, and active subscriptions vs. DAU. Grafana is great; an embedded Notion table is fine to start with — I ran on Notion alone for the first few months without regret.
+
+**Cost alerts.** Knowing immediately if your Gemini API spend is running hot is non-negotiable. A Google Cloud budget alert at 150% of daily projected spend will surface a heavy user (or an attack) before you wake up to a real bill.
+
+**Prompt-side cost work.** Gemini 2.5 Flash and Gemini 2.5 Pro have very different per-token economics. Routing summarization to Flash with context caching, and only sending tricky reasoning to Pro, has a dramatic effect on margins. I've written up the techniques in detail in the [Gemini API context caching cost-optimization guide](/en/articles/gemini-api/gemini-api-context-caching-cost-optimization) and [the Gemini 2.5 Pro thinking-budget optimization guide](/en/articles/gemini-api/gemini-25-thinking-budget-optimization-guide).
+
+**Reconciliation between Stripe and your DB.** Once a month, list all active subscriptions via the Stripe API and diff them against your local `tier` column. Any mismatch is almost certainly a webhook your handler dropped — catching them this way prevents users from quietly losing access (or quietly keeping access).
+
+If you want to go deeper on rate limiting and error handling — the next thing you'll need on the Gemini side once usage grows — see the [Gemini API rate-limiting and quota-management production guide](/en/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide).
+
+For book-form deeper dives, two that complement this article well: [Web API: The Good Parts (Takaaki Mizuno)](https://www.amazon.co.jp/dp/4873116821/?tag=pinocchio-22) for API design fundamentals, and [The Science of SaaS (Shintaro Kakutani et al.)](https://www.amazon.co.jp/dp/4798182990/?tag=pinocchio-22) for SaaS metric design.
+
+## Designing the upgrade prompt that actually converts
+
+A subtle thing that took me longer than it should have: the way you surface the upgrade prompt has a much bigger effect on conversion than the price itself. The technical machinery to gate features is easy. Designing the prompt around it so that users feel guided rather than blocked is what separates a SaaS that grows from one that just collects support tickets.
+
+Three principles I now follow when a 402 response comes back from the API.
+
+First, **show the value the user is reaching for, not the wall**. A modal that says "Upgrade to Pro to use this feature" tells the user nothing. A modal that says "You're trying to use the gemini-2.5-pro model, which is included on the Pro plan ($X/month) — your current plan is Free" gives them the context to make a decision in one read. Pulling the `current_tier` and `required_tier` out of the 402 response makes this trivial.
+
+Second, **let users try the feature once before paying**. For high-value features, I issue a one-off bypass token good for a single request. The user gets to feel the difference, and in my data they convert at roughly 4× the rate of users who only see the modal. The implementation is small: a temporary row in a `feature_trials` table that the gate checks before throwing `FeatureNotAllowedError`.
+
+Third, **make downgrades reversible without re-onboarding**. When a user cancels, I keep their data, their settings, and their token history for 90 days before any deletion. About 12% of canceled users come back within that window, and they convert at near-100% if they didn't lose anything during the gap. This is purely a database design choice — soft-delete the subscription, not the user.
+
+These design decisions don't live in the code I've shown above, but they shape how everything connects. The metering, the tier matrix, the upgrade prompt — all of it serves the same goal: making it as easy as possible for a user to pay you what your service is worth to them, and as easy as possible to keep paying.
+
+## Migrating an existing flat-rate SaaS to usage-based billing
+
+If you're already running a flat subscription and want to add metering, the migration is gentler than you might expect — but skipping a few steps will cause incidents.
+
+Start by **adding metering in shadow mode for at least one full billing cycle**. Capture token counts and even compute what each user's overage would be, but do not actually report them to Stripe. This gives you real data to size the included allowances. I picked the 50K / 500K / 5M numbers above only after watching shadow data for six weeks; my initial guesses would have over-billed about 18% of users.
+
+Next, **announce the change at least one full billing cycle in advance**, with the user's personal projected impact based on their last 30 days. "Your usage last month was 327K tokens; on the new plan you would have paid an extra ¥0" is reassuring; "Your usage last month was 1.2M tokens; on the new plan that would be an extra ¥1,050" is the conversation you need to have with that user before they discover it on their own invoice.
+
+Finally, **grandfather aggressive users for one extra cycle**. The handful of accounts who would see a meaningful price hike deserve one final flat-rate month and a personal email offering an annual discount or a custom plan. Losing them to churn costs more than the discount. The rest of the user base is unaffected, and your overall revenue per user goes up while your highest-cost users either pay appropriately or churn cleanly.
+
+## Three early mistakes I made (so you don't have to)
+
+To wrap, three concrete things I broke in the first weeks of running this in production. These are the kinds of bugs that don't show up in tutorials.
+
+**One: I broke token metering and didn't notice for a week.** During an SDK upgrade, the field name shifted between `totalTokens` and `totalTokenCount` versions. My metering silently recorded zero, and I only caught it when I happened to look at the dashboard. Before launching, manually verify that "the dashboard shows roughly the token count I expect" — don't just trust that the code compiles.
+
+**Two: I deployed test-mode Stripe credentials to production.** Live-mode webhooks fired into a server expecting test-mode signing secrets, and every single delivery failed verification. Stripe lets you manually re-deliver failed webhooks for 24 hours in the dashboard, which saved me, but it was a stomach-drop moment. I now have a CI check that refuses any deploy where `STRIPE_WEBHOOK_SECRET` starts with `whsec_test_`.
+
+**Three: I didn't design a grace period for failed payments.** If a user's card expires and you instantly downgrade them to Free, well-meaning users churn out of frustration before they can update their card. Stripe's `past_due` and `unpaid` states exist for a reason — keep features available during `past_due`, send a reminder email, and only downgrade once Stripe gives up entirely.
+
+## Wrap-up — the one thing to ship today
+
+Thanks for reading this far. I've thrown a lot of code at you in one go, but trying to implement everything in one sitting is a recipe for getting stuck. My recommendation: **wire up metering first**.
+
+Concretely: drop `recordTokenUsage` in immediately after every Gemini API call, and verify that token usage is accumulating correctly in your own database. Stripe integration and webhooks can come later — what matters most is that you have the historical usage data when you eventually need to design your pricing. Launching without that data and trying to backfill is brutal; launching *with* a few weeks of real usage logs makes pricing decisions almost trivial.
+
+Usage-based billing is a strong fit for indie AI SaaS. Once it's in place, your revenue scales with your users' value — quietly, automatically, in the background.
