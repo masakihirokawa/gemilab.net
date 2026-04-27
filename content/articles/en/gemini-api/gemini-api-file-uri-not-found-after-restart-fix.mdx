@@ -1,0 +1,146 @@
+---
+title: "Why Your Gemini File URI Suddenly Returns 404 — Designing Around the 48-Hour TTL"
+slug: "gemini-api-file-uri-not-found-after-restart-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-27T18:30"
+author: "Gemini Lab"
+description: "Your Gemini-powered image or video pipeline worked perfectly yesterday, then started returning 404 the morning after a restart. The culprit is the File API's 48-hour TTL. Here is how to detect it and design an app that survives it."
+tags: ["gemini-api", "file-api", "troubleshooting", "ttl", "production"]
+---
+
+"Image recognition was working perfectly yesterday, but after restarting the server this morning, every request comes back with an error." This is one of the most common questions I get from indie developers who have just put a Gemini-powered feature into production. The error message says something like `File ... is not found` or `INVALID_ARGUMENT`, and not a single line of code changed. Half a day disappears looking for a bug that does not exist.
+
+Here is the short answer. Files uploaded via the Gemini File API have a **48-hour TTL** and are deleted automatically after that window. If you save the File URI (the identifier in the form `files/xxxx`) in your database or cache and try to reuse it the next day, you will eventually hit a 404. This is the documented behavior, not a bug, and it forces you to rethink how the file lifecycle fits into your app.
+
+This article covers why this happens, then walks through three concrete design patterns that account for the TTL. I have hit this exact issue in one of my own apps — woken up by an early-morning alert after a routine deploy — so the patterns below come from rebuilding around the constraint, not from reading the docs.
+
+## Confirm what is actually happening
+
+Before assuming the API itself is broken, ask the API directly. Calling `client.files.get(name)` returns the current state of the file you uploaded earlier.
+
+```python
+# What this solves: confirms whether a stored File URI is still usable
+from google import genai
+import os
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+# A File URI you previously stored in your DB or session
+saved_file_name = "files/abc123def456"
+
+try:
+    file_info = client.files.get(name=saved_file_name)
+    print(f"State: {file_info.state}")           # ACTIVE / PROCESSING / FAILED
+    print(f"Expiration: {file_info.expiration_time}")  # Scheduled deletion (UTC)
+    print(f"URI: {file_info.uri}")
+except Exception as e:
+    # A 404-style error means the file is already gone
+    print(f"File no longer exists: {e}")
+```
+
+If the file is still alive, you get back `state=ACTIVE` together with an `expiration_time`. **The key insight here is that the TTL is not a flat 48 hours — it shifts slightly depending on capacity and configuration.** That means it is wrong to set your own 48-hour timer and assume the file is fine until then. Trust the `expiration_time` returned by the API, not your own clock.
+
+When the call returns a 404, the file is already gone. Wrapping this state check around any reuse of a saved URI cuts your debugging time by an order of magnitude — you stop chasing imaginary bugs in your image preprocessing code and immediately know that the issue is upstream.
+
+## Pattern 1: Send small data inline and skip File API entirely
+
+There are cases where you do not need the File API at all. Gemini accepts images and PDFs as **inline data** (raw bytes embedded in the request), and for anything under 20MB that you upload-then-immediately-use, sending inline is the simpler choice.
+
+```python
+# What this solves: sends a small image inline, sidestepping TTL entirely
+from google import genai
+from google.genai import types
+import pathlib, os
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+image_bytes = pathlib.Path("photo.jpg").read_bytes()
+
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=[
+        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+        "Describe what you see in this image.",
+    ],
+)
+print(response.text)
+# Expected output: "A coastline at sunset with a rocky outcrop in the center..."
+```
+
+The reason this dodges the TTL problem is structural: the file is never stored on Google's side. It travels with the request, is consumed by the model, and that's it. **Things that aren't stored cannot be deleted.**
+
+In chat-style apps I personally send every user-attached image inline. It eliminates the upload → store → re-fetch round-trip entirely, and response time noticeably drops as a side benefit. The 20MB cap rarely matters in practice if you resize phone-camera images down to 1568px on the long edge before sending.
+
+## Pattern 2: When you need persistence, own the storage and re-upload on demand
+
+Some workloads — long videos, large PDFs that get queried many times — really do need the File API. The right approach in that case is to **treat the File URI as a volatile cache while keeping the original file in your own storage.**
+
+```python
+# What this solves: re-uploads automatically when the cached File URI is gone
+import os
+from google import genai
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def get_or_upload(local_path: str, cached_file_name: str | None):
+    """Reuse the existing File URI if alive, otherwise re-upload."""
+    if cached_file_name:
+        try:
+            info = client.files.get(name=cached_file_name)
+            if info.state.name == "ACTIVE":
+                return info  # Still alive — use as-is
+        except Exception:
+            pass  # 404 etc — fall through to re-upload
+
+    # Re-upload
+    uploaded = client.files.upload(file=local_path)
+    # Important: persist the new file.name on the caller side
+    return uploaded
+
+# Usage
+file = get_or_upload("video.mp4", cached_file_name="files/oldname123")
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=[file, "Summarize the three key moments in this video."],
+)
+print(response.text)
+```
+
+Two details matter here. First, **wrap `client.files.get` in a try block**. Catching the 404 as an exception and falling through is the cleanest way to keep the code linear. Second, **persist the new `file.name` after a re-upload**. The new URI will not match the old one, so failing to update your DB means you re-upload on every call.
+
+For storage, anything cheap works — S3, Cloudflare R2, GCS. I personally use R2 and treat the Gemini File URI as something that "may need to be regenerated every 24 hours, no big deal." The user-uploaded video itself is durably persisted in R2; only the File URI is throwaway.
+
+## Pattern 3: Batch heavy inference inside the TTL window
+
+The File API really shines when you reference one file multiple times in rapid succession. Running summarization, tag extraction, scene detection, and caption generation against a single video is dramatically cheaper if you upload once and reuse the File URI across all four calls.
+
+The discipline this requires is **finishing the work inside 48 hours**. Long-running batch jobs that drag past the TTL will start hitting 404s mid-run. As a rule of thumb, if a job looks like it might exceed 24 hours, redesign it so each batch starts with a fresh upload and runs to completion within its own window.
+
+Practically, this means treating "upload → process → (optionally) delete" as a single transactional unit in your job queue. Tasks that fail with a TTL-related 404 should be re-uploaded and re-queued automatically, which removes one whole class of operational incidents.
+
+## Choosing the right pattern
+
+A simple decision rule that has held up well in my own work: ask whether the same file will be referenced more than once in the next few hours. If the answer is no, send inline (Pattern 1). If yes and the file is small enough to fit cheaply in your own storage, persist locally and re-upload on demand (Pattern 2). If yes and the workload is genuinely batch-shaped — many calls against the same large file in rapid succession — accept the File API lifecycle and time-box the batch to fit inside 48 hours (Pattern 3).
+
+Mixing these is fine. In one app I run, user-uploaded screenshots go inline because they are small and used once, while user-uploaded videos go through Pattern 2 with R2 as the durable layer. The point is to choose deliberately rather than defaulting to "upload everything via File API and store the URI" — that default is what gets people paged at 4am.
+
+## Anti-patterns to avoid
+
+A few of these came up implicitly above; let me state them outright.
+
+- **Storing the File URI as a permanent ID in your DB** — it will be invalid 48 hours later. The fact that it works fine in tests is exactly what makes this a time bomb in production.
+- **Skipping the `expiration_time` check** — "I'm calling it within 30 seconds of upload, why bother?" Add a retry loop and that 30 seconds can quietly grow past 48 hours.
+- **Swallowing the 404** — file-not-found errors should always be logged at a level your alerting actually sees. Silent failure delays detection by hours or days.
+- **Re-uploading huge videos on every call as a TTL workaround** — that's a cost and latency disaster. Combine inline data, short-lived caches, and your own storage instead.
+
+## What to do next
+
+If you change one thing in your code tomorrow as a result of this article, make it **adding a `client.files.get` state check anywhere a saved File URI is reused**. That single line of defense will eliminate most of the "it worked yesterday" alerts you would otherwise wake up to.
+
+In my own apps I ended up storing only the persistent storage URI alongside metadata when the user attaches an image or video, then uploading to the File API on-demand right before each Gemini call. The pattern is simple but it removes the TTL from your operational worries entirely.
+
+For the basics of File API itself, the [Files API guide](/en/articles/gemini-api/files-api-guide) covers the upload flow in detail. If your real need is repeatedly referencing a large context, [Context Caching](/en/articles/gemini-api/context-caching-guide) is often the more correct primitive. For broader error-handling patterns around the API, the [retry pattern guide](/en/articles/gemini-api/gemini-api-error-handling-retry-patterns) is worth a read.
+
+If you want a deeper book-length treatment of designing around lifecycle constraints in cloud platforms, [Designing Data-Intensive Applications (Martin Kleppmann)](https://www.amazon.co.jp/dp/1449373321/?tag=pinocchio-22) remains the canonical reference for thinking about state, expiration, and durability across distributed systems.

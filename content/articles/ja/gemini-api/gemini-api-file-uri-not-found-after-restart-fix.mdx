@@ -1,0 +1,147 @@
+---
+title: "Gemini API のファイル URI が突然 404 になる問題 — 48時間 TTL を前提にした設計の組み立て方"
+slug: "gemini-api-file-uri-not-found-after-restart-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-27T18:30"
+author: "Gemini Lab"
+description: "昨日まで動いていた Gemini API の画像/動画認識が、サーバー再起動後に急に動かなくなることがあります。原因は File API の48時間 TTL でした。検出方法と、TTL を前提にしたアプリ設計の組み立て方を実例で解説します。"
+tags: ["gemini-api", "file-api", "troubleshooting", "ttl", "production"]
+---
+
+「昨日まで普通に画像認識が動いていたのに、今朝サーバーを再起動したら急にエラーが返ってくるようになった」— Gemini API を本番投入したばかりの個人開発者の方から、この相談を受けることがあります。エラーメッセージを見ると `File ... is not found` や `INVALID_ARGUMENT` が出ていて、コード自体は何も変えていません。原因がさっぱり分からず、半日溶けてしまうパターンです。
+
+結論から書きます。Gemini File API でアップロードしたファイルには **48時間の TTL** があり、それを過ぎると自動で削除されます。File URI（`files/xxxx` という識別子）を DB やキャッシュに保存して翌日使い回そうとすると、ある日突然 404 で落ちます。これは仕様であり、運用前提から見直す必要があります。
+
+この記事では、なぜこの問題が起きるのかを公式仕様の側から整理した上で、**TTL を前提にしたアプリ設計のパターン**を3つに分けて紹介します。私自身が個人アプリで一度ハマってサーバー再起動後の早朝アラートで起こされた経験があるので、再発防止の観点から書いています。
+
+## まず起きていることを正確に把握する
+
+最初にやるべきは、エラーメッセージを目視で確認するのではなく、**File API でファイルの状態を能動的に取りにいく**ことです。`client.files.get(name)` を呼べば、そのファイルが今どういう状態にあるかが返ってきます。
+
+```python
+# 何を解決するコード: 保存していた File URI が今も使えるか確認する
+from google import genai
+import os
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+# DB やセッションから引いてきた File URI（例）
+saved_file_name = "files/abc123def456"
+
+try:
+    file_info = client.files.get(name=saved_file_name)
+    print(f"State: {file_info.state}")          # ACTIVE / PROCESSING / FAILED のいずれか
+    print(f"Expiration: {file_info.expiration_time}")  # 削除予定時刻(UTC)
+    print(f"URI: {file_info.uri}")
+except Exception as e:
+    # 404 系のエラーが返ってきたら既に削除されている
+    print(f"File no longer exists: {e}")
+```
+
+このコードを動かすと、ファイルが生きていれば `state=ACTIVE` と `expiration_time` が返ります。`expiration_time` を見れば、「あと何時間で消える予定なのか」が分かります。**ここが最重要ポイントで、File API は確定的に48時間で消えるとは限らず、設定や負荷状況で多少前後します。** つまりタイマーで「48時間後に消える」と決め打ちするのではなく、毎回 `expiration_time` を信頼するのが正しい設計です。
+
+なお、404 エラーが返ってきたらファイルは既に削除されています。エラー文だけで「File API が壊れた」と思い込まずに、まずこの状態確認を挟むだけで原因の切り分けが10倍速くなります。
+
+## パターン1: 短命データはインラインで送る
+
+そもそも File API を使わなくていいケースがあります。Gemini API は画像や PDF を **inline data**（base64 エンコードされたバイト列）として直接プロンプトに含められるため、20MB 以下のデータで「アップロード後すぐ使う」用途なら、File API を経由する必要はありません。
+
+```python
+# 何を解決するコード: 小さい画像をインラインで送って TTL 問題を完全に回避する
+from google import genai
+from google.genai import types
+import pathlib
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+image_bytes = pathlib.Path("photo.jpg").read_bytes()
+
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=[
+        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+        "この画像に写っているものを日本語で説明してください。",
+    ],
+)
+print(response.text)
+# 期待出力: 「夕焼けに染まった海岸線の写真です。中央に岩礁があり…」のような自然な日本語の説明
+```
+
+なぜこれが TTL 問題を解決するのか。インラインで送るとファイルはサーバー側に保存されず、その場でモデルに渡されて終わります。**保存されないものは消えようがない** — シンプルな話です。
+
+私はチャットボット系のアプリでは、ユーザーが添付した画像はすべてインラインで送るようにしています。アップロード→保存→再読み込みの3往復が消えるので、レスポンスも目に見えて速くなります。20MB という上限はあるものの、スマホ撮影画像であれば事前に長辺を1568px に縮小しておけば、まず引っかかりません。
+
+## パターン2: 永続化が必要なら自分でストレージ + 都度再アップロード
+
+動画解析や、繰り返し参照される大きな PDF など、本当に File API を使わないと厳しいケースもあります。その場合の正攻法は「**File URI は揮発キャッシュとして扱い、原本は自分のストレージに保存しておく**」設計です。
+
+```python
+# 何を解決するコード: File URI が消えていたら自動で再アップロードする
+import os
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def get_or_upload(local_path: str, cached_file_name: str | None) -> object:
+    """既存の File URI が生きていれば再利用、なければ再アップロードする"""
+    if cached_file_name:
+        try:
+            info = client.files.get(name=cached_file_name)
+            if info.state.name == "ACTIVE":
+                return info  # まだ生きているのでそのまま使う
+        except Exception:
+            pass  # 404 など — そのまま再アップロードへフォールスルー
+
+    # 再アップロード
+    uploaded = client.files.upload(file=local_path)
+    # 重要: 新しい file.name を呼び出し側で保存し直すこと
+    return uploaded
+
+# 利用例
+file = get_or_upload("video.mp4", cached_file_name="files/oldname123")
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=[file, "この動画の要点を3つに絞って教えてください。"],
+)
+print(response.text)
+```
+
+ポイントは2つあります。1つは、**`client.files.get` を try で囲むこと**。404 を例外で受け取って自然にフォールスルーさせると、コードがシンプルになります。もう1つは、**新しい `file.name` を必ず呼び出し側で保存し直すこと**。再アップロードしても古い URI には戻らないので、DB を更新しないと次回もまた再アップロードが走ります。
+
+ストレージ側は、AWS S3、Cloudflare R2、Google Cloud Storage などコストの低い選択肢で十分です。私の場合は R2 を使っていて、ユーザーがアップロードした動画は永続化、Gemini に渡す File URI は「24時間で再生成し直してもいい」くらいの感覚で運用しています。
+
+## パターン3: 大量推論はバッチで TTL 内に終わらせる
+
+File API の本来の使いどころは、**1ファイルを複数回・短期間で参照する**ケースです。例えば1本の動画から「要約」「タグ抽出」「シーン検出」「テロップ起こし」を順に走らせるなら、毎回アップロードするより File URI を取り回したほうがトークンコストもレイテンシも下がります。
+
+このときに気をつけたいのは、**処理を48時間以内に終わらせる**ことです。バッチ処理が長引いて TTL を超えると、バッチの途中で 404 が出始めます。私の経験則では、24時間を超えそうなジョブは「バッチを分割して、各バッチの先頭で File API にアップロードする」設計に切り替えると安全です。
+
+具体的には、ジョブキューを設計するときに「アップロード→処理→（必要なら）削除」を1つのトランザクション単位として扱い、48時間を超えないように分割します。ジョブキュー側で TTL 切れを起こしたタスクは、再アップロード→再キューする処理を入れておくと、運用中の事故をさらに減らせます。
+
+## どのパターンを選ぶか
+
+私が普段使っている判断基準はシンプルです。「このファイルを今後数時間以内にもう一度参照するか？」と自問してみます。答えが「いいえ」ならインライン（パターン1）。答えが「はい」で、かつ自前ストレージに置いても運用コスト的に痛くないサイズならパターン2。本当にバッチ処理として大量推論を回す必要がある場合のみパターン3、という流れです。
+
+一つのアプリの中で混在しても問題ありません。私が運営しているアプリでは、ユーザーが添付したスクリーンショットは小さくて1回しか使わないのでインラインで送り、長尺の動画ファイルは R2 に永続化してパターン2で扱う、という使い分けにしています。重要なのは「とりあえず File API にアップロードして URI を保存する」という安易な既定路線を取らないことです。それが深夜のアラートを生む原因になります。
+
+## やってはいけない設計
+
+ここまでで何度か出てきていますが、明示的に書き出しておきます。
+
+- **File URI を「永続的な ID」として DB に保存する**: 48時間後に必ず無効になります。一見テストでは動くため、本番投入後に時限爆弾化します
+- **`expiration_time` を確認せずに使う**: 「アップロードして30秒以内に使うから大丈夫」というコードでも、再試行ロジックが入ると48時間越えに化けることがあります
+- **404 を握りつぶす**: 「ファイルが見つからない」というエラーは、ユーザー体験を損なう前にロガーへ警告として残しておくべき情報です。サイレントに失敗させると検知が遅れます
+- **巨大な動画ファイルを毎回アップロードし直す**: TTL 対策として全部再アップロードにすると、コストとレイテンシが膨らみます。インライン・短期キャッシュ・自前ストレージの組み合わせで設計するのが現実解です
+
+## 次にやること
+
+ここまでの内容を、明日以降のあなたのコードに1つだけ反映するなら、**「File URI を保存しているコードに `client.files.get` の状態確認を1行挟む」** のが一番効きます。これだけで「昨日まで動いていたのに今朝から 404」というアラートはほぼ消えます。
+
+私が運営しているアプリでは、ユーザーが画像/動画を添付したタイミングでメタデータと一緒に保存先 URI（自前ストレージのもの）を持ち、Gemini に渡すときだけ File API にアップロードして使い捨てる、という形に落ち着きました。シンプルですが、TTL に振り回されることがなくなります。
+
+File API 自体の基本的な使い方は [Files API ガイド](/articles/gemini-api/files-api-guide) に詳しくまとまっています。大きなコンテキストを繰り返し参照したい場合は [Context Caching ガイド](/articles/gemini-api/context-caching-guide) のほうが本質的な解になることもあるので、合わせて検討してみてください。エラーハンドリング全般のパターンは [リトライパターン](/articles/gemini-api/gemini-api-error-handling-retry-patterns) も参考になります。
+
+実践的な書籍では [Google Cloud Platform エンタープライズ設計実践ガイド（遠山 陽介ほか）](https://www.amazon.co.jp/dp/4798168726/?tag=pinocchio-22) が、TTL 前提の運用設計や Cloud Storage との組み合わせを論じていて、参考になる部分が多いです。
