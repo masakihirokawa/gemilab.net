@@ -1,0 +1,200 @@
+---
+title: "Cancelling Gemini API Streams the Right Way — AbortController, asyncio, and the User-Initiated Stop Button"
+slug: "gemini-api-streaming-cancel-abortcontroller-guide"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-27T06:30"
+author: "Gemini Lab"
+description: "Hitting your chat UI's stop button shouldn't just freeze the screen — it should also stop billing. This guide shows how to wire up AbortController, request.is_disconnected, and the buffered-history pattern so cancellation actually does what users expect."
+tags: ["Gemini API", "streaming", "AbortController", "Python", "TypeScript", "chat UI"]
+---
+
+You build a chat UI, drop in a "Stop" button, ship it, and only later notice that the screen freezes the moment the user clicks Stop — but the Gemini API request behind it keeps generating tokens to completion. The visible side stops; the meter keeps running. I fell into this trap with my first Gemini-powered chat app, and I see it in production code more often than I'd expect.
+
+This article is about wiring user-initiated cancellation correctly across both stacks I most often reach for: TypeScript on the front end (with a Next.js or Node backend) and Python with FastAPI. The patterns here are the ones I've actually shipped, not the ones in the SDK quickstart.
+
+A quick note on scope. I am not going to cover every cancellation edge case (like aborting from a Web Worker or coordinating cancellation across multiple parallel Gemini calls in an agent loop). Those patterns layer cleanly on top of what is below, but they have enough nuance to deserve their own treatment. The single-stream, user-clicks-Stop case is the one most apps need to get right first.
+
+## What "broken cancel" actually looks like
+
+Here's the shape of the problem. The naïve streaming loop is fine when it runs to completion, but it has no off-switch:
+
+```typescript
+// Anti-pattern: nothing to cancel
+const stream = await ai.models.generateContentStream({
+  model: "gemini-2.5-flash",
+  contents: prompt,
+});
+
+for await (const chunk of stream) {
+  ui.append(chunk.text);
+}
+```
+
+A Stop button that calls `setIsStreaming(false)` will hide the spinner, but the `for await` loop keeps draining the underlying HTTP response until Gemini finishes generating. That's billable tokens you don't want, plus it ties up the connection on Cloud Run / Workers / wherever the API route lives.
+
+A correct cancellation has three moving parts: tear down the HTTP request itself, break out of the loop early, and run any cleanup needed for the partial state (DB rows, optimistic UI updates).
+
+## TypeScript / Node — pass an AbortSignal all the way through
+
+The `@google/genai` SDK accepts an `AbortSignal`. The trick is making sure you propagate the signal from the browser's fetch all the way into the SDK call, and double-check it inside the loop in case any layer between you and Gemini swallows the abort.
+
+```typescript
+// app/api/chat/route.ts (Next.js App Router)
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+export async function POST(req: Request) {
+  const { prompt } = await req.json();
+
+  // Fires when the browser's fetch is aborted or the connection drops.
+  const signal = req.signal;
+
+  const encoder = new TextEncoder();
+  const body = new ReadableStream({
+    async start(controller) {
+      try {
+        const stream = await ai.models.generateContentStream({
+          model: "gemini-2.5-flash",
+          contents: prompt,
+          // Hand the signal to the SDK so the upstream fetch is cancelled.
+          config: { abortSignal: signal },
+        });
+
+        for await (const chunk of stream) {
+          if (signal.aborted) break;
+          controller.enqueue(encoder.encode(chunk.text ?? ""));
+        }
+      } catch (err) {
+        // Aborts surface as DOMException("AbortError") — treat as a clean exit.
+        if (!signal.aborted) controller.error(err);
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(body, {
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
+}
+```
+
+The two things to remember: pass `signal` to the SDK, and check `signal.aborted` inside the loop. The redundant check is a small belt-and-suspenders move that has saved me on at least one SDK minor version where the upstream fetch did not unwind cleanly.
+
+When this works, you'll see the request show as `(canceled)` in the browser's Network tab the moment the user clicks Stop, and Cloud Logging will show a token usage figure that reflects only what was generated before cancellation.
+
+If your route runs on Cloudflare Workers or another edge runtime, the same code path works, but be aware that some edge runtimes count subrequest time, not just CPU time, against your worker quota. A long uncancelled stream is therefore not just a billing concern — it can also count against your platform limits in subtle ways. Wiring up cancel correctly is essentially free insurance against both.
+
+The client side is mostly idiomatic `fetch` with an `AbortController`:
+
+```typescript
+// React client
+const controllerRef = useRef<AbortController | null>(null);
+
+const send = async (prompt: string) => {
+  controllerRef.current = new AbortController();
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    body: JSON.stringify({ prompt }),
+    signal: controllerRef.current.signal,
+  });
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    setText((prev) => prev + decoder.decode(value));
+  }
+};
+
+const stop = () => controllerRef.current?.abort();
+```
+
+Wire up `abort()` to both the Stop button and your component's unmount cleanup. Users who navigate away mid-stream are just as expensive as users who click Stop, and the cleanup costs you nothing.
+
+## Python / FastAPI — request.is_disconnected and CancelledError
+
+The Python flavor uses different primitives but the same shape: detect that the client is gone, exit the loop, run cleanup.
+
+```python
+# main.py (FastAPI)
+import asyncio
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from google import genai
+
+app = FastAPI()
+client = genai.Client()
+
+async def stream_response(prompt: str, request: Request):
+    stream = await client.aio.models.generate_content_stream(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+    try:
+        async for chunk in stream:
+            # Poll for client disconnect on every chunk.
+            if await request.is_disconnected():
+                break
+            yield (chunk.text or "").encode("utf-8")
+    except asyncio.CancelledError:
+        # FastAPI may surface a disconnect as a CancelledError.
+        # Swallow it — re-raising leaks a 500 in some ASGI middlewares.
+        pass
+    finally:
+        # Close the SDK stream if the API supports it.
+        if hasattr(stream, "aclose"):
+            await stream.aclose()
+
+@app.post("/chat")
+async def chat(prompt: str, request: Request):
+    return StreamingResponse(
+        stream_response(prompt, request),
+        media_type="text/plain; charset=utf-8",
+    )
+```
+
+Expected behavior: the moment the browser's `AbortController.abort()` fires, FastAPI's `request.is_disconnected()` flips to `True`, the `async for` exits, and `finally` closes the SDK stream. Treat `CancelledError` as a normal exit — propagating it up the stack tends to log as a 500, which both pollutes monitoring and makes real failures harder to spot.
+
+One caveat for Cloud Run and other proxied deployments: there can be a 1–2 second lag before `is_disconnected()` returns `True`. If you have other awaitables in the loop (DB writes, vector store updates), give them their own timeouts so the whole thing tears down promptly.
+
+## What to do with the half-finished response
+
+The part most cancellation guides skip: the text the user did receive. In a chat app, you have to decide whether a stopped reply gets saved to history or discarded.
+
+My default is **save it, with a `[stopped]` marker appended**. Two reasons. First, users want to find what they were looking at — discarding it means "wait, what did I just ask?" Second, you've already been billed for those tokens, so making the partial output retrievable is the least the product can do.
+
+```typescript
+// Persisting a cancelled response on the client
+try {
+  await streamToUI(prompt, controllerRef.current.signal);
+} catch (err) {
+  if ((err as DOMException).name === "AbortError") {
+    saveHistory({ prompt, response: bufferRef.current + "\n\n[stopped]" });
+    return;
+  }
+  throw err;
+}
+saveHistory({ prompt, response: bufferRef.current });
+```
+
+Server-side persistence is easier if you flush the buffer periodically (every 500 ms or so) instead of waiting for the stream to end. That way, a cancellation leaves the database in a consistent partial state, even if your worker is killed by an autoscaler shortly after the cancel. The "save partial as a finished row" approach also plays well with optimistic UI: if the user retries the same prompt, you can pre-populate the input from the partial response so they do not have to re-type their question.
+
+One edge I have hit in production: if you persist with a per-chunk write, make sure the writes are debounced or batched. Writing to Postgres on every Gemini chunk will burn IOPS for negligible UX benefit, and at 50 tokens per second, a long answer can fire several hundred writes that all collapse into the same final row. A simple in-memory buffer that flushes every 500 ms or on cancellation is plenty.
+
+If you are already pairing this with a retry layer, the patterns in [Gemini API Error Handling and Retry Patterns](/en/articles/gemini-api/gemini-api-error-handling-retry-patterns) compose cleanly with everything above.
+
+## Where to go from here
+
+If you want the full story on streaming — chunk assembly, reconnection on transient drops, UX polish — I went deeper in [Mastering Gemini API Streaming Responses](/en/articles/gemini-api/gemini-api-streaming-response-control-chunk-error-ux). For end-to-end React chat UI plumbing, [Building a React Chat UI on the Gemini API](/en/articles/gemini-dev/gemini-api-react-ai-chat-ui-guide) walks through the full round trip including state management.
+
+For book-length grounding on the underlying primitives, [Expert Python Programming, 4th Ed. by Michał Jaworski](https://www.amazon.co.jp/dp/4048931083/?tag=pinocchio-22) covers cooperative cancellation and `CancelledError` thoroughly. On the JavaScript side, [TypeScript for Professionals by Ryota Suzuki](https://www.amazon.co.jp/dp/4297127474/?tag=pinocchio-22) is a solid systematic treatment of `AbortController` and the surrounding async APIs.
+
+## One thing to ship today
+
+If your chat app has no Stop button, or has one but doesn't pass an `AbortSignal` into `fetch`, just adding the client-side signal is the highest-leverage change you can make today. That alone ends the silent token bleed and you'll see it in next month's cost report. Layering on the server-side disconnect check and the `[stopped]` history marker can come after, in that order.
+
+Most of what we publish on this site is free, and we'll keep it that way. If you find these implementation walkthroughs useful and want the deeper material as well, we'd be grateful if you considered the membership.

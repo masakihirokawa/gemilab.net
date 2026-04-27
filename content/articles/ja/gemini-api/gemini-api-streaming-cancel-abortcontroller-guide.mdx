@@ -1,0 +1,192 @@
+---
+title: "Gemini API のストリーミング応答をユーザー操作で中止する — AbortController と asyncio の正しい使い方"
+slug: "gemini-api-streaming-cancel-abortcontroller-guide"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-27T06:30"
+author: "Gemini Lab"
+description: "チャットUIの『停止』ボタンを押したのに Gemini API のストリーミングが裏で動き続けている — そんな見落としを防ぐための、AbortController と asyncio.CancelledError を使った安全な中止処理の実装方法をまとめます。"
+tags: ["Gemini API", "ストリーミング", "AbortController", "Python", "TypeScript", "チャットUI"]
+---
+
+チャットUIに「停止」ボタンを置いてみたものの、押した瞬間に画面の文字は止まっても、サーバー側ではトークンが流れ続けている — そんな実装を本番で見つけることがあります。私自身、最初に Gemini API でチャットアプリを書いたときに同じ落とし穴にはまりました。表示は止まっても課金は続くわけで、ユーザー体験としても、コストの観点でも、後から直したくなるポイントです。
+
+この記事では、ユーザー操作によるストリーミング応答の中止を、TypeScript（フロントエンド/Node.js）と Python（FastAPI）の両方で正しく実装する方法をまとめます。SDK の挙動を踏まえた、現場で動くパターンに絞っています。
+
+## 中止が「効いていない」典型的な状態
+
+まず、よくある見落としから整理します。次のコードは `for await...of` で受け取ったチャンクを画面に出すだけのシンプルな例です。
+
+```typescript
+// アンチパターン: 中止できない実装
+const stream = await ai.models.generateContentStream({
+  model: "gemini-2.5-flash",
+  contents: prompt,
+});
+
+for await (const chunk of stream) {
+  ui.append(chunk.text);
+}
+```
+
+このコードには中止する手段がありません。ボタンを押しても、`for await` のループが自然終了するまで HTTP コネクションは閉じませんし、サーバー側はトークン生成を続けます。生成し終わるまでの数秒〜十数秒、課金は止まりません。
+
+中止を機能させるには、(1) HTTP リクエスト自体を打ち切る、(2) ループから即座に抜ける、(3) 後始末（途中まで書いた DB レコードや UI 状態）を行う、の三つを揃える必要があります。
+
+## TypeScript / Node.js — AbortController で打ち切る
+
+`@google/genai` SDK は `AbortSignal` を受け取れます。React のチャットUIから使う場合は、コンポーネントのライフサイクルと連動させるのがコツです。
+
+```typescript
+// app/api/chat/route.ts (Next.js App Router)
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+export async function POST(req: Request) {
+  const { prompt } = await req.json();
+
+  // クライアントが切断したときに発火する AbortSignal
+  const signal = req.signal;
+
+  const encoder = new TextEncoder();
+  const body = new ReadableStream({
+    async start(controller) {
+      try {
+        const stream = await ai.models.generateContentStream({
+          model: "gemini-2.5-flash",
+          contents: prompt,
+          // ★ ここで signal を渡すのが肝心
+          config: { abortSignal: signal },
+        });
+
+        for await (const chunk of stream) {
+          if (signal.aborted) break;
+          controller.enqueue(encoder.encode(chunk.text ?? ""));
+        }
+      } catch (err) {
+        // signal.aborted 起因のエラーは正常終了として扱う
+        if (!signal.aborted) controller.error(err);
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(body, {
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
+}
+```
+
+ポイントは `req.signal` を SDK に渡すこと、そしてループ内でも `signal.aborted` を見ることです。SDK バージョンによっては `abortSignal` を渡しても内部のフェッチが完全には止まらない過渡期があったため、二重に守ると安心です。期待する出力としては、ユーザーが停止ボタンを押した瞬間に Network タブのリクエストが `(canceled)` になり、Cloud Logging 側でも該当リクエストの token usage が打ち切り時点までで確定します。
+
+クライアント側はもっとシンプルで、`fetch` に `AbortController.signal` を渡すだけです。
+
+```typescript
+// クライアント (React)
+const controllerRef = useRef<AbortController | null>(null);
+
+const send = async (prompt: string) => {
+  controllerRef.current = new AbortController();
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    body: JSON.stringify({ prompt }),
+    signal: controllerRef.current.signal,
+  });
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    setText((prev) => prev + decoder.decode(value));
+  }
+};
+
+const stop = () => controllerRef.current?.abort();
+```
+
+`fetch` の中断はサーバー側の `req.signal.aborted` を `true` にするので、API ルートのループも自然に抜けます。停止ボタンと、コンポーネントのアンマウント時 (`useEffect` のクリーンアップ) の両方で `abort()` を呼ぶようにしておくと、ページ遷移時のリーク防止にもなります。
+
+## Python / FastAPI — request.is_disconnected() と CancelledError
+
+Python SDK でも考え方は同じですが、AbortController の代わりに `Request.is_disconnected()` と `asyncio.CancelledError` を組み合わせます。
+
+```python
+# main.py (FastAPI)
+import asyncio
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from google import genai
+
+app = FastAPI()
+client = genai.Client()
+
+async def stream_response(prompt: str, request: Request):
+    stream = await client.aio.models.generate_content_stream(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+    try:
+        async for chunk in stream:
+            # クライアント切断を毎チャンクで確認する
+            if await request.is_disconnected():
+                break
+            yield (chunk.text or "").encode("utf-8")
+    except asyncio.CancelledError:
+        # FastAPI が disconnect を検知して例外を投げてくることもある
+        # ここでは追加処理せず、上位に再 raise しない（黙って終わる）
+        pass
+    finally:
+        # SDK は async with で閉じることを推奨。明示的に閉じる API があれば呼ぶ
+        await stream.aclose() if hasattr(stream, "aclose") else None
+
+@app.post("/chat")
+async def chat(prompt: str, request: Request):
+    return StreamingResponse(
+        stream_response(prompt, request),
+        media_type="text/plain; charset=utf-8",
+    )
+```
+
+期待される動作は、ブラウザ側で `AbortController.abort()` を呼んだ瞬間に、FastAPI 側の `request.is_disconnected()` が `True` を返し、`async for` を抜けて `finally` でストリームを閉じる、というものです。`asyncio.CancelledError` は黙って受け止めるのが基本です — 上位に再 raise すると ASGI ミドルウェアが 500 を返してしまうことがあり、ログが汚れます。
+
+なお、Cloud Run などプロキシ越しにデプロイする場合は、リクエストの切断検知に最大 1〜2 秒のラグが出ることがあります。チャンクごとの `is_disconnected()` チェックでは、ループ内の他の処理（DB 書き込みなど）にもタイムアウトを設けておくと、より早く中止できます。
+
+## 中止後の後始末 — 途中まで書いたものをどう扱うか
+
+中止処理で意外と漏れるのが、途中まで蓄積したテキストの扱いです。チャットアプリでは「停止までに表示した内容をそのまま会話履歴として残すか、破棄するか」をプロダクト判断として決めておく必要があります。
+
+私のおすすめは、**中断時点までの応答に `[中断されました]` のサフィックスを付けて履歴に保存する**設計です。理由は二つあります。
+
+第一に、ユーザーは「途中で止めた」という事実を後から見返したいことが多く、完全に消してしまうと「あのとき何を聞いたんだっけ」が失われます。第二に、課金は中断時点までで発生しているので、何かしら残しておかないと「お金だけ取られた」感覚が残ってしまいます。
+
+```typescript
+// 中断時の履歴保存（クライアント）
+try {
+  await streamToUI(prompt, controllerRef.current.signal);
+} catch (err) {
+  if ((err as DOMException).name === "AbortError") {
+    saveHistory({ prompt, response: bufferRef.current + "\n\n[中断されました]" });
+    return;
+  }
+  throw err;
+}
+saveHistory({ prompt, response: bufferRef.current });
+```
+
+サーバー側の DB 書き込みは、ストリームが完了してから一括で書くのではなく、一定間隔（例: 500ms ごと）でバッファをフラッシュする設計にすると、中断後の状態が一貫します。リトライ処理を別途実装しているなら、[Gemini API のエラーハンドリング・リトライ実装パターン](/articles/gemini-api/gemini-api-error-handling-retry-patterns)も合わせて参照してみてください。
+
+## ストリーミング全般の制御を学びたい方へ
+
+中止だけでなく、チャンクの組み立て・接続断からの自動復帰・UX 最適化まで含めて深掘りしたい場合は、[Gemini API のストリーミングレスポンスを完全制御する](/articles/gemini-api/gemini-api-streaming-response-control-chunk-error-ux) が実装パターンを網羅しています。React のチャットUIを一から組み立てる流れは [Gemini API で React チャット UI を作る実践ガイド](/articles/gemini-dev/gemini-api-react-ai-chat-ui-guide) でフロー全体を追えます。
+
+書籍で体系立てて学びたい方には、[エキスパートPythonプログラミング 改訂4版（Michał Jaworski 著）](https://www.amazon.co.jp/dp/4048931083/?tag=pinocchio-22) が `asyncio` の協調的キャンセルや `CancelledError` の扱いを丁寧に解説しています。Web フロントエンド寄りの読者には [プロを目指す人のためのTypeScript入門（鈴木僚太 著）](https://www.amazon.co.jp/dp/4297127474/?tag=pinocchio-22) が `AbortController` を含む非同期 API を体系的に押さえるのに役立ちます。
+
+## まずは今日できる一歩
+
+もし手元のチャットアプリにまだ「停止」ボタンが無い、あるいはあっても `AbortController` を渡していない実装になっているなら、今日のうちにクライアント側の `fetch` に `signal` を渡す変更だけでも入れてみてください。これだけでサーバーへの不要なトークン生成が大幅に減り、月末のコストレポートで体感できるはずです。サーバー側の `is_disconnected()` チェック、後始末用の履歴保存は、その後で順に積み上げていけば十分です。
+
+無料で読める Gemini API の基本機能解説と並行して、本サイトでは個人開発者向けの実装ノウハウを地道に書き溜めています。「もう少し深い話を読みたい」と感じた方は、メンバーシップでより踏み込んだ内容にも触れていただけたら嬉しいです。
+
