@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMINIDROPS — Gemini Drops 4月版公開、Mac版ネイティブアプリ対応＆音楽作成機能追加（4月）",
-    "MACAPP — Gemini for MacがmacOSデスクトップから直接AIサポート、よりスピーディな体験（4月）",
-    "LYRIA3PRO — Lyria 3 Pro登場、高品質オーディオトラックを無料で作成・カスタマイズ可能（4月）",
-    "NOTEBOOKS — NotebookLM統合のNotebooks機能、チャット＆リサーチを一元管理（4月）",
-    "CHROMEAPAC — Gemini in ChromeがAPAC 7か国で展開（日本・韓国・豪州・東南アジア・4/20）",
-    "ENTERPRISE — DeloitteとAccentureがGemini Enterprise提携拡大、25,000名→100,000名にスケール（4/22）",
+    "NOTEBOOKS — Gemini に Notebooks 機能追加、NotebookLM と双方向シンクで PDF・チャット・リサーチを一元管理（4/24）",
+    "MACOS — Gemini app の macOS ネイティブ版が登場、Mac 15 以上対応で Dock からワンタップ起動（4月）",
+    "PERSONAL — Personal Intelligence で Gmail・Drive・Photos・Calendar 連携、自分専用のコンテキストを活用（4月）",
+    "WORKSPACE — Workspace Intelligence が Gmail・Chat・Calendar・Drive にリアルタイムアクセス、AI生成タスクが業務データを直接参照（4月）",
+    "SHEETS — Google Sheets に Fill with Gemini 機能、ドラッグ＆ドロップで列補完・空白範囲をプロンプトで一括生成（4月）",
+    "SIRI — Gemini-powered Siri が2026年後半に正式リリース、Apple-Google提携でコンテキスト対応 Siri 実現（4/22）",
   ],
   en: [
-    "GEMINIDROPS — Gemini Drops April edition: native Mac app support and music creation features (Apr)",
-    "MACAPP — Gemini for Mac brings AI assistance directly to macOS desktop with faster native experience (Apr)",
-    "LYRIA3PRO — Lyria 3 Pro arrives — create and customize high-fidelity audio tracks for free (Apr)",
-    "NOTEBOOKS — Notebooks with NotebookLM integration unify chats and research in one place (Apr)",
-    "CHROMEAPAC — Gemini in Chrome rolls out to 7 APAC markets including Japan, Korea, Australia (4/20)",
-    "ENTERPRISE — Deloitte & Accenture expand Gemini Enterprise partnerships, scaling to 100K licenses (4/22)",
+    "NOTEBOOKS — Gemini adds Notebooks with two-way NotebookLM sync, organize chats, PDFs, and research in one place (4/24)",
+    "MACOS — Gemini app for macOS launches, native Mac 15+ build with one-tap access from the Dock (April)",
+    "PERSONAL — Personal Intelligence connects Gmail, Drive, Photos, and Calendar for context tailored to your life (April)",
+    "WORKSPACE — Workspace Intelligence brings real-time Gmail, Chat, Calendar, and Drive context to AI tasks (April)",
+    "SHEETS — Google Sheets adds Fill with Gemini, drag-and-drop column inference and prompt-based bulk fills (April)",
+    "SIRI — Gemini-powered Siri confirmed for late 2026, Apple-Google partnership delivers context-aware Siri (4/22)",
   ],
 };
 
