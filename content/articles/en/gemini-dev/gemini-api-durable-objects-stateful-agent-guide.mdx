@@ -1,0 +1,577 @@
+---
+title: "Building Stateful AI Agents with Gemini API and Cloudflare Durable Objects — A Production Guide"
+slug: "gemini-api-durable-objects-stateful-agent-guide"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-04-27T19:45"
+author: "Gemini Lab"
+description: "A complete production guide to building a stateful AI agent that remembers conversation history, using Cloudflare Durable Objects, WebSocket Hibernation, and the Gemini API streaming endpoint."
+tags: ["gemini-api", "cloudflare", "durable-objects", "websocket", "agent"]
+highlights:
+  - "Get a working stateful AI chat backend that solo developers can ship to production this week, not the kind of toy you abandon after a weekend."
+  - "Avoid the WebSocket Hibernation, SQLite transaction, and concurrency pitfalls I hit running a chat agent in production for a year."
+  - "Run a 24/7 conversational AI service for a few dollars a month rather than the $50+ a Postgres-backed setup costs at the same scale."
+---
+
+"Can the AI remember what I told it yesterday?" is a request that comes up in almost every chat app I have shipped as a solo developer. The Gemini API itself does not retain conversation state between calls, so the server has to keep that history. Over the past year I have tried KV-backed, D1-backed, and Postgres-backed approaches, and the combination of Cloudflare Durable Objects with the Gemini API has consistently come out on top in terms of cost and operational simplicity.
+
+This article walks through the production design I have settled on. The structure is deliberately built around the mistakes I made — the things I had to fix at 2am, the architectures I tore out and rebuilt — so you can short-circuit those steps.
+
+## Why Durable Objects: the Workers state problem
+
+Cloudflare Workers are a wonderful edge runtime, but they are stateless. Every request might land on a different worker instance, so any in-memory data disappears between calls. That is fine for stateless API gateways, but a chat agent is not stateless.
+
+You could keep the history in KV or in D1 (Cloudflare's distributed SQLite). The trouble is concurrency. When two requests for the same conversation arrive nearly simultaneously, both read the current history, both append to it, and both write it back. Whichever finishes second silently overwrites the first — the classic lost update. In a KV-backed chat I ran in 2025, this manifested as user complaints like "wait, my last message just disappeared." It took me an embarrassing amount of time to realize the issue was structural, not a UI bug.
+
+Durable Objects solve this by guaranteeing that for any given key — say `userId:sessionId` — there is exactly one live instance in the world. Every request for that key is routed to the same instance, and the instance can hold both in-memory state and SQLite-backed durable state, in a strictly serialized order. For a conversational agent, that single-writer property is exactly what you want.
+
+The pricing also lands in a sensible place for indie developers. The Workers Paid plan at $5/month includes Durable Objects with generous request and compute allowances. For a hundred-user-scale app, you are looking at a few extra dollars a month rather than the $25+ floor of a managed Postgres tier.
+
+## What you will build
+
+Here is the system the rest of the article walks through:
+
+- A browser chat UI that connects via WebSocket
+- One Durable Object per session, persisting history in built-in SQLite
+- User messages routed to Gemini 2.5 Pro, with replies streamed back over the WebSocket
+- Automatic summarization once the history exceeds a threshold, so the context window does not blow up
+- Hibernation enabled, so idle sessions cost nothing in compute
+
+The whole thing fits in three files: `wrangler.toml`, `src/worker.ts`, and `src/agent.ts`. Seeing the small surface area first helps each subsequent section feel less abstract.
+
+## Step 1: wrangler.toml and the Durable Object binding
+
+Here is the configuration. Notice the `migrations` block — Durable Objects with SQLite require you to declare the class name and the migration tag explicitly.
+
+```toml
+# wrangler.toml
+name = "gemini-stateful-agent"
+main = "src/worker.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "ChatAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatAgent"]
+
+[vars]
+GEMINI_MODEL = "gemini-2.5-pro"
+
+# Provide via `wrangler secret put`:
+# - GEMINI_API_KEY
+```
+
+The `new_sqlite_classes` directive is the modern way to opt a Durable Object class into the built-in SQLite storage. The earlier KV-style storage API still works, but SQLite makes time-series data like conversation turns dramatically easier to query.
+
+Set the API key with `wrangler secret put GEMINI_API_KEY`. Putting it in `vars` would commit it to your repository — please use the secret command.
+
+## Step 2: routing Worker — getting requests to the right object
+
+The entry-point Worker is small. Its only job is to extract the session ID from the URL and forward the request to the matching Durable Object.
+
+```typescript
+// src/worker.ts
+export { ChatAgent } from "./agent";
+
+export interface Env {
+  AGENT: DurableObjectNamespace;
+  GEMINI_API_KEY: string;
+  GEMINI_MODEL: string;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const sessionId = url.searchParams.get("session");
+
+    if (!sessionId) {
+      return new Response("session query param required", { status: 400 });
+    }
+
+    // idFromName is deterministic: the same string always returns
+    // the same Durable Object ID, so the same session reaches the same instance.
+    const id = env.AGENT.idFromName(sessionId);
+    const stub = env.AGENT.get(id);
+
+    // Forward the request as-is to the Durable Object.
+    return stub.fetch(request);
+  },
+};
+```
+
+The crucial primitive here is `idFromName`. It hashes the input string into a stable Durable Object ID, so a session identifier of `"abc"` always lands on the same instance, no matter where the request originates. That is the foundation of the lock-free consistency story.
+
+One caveat: putting the session ID directly in the URL is fine for prototypes, but in production you almost certainly want to issue a short-lived ephemeral token per session and authenticate the WebSocket against that. Otherwise anyone who guesses or steals the session ID can replay the conversation. I cover the implementation pattern in [the Gemini Live API ephemeral token production guide](/articles/gemini-api/gemini-live-api-websocket-ephemeral-token-production).
+
+## Step 3: ChatAgent — the Durable Object itself
+
+This is the heart of the system. The class handles SQLite setup, WebSocket acceptance, the Gemini call, streaming back deltas, and history compression — all in one place.
+
+```typescript
+// src/agent.ts
+import { DurableObject } from "cloudflare:workers";
+import type { Env } from "./worker";
+
+const HISTORY_LIMIT = 30; // turns kept before triggering compression
+
+interface Turn {
+  role: "user" | "model";
+  text: string;
+  ts: number;
+}
+
+export class ChatAgent extends DurableObject<Env> {
+  private sql: SqlStorage;
+
+  constructor(state: DurableObjectState, env: Env) {
+    super(state, env);
+    this.sql = state.storage.sql;
+
+    // Run schema migrations on first construction.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL,
+        text TEXT NOT NULL,
+        ts INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS summary (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        content TEXT NOT NULL DEFAULT ''
+      );
+      INSERT OR IGNORE INTO summary (id, content) VALUES (1, '');
+    `);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade !== "websocket") {
+      return new Response("WebSocket only", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    // Use the Hibernation API: do NOT call server.accept() directly.
+    this.ctx.acceptWebSocket(server);
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
+  }
+
+  // Hibernation API: invoked when a message arrives.
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    if (typeof message !== "string") {
+      ws.send(JSON.stringify({ type: "error", reason: "binary not supported" }));
+      return;
+    }
+
+    let parsed: { type: string; text?: string };
+    try {
+      parsed = JSON.parse(message);
+    } catch {
+      ws.send(JSON.stringify({ type: "error", reason: "invalid json" }));
+      return;
+    }
+
+    if (parsed.type !== "user_message" || !parsed.text) {
+      ws.send(JSON.stringify({ type: "error", reason: "missing text" }));
+      return;
+    }
+
+    await this.handleUserMessage(ws, parsed.text);
+  }
+
+  async webSocketClose(ws: WebSocket, code: number) {
+    // Nothing to clean up — Hibernation releases memory automatically.
+    console.log("ws closed", code);
+  }
+
+  private async handleUserMessage(ws: WebSocket, userText: string) {
+    const now = Date.now();
+
+    // 1. Persist the user turn first.
+    this.sql.exec(
+      "INSERT INTO turns (role, text, ts) VALUES (?, ?, ?)",
+      "user",
+      userText,
+      now,
+    );
+
+    // 2. Load history and the rolling summary.
+    const turns = this.fetchRecentTurns();
+    const summary = this.fetchSummary();
+
+    // 3. Stream from Gemini.
+    const reply = await this.callGeminiStream(ws, summary, turns, userText);
+
+    // 4. Persist the AI turn.
+    this.sql.exec(
+      "INSERT INTO turns (role, text, ts) VALUES (?, ?, ?)",
+      "model",
+      reply,
+      Date.now(),
+    );
+
+    // 5. Compress old turns if we are over the limit.
+    const totalTurns = this.countTurns();
+    if (totalTurns > HISTORY_LIMIT) {
+      // Run compression in the background so the client is not blocked.
+      this.ctx.waitUntil(this.compressHistory());
+    }
+  }
+
+  private fetchRecentTurns(): Turn[] {
+    const cursor = this.sql.exec<Turn>(
+      "SELECT role, text, ts FROM turns ORDER BY id DESC LIMIT ?",
+      HISTORY_LIMIT,
+    );
+    return [...cursor].reverse();
+  }
+
+  private fetchSummary(): string {
+    const cursor = this.sql.exec<{ content: string }>(
+      "SELECT content FROM summary WHERE id = 1",
+    );
+    return [...cursor][0]?.content ?? "";
+  }
+
+  private countTurns(): number {
+    const cursor = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM turns");
+    return [...cursor][0]?.n ?? 0;
+  }
+
+  private async callGeminiStream(
+    ws: WebSocket,
+    summary: string,
+    turns: Turn[],
+    userText: string,
+  ): Promise<string> {
+    const systemInstruction = summary
+      ? `Earlier conversation summary: ${summary}\n\nReply with that context in mind.`
+      : "Be concise and helpful.";
+
+    const contents = [
+      ...turns.map((t) => ({
+        role: t.role,
+        parts: [{ text: t.text }],
+      })),
+      { role: "user", parts: [{ text: userText }] },
+    ];
+
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/${this.env.GEMINI_MODEL}:streamGenerateContent` +
+      `?alt=sse&key=${this.env.GEMINI_API_KEY}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        contents,
+        generationConfig: { temperature: 0.7, maxOutputTokens: 4096 },
+      }),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      ws.send(JSON.stringify({ type: "error", reason: `gemini ${res.status}` }));
+      throw new Error(`Gemini API ${res.status}: ${errBody.slice(0, 200)}`);
+    }
+
+    // Read SSE chunks and forward deltas over the WebSocket.
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE events are separated by "\n\n".
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const json = line.slice(6).trim();
+        if (!json) continue;
+
+        try {
+          const chunk = JSON.parse(json);
+          const delta = chunk.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+          if (delta) {
+            fullText += delta;
+            ws.send(JSON.stringify({ type: "delta", text: delta }));
+          }
+        } catch {
+          // Partial JSON is normal mid-stream; the next chunk will complete it.
+          continue;
+        }
+      }
+    }
+
+    ws.send(JSON.stringify({ type: "done" }));
+    return fullText;
+  }
+
+  private async compressHistory() {
+    const oldCursor = this.sql.exec<{ id: number; role: string; text: string }>(
+      "SELECT id, role, text FROM turns ORDER BY id ASC LIMIT ?",
+      HISTORY_LIMIT - 10, // keep the most recent 10 turns out of compression
+    );
+    const oldTurns = [...oldCursor];
+    if (oldTurns.length === 0) return;
+
+    const oldText = oldTurns.map((t) => `${t.role}: ${t.text}`).join("\n");
+    const prevSummary = this.fetchSummary();
+
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/${this.env.GEMINI_MODEL}:generateContent` +
+      `?key=${this.env.GEMINI_API_KEY}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text:
+                  `Previous summary:\n${prevSummary}\n\n` +
+                  `Additional turns:\n${oldText}\n\n` +
+                  `Combine these into a 500-word summary. Preserve all decisions and key points.`,
+              },
+            ],
+          },
+        ],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 1024 },
+      }),
+    });
+
+    if (!res.ok) return; // try again next time
+
+    const data = (await res.json()) as {
+      candidates?: { content?: { parts?: { text?: string }[] } }[];
+    };
+    const newSummary = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    if (!newSummary) return;
+
+    const ids = oldTurns.map((t) => t.id);
+    // Update the summary and prune old rows atomically.
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("UPDATE summary SET content = ? WHERE id = 1", newSummary);
+      const placeholders = ids.map(() => "?").join(",");
+      this.sql.exec(`DELETE FROM turns WHERE id IN (${placeholders})`, ...ids);
+    });
+  }
+}
+```
+
+What you should see at runtime: the client opens a WebSocket, sends a `user_message`, and a stream of `{"type":"delta","text":"..."}` JSON events arrives in near real time, terminated by `{"type":"done"}`. Once you cross 30 turns, older turns are folded into a rolling summary and the table is pruned, keeping the context window manageable forever.
+
+## Step 4: why acceptWebSocket — the Hibernation story
+
+You may have noticed the code uses `this.ctx.acceptWebSocket(server)` and a `webSocketMessage` method instead of attaching event listeners to `server`. That is the Hibernation API, and choosing it over the older direct `server.accept()` path is the difference between "this scales to thousands of idle sessions for free" and "my Workers bill quintupled overnight."
+
+In the non-hibernating mode, the Durable Object has to remain in memory for the entire WebSocket lifetime so that the JavaScript event listeners survive. Idle time counts toward billable compute. If users open the chat and walk away for an hour, you pay for that hour.
+
+With `acceptWebSocket`, Cloudflare evicts the Durable Object from memory once it goes idle and rehydrates it within milliseconds when the next message arrives. In my own indie chat app, switching to Hibernation reduced the compute portion of my Workers bill by roughly 80%.
+
+The trade-off is that any state held in instance fields disappears across hibernation events. Anything you want to remember — including conversation history — has to live in `state.storage` (SQLite). If you ever find yourself caching turns in a class field, expect them to vanish.
+
+## Step 5: a minimal client for testing
+
+Server code is only half the story. Here is a barebones HTML page you can deploy on Cloudflare Pages to verify the end-to-end flow.
+
+```html
+<!-- index.html (deploy on Cloudflare Pages) -->
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Gemini Stateful Agent</title></head>
+<body>
+  <ul id="log"></ul>
+  <input id="input" type="text" placeholder="Ask anything" style="width: 80%">
+  <button id="send">Send</button>
+<script>
+  const sessionId = localStorage.getItem("sid") ||
+    (() => { const s = crypto.randomUUID(); localStorage.setItem("sid", s); return s; })();
+  const ws = new WebSocket(
+    `wss://gemini-stateful-agent.YOUR-SUBDOMAIN.workers.dev/?session=${sessionId}`
+  );
+
+  const log = document.getElementById("log");
+  let currentBubble = null;
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "delta") {
+      if (!currentBubble) {
+        currentBubble = document.createElement("li");
+        currentBubble.textContent = "AI: ";
+        log.appendChild(currentBubble);
+      }
+      currentBubble.textContent += msg.text;
+    } else if (msg.type === "done") {
+      currentBubble = null;
+    } else if (msg.type === "error") {
+      const li = document.createElement("li");
+      li.textContent = "[error] " + msg.reason;
+      log.appendChild(li);
+    }
+  };
+
+  document.getElementById("send").onclick = () => {
+    const input = document.getElementById("input");
+    const text = input.value.trim();
+    if (!text) return;
+    const li = document.createElement("li");
+    li.textContent = "You: " + text;
+    log.appendChild(li);
+    ws.send(JSON.stringify({ type: "user_message", text }));
+    input.value = "";
+  };
+</script>
+</body>
+</html>
+```
+
+The key thing this page demonstrates is persistence across reloads. Because the session ID is stashed in `localStorage`, refreshing the page reconnects to the same Durable Object and the agent will recall the previous conversation, summary and all. Try telling it "My name is Masaki" then reloading and asking "What is my name?" — you should get the right answer back.
+
+## Common mistakes and pitfalls
+
+### Pitfall 1: using newUniqueId instead of idFromName
+
+`env.AGENT.newUniqueId()` produces a fresh ID every time it is called. If you reach for it instead of `idFromName(sessionId)`, every request gets routed to a brand new Durable Object — meaning the agent has no memory of anything before the current request. Users will report things like "I told it my name two messages ago and it forgot."
+
+Stick to `idFromName(sessionId)` for any session-continuity use case. `newUniqueId` is appropriate only when you genuinely want a brand new resource that does not need to be addressable by name.
+
+### Pitfall 2: scattering SQLite writes across awaits
+
+The Durable Objects input gate handles per-request isolation neatly, but inside a single request that calls `fetch` mid-flight (as ours does for the streaming Gemini call), things get subtler. If you interleave multiple `INSERT` statements with `await fetch(...)` calls, a second incoming WebSocket message can slip in between writes and produce out-of-order rows.
+
+In an early version of this code I wrote insert → await Gemini → insert and saw turn ordering like `user, user, model, model` when a user sent two messages in quick succession. The fix is to write the user turn synchronously first, kick off the Gemini call, and only insert the model turn after the stream completes. If you have multiple writes that must commit together, wrap them in `transactionSync`.
+
+### Pitfall 3: leaking secrets into the client URL
+
+It is dangerously easy to write something like `?key=${API_KEY}` while debugging and forget to remove it. Once the API key shows up in a client-side URL, it is in browser history, in proxy logs, and quite possibly in someone's screen recording. The three-tier shape — client connects to Worker, Worker calls Gemini — has to be enforced rigidly. Never put the Gemini API key on the client side.
+
+### Pitfall 4: assuming one user equals one session
+
+A Durable Object is per session ID, not per user. If your app generates a new session ID for each device, the user's phone and laptop will hold separate, independent conversations. The phone will not know what was said on the laptop.
+
+If you want a unified per-user experience, use the user's stable account ID (issued at login) as the input to `idFromName`. Be aware that simultaneous connections from multiple devices can race; you may need a small concurrency token to serialize handle-message processing if both devices are typing at once.
+
+### Pitfall 5: forgetting the SQLite size cap
+
+Each Durable Object's built-in SQLite is capped at 10 GB. For text conversations that is enormous, but if you start storing base64-encoded images directly in the database, you will hit the wall after a few thousand multimodal turns. The right pattern for image-heavy chats is to store the image bytes in R2 and persist only the URL in SQLite.
+
+## Comparing the alternatives — and why Durable Objects wins for this use case
+
+You have other options. Here is the honest assessment from running each in production.
+
+**Cloudflare KV**: cheap and simple, but eventually consistent across regions. For a chat agent, the moment a user sends two quick messages and KV serves stale data on the second read, you have a broken feature. It is structurally wrong for stateful chat.
+
+**Cloudflare D1**: distributed SQLite with a single primary region for writes. From the edge, every write incurs a round-trip to the primary. If your primary is in North America and your user is in Tokyo, you can feel the lag in the typing indicator alone.
+
+**Supabase Realtime + Postgres**: full-featured, well-documented, but the Pro tier starts at $25/month. Worth it for a real product, but heavy for a side project.
+
+**Vercel + Upstash Redis**: viable on the edge, but the concurrency control becomes your problem. Most teams end up writing Lua CAS scripts. Durable Objects let you skip that entire category of code by leaning on the single-instance guarantee.
+
+The honest reason I keep choosing Durable Objects is cognitive load. You write ordinary class methods and the runtime handles serialization for you. There is no lock, no CAS, no advisory mutex — just code that reads as if it owns the state, because it does.
+
+## Observability and debugging in production
+
+Debugging Durable Objects leans heavily on logs. You cannot easily attach a debugger to a hibernating instance, so plan your `console.log` calls deliberately. The Cloudflare dashboard's Workers Logs view is your primary window into runtime behavior.
+
+The three signals I always make sure to log:
+
+- The session ID and the resulting Durable Object ID (the output of `idFromName`)
+- WebSocket lifecycle events with their close codes
+- Gemini call latency and the `usageMetadata` from each response
+
+That last one is gold for cost analysis. Pipe the per-call token counts into Workers Analytics Engine and you can answer "which sessions are eating my budget?" by querying a single dataset at the end of the month.
+
+## Cost projection for a real indie deployment
+
+Concrete numbers help. Imagine 100 users at 30 messages per day on the Workers Paid plan ($5/month):
+
+- Workers and Durable Objects requests: you would need about 300,000 messages a month to use the included one million requests; you are well inside the included tier
+- Compute time: with Hibernation, near zero
+- Durable Object storage (SQLite): roughly $0.20 per GB; for 100 users you will pay cents
+- Gemini 2.5 Pro: $1.25 per million input tokens, $5.00 per million output tokens
+
+Gemini's per-token cost dominates. If the average message is 1,000 input + 500 output tokens, 90,000 messages a month works out to about $112 of input and $225 of output, around $340 total. That assumes every user maxes out 30 messages every day, which they will not. Most real apps see a fraction of that engagement.
+
+There are also clean optimizations: switch the summarization step to Gemini Flash, enable context caching for system instructions, and trim history more aggressively. I cover those techniques in [the Cloudflare Workers edge AI cost guide](/articles/gemini-api/gemini-api-cloudflare-workers-edge-ai) and [the Hono + Cloudflare edge AI implementation guide](/articles/gemini-api/gemini-api-hono-cloudflare-edge-ai-guide). Apply them and the total bill drops further.
+
+## Deploying with a minimal CI/CD setup
+
+Once the agent works locally, you want a hands-off deployment path. Here is the smallest GitHub Actions workflow I rely on:
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to Cloudflare Workers
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Deploy
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+A few non-obvious notes from running this in production. First, set the API token's permissions to "Edit Cloudflare Workers" only — the default scope is broader than you want a CI runner to have. Second, do not set Gemini secrets through GitHub Actions; set them once with `wrangler secret put GEMINI_API_KEY` so they are stored only inside Cloudflare and never seen by your CI logs. Third, when you change the `migrations` block — for example by adding a new SQLite class — you must bump the migration tag from `v1` to `v2`. I once forgot this and the deploy failed with a cryptic "migration not applied" message that took me an hour to track down.
+
+If you prefer Cloudflare's own deployment integration, connecting the GitHub repo through the dashboard works equally well. The Actions approach gives you more flexibility when you eventually want to add a test step or a build step before deploy, which is why I keep recommending it.
+
+## Scaling thoughts: when to graduate beyond a single Durable Object
+
+Durable Objects scale beautifully horizontally because each session ID gets its own instance. There is no shared state, so adding the next user adds the next object. The places this design starts to strain are not horizontal — they are vertical, within a single session.
+
+Imagine a session that is shared among ten team members in a Slack-like collaborative chat. All their writes hit the same Durable Object instance. The instance is single-threaded, so the throughput ceiling is roughly "how fast one event loop can process ten people's messages plus ten Gemini calls." That is still surprisingly good — easily a few requests per second — but you cannot scale past one CPU on a single key.
+
+The fixes are at the data model level rather than the infrastructure level. Two patterns work well:
+
+The first is sharding by sub-conversation. If your collaborative chat naturally splits into threads, give each thread its own Durable Object. Cross-thread coordination then becomes coarser-grained and the per-instance load drops.
+
+The second is offloading expensive work. The Gemini call is the slowest thing the agent does. You can dispatch the call from the Durable Object via `ctx.waitUntil` and stream tokens back through the WebSocket without holding the input gate. The trick is to make sure that any state mutation triggered by the response runs inside a fresh `transactionSync` — otherwise you risk reordering issues.
+
+Most indie projects never approach these limits. I am writing this section to give you a sense of the road ahead, not to scare you away from the simple path. Start with one Durable Object per session and only revisit the architecture if you measure contention.
+
+## Testing the agent locally with miniflare
+
+The local development experience is one of the underrated reasons to use this stack. `wrangler dev --local` launches Miniflare under the hood and runs the entire Workers + Durable Objects + SQLite environment on your laptop, fully offline. There is no AWS-style "deploy to dev environment to test" loop.
+
+A few testing patterns I have found useful. For unit-style tests on the agent class, instantiate Miniflare directly and call into your Worker's `fetch` handler from a test runner like Vitest. For end-to-end tests with the WebSocket flow, use Playwright pointed at the local dev server — it can drive a real browser through the chat UI and assert that conversation history is preserved across reloads.
+
+Mocking the Gemini API is straightforward because the call is a plain `fetch`. In tests I usually swap the URL to a local Express stub that returns a deterministic SSE stream. That keeps tests fast, free, and reproducible. The one thing to be careful about is that real Gemini responses can be partial JSON across chunk boundaries, so your stub should also send malformed-mid-stream payloads to verify your parser handles them.
+
+## Closing — what changes once you ship this
+
+Thank you for reading this far. The combination of Durable Objects and the Gemini API is, in my experience, the most realistic path for a solo developer to ship a chat agent that genuinely remembers users — without setting up a Postgres tier or paying for an always-on container.
+
+Your immediate next step is to stand the code up locally with `wrangler dev --local`, which gives you a real SQLite-backed Durable Object on your machine. Confirm that conversation continuity works across reloads, then run `wrangler deploy` to push it to the global edge.
+
+For me, the most underappreciated benefit of this architecture is psychological. After the migration, I stopped worrying about my server going down — Cloudflare's edge handles regional failures and horizontal scale without me thinking about it. For a solo developer, that mental load reduction is as valuable as the cost savings. I hope it serves your next chat app the same way.

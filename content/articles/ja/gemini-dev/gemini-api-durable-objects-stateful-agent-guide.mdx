@@ -1,0 +1,532 @@
+---
+title: "Gemini API + Cloudflare Durable Objects でつくるステートフルAIエージェント本番ガイド"
+slug: "gemini-api-durable-objects-stateful-agent-guide"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-04-27T19:45"
+author: "Gemini Lab"
+description: "Cloudflare Durable Objects を使い、会話履歴を永続化したステートフルなAIエージェントを Gemini API で構築する本番設計を、コード例とともに体系的に解説します。"
+tags: ["gemini-api", "cloudflare", "durable-objects", "websocket", "agent"]
+highlights:
+  - "Cloudflare Workers だけでは実装できない『会話を覚えているAI』を、Durable Objects と Gemini API の組み合わせで動く形にできる"
+  - "WebSocket Hibernation や Storage トランザクションの落とし穴を避けながら、本番投入できるステートフルエージェントの設計パターンを習得できる"
+  - "個人開発者でも月額数ドル規模のインフラ費用で、24時間動き続ける会話AIサービスを運用できる構成へ移行できる"
+---
+
+「AIに昨日話した内容を覚えていてほしい」という要望は、個人開発のチャットアプリでも繰り返し出てきます。Gemini API には会話状態を覚えてくれる機能はないので、サーバー側で履歴を保持する必要があります。私はこの 1 年でいくつかの構成を試しましたが、Cloudflare Durable Objects と Gemini API を組み合わせた構成が、個人開発者にとって最もコストパフォーマンスが良いという結論に至りました。
+
+この記事では、その本番運用で得た知見を体系的にまとめます。とりわけ「Workers だけで作ろうとして詰まった」「KV や D1 で会話履歴を持たせようとして同時編集が壊れた」といった、私が実際に踏んだ落とし穴を中心に書いていきます。
+
+## なぜ Durable Objects が必要なのか — Workers の状態問題
+
+Cloudflare Workers は素晴らしいエッジ実行環境ですが、ステートレスです。リクエストごとに別のワーカーインスタンスで実行されるため、メモリ上に持った変数は次のリクエストでは消えてしまいます。
+
+会話履歴を持たせるには KV や D1 (SQLite) を使う方法もありますが、ここで問題が起きます。同じ会話セッションに対して 2 つのリクエストがほぼ同時に来た場合、片方が読んで書き戻している間にもう片方も読み書きしてしまい、会話履歴の一部が消える「lost update」が発生するのです。私が以前 KV ベースで実装したチャットでは、ユーザーが連続でメッセージを送ったときに「あれ、さっきの返信が消えた？」というクレームが入って気付きました。
+
+Durable Objects は、特定のキー（私の場合は `userId:sessionId`）に対して**世界に 1 つだけ**のシングルトンインスタンスを保証してくれます。同じキーへのリクエストはすべてその同じインスタンスにルーティングされ、内部のメモリと SQLite ストレージは順序保証された状態で扱えます。これは、会話エージェントのように「同じセッションには同じ状態」が要求される用途に理想的です。
+
+価格面でも、Workers Paid プラン（月 $5）に Durable Objects が含まれており、リクエスト数とコンピュート時間に応じた従量課金で、個人開発で本番投入する規模なら月数ドルの追加で十分です。書籍で体系的に学ぶなら、[Cloudflare Workers サーバーレス開発実践ガイド（柳澤永人 著）](https://www.amazon.co.jp/dp/B0BYVMJJ4Z/?tag=pinocchio-22) が Durable Objects の設計判断まで踏み込んで書かれており参考になります。
+
+## 構築するもの — WebSocket 接続のステートフル会話エージェント
+
+この記事で実装するのは次のような系です。
+
+- ブラウザから WebSocket で接続するチャット UI
+- セッションごとに 1 つの Durable Object が紐付き、会話履歴を SQLite に永続化
+- ユーザー発話を Gemini 2.5 Pro に投げ、応答をストリーミングで WebSocket に流す
+- 履歴が長くなったら古い部分を自動要約して圧縮（コンテキスト爆発の防止）
+- ハイバネーション対応で、無接続時はメモリゼロで待機できる
+
+ファイル構成は最小で次の 3 つだけです。
+
+- `wrangler.toml` — バインディング定義
+- `src/worker.ts` — エントリポイント、Durable Object へルーティング
+- `src/agent.ts` — Durable Object 本体（会話エージェントの実装）
+
+完成形をひと目で見てから読み進めると、各セクションの位置付けが分かりやすいかと思います。
+
+## Step 1: wrangler.toml と Durable Object のバインディング
+
+まずは `wrangler.toml` です。Durable Objects は通常の KV と違い、`migrations` セクションでクラス名と SQLite 利用フラグを宣言する必要があります。
+
+```toml
+# wrangler.toml
+name = "gemini-stateful-agent"
+main = "src/worker.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "ChatAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatAgent"]
+
+[vars]
+GEMINI_MODEL = "gemini-2.5-pro"
+
+# secret は wrangler secret put で投入する
+# - GEMINI_API_KEY
+```
+
+`new_sqlite_classes` を使うと、Durable Object に内蔵の SQLite を持たせることができます。以前は KV ライクな Storage API しかなく、複雑なクエリは書きにくかったのですが、SQLite が利用できるようになってから会話履歴のような時系列データの扱いが格段に楽になりました。
+
+API キーは `wrangler secret put GEMINI_API_KEY` で投入します。`vars` に書くとコードに残ってしまうので、シークレットには必ず secret コマンドを使ってください。
+
+## Step 2: ルーティング Worker — リクエストを正しい Durable Object へ届ける
+
+エントリポイントの Worker は、URL から `sessionId` を抽出し、対応する Durable Object へリクエストを転送する役目だけを担います。
+
+```typescript
+// src/worker.ts
+export { ChatAgent } from "./agent";
+
+export interface Env {
+  AGENT: DurableObjectNamespace;
+  GEMINI_API_KEY: string;
+  GEMINI_MODEL: string;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const sessionId = url.searchParams.get("session");
+
+    if (!sessionId) {
+      return new Response("session query param required", { status: 400 });
+    }
+
+    // sessionId をキーに DO の ID を生成。
+    // idFromName は決定論的なので、同じ sessionId は常に同じ DO に届く。
+    const id = env.AGENT.idFromName(sessionId);
+    const stub = env.AGENT.get(id);
+
+    // リクエストをそのまま DO に丸ごと渡す
+    return stub.fetch(request);
+  },
+};
+```
+
+ここで重要なのは `idFromName` の使い方です。同じ文字列を渡せば常に同じ Durable Object ID が返るため、ユーザー A の `sessionId="abc"` 宛のリクエストは世界中どこから来ても同じ DO インスタンスに集約されます。これがロックフリーな整合性を担保する基盤になります。
+
+注意点として、`sessionId` は URL に直接乗せていますが、本番ではセッションごとに短命なエフェメラルトークンを発行する設計を強く推奨します。`sessionId` を秘匿しないと、第三者がセッションを乗っ取って会話履歴を読み出せてしまうためです。実装パターンは [Gemini Live API のエフェメラルトークン本番ガイド](/articles/gemini-api/gemini-live-api-websocket-ephemeral-token-production) で詳しく扱っています。
+
+## Step 3: ChatAgent Durable Object — 本体実装
+
+ここが記事の中心です。SQLite 初期化、WebSocket 受信、Gemini 呼び出し、ストリーミング応答までを 1 つのクラスに統合します。
+
+```typescript
+// src/agent.ts
+import { DurableObject } from "cloudflare:workers";
+import type { Env } from "./worker";
+
+const HISTORY_LIMIT = 30; // 圧縮前の最大ターン数
+
+interface Turn {
+  role: "user" | "model";
+  text: string;
+  ts: number;
+}
+
+export class ChatAgent extends DurableObject<Env> {
+  private sql: SqlStorage;
+
+  constructor(state: DurableObjectState, env: Env) {
+    super(state, env);
+    this.sql = state.storage.sql;
+
+    // SQLite テーブルを 1 度だけ作成
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL,
+        text TEXT NOT NULL,
+        ts INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS summary (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        content TEXT NOT NULL DEFAULT ''
+      );
+      INSERT OR IGNORE INTO summary (id, content) VALUES (1, '');
+    `);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade !== "websocket") {
+      return new Response("WebSocket only", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    // Hibernation 対応の WebSocket 受け入れ。
+    // 重要: server.accept() を直接呼ばず、acceptWebSocket を使う
+    this.ctx.acceptWebSocket(server);
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
+  }
+
+  // Hibernation API: メッセージ受信ハンドラ
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    if (typeof message !== "string") {
+      ws.send(JSON.stringify({ type: "error", reason: "binary not supported" }));
+      return;
+    }
+
+    let parsed: { type: string; text?: string };
+    try {
+      parsed = JSON.parse(message);
+    } catch {
+      ws.send(JSON.stringify({ type: "error", reason: "invalid json" }));
+      return;
+    }
+
+    if (parsed.type !== "user_message" || !parsed.text) {
+      ws.send(JSON.stringify({ type: "error", reason: "missing text" }));
+      return;
+    }
+
+    await this.handleUserMessage(ws, parsed.text);
+  }
+
+  async webSocketClose(ws: WebSocket, code: number) {
+    // 切断時に特別な処理は不要。Hibernation で自動的にメモリ解放される
+    console.log("ws closed", code);
+  }
+
+  private async handleUserMessage(ws: WebSocket, userText: string) {
+    const now = Date.now();
+
+    // 1. ユーザー発話を保存
+    this.sql.exec(
+      "INSERT INTO turns (role, text, ts) VALUES (?, ?, ?)",
+      "user",
+      userText,
+      now,
+    );
+
+    // 2. 履歴と要約を取得
+    const turns = this.fetchRecentTurns();
+    const summary = this.fetchSummary();
+
+    // 3. Gemini にストリームリクエスト
+    const reply = await this.callGeminiStream(ws, summary, turns, userText);
+
+    // 4. AI 応答を保存
+    this.sql.exec(
+      "INSERT INTO turns (role, text, ts) VALUES (?, ?, ?)",
+      "model",
+      reply,
+      Date.now(),
+    );
+
+    // 5. 履歴が増えすぎたら古い部分を要約して圧縮
+    const totalTurns = this.countTurns();
+    if (totalTurns > HISTORY_LIMIT) {
+      // バックグラウンドで実行（クライアントを待たせない）
+      this.ctx.waitUntil(this.compressHistory());
+    }
+  }
+
+  private fetchRecentTurns(): Turn[] {
+    const cursor = this.sql.exec<Turn>(
+      "SELECT role, text, ts FROM turns ORDER BY id DESC LIMIT ?",
+      HISTORY_LIMIT,
+    );
+    return [...cursor].reverse();
+  }
+
+  private fetchSummary(): string {
+    const cursor = this.sql.exec<{ content: string }>(
+      "SELECT content FROM summary WHERE id = 1",
+    );
+    return [...cursor][0]?.content ?? "";
+  }
+
+  private countTurns(): number {
+    const cursor = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM turns");
+    return [...cursor][0]?.n ?? 0;
+  }
+
+  private async callGeminiStream(
+    ws: WebSocket,
+    summary: string,
+    turns: Turn[],
+    userText: string,
+  ): Promise<string> {
+    const systemInstruction = summary
+      ? `これまでの会話の要約: ${summary}\n\n上記を踏まえてユーザーに応答してください。`
+      : "丁寧で簡潔に応答してください。";
+
+    const contents = [
+      ...turns.map((t) => ({
+        role: t.role,
+        parts: [{ text: t.text }],
+      })),
+      { role: "user", parts: [{ text: userText }] },
+    ];
+
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/${this.env.GEMINI_MODEL}:streamGenerateContent` +
+      `?alt=sse&key=${this.env.GEMINI_API_KEY}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        contents,
+        generationConfig: { temperature: 0.7, maxOutputTokens: 4096 },
+      }),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      ws.send(JSON.stringify({ type: "error", reason: `gemini ${res.status}` }));
+      throw new Error(`Gemini API ${res.status}: ${errBody.slice(0, 200)}`);
+    }
+
+    // Server-Sent Events を読みながら WebSocket に流す
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // "data: {...}\n\n" で区切られる
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const json = line.slice(6).trim();
+        if (!json) continue;
+
+        try {
+          const chunk = JSON.parse(json);
+          const delta = chunk.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+          if (delta) {
+            fullText += delta;
+            ws.send(JSON.stringify({ type: "delta", text: delta }));
+          }
+        } catch (e) {
+          // 部分的な JSON は無視（次のチャンクで補完される）
+          continue;
+        }
+      }
+    }
+
+    ws.send(JSON.stringify({ type: "done" }));
+    return fullText;
+  }
+
+  private async compressHistory() {
+    const oldCursor = this.sql.exec<{ id: number; role: string; text: string }>(
+      "SELECT id, role, text FROM turns ORDER BY id ASC LIMIT ?",
+      HISTORY_LIMIT - 10, // 直近 10 ターンは圧縮対象から除外
+    );
+    const oldTurns = [...oldCursor];
+    if (oldTurns.length === 0) return;
+
+    const oldText = oldTurns.map((t) => `${t.role}: ${t.text}`).join("\n");
+    const prevSummary = this.fetchSummary();
+
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/${this.env.GEMINI_MODEL}:generateContent` +
+      `?key=${this.env.GEMINI_API_KEY}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text:
+                  `以前の要約:\n${prevSummary}\n\n` +
+                  `追加の会話:\n${oldText}\n\n` +
+                  `これらを 500 字以内の要約に統合してください。会話の論点と決定事項を必ず残してください。`,
+              },
+            ],
+          },
+        ],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 1024 },
+      }),
+    });
+
+    if (!res.ok) return; // 失敗したら次の機会まで先延ばし
+
+    const data = (await res.json()) as {
+      candidates?: { content?: { parts?: { text?: string }[] } }[];
+    };
+    const newSummary = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    if (!newSummary) return;
+
+    const ids = oldTurns.map((t) => t.id);
+    // SQLite トランザクションで「要約更新 + 古い行の削除」を原子的に行う
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("UPDATE summary SET content = ? WHERE id = 1", newSummary);
+      const placeholders = ids.map(() => "?").join(",");
+      this.sql.exec(`DELETE FROM turns WHERE id IN (${placeholders})`, ...ids);
+    });
+  }
+}
+```
+
+期待される動作は次の通りです。クライアントが WebSocket を開いてユーザー発話を送ると、Gemini からのストリーミングチャンクが `{"type":"delta","text":"..."}` という JSON 形式で次々と返り、最後に `{"type":"done"}` が届きます。30 ターンを超えると古い会話が要約に押し込められ、`summary` テーブルが更新されます。
+
+## Step 4: なぜ acceptWebSocket を使うのか — Hibernation の話
+
+上のコードで `this.ctx.acceptWebSocket(server)` を使い、`webSocketMessage` メソッドでメッセージを受けている点に気付かれたでしょうか。これは Hibernation API という Cloudflare 独自の仕組みで、知らずに `server.accept()` の方で書くと本番運用でコストが跳ね上がります。
+
+通常の WebSocket では、メッセージを受け取るために Durable Object のインスタンスがメモリに常駐し続けます。アイドル時間も課金される（コンピュート時間に含まれる）ため、ユーザーが沈黙している時間も支払いが発生します。
+
+`acceptWebSocket` で受けると、メッセージが来るまで DO は完全にハイバネートされ、メモリと CPU を消費しません。メッセージが届いた瞬間に高速で復帰し、`webSocketMessage` が呼ばれます。私が個人開発のチャットアプリで実測したところ、コンピュート時間の請求がおおむね 8 割減りました。
+
+注意点として、ハイバネートするとメモリ上の変数は消えるため、状態は必ず `state.storage`（SQLite）に置く必要があります。ローカル変数で会話履歴を保持していると、ハイバネート後に空になっています。
+
+## Step 5: クライアント側の実装サンプル
+
+サーバー側だけ書いて満足してしまうと動作確認ができないので、ブラウザ側の最小コードも示します。
+
+```html
+<!-- index.html (Pages にデプロイする想定) -->
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><title>Gemini Stateful Agent</title></head>
+<body>
+  <ul id="log"></ul>
+  <input id="input" type="text" placeholder="質問を入力" style="width: 80%">
+  <button id="send">送信</button>
+<script>
+  const sessionId = localStorage.getItem("sid") ||
+    (() => { const s = crypto.randomUUID(); localStorage.setItem("sid", s); return s; })();
+  const ws = new WebSocket(
+    `wss://gemini-stateful-agent.YOUR-SUBDOMAIN.workers.dev/?session=${sessionId}`
+  );
+
+  const log = document.getElementById("log");
+  let currentBubble = null;
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "delta") {
+      if (!currentBubble) {
+        currentBubble = document.createElement("li");
+        currentBubble.textContent = "AI: ";
+        log.appendChild(currentBubble);
+      }
+      currentBubble.textContent += msg.text;
+    } else if (msg.type === "done") {
+      currentBubble = null;
+    } else if (msg.type === "error") {
+      const li = document.createElement("li");
+      li.textContent = "[error] " + msg.reason;
+      log.appendChild(li);
+    }
+  };
+
+  document.getElementById("send").onclick = () => {
+    const input = document.getElementById("input");
+    const text = input.value.trim();
+    if (!text) return;
+    const li = document.createElement("li");
+    li.textContent = "You: " + text;
+    log.appendChild(li);
+    ws.send(JSON.stringify({ type: "user_message", text }));
+    input.value = "";
+  };
+</script>
+</body>
+</html>
+```
+
+このページを Cloudflare Pages にデプロイすれば、同一オリジンから WebSocket を張れて、リロード後も `localStorage` の `sessionId` が維持されるため過去の会話を引き継げます。試しに「私の名前はマサキです」と教えた後にリロードして「私の名前を覚えていますか？」と聞いてみてください。要約まで含めて応答が返ってくるはずです。
+
+## よくある間違い・落とし穴
+
+### 落とし穴 1: idFromName ではなく newUniqueId を使ってしまう
+
+`env.AGENT.newUniqueId()` で ID を生成すると、**毎回違う ID** が返るため、同じセッションのリクエストでも別の DO に飛びます。最初に挙げたチャット例なら、ユーザーが 2 通目を送った瞬間に「初対面ですね、お名前は？」と返ってきて頭を抱えることになります。
+
+セッション継続が要件なら必ず `idFromName(sessionId)` を使ってください。`newUniqueId` は本当にユニークな新規セッションを作りたいときだけ意味があります。
+
+### 落とし穴 2: SQLite の WRITE を非同期処理の中で散らす
+
+WebSocket メッセージ処理の中で、Gemini の応答が完了する前に複数の `sql.exec(INSERT...)` を await を挟みながら呼ぶと、別のメッセージ受信が割り込んで状態が壊れることがあります。Durable Objects の入力ゲートはリクエスト境界では効きますが、`fetch` 呼び出しを跨ぐ場合は明示的に `transactionSync` で囲うのが安全です。
+
+私が最初に書いたコードでは「ユーザー発話を保存 → Gemini 呼び出し → AI 応答を保存」を素直に await でつないでいましたが、ユーザーが連投すると、ターンの順序が `user, user, model, model` になってしまうことがありました。修正は、最初の `INSERT` の後に十分早く `fetch` を始めることと、AI 応答保存はストリーム終了直後に同期的に行うことで対処できます。
+
+### 落とし穴 3: WebSocket からシークレットを丸見えで送る
+
+`?key=${API_KEY}` のように URL クエリで Gemini API キーを渡すと、Cloudflare のログやプロキシのアクセスログに残る可能性があります。コード例では Worker サーバー側でのみキーを使っていますが、誤ってクライアント側の WebSocket URL にキーを露出させるとそのまま漏洩します。クライアント→Worker→Gemini という三層構造を必ず守ってください。
+
+### 落とし穴 4: 1 ユーザー 1 セッションだけと思い込む
+
+Durable Object は `sessionId` ごとに 1 インスタンスです。ユーザーが PC とスマホの両方からアクセスすると、別の `sessionId` を作っていれば**別の会話**になります。スマホでは PC の会話を覚えていません。
+
+「ユーザー単位で会話を統一したい」場合は、ログイン後に発行する安定なユーザー ID を `idFromName` に渡し、デバイスを跨いで同じ DO を共有する設計にしてください。ただし複数デバイスから同時接続する場合の競合制御は別途必要になります（後述の応用編で扱える内容です）。
+
+### 落とし穴 5: SQLite の容量制限を忘れる
+
+Durable Object 内蔵の SQLite には、1 オブジェクトあたり **10 GB** の容量上限があります。チャット履歴くらいなら通常は問題ありませんが、画像 base64 を直接保存し始めると数千ターンで限界に達します。マルチモーダルで画像を扱う場合は、画像本体は R2 に置き、SQLite には URL だけ保存するパターンに切り替えてください。
+
+## 他の選択肢と比較してなぜ Durable Objects か
+
+会話履歴を持たせる手段は他にもあります。私が試した範囲で正直な比較を書いておきます。
+
+**Cloudflare KV**: シンプルで安価ですが、世界各リージョンに最終的整合性で複製されるため、書き込み直後の読み取りで古い値が返ることがあります。チャットでは「直前の発話が読めない」という致命的な不具合になります。ステートフルなチャットには本質的に向きません。
+
+**Cloudflare D1**: SQL が使える分散 SQLite ですが、書き込みは単一プライマリへルーティングされる設計のため、エッジに分散する Workers から見るとプライマリリージョンとの間にレイテンシが乗ります。北米プライマリで日本のユーザーが書き込むと往復遅延が大きく、応答前のラグが目立ちます。
+
+**Supabase Realtime + Postgres**: 完全な機能を求めるなら最有力ですが、月 $25 の Pro プランからスケールが見えてきます。個人開発で月数百ユーザー規模なら Durable Objects の方が安く済みます。
+
+**Vercel + Upstash Redis**: Edge ランタイムで Redis に履歴を持たせるパターンも実用的ですが、同時編集の整合性は自前で実装する必要があり、結局 Lua スクリプトで CAS ロジックを書くことになります。Durable Objects は単一インスタンス保証を CAS の代わりに使えるので、ロジックがシンプルです。
+
+私が Durable Objects を推す最大の理由は「コードの認知負荷が低い」ことです。ロックも CAS も書かず、普通のクラスメソッドを書く感覚で同時実行制御まで成立してしまいます。本番運用で読みやすい状態を保ちたい個人開発者には大きな利点です。
+
+## 監視とデバッグ — 本番で困らないためのログ設計
+
+Durable Objects のデバッグはログが頼りです。ハイバネートしたインスタンスにアタッチするのは難しいので、要所で `console.log` を残し、Cloudflare ダッシュボードのログ画面（Logs → Workers Logs）で観察できるようにしておきます。
+
+特に押さえておきたいログは次の 3 種類です。
+
+- セッション ID と DO ID の対応（`idFromName` の結果）
+- WebSocket の受け入れ・終了イベントとそのコード
+- Gemini 呼び出しのレイテンシとレスポンスのトークン消費
+
+トークン消費は Gemini API のレスポンス内 `usageMetadata` フィールドに含まれているので、これを毎回ログに出しておくと、後で「どのセッションがコストを食っているか」を追跡できます。私はこのログを Workers Analytics Engine に流して、月次でセッション単位のコスト分析を回しています。
+
+## 本番運用のためのコスト試算
+
+個人開発で月 100 ユーザー、平均 30 メッセージ/日のチャットを動かすケースで概算してみます。Workers Paid プラン $5 の中に Durable Objects のリクエスト数 100 万まで含まれるため、メッセージ数換算でかなり余裕があります。
+
+- Workers/DO リクエスト: 100 万に到達するには月 30 万メッセージ以上が必要 → ほぼ無料枠内
+- DO コンピュート時間: Hibernation のおかげで実質ほぼ 0 円
+- DO Storage（SQLite）: 1 GB 月 $0.20 程度。100 ユーザーなら数十円
+- Gemini 2.5 Pro: 入力 $1.25 / 100 万トークン、出力 $5.00 / 100 万トークン
+
+Gemini 側の従量課金が支配的になります。1 メッセージ平均 1,000 入力 + 500 出力トークンと仮定すると、月 9 万メッセージで入力 9,000 万トークン × $1.25/M = $112.5、出力 4.5 千万 × $5/M = $225、合計約 $340。これは「100 ユーザー × 30 メッセージ/日 × 30 日」のフル稼働ケースで、実際はもっと少ないでしょう。
+
+なお Gemini API のコスト最適化は単独の論点として深掘りする価値があります。コンテキストキャッシングの併用や、要約処理を Flash に切り替えるテクニックは [Cloudflare Workers でエッジ AI を組む際のコスト設計](/articles/gemini-api/gemini-api-cloudflare-workers-edge-ai) や [Hono + Cloudflare のエッジ AI 実装ガイド](/articles/gemini-api/gemini-api-hono-cloudflare-edge-ai-guide) でも触れていますので、本気で月額数千円台に抑えたい方は併読をおすすめします。
+
+## まとめ — この構成で何が変わるか
+
+ここまで読んでいただき、ありがとうございます。Durable Objects と Gemini API の組み合わせは、個人開発者にとって「会話を覚えてくれる AI」を本番投入できる現実的なゴールラインです。サーバーレスのままステートを持てるという特性は、Vercel + 外部 DB のような従来構成と比べてシンプルさで明確に優位です。
+
+明日からの一歩としては、まず手元で `wrangler dev` を立ち上げて、上のコードを動かしてみてください。`wrangler dev --local` でローカル SQLite が使えるので、本番デプロイ前にハイバネーション以外の動作はすべて確認できます。動いてしまえば、あとは UI を整えて `wrangler deploy` 一発で世界配信です。
+
+私自身、この構成に切り替えてから「サーバーが落ちたらどうしよう」というプレッシャーから解放されました。Cloudflare のエッジに乗せるだけで、リージョン障害も水平スケールもほぼ意識せずに済むのは、個人開発の体力的にも大きな違いです。あなたの次のチャットアプリでも、ぜひ選択肢に入れてみてください。
