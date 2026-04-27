@@ -1,0 +1,240 @@
+---
+title: "Gemini API キーをダウンタイムゼロでローテーションする実装パターン"
+slug: "gemini-api-key-rotation-zero-downtime-production"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-28T00:30"
+author: "Gemini Lab"
+description: "Gemini API キーの定期ローテーションと漏えい時の即時切替を、本番サービスを止めずに行うための設計パターンを実装コード付きで解説します。デュアルキー構成、Cloudflare Workers Secrets、自動フェイルオーバー、漏えい60分対応まで網羅。"
+tags: ["Gemini API", "セキュリティ", "API キー", "ローテーション", "Cloudflare Workers", "本番運用"]
+---
+
+Gemini API キーが GitHub の公開コミットに紛れ込んでしまった経験は、長くAPIを触っているとどこかで一度はあるものではないでしょうか。私も以前、急いでいた検証スクリプトをそのまま push してしまい、Push Protection に引っかからなかったキーが30分ほど野ざらしになった瞬間がありました。
+
+その時に痛感したのは「無効化すれば終わり」ではないということです。本番サービスから呼ばれているキーをただ削除すると、その瞬間からエラーが噴き出します。安全と継続稼働を両立させるには、キーを「捨てて作り直す」のではなく「重ね替える」発想が必要です。この記事ではそのための実装パターンを、Node.js / Python / Cloudflare Workers の3環境分のコードと一緒に整理します。
+
+## なぜ単純な「無効化→再発行」では本番が止まるのか
+
+Google AI Studio で発行した API キーを「Disable」した瞬間、そのキーで進行中のリクエストはすべて 401 か 403 で失敗します。Cloudflare Workers のように冷たいエッジで動く環境では、デプロイ反映までにさらに数十秒のラグが生まれることもあります。
+
+つまり「鍵を変える」という1ステップの作業は、現場では次の3ステップに分解する必要があります。
+
+- 新しいキーを発行して新環境変数として配備する（旧キーはまだ有効）
+- 全インスタンスが新キーに切り替わったことを確認する
+- 旧キーを無効化する
+
+3ステップ目を遅らせれば遅らせるほど安全マージンが取れますが、漏えい対応の場合は逆に「2ステップ目を1分でも早く済ませる」ための仕掛けが要ります。後述するデュアルキー構成は、まさにこの「観測と切替の高速化」を仕組みで実現するための設計です。
+
+## ローテーション戦略は3パターンから選ぶ
+
+実装する前に、自分のサービス規模に合った戦略を選んでおきましょう。
+
+- **シングルキー差し替え型**: 個人開発・検証用。新キー発行 → 環境変数を上書き → 再デプロイ → 旧キー無効化の流れ。所要時間は数分〜十数分。
+- **デュアルキー型（Active + Standby）**: 個人〜小規模 SaaS の標準解。常に2本のキーを保持し、Active が失敗したら Standby に自動フォールバックします。漏えい時はキーラベルを入れ替えるだけ。
+- **リング型（n本プール）**: 高トラフィック・複数リージョン対応。複数の API キーを順番に使うことでレート上限を分散しつつ、1本ずつローテーションします。
+
+個人開発者の現場ではデュアルキー型が現実的だと感じています。コード量も多くなく、Standby を持っておくだけで漏えい時の心理的負担が大きく減るからです。
+
+## 実装1: 環境変数だけで動かすデュアルキー構成（Node.js）
+
+最小限のコードで、まずは「キーが2本ある」状態を作ります。`GEMINI_API_KEY_PRIMARY` と `GEMINI_API_KEY_SECONDARY` の2つを定義し、最初のリクエストが認証エラーになったら後者で再試行するだけのラッパーです。
+
+```javascript
+// gemini-client.js
+import { GoogleGenAI } from "@google/genai";
+
+const KEYS = [
+  process.env.GEMINI_API_KEY_PRIMARY,
+  process.env.GEMINI_API_KEY_SECONDARY,
+].filter(Boolean);
+
+if (KEYS.length === 0) {
+  throw new Error("Gemini API キーが1本も設定されていません");
+}
+
+let activeIndex = 0;
+
+export async function generate(prompt) {
+  for (let attempt = 0; attempt < KEYS.length; attempt++) {
+    const idx = (activeIndex + attempt) % KEYS.length;
+    const ai = new GoogleGenAI({ apiKey: KEYS[idx] });
+    try {
+      const res = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: prompt,
+      });
+      activeIndex = idx; // 成功したキーを次回も先頭に
+      return res.text;
+    } catch (err) {
+      const code = err?.status ?? err?.response?.status;
+      // 401 / 403 / 429 のときだけ次のキーへ
+      if (![401, 403, 429].includes(code) || attempt === KEYS.length - 1) {
+        throw err;
+      }
+      console.warn(`Key index ${idx} failed (${code}). Falling back…`);
+    }
+  }
+}
+
+// 期待動作: PRIMARY が無効化されても自動で SECONDARY に切り替わり、
+// プロセス再起動なしでサービスは継続稼働する
+```
+
+ポイントは「次回成功したキーを `activeIndex` として記録する」ことです。これがないと毎回必ず PRIMARY から試すことになり、失敗したキーの認証で1リクエスト分のレイテンシを毎回支払うことになります。
+
+## 実装2: Cloudflare Workers Secrets での取り回し
+
+エッジ環境では `process.env` ではなく Workers Secrets を使います。`wrangler secret put` で2本のキーを設定し、リクエストハンドラ側で同じフェイルオーバー戦略を組みます。
+
+```bash
+wrangler secret put GEMINI_API_KEY_PRIMARY
+wrangler secret put GEMINI_API_KEY_SECONDARY
+```
+
+```typescript
+// worker.ts
+import { GoogleGenAI } from "@google/genai";
+
+interface Env {
+  GEMINI_API_KEY_PRIMARY: string;
+  GEMINI_API_KEY_SECONDARY?: string;
+}
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const { prompt } = await req.json<{ prompt: string }>();
+    const keys = [env.GEMINI_API_KEY_PRIMARY, env.GEMINI_API_KEY_SECONDARY].filter(Boolean) as string[];
+
+    let lastErr: unknown;
+    for (const key of keys) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: key });
+        const res = await ai.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: prompt,
+        });
+        // 観測: どのキーで成功したかを Workers Logs に出す
+        console.log(JSON.stringify({ event: "gemini_ok", key_id: key.slice(-4) }));
+        return Response.json({ text: res.text });
+      } catch (err) {
+        lastErr = err;
+        console.warn(JSON.stringify({ event: "gemini_fail", key_id: key.slice(-4) }));
+      }
+    }
+    return new Response("All keys failed: " + String(lastErr), { status: 502 });
+  },
+};
+
+// 期待動作: ログには key_id（末尾4桁）だけが残り、漏えい時に
+// どのキーが本番でアクティブだったかを後から追跡できる
+```
+
+ログにフルキーを出さずに末尾4桁だけ記録するのは、後から監査ログを見返すときの基本作法です。Cloudflare 周りのデプロイ詳細は[Cloudflare Workers でのエッジAI実装](/articles/gemini-api/gemini-api-cloudflare-workers-edge-ai)で別途解説しています。
+
+## 実装3: フェイルオーバー込みのクライアントラッパー（Python）
+
+Python 側ではクラスでまとめておくと、再利用が楽になります。`google-genai` の `Client` を内部で使い、認証系エラーのときだけ次のキーに切り替える設計です。
+
+```python
+# gemini_failover_client.py
+import os
+import logging
+from typing import Optional
+from google import genai
+from google.genai import errors
+
+logger = logging.getLogger(__name__)
+
+class GeminiFailoverClient:
+    def __init__(self, keys: Optional[list[str]] = None):
+        self.keys = keys or [
+            os.environ.get("GEMINI_API_KEY_PRIMARY"),
+            os.environ.get("GEMINI_API_KEY_SECONDARY"),
+        ]
+        self.keys = [k for k in self.keys if k]
+        if not self.keys:
+            raise RuntimeError("Gemini API キーが1本もありません")
+        self._active = 0
+
+    def _client(self, idx: int) -> genai.Client:
+        return genai.Client(api_key=self.keys[idx])
+
+    def generate(self, prompt: str, model: str = "gemini-2.5-flash") -> str:
+        last_exc: Optional[Exception] = None
+        for offset in range(len(self.keys)):
+            idx = (self._active + offset) % len(self.keys)
+            try:
+                resp = self._client(idx).models.generate_content(
+                    model=model, contents=prompt
+                )
+                self._active = idx
+                return resp.text
+            except errors.ClientError as e:
+                # 401/403/429 系のみフェイルオーバー対象
+                if e.code not in (401, 403, 429):
+                    raise
+                logger.warning("Key index %d failed (%s). Falling over.", idx, e.code)
+                last_exc = e
+        raise RuntimeError("全てのキーが失敗") from last_exc
+
+# 期待動作:
+# >>> client = GeminiFailoverClient()
+# >>> client.generate("こんにちは")
+# 'こんにちは！何かお手伝いしましょうか…'
+# PRIMARY 無効化中でも例外を投げずに応答が返る
+```
+
+このクラスは内部で `Client` を都度生成しています。プロセスが長時間稼働するワーカーでは2つのクライアントを最初から保持しておくと、コネクション再利用の恩恵を受けられます。エラーハンドリングのより踏み込んだパターンは[リトライとサーキットブレーカーの実装](/articles/gemini-api/gemini-api-error-handling-retry-patterns)も参考にしてみてください。
+
+## 鍵漏えい時の「最初の60分」で必ずやること
+
+漏えいに気付いた瞬間に走るべきステップを、実体験ベースで整理します。順番が大切です。
+
+- **1分以内**: Standby キーが有効か確認し、`activeIndex` を Standby 側に向けて1リクエスト投げる。これで切替準備が整っているか先に検証する
+- **5分以内**: AI Studio で漏えいキーを「Disable」ではなく「Delete」する。Disable は将来うっかり再有効化される事故の温床になります
+- **15分以内**: 新しい Standby キーを発行し、Workers Secrets / `.env` に追加してデプロイ
+- **30分以内**: 漏えいしたコミットを `git filter-repo` で履歴から削除し、強制 push
+- **60分以内**: 過去24時間の請求ダッシュボードを確認し、見覚えのない使用がないか確認
+
+GitHub Push Protection や GitGuardian は便利ですが、シークレットのフォーマットが少し変わると検知をすり抜けます。「ツールが守ってくれているはず」と過信しないことが、いざという時の差を生みます。日常運用のチェックリストとしては[Gemini API キーの安全運用チェックリスト](/articles/gemini-api/gemini-api-key-safe-operations-indie-developer-checklist)に細かい項目がまとまっています。
+
+## 定期ローテーションを継続する仕組み
+
+90日に一度の自動ローテーションを Cron で回すと、漏えい対応の手順を「年に4回はリハーサルしている」状態を作れます。
+
+```yaml
+# .github/workflows/rotate-gemini-key.yml
+name: Rotate Gemini API Key
+on:
+  schedule:
+    - cron: "0 0 1 */3 *"  # 3ヶ月ごとの月初
+  workflow_dispatch:
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Promote SECONDARY to PRIMARY
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          # 1. 旧 PRIMARY を退避
+          OLD_PRIMARY=$(wrangler secret get GEMINI_API_KEY_PRIMARY)
+          # 2. SECONDARY を PRIMARY に昇格
+          wrangler secret get GEMINI_API_KEY_SECONDARY | wrangler secret put GEMINI_API_KEY_PRIMARY
+          # 3. 新しい SECONDARY を発行（手動で AI Studio から取得し vault に格納）
+          echo "::notice::新しい SECONDARY キーを AI Studio で発行し vault に保存してください"
+          # 4. 24時間後に旧 PRIMARY を Delete（別ジョブで実装）
+```
+
+完全自動化は「鍵の発行」がGoogle側のUIに依存するため難しい部分もあります。ですが「昇格・配備・通知」だけでも自動化しておくと、忘れずに回せるようになります。
+
+ロールバック条件はあらかじめ明文化しておきましょう。たとえば「ローテーション後30分以内に 5xx 率が平常時の3倍を超えたら旧キーへ即時戻す」といった数値目標があるだけで、現場の判断が早くなります。
+
+API設計とセキュリティの基礎を体系的に押さえたい方には、[Web API: The Good Parts（水野貴明）](https://www.amazon.co.jp/dp/4873116864/?tag=pinocchio-22)が今でも色褪せない参考書です。本記事の「ステップを分解してダウンタイムを潰す」考え方の下地になっている本でもあります。
+
+## まとめ
+
+長く動かすサービスにとって、API キーは「いつか必ず差し替える」消耗品です。今日できる一歩はとても単純で、AI Studio で予備のキーをもう1本だけ発行して `GEMINI_API_KEY_SECONDARY` という名前で `.env` に追記しておくこと。これだけで、次に何かが起きた時の選択肢が一気に広がります。デュアルキー構成のラッパーを書くのは、その後で大丈夫です。

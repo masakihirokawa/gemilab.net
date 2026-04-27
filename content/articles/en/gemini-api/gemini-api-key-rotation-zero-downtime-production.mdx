@@ -1,0 +1,238 @@
+---
+title: "Rotating Gemini API Keys with Zero Downtime in Production"
+slug: "gemini-api-key-rotation-zero-downtime-production"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-28T00:30"
+author: "Gemini Lab"
+description: "A practical playbook for rotating Gemini API keys without dropping production traffic. Covers dual-key fallback, Cloudflare Workers Secrets, automatic failover clients, and the first sixty minutes of a leak response."
+tags: ["Gemini API", "Security", "API Key", "Rotation", "Cloudflare Workers", "Production"]
+---
+
+If you have shipped anything against the Gemini API for long enough, you have probably had that small heart-attack moment where you realize a key slipped into a public commit. Mine was a hurried test script that pushed straight past Push Protection. The key sat in the open for about thirty minutes before I caught it.
+
+What I learned that night is that "kill the key" is not the end of the story. The moment you disable a key that production is calling, errors start streaming from your service. To stay both safe and online you cannot simply throw the key away — you have to *swap it out* on top of a still-running system. This article walks through the implementation patterns that make that possible, with code for Node.js, Python, and Cloudflare Workers.
+
+## Why "disable then re-issue" stops production cold
+
+The instant you flip a Google AI Studio key to "Disabled," every in-flight request signed with it fails with 401 or 403. On cold edges like Cloudflare Workers there is also a measurable lag before a fresh deployment reaches every region.
+
+So the seemingly atomic "rotate the key" task really has three steps:
+
+- Issue a new key and ship it as a new env var (the old key is still alive)
+- Confirm every instance is now using the new key
+- Disable the old key
+
+The longer you wait on step three the more cushion you have, but during a leak you also need to make step two finish in *minutes*, not hours. The dual-key pattern below is what makes that observability-and-swap loop fast.
+
+## Pick your rotation strategy first
+
+Before you write code, decide which strategy fits your scale.
+
+- **Single-key swap** — fine for personal projects. Issue, replace env, redeploy, then disable. Takes a few to fifteen minutes and you accept the brief gap.
+- **Dual-key (Active + Standby)** — the standard for indie SaaS. Always carry two keys. If Active fails the client falls back to Standby automatically. During an incident you just relabel.
+- **Ring (n-key pool)** — for high-traffic, multi-region setups. Distribute load across keys to spread quotas, then rotate one at a time.
+
+For most indie developers the dual-key pattern is the sweet spot. The code is short, and just *knowing* you have a Standby key removes a surprising amount of stress when something goes wrong.
+
+## Pattern 1: Dual keys with environment variables (Node.js)
+
+The smallest possible change is to read two keys and try the second when the first fails authentication.
+
+```javascript
+// gemini-client.js
+import { GoogleGenAI } from "@google/genai";
+
+const KEYS = [
+  process.env.GEMINI_API_KEY_PRIMARY,
+  process.env.GEMINI_API_KEY_SECONDARY,
+].filter(Boolean);
+
+if (KEYS.length === 0) {
+  throw new Error("No Gemini API key is configured.");
+}
+
+let activeIndex = 0;
+
+export async function generate(prompt) {
+  for (let attempt = 0; attempt < KEYS.length; attempt++) {
+    const idx = (activeIndex + attempt) % KEYS.length;
+    const ai = new GoogleGenAI({ apiKey: KEYS[idx] });
+    try {
+      const res = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: prompt,
+      });
+      activeIndex = idx; // remember which key just worked
+      return res.text;
+    } catch (err) {
+      const code = err?.status ?? err?.response?.status;
+      if (![401, 403, 429].includes(code) || attempt === KEYS.length - 1) {
+        throw err;
+      }
+      console.warn(`Key index ${idx} failed (${code}). Falling back...`);
+    }
+  }
+}
+
+// Expected behaviour: if PRIMARY is disabled, the next call quietly
+// switches to SECONDARY and the service keeps serving traffic.
+```
+
+The key detail is caching `activeIndex` after a success. Without it you would always try PRIMARY first and pay one failed-auth round-trip on every request whenever PRIMARY is broken.
+
+## Pattern 2: Cloudflare Workers with Secrets
+
+On the edge you do not have `process.env`. Use `wrangler secret put` to store both keys, then apply the same fallback in your handler.
+
+```bash
+wrangler secret put GEMINI_API_KEY_PRIMARY
+wrangler secret put GEMINI_API_KEY_SECONDARY
+```
+
+```typescript
+// worker.ts
+import { GoogleGenAI } from "@google/genai";
+
+interface Env {
+  GEMINI_API_KEY_PRIMARY: string;
+  GEMINI_API_KEY_SECONDARY?: string;
+}
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const { prompt } = await req.json<{ prompt: string }>();
+    const keys = [env.GEMINI_API_KEY_PRIMARY, env.GEMINI_API_KEY_SECONDARY].filter(Boolean) as string[];
+
+    let lastErr: unknown;
+    for (const key of keys) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: key });
+        const res = await ai.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: prompt,
+        });
+        // Observability: record only the last 4 chars of the key
+        console.log(JSON.stringify({ event: "gemini_ok", key_id: key.slice(-4) }));
+        return Response.json({ text: res.text });
+      } catch (err) {
+        lastErr = err;
+        console.warn(JSON.stringify({ event: "gemini_fail", key_id: key.slice(-4) }));
+      }
+    }
+    return new Response("All keys failed: " + String(lastErr), { status: 502 });
+  },
+};
+
+// Expected behaviour: logs only carry key_id (last 4 chars), so during
+// a postmortem you can trace which key was actually live.
+```
+
+Logging the suffix instead of the full key is a small habit that pays for itself the first time you have to do an audit. For the deployment side of edge work, see [Building edge AI with Cloudflare Workers and the Gemini API](/en/articles/gemini-api/gemini-api-cloudflare-workers-edge-ai).
+
+## Pattern 3: A failover client wrapper (Python)
+
+Wrapping the failover logic in a class keeps the rest of your code clean. The example below uses the official `google-genai` SDK and only switches keys on auth or quota errors.
+
+```python
+# gemini_failover_client.py
+import os
+import logging
+from typing import Optional
+from google import genai
+from google.genai import errors
+
+logger = logging.getLogger(__name__)
+
+class GeminiFailoverClient:
+    def __init__(self, keys: Optional[list[str]] = None):
+        self.keys = keys or [
+            os.environ.get("GEMINI_API_KEY_PRIMARY"),
+            os.environ.get("GEMINI_API_KEY_SECONDARY"),
+        ]
+        self.keys = [k for k in self.keys if k]
+        if not self.keys:
+            raise RuntimeError("No Gemini API key is configured.")
+        self._active = 0
+
+    def _client(self, idx: int) -> genai.Client:
+        return genai.Client(api_key=self.keys[idx])
+
+    def generate(self, prompt: str, model: str = "gemini-2.5-flash") -> str:
+        last_exc: Optional[Exception] = None
+        for offset in range(len(self.keys)):
+            idx = (self._active + offset) % len(self.keys)
+            try:
+                resp = self._client(idx).models.generate_content(
+                    model=model, contents=prompt
+                )
+                self._active = idx
+                return resp.text
+            except errors.ClientError as e:
+                if e.code not in (401, 403, 429):
+                    raise
+                logger.warning("Key index %d failed (%s). Falling over.", idx, e.code)
+                last_exc = e
+        raise RuntimeError("All keys failed") from last_exc
+
+# Expected behaviour:
+# >>> client = GeminiFailoverClient()
+# >>> client.generate("Hello")
+# 'Hi! How can I help you today?'
+# Continues to respond even if PRIMARY has been disabled.
+```
+
+The wrapper instantiates a fresh client per attempt for clarity. In a long-running worker you can keep both clients pre-built to reuse connections. For deeper retry semantics, see [Gemini API retry and backoff patterns](/en/articles/gemini-api/gemini-api-error-handling-retry-patterns).
+
+## The first sixty minutes after a leak
+
+When you spot a leak, the order of operations matters more than people expect.
+
+- **Within 1 minute** — confirm Standby is alive by sending a test request that targets Standby first. You want to know the swap *can* happen before you commit to it.
+- **Within 5 minutes** — in AI Studio, choose Delete rather than Disable on the leaked key. A disabled key is one accidental click away from being live again.
+- **Within 15 minutes** — generate a brand-new Standby and push it to Workers Secrets / `.env`, then deploy.
+- **Within 30 minutes** — rewrite history with `git filter-repo` to scrub the leaked commit, then force-push.
+- **Within 60 minutes** — open the billing dashboard for the last 24 hours and look for unexpected spikes.
+
+GitHub Push Protection and GitGuardian are great safety nets, but they fail silently when a secret format changes slightly. Treat them as a second line of defense, not the first. For day-to-day hygiene I keep [the Gemini API key safe-operations checklist](/en/articles/gemini-api/gemini-api-key-safe-operations-indie-developer-checklist) pinned in our team wiki.
+
+## Make rotation a recurring habit
+
+Running a rotation once a quarter doubles as a four-times-a-year fire drill for the leak response itself.
+
+```yaml
+# .github/workflows/rotate-gemini-key.yml
+name: Rotate Gemini API Key
+on:
+  schedule:
+    - cron: "0 0 1 */3 *"  # every 3 months, on the first of the month
+  workflow_dispatch:
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Promote SECONDARY to PRIMARY
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          # 1. Snapshot the old PRIMARY (kept for 24h then deleted)
+          OLD_PRIMARY=$(wrangler secret get GEMINI_API_KEY_PRIMARY)
+          # 2. Promote SECONDARY into the PRIMARY slot
+          wrangler secret get GEMINI_API_KEY_SECONDARY | wrangler secret put GEMINI_API_KEY_PRIMARY
+          # 3. Notify ops to issue a new SECONDARY in AI Studio and store it in the vault
+          echo "::notice::Issue a new SECONDARY key in AI Studio and write it to the vault."
+          # 4. A separate scheduled job deletes OLD_PRIMARY after 24h.
+```
+
+Full automation is hard because issuing a key still happens in the AI Studio UI. Even so, automating the promotion and notification half of the loop is enough to make rotation a habit instead of a chore.
+
+Decide your rollback condition in advance. Something as concrete as "if 5xx rate triples within thirty minutes of rotation, revert to OLD_PRIMARY" gives the on-call engineer permission to act without overthinking it.
+
+If you want to deepen the underlying API design intuition, [Web API: The Good Parts (by Takaaki Mizuno, Japanese only)](https://www.amazon.co.jp/dp/4873116864/?tag=pinocchio-22) is the book that helped me internalize "decompose the step, kill the downtime."
+
+## Wrap-up
+
+API keys are wear-and-tear parts of any long-lived service. The smallest useful step you can take today is to issue one extra key in AI Studio and drop it into your `.env` as `GEMINI_API_KEY_SECONDARY`. With that single line in place, you have multiplied the options available to you the next time something goes wrong. Wiring up the dual-key wrapper is a problem for tomorrow.
