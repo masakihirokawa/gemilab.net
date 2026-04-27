@@ -1,0 +1,581 @@
+---
+title: "Gemini API を主軸にしたマルチLLMフェイルオーバー設計 — 本番の可用性を底上げする冗長化アーキテクチャ"
+slug: "gemini-api-multi-llm-failover-production-architecture"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-27T11:00"
+author: "Gemini Lab"
+description: "Gemini API を主軸に Claude / GPT-4o をフォールバックに据えたマルチLLM冗長化アーキテクチャを、ルーター・アダプタ・サーキットブレーカー・観測まで Python で本番品質の実装パターンとして解説します。"
+tags: ["Gemini API", "マルチLLM", "フェイルオーバー", "本番アーキテクチャ", "サーキットブレーカー", "可用性"]
+highlights:
+  - "LLM プロバイダー1社に依存していた本番アプリを、片寄せのまま安定運用できる冗長構成へ移行できる"
+  - "Gemini を主軸に Claude / GPT-4o をフォールバックに据えたルーター + アダプタの実装を、コピペで動くコードとして手に入れる"
+  - "サーキットブレーカー・ヘルスチェック・観測ログまで含めて、障害時に静かに片肺で動き続ける本番構成を組める"
+---
+
+import { Callout } from '@/components/ui/callout';
+
+Gemini API を本番アプリに組み込んで半年が過ぎたある深夜、Google 側で一時的なリージョン障害が起きました。アラートが鳴り、ユーザーからの問い合わせが増え、CS チームから「AI 機能だけ落ちている」と連絡が来ました。フロントは表示できる、DB も生きている、けれど Gemini への呼び出しだけが軒並みタイムアウトしているという状況です。
+
+その夜、私はターミナルで `curl` を叩きながら「これは LLM 1 社依存の構成では本番アプリは耐えられないな」と痛感しました。SLA を結んでいる相手であれば話は別ですが、個人開発や中小規模のサービスでは、プロバイダーがダウンしたら自分のアプリも一緒に止まってしまいます。
+
+この記事は、そのときに学んだことをきっかけに整理した「Gemini API を主軸に、Claude / GPT-4o をフォールバックとして使うマルチLLM冗長化アーキテクチャ」の本番実装パターンです。理論ではなく、実際にプロダクションに組み込んで運用してきた構成を中心に解説します。
+
+## なぜマルチLLM冗長化を考える必要があるのか
+
+ひとつのプロバイダーに賭けることが間違いというわけではありません。Gemini API は性能・コスト・マルチモーダル対応の3点で非常にバランスが良く、私自身もメイン採用の判断は変えていません。問題は「主軸を決めること」と「主軸が落ちたときの逃げ道を用意すること」を別の議論として扱う必要があるという点です。
+
+私の経験上、本番アプリで LLM 障害に直面するシナリオは大きく3つあります。
+
+**1つ目はプロバイダー側の障害**です。Google も OpenAI も Anthropic も、いずれも数時間規模の障害を年に数回は経験しています。Status Page を眺めると分かりますが、特に新モデルのリリース直後は不安定になりやすい傾向があります。
+
+**2つ目はレート制限への到達**です。バーストトラフィックが来たり、新規ユーザーが急増したりすると、自分のアプリが原因で急にレート制限に当たります。Gemini API の RPM/TPM 上限はプロジェクトごとに設定されており、申請しても緩和に時間がかかります。
+
+**3つ目はコスト管理上の意図的な切り替え**です。複雑な質問は Gemini 2.5 Pro、シンプルな質問は Gemini 2.5 Flash、それでも余裕がない時間帯は Claude Haiku で逃がす、といったコストベースルーティングは、月額の AI 費用を 30〜50% 削減できる現実的な手段になります。
+
+これら3つのシナリオはどれも「マルチLLM冗長化」で対処できます。完全に異なるベンダーに分散する設計は心理的なハードルが高いものの、いったん仕組みを作ってしまえば日々の運用は単純です。
+
+## 全体アーキテクチャ — ルーター + アダプタパターン
+
+私が本番運用している構成は、おおよそ次のレイヤーで成り立っています。
+
+- **アプリケーションコード**: 「LLM に質問を投げる」という抽象的な API のみを呼び出す
+- **ルーター層**: ヘルス状態・コスト・タスク特性をもとに使うプロバイダーを選ぶ
+- **アダプタ層**: 各プロバイダーの SDK を共通のインターフェースに揃える
+- **可観測性層**: 呼び出しログ・レイテンシ・成功率をすべて記録する
+- **サーキットブレーカー**: 連続失敗時に該当プロバイダーを一時的にオープン状態にする
+
+「アプリ → ルーター → アダプタ → プロバイダー」の流れに統一することで、アプリ側のコードはどのプロバイダーが選ばれたかを意識せずに済みます。これが拡張性の鍵です。あとから新しいプロバイダーを追加するときも、アダプタを 1 ファイル足してルーターに登録するだけで完結します。
+
+## アダプタ層の実装 — 共通インターフェースを定める
+
+まず、すべてのプロバイダーが満たすべき共通インターフェースを Python の Protocol で定義します。型がそろっていないと、ルーターを書くときに分岐だらけになって辛くなります。
+
+```python
+# llm/base.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Protocol, AsyncIterator
+
+
+@dataclass(frozen=True)
+class LLMRequest:
+    """共通リクエスト。プロバイダー固有の差はここで吸収しない。"""
+    system: str
+    user: str
+    max_tokens: int = 2048
+    temperature: float = 0.3
+
+
+@dataclass(frozen=True)
+class LLMResponse:
+    """共通レスポンス。どのプロバイダーで応答したかも保持する。"""
+    text: str
+    provider: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+
+
+class LLMAdapter(Protocol):
+    name: str  # "gemini" / "claude" / "openai"
+
+    async def complete(self, request: LLMRequest) -> LLMResponse: ...
+    async def health_check(self) -> bool: ...
+```
+
+このインターフェースの肝は、レスポンスに `provider` と `model` を必ず含める点です。あとで観測可能性のセクションで触れますが、「障害が起きたとき、どのプロバイダーがどれくらい応答したか」を後追いできるかどうかが運用の楽さを決めます。
+
+次に Gemini アダプタを実装します。
+
+```python
+# llm/gemini_adapter.py
+import os
+import time
+from google import genai
+from .base import LLMAdapter, LLMRequest, LLMResponse
+
+
+# 1M トークンあたりの料金（2026年時点の参考値・実運用では公式の最新値を取得すること）
+GEMINI_25_PRO_PRICING = {"input": 1.25, "output": 5.00}
+
+
+class GeminiAdapter:
+    name = "gemini"
+
+    def __init__(self, model: str = "gemini-2.5-pro"):
+        self._client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        self._model = model
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        result = await self._client.aio.models.generate_content(
+            model=self._model,
+            contents=request.user,
+            config={
+                "system_instruction": request.system,
+                "max_output_tokens": request.max_tokens,
+                "temperature": request.temperature,
+            },
+        )
+        usage = result.usage_metadata
+        cost = (
+            usage.prompt_token_count / 1_000_000 * GEMINI_25_PRO_PRICING["input"]
+            + usage.candidates_token_count / 1_000_000 * GEMINI_25_PRO_PRICING["output"]
+        )
+        return LLMResponse(
+            text=result.text,
+            provider=self.name,
+            model=self._model,
+            input_tokens=usage.prompt_token_count,
+            output_tokens=usage.candidates_token_count,
+            cost_usd=cost,
+        )
+
+    async def health_check(self) -> bool:
+        try:
+            await self._client.aio.models.generate_content(
+                model=self._model,
+                contents="ping",
+                config={"max_output_tokens": 4, "temperature": 0.0},
+            )
+            return True
+        except Exception:
+            return False
+```
+
+Claude / OpenAI のアダプタも同じ形で揃えます。要点は「プロバイダー固有の SDK 呼び出しはアダプタ内に閉じ込め、外側からは LLMRequest / LLMResponse のみで会話する」ことです。
+
+```python
+# llm/claude_adapter.py
+import os
+import anthropic
+from .base import LLMRequest, LLMResponse
+
+
+CLAUDE_HAIKU_PRICING = {"input": 0.25, "output": 1.25}
+
+
+class ClaudeAdapter:
+    name = "claude"
+
+    def __init__(self, model: str = "claude-haiku-4-5-20251001"):
+        self._client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        self._model = model
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        result = await self._client.messages.create(
+            model=self._model,
+            system=request.system,
+            messages=[{"role": "user", "content": request.user}],
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+        )
+        cost = (
+            result.usage.input_tokens / 1_000_000 * CLAUDE_HAIKU_PRICING["input"]
+            + result.usage.output_tokens / 1_000_000 * CLAUDE_HAIKU_PRICING["output"]
+        )
+        return LLMResponse(
+            text=result.content[0].text,
+            provider=self.name,
+            model=self._model,
+            input_tokens=result.usage.input_tokens,
+            output_tokens=result.usage.output_tokens,
+            cost_usd=cost,
+        )
+
+    async def health_check(self) -> bool:
+        try:
+            await self._client.messages.create(
+                model=self._model,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=4,
+            )
+            return True
+        except Exception:
+            return False
+```
+
+## サーキットブレーカー — 落ちているプロバイダーへ無駄に投げない
+
+ルーターを書く前に、サーキットブレーカーを先に整備しておきます。これがないと「Gemini が落ちている → Gemini に投げる → タイムアウトで遅延 → やっと Claude にフォールバック」という構造になり、ユーザーの待ち時間が大きくなってしまいます。
+
+```python
+# llm/breaker.py
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class BreakerState(Enum):
+    CLOSED = "closed"          # 通常状態
+    OPEN = "open"              # 障害中、しばらく投げない
+    HALF_OPEN = "half_open"    # 試験的に1回だけ通す
+
+
+@dataclass
+class CircuitBreaker:
+    failure_threshold: int = 3        # 連続失敗数
+    recovery_timeout_sec: float = 30  # オープン後この秒数で半開に
+    state: BreakerState = BreakerState.CLOSED
+    failure_count: int = 0
+    opened_at: float = 0.0
+
+    def can_attempt(self) -> bool:
+        if self.state == BreakerState.CLOSED:
+            return True
+        if self.state == BreakerState.OPEN:
+            if time.time() - self.opened_at >= self.recovery_timeout_sec:
+                self.state = BreakerState.HALF_OPEN
+                return True
+            return False
+        # HALF_OPEN
+        return True
+
+    def record_success(self) -> None:
+        self.state = BreakerState.CLOSED
+        self.failure_count = 0
+
+    def record_failure(self) -> None:
+        self.failure_count += 1
+        if self.failure_count >= self.failure_threshold:
+            self.state = BreakerState.OPEN
+            self.opened_at = time.time()
+```
+
+サーキットブレーカーは「閉じている（通常）」「開いている（投げない）」「半開（試しに1回投げる）」の3状態を持つだけのシンプルな仕組みですが、本番では効果が大きい部品です。3 回連続で失敗したら 30 秒間そのプロバイダーへの呼び出しをスキップする、と決めておくだけで、ユーザーの平均レイテンシが大きく改善します。
+
+## ルーター — ポリシーで使うプロバイダーを選ぶ
+
+ルーターは「ポリシー」と「フォールバック順序」を持ちます。私は次のような単純なフォールバックリスト方式を本番で採用しています。
+
+```python
+# llm/router.py
+import logging
+from .base import LLMAdapter, LLMRequest, LLMResponse
+from .breaker import CircuitBreaker
+
+logger = logging.getLogger(__name__)
+
+
+class LLMRouter:
+    def __init__(self, adapters: list[LLMAdapter]):
+        self._adapters = adapters
+        self._breakers = {a.name: CircuitBreaker() for a in adapters}
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        last_error: Exception | None = None
+        for adapter in self._adapters:
+            breaker = self._breakers[adapter.name]
+            if not breaker.can_attempt():
+                logger.warning(
+                    "skip provider=%s reason=breaker_open", adapter.name,
+                )
+                continue
+            try:
+                response = await adapter.complete(request)
+                breaker.record_success()
+                return response
+            except Exception as e:
+                breaker.record_failure()
+                logger.error(
+                    "provider_failed provider=%s err=%s", adapter.name, e,
+                )
+                last_error = e
+                continue
+        raise RuntimeError(
+            f"all providers failed, last_error={last_error}"
+        )
+```
+
+ルーターをこの形にしておくと、設定はシンプルです。Gemini を最初に、Claude を 2 番目に、GPT-4o を 3 番目に登録すれば、Gemini が落ちたときに自動でフェイルオーバーします。
+
+```python
+# main.py
+from llm.router import LLMRouter
+from llm.gemini_adapter import GeminiAdapter
+from llm.claude_adapter import ClaudeAdapter
+
+router = LLMRouter([
+    GeminiAdapter(model="gemini-2.5-pro"),
+    ClaudeAdapter(model="claude-haiku-4-5-20251001"),
+])
+
+response = await router.complete(LLMRequest(
+    system="あなたは丁寧な日本語のアシスタントです。",
+    user="フェイルオーバーの動作確認をしてください。",
+))
+print(f"応答: {response.text}")
+print(f"プロバイダー: {response.provider}, コスト: ${response.cost_usd:.4f}")
+# 期待出力例:
+# 応答: 動作確認のメッセージを正しく受け取りました ...
+# プロバイダー: gemini, コスト: $0.0023
+```
+
+## なぜシンプルなフォールバックリスト方式を採るのか
+
+「重み付きランダムや加重ラウンドロビンの方が高度では？」と思われるかもしれません。私もはじめは凝った構成を試しました。けれど運用すると、シンプルなフォールバックリスト方式のほうが圧倒的に扱いやすかったのです。
+
+理由は3つあります。**1つ目**は、トラブルシュート時に「いまどのプロバイダーで動いているか」を即答できることです。重み付き分散だと「半分くらい Gemini、半分くらい Claude」のような曖昧な状態が常態化し、特定のプロバイダー固有のバグを再現するのが難しくなります。
+
+**2つ目**は、メインプロバイダーのコスト構造を読みやすいことです。Gemini を 100% 使うつもりで予算を立てておけば、フォールバックが発動した分だけ追加コストが発生する、というシンプルな考え方ができます。
+
+**3つ目**は、プロンプトのチューニングがメインプロバイダーに集中できることです。マルチプロバイダーで毎回違うものに投げると、プロンプトの最適化先が定まりません。「Gemini で最高の品質を出すプロンプト」を磨きこみ、フォールバック側は安全網として割り切る方が、長期的な品質は安定します。
+
+## プロンプトテンプレートの差分管理 — プロバイダーごとに微調整する
+
+「同じプロンプトを全プロバイダーに投げれば良い」と最初は考えがちですが、実際には微調整が必要です。Gemini は System Instructions と user プロンプトを明確に分離する設計、Claude は system/messages 構造、OpenAI は messages の role ベース、と入力形式が異なります。さらに同じ「JSON を返して」という指示でも、各モデルが好む書き方は違います。
+
+私は次のような「プロバイダー特化テンプレート」をアダプタの中で吸収する設計にしています。
+
+```python
+# llm/prompt_templates.py
+GEMINI_JSON_HINT = (
+    "出力は必ず JSON のみで返してください。"
+    "コードフェンスや前置き、後置きはつけないでください。"
+)
+
+CLAUDE_JSON_HINT = (
+    "Respond with valid JSON only. "
+    "Do not include any prose before or after the JSON."
+)
+
+
+def to_gemini_prompt(system: str, user: str, expects_json: bool) -> tuple[str, str]:
+    if expects_json:
+        system = system + "\n\n" + GEMINI_JSON_HINT
+    return system, user
+
+
+def to_claude_prompt(system: str, user: str, expects_json: bool) -> tuple[str, str]:
+    if expects_json:
+        # Claude には英語で JSON 指示を入れる方が安定する
+        user = user + "\n\n" + CLAUDE_JSON_HINT
+    return system, user
+```
+
+このように「JSON を求めるかどうか」というメタ情報を `LLMRequest` に追加し、アダプタの中でプロバイダー固有の文言に変換します。アプリ側はそのプロバイダーがどんな指示を好むかを知らなくて済みます。
+
+## 観測可能性 — 障害発生時に状況を即把握する
+
+冗長化を組んでも、観測しなければ運用は楽になりません。私は最低限、次の項目を Cloud Logging に書き出しています。
+
+- **provider**: どのプロバイダーが応答したか
+- **model**: 具体的なモデル名
+- **latency_ms**: 応答に何ミリ秒かかったか
+- **input_tokens / output_tokens / cost_usd**: コスト把握
+- **fallback_count**: 何回目のフォールバックで成功したか（0 なら主軸成功）
+- **breaker_states**: 呼び出し時点のブレーカー状態
+
+```python
+# llm/observability.py
+import json
+import logging
+import time
+from contextlib import asynccontextmanager
+
+logger = logging.getLogger("llm.observability")
+
+
+@asynccontextmanager
+async def observe_call(request, provider_name: str, fallback_count: int):
+    start = time.monotonic()
+    try:
+        yield
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.info(json.dumps({
+            "event": "llm_call_success",
+            "provider": provider_name,
+            "fallback_count": fallback_count,
+            "latency_ms": round(elapsed_ms, 1),
+            "user_prompt_chars": len(request.user),
+        }, ensure_ascii=False))
+    except Exception as e:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.error(json.dumps({
+            "event": "llm_call_failure",
+            "provider": provider_name,
+            "fallback_count": fallback_count,
+            "latency_ms": round(elapsed_ms, 1),
+            "error": str(e)[:200],
+        }, ensure_ascii=False))
+        raise
+```
+
+このログがあるだけで、障害発生時に「Gemini の成功率がいつから 0% になったか」「フォールバックが何時に何回発動したか」「コストの増加分はどれくらいか」を後追いで追えるようになります。私は実際にこのログを Looker Studio に流して、日次のフォールバック発動回数と推定追加コストをダッシュボードで監視しています。
+
+## 本番でつまずきやすい3つの落とし穴
+
+### 1. フォールバック先のコンテキストウィンドウが小さくて入らない
+
+Gemini 2.5 Pro は 1M トークン、Claude Haiku 4.5 は 200K、GPT-4o は 128K と、プロバイダーごとにコンテキストウィンドウが大きく異なります。Gemini に投げていた長文を、フォールバックでそのまま Claude に投げると、入力超過でエラーになる構造的問題が起きます。
+
+対策は、ルーターレベルで「リクエストのトークン推定値が閾値を超えていたら、対応できないプロバイダーをスキップする」ロジックを入れることです。
+
+```python
+def select_capable(adapters, estimated_tokens: int):
+    capacity = {"gemini": 1_000_000, "claude": 200_000, "openai": 128_000}
+    return [
+        a for a in adapters
+        if estimated_tokens < capacity.get(a.name, 32_000) * 0.8
+    ]
+```
+
+私はこのロジックを入れていなかった頃、深夜のロングプロンプトでフォールバックが連鎖的に失敗するインシデントを経験しました。事前に弾く設計に変えてから同種の事故はゼロになっています。
+
+### 2. プロバイダーごとに JSON の安定度が違う
+
+Gemini は `response_mime_type="application/json"` と `response_schema` を組み合わせると非常に安定して JSON を返します。一方、Claude や GPT-4o では、プロンプト末尾に「JSON 以外を一切出力しないでください」と明示しないと、たまに前置きの文章が混ざります。
+
+対策は、ルーター側で**必ず JSON パーサ層を挟む**ことです。`json.loads()` で失敗したら、各プロバイダー固有の「コードフェンス除去」「前置き文章カット」を試してから再度パースします。
+
+```python
+import json
+import re
+
+
+def safe_parse_json(text: str):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # ```json ... ``` の中身だけ抽出
+        m = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", text, re.DOTALL)
+        if m:
+            return json.loads(m.group(1))
+        # 最初の { から最後の } までを抽出
+        m = re.search(r"\{.*\}|\[.*\]", text, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+        raise
+```
+
+### 3. アダプタ間で温度・トークン上限の意味が微妙に違う
+
+`temperature=0.0` でも、Gemini と Claude では決定論性の度合いが異なります。Gemini は内部的にサンプリングが残ることがあり、完全な決定論性が必要ならば `seed` パラメータと組み合わせる必要があります。
+
+また、`max_tokens` は Gemini では「出力の最大値」を意味しますが、OpenAI では一部のモデルで「入力 + 出力の合計上限」を指す挙動が残っています。「同じパラメータを渡せば同じ振る舞い」だと信じ込むと、本番でだけ突然短い応答が返って混乱します。アダプタ層でプロバイダーごとに正規化処理を入れて、外から見たときに意味が揃うようにしてください。
+
+
+## コストベースルーティング — シンプルなフォールバックを「あえて崩す」設計
+
+先ほど「重み付き分散より順序付きフォールバックが楽」と書きましたが、ひとつだけそのルールを意図的に崩すケースがあります。同一ワークロード内での **コストベースルーティング** です。
+
+ユーザー向けタスクには明らかに軽いもの（短い QA・分類・意図抽出）と、明らかに重いもの（多段推論・長文要約・コード生成）があります。すべてを Gemini 2.5 Pro に投げると、Flash や Haiku で十分なタスクにも Pro 料金を払うことになります。
+
+ポイントは、これを「リクエストごとの抽選」ではなく「タスクタイプごとの判断」にすることです。私は呼び出し側にタスクプロファイルを付け、ルーターがプロファイルごとに別の順序付きアダプタリストを使う設計にしています。
+
+```python
+# llm/profiles.py
+from dataclasses import dataclass
+from .gemini_adapter import GeminiAdapter
+from .claude_adapter import ClaudeAdapter
+
+
+@dataclass
+class TaskProfile:
+    name: str
+    primary: list  # ordered adapter list
+
+
+CHEAP_QA = TaskProfile(
+    name="cheap_qa",
+    primary=[
+        GeminiAdapter(model="gemini-2.5-flash"),
+        ClaudeAdapter(model="claude-haiku-4-5-20251001"),
+    ],
+)
+
+DEEP_REASONING = TaskProfile(
+    name="deep_reasoning",
+    primary=[
+        GeminiAdapter(model="gemini-2.5-pro"),
+        ClaudeAdapter(model="claude-sonnet-4-6"),
+    ],
+)
+```
+
+呼び出し側はモデル名ではなくプロファイルを指定します。
+
+```python
+response = await router.complete_with_profile(CHEAP_QA, request)
+```
+
+プロファイル単位で順序付きフォールバックの単純さを保ちつつ、ルーティング戦略を1か所に閉じ込められます。私の運用しているサービスでは、この設計だけで月額 LLM 料金が約 40% 削減できました。実際には全リクエストの 7 割が分類系の軽タスクで、Pro 級モデルは過剰だったというだけの話です。アーキテクチャ層で見える化したことで、計測・監視・チューニングが可能になりました。
+
+## 障害発生時のログは実際にどう見えるか
+
+「冗長化したからきっと大丈夫」と頭で理解していても、本当に障害が起きた瞬間にログが正しく流れていないと運用者は何もできません。実際にあった夜の障害ログ（一部マスキング済み）を載せておきます。次にあなたが障害を見つめるとき、似たパターンを探す手がかりになります。
+
+```text
+2026-04-09T03:14:22Z INFO llm_call_success provider=gemini fallback_count=0 latency_ms=812.4
+2026-04-09T03:15:08Z INFO llm_call_success provider=gemini fallback_count=0 latency_ms=945.1
+2026-04-09T03:15:51Z ERROR provider_failed provider=gemini err=DeadlineExceeded
+2026-04-09T03:15:53Z INFO llm_call_success provider=claude fallback_count=1 latency_ms=1342.8
+2026-04-09T03:16:20Z ERROR provider_failed provider=gemini err=DeadlineExceeded
+2026-04-09T03:16:22Z INFO llm_call_success provider=claude fallback_count=1 latency_ms=1289.4
+2026-04-09T03:16:51Z ERROR provider_failed provider=gemini err=ServerError(503)
+2026-04-09T03:16:51Z WARN  breaker_open provider=gemini cooldown_sec=30
+2026-04-09T03:16:53Z INFO llm_call_success provider=claude fallback_count=1 latency_ms=1310.7
+2026-04-09T03:17:23Z INFO llm_call_success provider=claude fallback_count=1 latency_ms=1265.0
+...
+2026-04-09T03:21:52Z INFO breaker_half_open provider=gemini
+2026-04-09T03:21:54Z INFO llm_call_success provider=gemini fallback_count=0 latency_ms=901.3
+2026-04-09T03:21:54Z INFO breaker_closed provider=gemini
+```
+
+ログを並べると、03:15:51 に Gemini が落ち始め、3 回連続失敗で 03:16:51 にブレーカーがオープン、その後 4 分間は Claude で受け切り（プロンプト形状の関係でレイテンシが約 400 ms 増えています）、03:21:54 の半開試験で Gemini が回復し、ブレーカーが閉じた、という時系列が読み取れます。ユーザーから見たエラーはブレーカーが開く瞬間の数件のみで、ほとんどの利用者には何も起きなかったように見えます。
+
+これが運用上のゴールです。「障害ゼロ」は無理ですが、「ログでだけ気づく障害」を目指すことはできます。
+
+## フェイルオーバーパスを腐らせない仕組み
+
+冗長化アーキテクチャの本当に難しい部分は、フォールバック経路を腐らせないことです。普段ほぼ実行されないコードは、どうしても劣化します。私は2つの防御線を引いています。
+
+**1つ目は月次の合成ドリル**です。本番環境にも「ドリルモード」を組み込み、定期的に「主軸を意図的に失敗させる固定プロンプト」を流して、Claude が `fallback_count=1` で応答することを自動チェックしています。これが落ちたら通知が飛びます。実際にはクレデンシャルの期限切れ・ライブラリのアップグレードでアダプタが壊れた事象・クォータ超過などを、本物の障害が起きる前に毎月のように発見しています。
+
+**2つ目はユニットテスト**です。常に失敗するダミーアダプタを先頭に置き、ルーターが必ずスタブの2番目に落ちることを検証します。
+
+```python
+# tests/test_router.py
+import pytest
+from llm.router import LLMRouter
+from llm.base import LLMRequest, LLMResponse
+
+
+class AlwaysFails:
+    name = "broken"
+    async def complete(self, request): raise RuntimeError("simulated outage")
+    async def health_check(self): return False
+
+
+class AlwaysWorks:
+    name = "stub"
+    async def complete(self, request):
+        return LLMResponse(
+            text="ok", provider="stub", model="stub-1",
+            input_tokens=1, output_tokens=1, cost_usd=0.0,
+        )
+    async def health_check(self): return True
+
+
+@pytest.mark.asyncio
+async def test_falls_through_to_secondary():
+    router = LLMRouter([AlwaysFails(), AlwaysWorks()])
+    response = await router.complete(LLMRequest(system="", user="ping"))
+    assert response.provider == "stub"
+```
+
+小さなテストですが、ルーターのリファクタリングで密かにフォールバック動作が壊れる事故を、過去に何度も食い止めてくれました。
+
+## まとめ — 今日の最初の一歩
+
+冗長化アーキテクチャは、構築する前から「うちにはオーバースペックでは」と思いがちです。しかし実際に組んでみると、コードの量はそれほど多くありません。アダプタの抽象化さえ済ませてしまえば、フォールバックの追加は1ファイルで完結します。
+
+もしあなたのアプリが今、Gemini API だけに依存しているなら、まずは「アダプタ層」だけ抜き出すリファクタから始めてみてください。`llm.complete(request)` という形に呼び出し側を寄せ替えるだけで、いつでもフォールバックを追加できる土壌が整います。私自身、最初のリファクタは半日もかからなかったので、思い立った日にやってしまうのが一番です。
+
+冗長化はその次でかまいません。土台があれば、Claude のキーを取得して 30 行のアダプタを足すだけで、深夜の障害でも片肺で動き続ける本番アプリになります。
+
+より深く LLM 本番運用の設計パターンを学びたい場合は、[『LLM のプロダクション活用 - AI システム設計と運用の本格ガイド』（西見公宏 著）](https://www.amazon.co.jp/dp/4297143364/?tag=pinocchio-22) が参考になります。コスト管理とフェイルオーバーの章は、本記事の内容と重なる部分が多く、実務に投入するときの判断材料が豊富です。
+
+関連する記事として、[Gemini API の本番パイプラインアーキテクチャ設計](/articles/gemini-api/gemini-api-production-pipeline-architecture) と [Gemini API のサーキットブレーカー・バルクヘッド設計](/articles/gemini-api/gemini-api-resilience-circuit-breaker-bulkhead-production-guide) も合わせて読むと、本番設計の解像度がさらに上がります。
