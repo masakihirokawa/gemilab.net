@@ -1,0 +1,268 @@
+---
+title: "Gemini API の usageMetadata で本番アプリのコストを記録する — リクエスト単位で請求書と突き合わせる実装パターン"
+slug: "gemini-api-usage-metadata-cost-tracking-production"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-28T20:30"
+author: "Gemini Lab"
+description: "Gemini API のレスポンスに含まれる usageMetadata を活用し、リクエスト単位でトークン使用量を記録する実装パターンを解説します。cachedContent や thoughts のように単価が異なるトークンを正しく集計し、月末に Google Cloud の請求書と突き合わせる方法までまとめました。"
+tags: ["gemini-api", "コスト管理", "usageMetadata", "本番運用", "python", "billing"]
+---
+
+「先月の Google Cloud の請求書を開いたら、Gemini API の項目だけ予想の倍だった」— 個人開発で Gemini API を使い始めて半年ほどが経った頃、私はこの体験をしました。原因を調べようと管理コンソールを掘り下げても、リクエスト単位の内訳までは出てきません。結局はアプリ側で `usageMetadata` を記録していなかったことが、再発防止できない最大の理由でした。
+
+`usageMetadata` は Gemini API のレスポンスに常に含まれている地味なフィールドですが、これを 1 リクエストずつ保存しておくだけで、後から「どのエンドポイント」「どのユーザー」「どのモデル」が請求の何割を占めているのか、ほぼ完璧に再現できます。本記事では、私が個人プロジェクトで実際に運用している記録パターンと、Google Cloud の請求書と突き合わせる方法を共有します。
+
+## usageMetadata に含まれるフィールドを正確に把握する
+
+最初につまずくのは、`usageMetadata` のフィールドが思った以上に多いことです。Python SDK（`google-genai`）でレスポンスを print するとこのような構造になっています。
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_API_KEY")
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents="Gemini API のコスト管理について200字で教えてください",
+)
+
+print(resp.usage_metadata)
+# UsageMetadata(
+#   prompt_token_count=18,
+#   candidates_token_count=210,
+#   cached_content_token_count=0,
+#   thoughts_token_count=0,
+#   tool_use_prompt_token_count=0,
+#   total_token_count=228
+# )
+```
+
+それぞれの意味は次の通りです。
+
+- **`prompt_token_count`** — 入力プロンプト全体のトークン数。System Instructions や履歴も含む
+- **`cached_content_token_count`** — Context Caching を使ったときにキャッシュから読み込んだトークン数（通常入力の 25% 程度の単価）
+- **`candidates_token_count`** — モデルが生成した出力トークン数。`candidate_count` が 2 以上なら全候補の合計
+- **`thoughts_token_count`** — Gemini 2.5 系の Thinking 出力トークン数。料金は出力トークンと同じ単価で課金される
+- **`tool_use_prompt_token_count`** — Function Calling や Code Execution の内部処理で消費した入力トークン
+- **`total_token_count`** — 上記すべての合計
+
+ここで重要なのは「`total_token_count` を見るだけでは料金は計算できない」という事実です。同じ 1,000 トークンでも、入力・出力・キャッシュ済み・思考でそれぞれ単価が違うため、フィールドごとに分けて記録しないと請求書と一致しません。
+
+## 1 リクエストずつ JSON ログに残す
+
+私が運用している方法はシンプルで、API 呼び出しのラッパー関数で usageMetadata を JSONL ファイルに追記するだけです。「あとで集計するから今は保存しておく」という割り切りが、月末になって最も助かります。
+
+```python
+import json
+import time
+from pathlib import Path
+from google import genai
+
+LOG_PATH = Path("logs/gemini_usage.jsonl")
+LOG_PATH.parent.mkdir(exist_ok=True)
+client = genai.Client(api_key="YOUR_API_KEY")
+
+def call_gemini_logged(model: str, prompt: str, *, user_id: str, endpoint: str):
+    """usageMetadata を必ず JSONL に追記してから返すラッパー"""
+    started = time.time()
+    resp = client.models.generate_content(model=model, contents=prompt)
+    um = resp.usage_metadata
+
+    record = {
+        "ts": time.time(),
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "user_id": user_id,
+        "endpoint": endpoint,
+        "model": model,
+        "prompt": um.prompt_token_count,
+        "cached": um.cached_content_token_count or 0,
+        "candidates": um.candidates_token_count or 0,
+        "thoughts": um.thoughts_token_count or 0,
+        "tool_use": um.tool_use_prompt_token_count or 0,
+        "total": um.total_token_count,
+    }
+    with LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return resp
+
+# 使用例
+resp = call_gemini_logged(
+    model="gemini-2.5-flash",
+    prompt="今日の天気を一言で",
+    user_id="u_001",
+    endpoint="/api/weather/summary",
+)
+print(resp.text)
+```
+
+JSONL を選ぶ理由は 2 つあります。1 つは追記書き込みが原子的に近く、複数プロセスから書いてもログが壊れにくいこと。もう 1 つは、後で SQLite や DuckDB に取り込むのが `read_json_auto()` 一発で済むことです。
+
+## モデルごとの単価表をコードに埋め込んで日本円で集計する
+
+ログが貯まったら、モデルごとの単価表と突き合わせて円換算します。価格は変動するので、私は単価を 1 つの Python モジュールに切り出しています。
+
+```python
+# pricing.py
+# 1M トークンあたりの USD（2026 年 4 月時点・必ず公式の最新表で確認）
+PRICING = {
+    "gemini-2.5-pro": {
+        "input": 1.25, "cached": 0.31, "output": 10.00, "thoughts": 10.00,
+    },
+    "gemini-2.5-flash": {
+        "input": 0.30, "cached": 0.075, "output": 2.50, "thoughts": 2.50,
+    },
+    "gemini-2.5-flash-lite": {
+        "input": 0.10, "cached": 0.025, "output": 0.40, "thoughts": 0.40,
+    },
+}
+
+def calc_usd(record: dict) -> float:
+    p = PRICING.get(record["model"])
+    if p is None:
+        # 未知のモデルは安全側に倒して 0 にせず Pro 単価で見積もる
+        p = PRICING["gemini-2.5-pro"]
+    input_billable = max(0, record["prompt"] - record.get("cached", 0))
+    return (
+        input_billable / 1_000_000 * p["input"]
+        + record.get("cached", 0) / 1_000_000 * p["cached"]
+        + record.get("candidates", 0) / 1_000_000 * p["output"]
+        + record.get("thoughts", 0) / 1_000_000 * p["thoughts"]
+    )
+```
+
+注意点が 1 つあります。`prompt_token_count` には **キャッシュ済みのトークンも含まれている** ため、`prompt - cached` で実際に課金される入力トークン数を求める必要があります。これを忘れるとキャッシュを使っているはずなのに見積もりが下がらず、最適化の効果が見えなくなります。
+
+集計はこんな具合です。
+
+```python
+import json
+from collections import defaultdict
+from pricing import calc_usd
+
+usd_by_endpoint = defaultdict(float)
+with open("logs/gemini_usage.jsonl") as f:
+    for line in f:
+        rec = json.loads(line)
+        usd_by_endpoint[rec["endpoint"]] += calc_usd(rec)
+
+USD_TO_JPY = 156  # 月初の TTM レートで固定するのが運用上ラク
+for ep, usd in sorted(usd_by_endpoint.items(), key=lambda x: -x[1]):
+    print(f"{ep:40s}  ${usd:>8.4f}  ¥{usd * USD_TO_JPY:>9.2f}")
+```
+
+エンドポイント別に並べるだけで、どの機能が課金の何割を食っているかが瞬時に見えます。実際にこれを始めてから「画像分類の前処理プロンプトが意外と高い」とか「翻訳だけは Pro でなく Flash でいい」といった、予想と違う発見が毎月のように出てきます。
+
+## 月末に Google Cloud の請求書と突き合わせる
+
+月初に「ログ集計の合計」と「Google Cloud の実請求」を突き合わせる作業は 5 分で済みますが、これをやっているかどうかで運用の安心感が大きく変わります。
+
+突き合わせの手順は次の通りです。
+
+1. Google Cloud Console → 請求 → レポート で対象プロジェクトの「Generative Language API」または「Vertex AI」の費用を表示する
+2. ログ集計の月合計（USD）を計算する
+3. 差額が請求の 5% 以内に収まっていれば OK。それ以上ズレていたら原因を調べる
+
+私の経験で、5% 以上ずれる主な原因は次の 3 つです。
+
+- **無料枠の引き忘れ** — 無料枠で消費したリクエストはログには載るが請求には来ない
+- **Failed リクエストの扱い** — 4xx で失敗したリクエストでも一部のトークンは課金されることがある
+- **モデル名の不一致** — `gemini-2.5-pro-latest` のようなエイリアスを使っていると、ログ側のモデル名と請求側の課金単価が食い違う場合がある
+
+このうち最後のモデル名の問題は地味ですが頻出します。エイリアスではなく `gemini-2.5-pro-001` のような固定 ID を本番では使うようにすると、請求とログがきれいに一致するようになります。
+
+## アラート閾値は「日次予算」で持つのが現実的
+
+月末になって突き合わせる運用だけでは、月の途中で暴走したケースを止められません。私はログに記録した時点で「日次の累計が予算を超えたら通知」を出すようにしています。
+
+```python
+import json
+from datetime import datetime, timezone, timedelta
+from pricing import calc_usd
+
+DAILY_BUDGET_USD = 3.0  # 月 90 ドルを想定
+
+def today_total_usd() -> float:
+    today = datetime.now(timezone(timedelta(hours=9))).date()
+    total = 0.0
+    with open("logs/gemini_usage.jsonl") as f:
+        for line in f:
+            rec = json.loads(line)
+            d = datetime.fromtimestamp(rec["ts"], tz=timezone(timedelta(hours=9))).date()
+            if d == today:
+                total += calc_usd(rec)
+    return total
+
+# 各リクエストの直後に呼ぶ
+if today_total_usd() > DAILY_BUDGET_USD:
+    # 例: Slack Webhook へ通知、または当日の API 呼び出しを停止
+    raise RuntimeError("Daily Gemini budget exceeded")
+```
+
+この閾値を月予算 ÷ 30 にしておくだけで、想定外の暴走を当日中に検知できます。月末の請求書を見て驚く回数が、私の場合はこの仕組みを入れてからゼロになりました。
+
+関連する記事として、より広いコスト最適化の戦略は [Gemini API のコスト最適化 — 実コードで学ぶ7つのテクニック](/articles/gemini-api/gemini-api-cost-optimization)、Context Caching を使う場合の単価設計は [Gemini API Context Caching でコストを下げる実践ガイド](/articles/gemini-api/gemini-api-context-caching-cost-optimization) を参考にしてください。
+
+## ログを SQLite に取り込んで自由にクエリする
+
+JSONL は記録には便利ですが、「先週いちばんお金を使ったユーザーは？」のような問いに即答するには SQL のほうが速いです。変換は 2 行で済みます。
+
+```bash
+sqlite3 usage.db <<'SQL'
+.mode json
+CREATE TABLE IF NOT EXISTS usage AS SELECT * FROM read_json('logs/gemini_usage.jsonl');
+SQL
+```
+
+テーブルになれば、実際に投げたい問い合わせは短く書けます。
+
+```sql
+-- 直近 7 日のエンドポイント別コスト Top 10（gemini-2.5-flash）
+SELECT endpoint,
+       SUM(prompt - cached) * 0.30 / 1e6 AS input_usd,
+       SUM(candidates + thoughts) * 2.50 / 1e6 AS output_usd
+FROM usage
+WHERE ts > strftime('%s','now') - 7*86400
+  AND model = 'gemini-2.5-flash'
+GROUP BY endpoint
+ORDER BY input_usd + output_usd DESC
+LIMIT 10;
+```
+
+個人開発レベルでは、JSONL → SQLite の変換は数十万行あっても 1 秒以内で終わります。私の場合、ログが 5GB を超えてから本格的なデータウェアハウスに移行しましたが、個人アプリではほぼ起きない規模です。
+
+## Node SDK で気をつけたいこと
+
+Node SDK（`@google/genai`）を使う場合、フィールド名は camelCase になります。構造自体は同じですが、いくつかハマりやすい点があります。
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const resp = await ai.models.generateContent({
+  model: "gemini-2.5-flash",
+  contents: "Hello",
+});
+
+const um = resp.usageMetadata;
+console.log({
+  prompt: um.promptTokenCount,
+  cached: um.cachedContentTokenCount ?? 0,
+  candidates: um.candidatesTokenCount ?? 0,
+  thoughts: um.thoughtsTokenCount ?? 0,
+});
+```
+
+私が実際に踏んだ落とし穴は次の 2 つです。
+
+- ストリーミングのチャンクでは `usageMetadata` が `undefined` のことが多く、最終チャンクにだけ値が乗ります。チャンクをまたいで足し算するとダブルカウントになるため、値が現れた 1 回だけ加算してください
+- `cachedContentTokenCount` はキャッシュを使っていないときに 0 ではなく **未定義** のことがあります。`?? 0` で吸収しないと TypeScript 側で実行時エラーになります
+
+## まとめ — 今日できる最初の一歩
+
+ここまでの内容を全部入れる必要はありません。今日この記事を読み終えたら、まず `usageMetadata` をそのまま JSONL に追記する 5 行のラッパー関数だけ追加してみてください。データさえ貯まっていれば、集計やアラートはあとからいくらでも書けます。
+
+1 ヶ月分のログが貯まったときに「どの機能が一番お金を使っているか」を初めて知る瞬間は、個人開発者にとっては小さなお祭りのようなものです。請求書を開くのが少しだけ楽しみになる、そんな運用を始めるのに今日はちょうどよい日かもしれません。
+
+書籍で体系的に学ばれたい方には、コスト管理を含めた API 運用全般の考え方が整理されている [入門 監視 ―モダンなモニタリングのためのデザインパターン（Mike Julian 著）](https://www.amazon.co.jp/dp/4873118646/?tag=pinocchio-22) が、本記事の延長として読みやすい一冊です。
