@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "FLASH3GA — Gemini 3 Flash 一般提供開始、SWE-bench 78% で 3 Pro を上回る効率性とコストを実現（4/22）",
+    "GMVEHICLES — GM 車4百万台に Gemini 展開、Cadillac/Chevrolet/Buick/GMC の2022年式以降が対象（4/28）",
     "NOTEBOOKS — Gemini に Notebooks 機能追加、NotebookLM と双方向シンクで PDF・チャット・リサーチを一元管理（4/24）",
     "MACOS — Gemini app の macOS ネイティブ版が登場、Mac 15 以上対応で Dock からワンタップ起動（4月）",
-    "PERSONAL — Personal Intelligence で Gmail・Drive・Photos・Calendar 連携、自分専用のコンテキストを活用（4月）",
-    "WORKSPACE — Workspace Intelligence が Gmail・Chat・Calendar・Drive にリアルタイムアクセス、AI生成タスクが業務データを直接参照（4月）",
-    "SHEETS — Google Sheets に Fill with Gemini 機能、ドラッグ＆ドロップで列補完・空白範囲をプロンプトで一括生成（4月）",
-    "SIRI — Gemini-powered Siri が2026年後半に正式リリース、Apple-Google提携でコンテキスト対応 Siri 実現（4/22）",
+    "DELOITTE — Deloitte が Google Cloud と提携拡大、Gemini Enterprise 専用エージェント変革プラクティス設立（4/22）",
+    "PROACTIVE — Gemini Beta に Proactive Assistance 機能、Gmail・Calendar・画面解析でリアルタイム提案（4月）",
   ],
   en: [
+    "FLASH3GA — Gemini 3 Flash GA delivers Pro-grade reasoning at Flash speed, hits 78% on SWE-bench Verified (4/22)",
+    "GMVEHICLES — Gemini rolls out to ~4M GM vehicles (Cadillac/Chevrolet/Buick/GMC, 2022 and later) (4/28)",
     "NOTEBOOKS — Gemini adds Notebooks with two-way NotebookLM sync, organize chats, PDFs, and research in one place (4/24)",
     "MACOS — Gemini app for macOS launches, native Mac 15+ build with one-tap access from the Dock (April)",
-    "PERSONAL — Personal Intelligence connects Gmail, Drive, Photos, and Calendar for context tailored to your life (April)",
-    "WORKSPACE — Workspace Intelligence brings real-time Gmail, Chat, Calendar, and Drive context to AI tasks (April)",
-    "SHEETS — Google Sheets adds Fill with Gemini, drag-and-drop column inference and prompt-based bulk fills (April)",
-    "SIRI — Gemini-powered Siri confirmed for late 2026, Apple-Google partnership delivers context-aware Siri (4/22)",
+    "DELOITTE — Deloitte expands Google Cloud alliance with a dedicated Gemini Enterprise agentic transformation practice (4/22)",
+    "PROACTIVE — Gemini Beta uncovers Proactive Assistance, real-time suggestions from Gmail, Calendar, and on-screen context (April)",
   ],
 };
 
