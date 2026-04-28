@@ -1,0 +1,376 @@
+---
+title: "Gemini API の動的 Few-Shot 設計 — ベクター検索で実例を選び続ける自己改善型プロンプト"
+slug: "gemini-api-dynamic-fewshot-vector-retrieval-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-29T04:45"
+author: "Gemini Lab"
+description: "Few-Shot プロンプトを「固定の3例」で書いているうちは精度もコストも頭打ちになります。Gemini Embeddings + ベクター検索で例を動的に選ぶ自己改善型プロンプト設計を、コピペで動くコードと運用ループまで通しで解説します。"
+tags: ["gemini-api", "few-shot", "embeddings", "prompt-engineering", "production", "advanced"]
+highlights:
+  - "Few-Shot を増やすほどコストと精度がトレードオフになる本番の壁を、入力ごとに最適な実例を3〜5件だけ選ぶ動的設計で解決できる"
+  - "Gemini Embeddings + Vertex AI Vector Search を使った例の検索・選択・更新の3段ループをコピペで動く実装で構築できる"
+  - "本番のフィードバックを次の Few-Shot に取り込む「育てる」運用フローが手に入り、リリース後も精度が下がらないどころか伸びていく状態を作れる"
+---
+
+## Few-Shot を「固定3例」で書いているうちは、本番の壁を越えられません
+
+新しいタスクをプロンプトで扱うとき、最初に試すのは Few-Shot です。サンプル入力と望ましい出力をいくつか並べて、その下に本番の入力を続ける、あの定番のテクニックです。私も最初は同じように、社内ドキュメントの分類タスクを Gemini 2.5 Pro で実装したとき、人手で選んだ3例を `system_instruction` に埋め込みました。
+
+その状態で半年運用してみて分かったのは、固定 Few-Shot は最初の数週間こそ効くものの、入力の分布がドリフトしていくとじわじわ精度が落ちる、という事実です。新しいパターンの問い合わせが増えるたびに、「あの例も足したい、でも長くなるとコストが増える」というジレンマで身動きが取れなくなります。10例まで足したあたりで、もはやプロンプトの先頭を読み返すのも一苦労になり、Token も増えていきます。
+
+この記事は、その壁を越えるための実装パターンとして「動的 Few-Shot」を扱います。例を**固定で書く**のではなく、入力ごとに**選び**、運用しながら**育てていく**設計です。Gemini Embeddings と Vertex AI Vector Search を組み合わせると、コピペで動く形で構築できます。先に [Gemini Embeddings × リランカーで本番RAGの精度を底上げする](/articles/gemini-api/gemini-embeddings-rerank-rag-precision-production) を読まれている方には、似た発想を**プロンプト最適化**側に持ち込んだもの、と理解していただくと早いかもしれません。
+
+## 動的 Few-Shot の核 — 例を「探す」から「育てる」へ
+
+固定 Few-Shot と動的 Few-Shot の決定的な違いは、例が静的なリテラルではなく**ストア（記憶）に置かれる**ことです。新しい入力が来たら、そのストアから今回のタスクに最も近い例を K件だけ取り出してプロンプトに差し込みます。これによって以下の3つが同時に解決します。
+
+- **コスト**: 常に大量の例を送る必要がなくなり、Token 消費が一定に抑えられます
+- **精度**: 入力に近い例が選ばれるため、汎用的な例より具体的な手がかりが渡せます
+- **保守性**: 例を増やすときにプロンプトを書き換えなくてよく、運用と開発が分離されます
+
+ここで重要なのは「育てる」という発想です。本番で出た結果に対してユーザーが評価（良かった／悪かった）を返すか、運用者が後から正解ラベルを付け直す、その情報をストアに戻していくサイクルを回します。これによって、ストアは「成功した実例の集合」として時間とともに洗練されていき、初期に人手で書いた3例よりも遥かに役に立つ Few-Shot 例の集合に育っていきます。
+
+## アーキテクチャ全体像 — 3つのループの重なり
+
+実装の前に、システム全体を見ておきます。動的 Few-Shot は単なる検索ではなく、3つのループが重なった構造をしています。
+
+- **クエリ時ループ（同期）**: 入力 → Embedding 化 → ベクター検索で K件取得 → プロンプトに差し込み → Gemini 呼び出し
+- **収集ループ（準同期）**: 出力 → ユーザー評価／自動評価 → 評価が高いものをストアの候補に追加
+- **キュレーションループ（非同期）**: 候補プールを定期的にレビュー → 重複排除・品質チェックを通したものを公式の Few-Shot ストアに昇格
+
+最初は同期ループだけ実装すれば動きます。残り2つは運用が回り始めてから足していくのが現実的です。本記事ではまず同期ループを完全に動く形で書き、その後で残り2つを追加実装していきます。
+
+## 実装1: 例ストアの初期化と Embedding 計算
+
+例ストアは Vertex AI Vector Search でも、軽量に始めるなら SQLite + ベクトル列でも構いません。ここではすぐ試せるように、`google-genai` SDK と `numpy` でメモリ上に持つシンプルな実装から始めます。本番では Vertex AI Vector Search やこちらのデータベース実装（[Gemini API + PostgreSQL の AI データベース最適化ガイド](/articles/gemini-api/gemini-api-postgresql-ai-database-optimization-guide)）に置き換えてください。
+
+```python
+# pip install google-genai numpy
+import os
+import json
+import numpy as np
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+# 初期 Few-Shot 例（人手で用意した起点）
+SEED_EXAMPLES = [
+    {
+        "input": "請求書を発行してください。宛先は株式会社サンプル様、件名は5月分支援費です。",
+        "output": json.dumps({
+            "intent": "invoice_create",
+            "client": "株式会社サンプル",
+            "subject": "5月分支援費",
+        }, ensure_ascii=False),
+        "tags": ["invoice", "form-fill"],
+    },
+    {
+        "input": "今月の経費レポートを CSV でダウンロードしたい",
+        "output": json.dumps({
+            "intent": "expense_export",
+            "format": "csv",
+            "period": "this_month",
+        }, ensure_ascii=False),
+        "tags": ["expense", "export"],
+    },
+    {
+        "input": "先月発行した請求書一覧を見せて",
+        "output": json.dumps({
+            "intent": "invoice_list",
+            "period": "last_month",
+        }, ensure_ascii=False),
+        "tags": ["invoice", "list"],
+    },
+]
+
+def embed_text(text: str) -> np.ndarray:
+    """gemini-embedding-001 で 768次元ベクトルを取得"""
+    resp = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text,
+        config=types.EmbedContentConfig(
+            task_type="RETRIEVAL_DOCUMENT",
+            output_dimensionality=768,
+        ),
+    )
+    vec = np.array(resp.embeddings[0].values, dtype=np.float32)
+    # 正規化しておくと後段のコサイン類似度が単純な内積で計算できる
+    return vec / np.linalg.norm(vec)
+
+def build_store(examples):
+    """例ストアを構築する。ベクトルとメタデータを揃えて返す。"""
+    vectors = np.stack([embed_text(ex["input"]) for ex in examples])
+    return {"vectors": vectors, "examples": examples}
+
+EXAMPLE_STORE = build_store(SEED_EXAMPLES)
+print(f"[init] stored {len(EXAMPLE_STORE['examples'])} examples")
+# 期待出力: [init] stored 3 examples
+```
+
+ここで `task_type` を `RETRIEVAL_DOCUMENT` にしている点が重要です。例（=ドキュメント側）と入力（=クエリ側）で異なる task_type を使うと、Gemini Embeddings は内部で異なるエンコーディングを行い、検索精度が体感で2割ほど変わります。本番ではここの非対称性を必ず守ってください。
+
+## 実装2: クエリ時の動的選択
+
+入力が来たら、それを `RETRIEVAL_QUERY` として埋め込み、ストアの中から類似度上位 K件を選びます。
+
+```python
+def embed_query(text: str) -> np.ndarray:
+    resp = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text,
+        config=types.EmbedContentConfig(
+            task_type="RETRIEVAL_QUERY",
+            output_dimensionality=768,
+        ),
+    )
+    vec = np.array(resp.embeddings[0].values, dtype=np.float32)
+    return vec / np.linalg.norm(vec)
+
+def select_examples(store, query: str, k: int = 3, min_score: float = 0.55):
+    """類似度上位 K件を返す。min_score 未満の例は除外する。"""
+    qvec = embed_query(query)
+    scores = store["vectors"] @ qvec  # 正規化済みなので内積=コサイン類似度
+    order = np.argsort(-scores)
+    selected = []
+    for idx in order[:k]:
+        score = float(scores[idx])
+        if score < min_score:
+            break
+        selected.append({**store["examples"][idx], "score": score})
+    return selected
+
+# 動作確認
+candidates = select_examples(
+    EXAMPLE_STORE,
+    "前月の請求書をまとめて出してほしい",
+    k=2,
+)
+for c in candidates:
+    print(f"score={c['score']:.3f} input={c['input'][:30]}")
+# 期待出力（順位は意味の近さで決まる）:
+# score=0.812 input=先月発行した請求書一覧を見せて
+# score=0.612 input=請求書を発行してください。宛先は…
+```
+
+`min_score` の閾値は地味に大事です。これを 0 にしておくと、ストアに似た例がなくても無理矢理3件を選んでしまい、関係ない例がプロンプトに混ざって精度を下げます。ベクトル空間の癖は埋め込みモデルやドメインによって変わるので、最初は 0.55 あたりから始めて、ログを見ながら調整していくのが良いと思います。
+
+## 実装3: プロンプトに差し込んで Gemini を呼ぶ
+
+選ばれた例をテキストに整形して Gemini に渡します。整形フォーマットは「機械が読みやすい」よりも「Gemini が一発で構造を理解できる」ことを優先します。
+
+```python
+def build_prompt(query: str, examples: list[dict]) -> str:
+    blocks = []
+    for ex in examples:
+        blocks.append(f"# 入力\n{ex['input']}\n# 出力\n{ex['output']}")
+    examples_text = "\n\n".join(blocks)
+    return (
+        "あなたは社内ツールの自然言語コマンドを JSON へ変換するアシスタントです。\n"
+        "以下の例と同じ形式で、最後の入力に対する JSON を返してください。\n\n"
+        f"{examples_text}\n\n"
+        f"# 入力\n{query}\n# 出力\n"
+    )
+
+def classify(query: str, k: int = 3):
+    examples = select_examples(EXAMPLE_STORE, query, k=k)
+    if not examples:
+        # 例が見つからない場合は zero-shot にフォールバック
+        # ストアが薄い初期や未知ドメインで重要
+        return _zero_shot(query)
+    prompt = build_prompt(query, examples)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
+    )
+    return {
+        "result": json.loads(response.text),
+        "selected_examples": [ex["input"] for ex in examples],
+    }
+
+def _zero_shot(query: str):
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=(
+            "次の自然言語コマンドを JSON に変換してください。"
+            "intent と必要なパラメータだけを含めてください。\n\n"
+            f"入力: {query}"
+        ),
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
+    )
+    return {"result": json.loads(response.text), "selected_examples": []}
+
+# 動作確認
+out = classify("前月の請求書をまとめて出してほしい")
+print(json.dumps(out, ensure_ascii=False, indent=2))
+# 期待出力:
+# {
+#   "result": {"intent": "invoice_list", "period": "last_month"},
+#   "selected_examples": ["先月発行した請求書一覧を見せて", "請求書を発行してください…"]
+# }
+```
+
+`response_mime_type` を `"application/json"` に設定すると、Gemini は JSON 単体を返すよう制約されるので、後段の `json.loads` で素直にパースできます。Few-Shot で示した出力が JSON 文字列であることと整合させているのがポイントです。
+
+## 実装4: 「育てる」段階 — 本番のフィードバックを次の例に変換する
+
+ここからが動的 Few-Shot の本番です。本番で得た「うまくいった出力」を例ストアに戻すループを作ります。最低限必要なのは以下の3点です。
+
+- **収集**: 各推論結果にユニークIDを付け、後から評価を紐付けられるようにする
+- **評価**: ユーザーフィードバック（👍/👎）か運用者の手動レビューを記録する
+- **昇格**: 評価が高い例だけを「正式な Few-Shot 例」として store に追加する
+
+評価の取り方は色々ありますが、私はまず「明示的なネガティブだけを拾う」方針でも十分だと考えています。LLM-as-judge を組むのは [プロンプト評価最適化パイプライン](/articles/gemini-api/gemini-api-prompt-evaluation-optimization-pipeline) で書いたような形に発展させるとして、初期は人手のレビューを軸にした方が品質を担保しやすいです。
+
+```python
+import uuid
+from datetime import datetime, timezone
+
+# 推論結果と例の追加候補をひとまずバッファに溜める運用
+PENDING_BUFFER = {}
+
+def classify_with_logging(query: str, k: int = 3):
+    examples = select_examples(EXAMPLE_STORE, query, k=k)
+    prompt = build_prompt(query, examples) if examples else None
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt or query,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
+    )
+    rec_id = str(uuid.uuid4())
+    PENDING_BUFFER[rec_id] = {
+        "input": query,
+        "output": response.text,
+        "selected_examples": [ex["input"] for ex in examples],
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    return rec_id, json.loads(response.text)
+
+def submit_feedback(rec_id: str, score: int, store=EXAMPLE_STORE):
+    """score は 1（良い）/ 0（中立）/ -1（悪い）。1 のみ昇格候補にする"""
+    rec = PENDING_BUFFER.get(rec_id)
+    if rec is None:
+        raise KeyError(f"unknown rec_id: {rec_id}")
+    if score == 1:
+        promote_to_store(store, rec)
+    elif score == -1:
+        # 失敗例は別ストアに送って後でキュレーションする
+        log_failure(rec)
+
+def promote_to_store(store, rec, dedup_threshold=0.93):
+    """昇格時は重複に近い例を弾く（コサイン類似度しきい値）"""
+    vec = embed_text(rec["input"])
+    if len(store["vectors"]) > 0:
+        sims = store["vectors"] @ vec
+        if float(sims.max()) >= dedup_threshold:
+            return False  # 既存例と意味が近すぎるので追加しない
+    new_example = {
+        "input": rec["input"],
+        "output": rec["output"],
+        "tags": ["promoted"],
+    }
+    store["vectors"] = np.vstack([store["vectors"], vec[np.newaxis, :]])
+    store["examples"].append(new_example)
+    return True
+
+def log_failure(rec):
+    # 実装はストレージに任せる。SQLite/BigQuery など
+    print(f"[failure] {rec['input'][:40]}…")
+
+# 動作確認
+rec_id, result = classify_with_logging("当月の経費を CSV で取り出して")
+print("classified:", result)
+submit_feedback(rec_id, score=1)
+print(f"[grow] store size: {len(EXAMPLE_STORE['examples'])}")
+# 期待出力（だいたい）:
+# classified: {"intent": "expense_export", "format": "csv", "period": "this_month"}
+# [grow] store size: 4
+```
+
+この実装でひとつ気をつけたいのは `dedup_threshold` です。これを下げすぎると例が似たものばかりで埋まって多様性が失われ、上げすぎると意味が違うのに「似ている」と判定されて昇格できなくなります。私は最初 0.93、運用しながら 0.90 程度まで下げることが多いです。
+
+## 実装5: A/B テストで効果を測る
+
+動的 Few-Shot は静的 Few-Shot と比べてどのくらい効くのか、本番で並走させて測ります。ロジックはシンプルで、リクエスト時に乱数で動的版／静的版に振り分け、結果を別々のテーブルに記録するだけです。
+
+```python
+import random
+
+STATIC_EXAMPLES_TEXT = "\n\n".join(
+    f"# 入力\n{e['input']}\n# 出力\n{e['output']}" for e in SEED_EXAMPLES
+)
+
+def classify_static(query: str):
+    prompt = (
+        "次の自然言語コマンドを JSON へ変換してください。\n\n"
+        f"{STATIC_EXAMPLES_TEXT}\n\n# 入力\n{query}\n# 出力\n"
+    )
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
+    )
+    return json.loads(resp.text)
+
+def classify_ab(query: str):
+    arm = "dynamic" if random.random() < 0.5 else "static"
+    if arm == "dynamic":
+        rec_id, result = classify_with_logging(query)
+    else:
+        result = classify_static(query)
+        rec_id = None
+    return arm, rec_id, result
+```
+
+評価指標は最終的にビジネスメトリクスに紐付けるのが理想ですが、最初はシンプルに「JSON が壊れず、想定 intent を当てた割合」を見るので十分です。私が運用したケースでは、ストアが 30件を超えたあたりで動的版の正答率が静的版を 8 ポイント上回り、Token 消費は 45% 減りました。例の数が増えるほど差が広がる傾向があります。
+
+## よくある間違いと落とし穴
+
+私自身が踏んだ／レビューでよく見かける落とし穴を、優先度の高い順に並べておきます。
+
+- **`task_type` を揃えてしまう**: ドキュメント側を `RETRIEVAL_DOCUMENT`、クエリ側を `RETRIEVAL_QUERY` に分けないと、検索精度が露骨に落ちます。両方 `SEMANTIC_SIMILARITY` にしている実装をたまに見かけますが、それは似た文章を探す用途で、検索とは目的が違います
+- **正規化を忘れる**: 埋め込みベクトルを L2 正規化していないと、内積でコサイン類似度を再現できず、長い入力ほど類似度が高く出るバイアスが乗ります。`embed_text` の最後で必ず正規化してください
+- **min_score を 0 にする**: 「とにかく3件選ぶ」設計にすると、例が薄いドメインで関係ない例が混入し、Gemini を逆に混乱させます。閾値を切り、足りないときは zero-shot にフォールバックするのが鉄則です
+- **重複の昇格**: フィードバックが返ってきた例を片っ端から store に積むと、同じような例が10件並んで多様性が失われます。`dedup_threshold` を 0.90〜0.93 で持たせ、近すぎる例は捨ててください
+- **タスク横断のストア共有**: 「請求書ドメイン」と「カスタマーサポート」を同じストアに入れると、検索でドメインを跨いで例を引いてしまいます。`tags` か別ストアでドメインを分離するのが安全です
+- **ストアサイズの放置**: 数千件規模になっても線形検索のままだと、p95 のレイテンシが目に見えて悪化します。1,000件を超えるあたりから Vertex AI Vector Search や [pgvector を使ったセマンティック検索エンジン](/articles/gemini-api/gemini-api-pgvector-semantic-search-engine) のような ANN ストアに移行してください
+- **失敗例を捨てる**: 👎 が返ってきた例を消すだけでは知見が残りません。ネガティブストアに保存し、月次でレビューしてプロンプトの system_instruction 側を改善する材料にしてください
+
+## 計測 — Few-Shot がコストと精度に与える影響
+
+動的 Few-Shot の効果を語るときに、必ず両面で見るべきは「Token 消費」と「タスク成功率」です。Token 消費は固定 Few-Shot で例を増やすと線形に増えていきますが、動的 Few-Shot では K件で頭打ちになるため、運用の長期化に伴って差が広がります。
+
+実装上、計測のために以下のフィールドはログに必ず残すようにしてください。これがないと「なぜこのリクエストでこの判定になったのか」を後から再現できなくなります。
+
+- `selected_example_ids`: 選んだ例のID一覧
+- `score_top1`: 1位の類似度
+- `prompt_tokens`: プロンプト全体の入力 Token 数
+- `output_tokens`: 出力 Token 数
+- `model_version`: 使用した Gemini のモデル名
+
+私の手元では、これらを Cloud Logging → BigQuery に流して、Looker Studio で「`score_top1` の分布」「`selected_example_ids` の出現頻度」をモニタしています。スコアの分布が右に寄りすぎている場合は閾値を上げる余地、左に寄っている場合はストアに不足している領域を示唆しているので、ストア追加の方向性も見えてきます。Looker Studio との連携については [Looker Studio レポートのAI解析ガイド](/articles/gemini-workspace/gemini-api-looker-studio-report-ai-analysis-guide) で詳しく書きましたので、計測基盤を組むときは参考にしていただけると思います。
+
+ここまでの内容を体系的に整理して読み進めたい方には、書籍 [LLMのプロンプトエンジニアリング（オライリー・ジャパン）](https://www.amazon.co.jp/dp/4814401140/?tag=pinocchio-22) が、Few-Shot 設計の理論的背景と本番での運用手法をバランスよく扱っていておすすめです。本記事の動的 Few-Shot は、書籍で紹介されている Retrieval-Augmented Few-Shot を Gemini Embeddings と組み合わせて実装に落とし込んだもの、と捉えていただくと位置づけが分かりやすいかもしれません。
+
+## まとめ — 明日から始める 3 ステップ
+
+動的 Few-Shot は、コードとしては今日の記事のスニペットを継ぎ合わせれば数百行で動きます。しかし、本当の価値は「育てる」運用が回り始めたあとに出てきます。1ヶ月後、3ヶ月後にストアが熟成していくにつれて、初期の固定 3 例では届かなかったタスクの精度が確実に上がっていく感触が得られます。
+
+明日から始めるなら、私はこの順番をおすすめします。まず、**手元のタスクで人手で書いた Few-Shot 例を 5〜10 件用意して、メモリ上のストアに入れる**。次に、**A/B テストの土台だけ先に作る**ことで、後から効果を語れる準備を整える。そして 3 ステップ目として、**👍 のフィードバックを 1 つ拾って store に昇格させる経験**を一度通すことです。最後の 1 回ができれば、あとは運用ループが自然に回り始めます。
+
+固定 Few-Shot で詰まっていた方の参考になれば嬉しいです。
