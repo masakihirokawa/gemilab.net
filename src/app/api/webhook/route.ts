@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 
 // eslint-disable-next-line @typescript-eslint/no-empty-interface
 interface KVNamespace {
@@ -38,7 +39,7 @@ export async function POST(request: NextRequest) {
 
     let kv: KVNamespace | null = null;
     try {
-      kv = (process.env as unknown as { PREMIUM_ACCESS: KVNamespace }).PREMIUM_ACCESS;
+      kv = (() => { try { const { env } = getCloudflareContext(); return (env as Record<string, unknown>).PREMIUM_ACCESS as KVNamespace; } catch { return null; } })();
     } catch {
       // KV not available
     }
@@ -51,7 +52,8 @@ export async function POST(request: NextRequest) {
       switch (event.type) {
         case "checkout.session.completed": {
           const session = event.data.object as Stripe.Checkout.Session;
-          const email = session.customer_details?.email?.trim().toLowerCase();
+          const rawEmail = session.customer_details?.email;
+          const email = rawEmail?.trim().toLowerCase();
           if (email) {
             const kvKey = `site:gemilab:email:${email}`;
             const now = new Date();
@@ -84,7 +86,8 @@ export async function POST(request: NextRequest) {
         }
         case "customer.subscription.updated": {
           const sub = event.data.object as Stripe.Subscription;
-          const email = (sub as unknown as { customer_email?: string }).customer_email?.trim().toLowerCase();
+          const rawEmail = (sub as unknown as { customer_email?: string }).customer_email;
+          const email = rawEmail?.trim().toLowerCase();
           if (email) {
             const kvKey = `site:gemilab:email:${email}`;
             const existing = await kv.get(kvKey);
@@ -98,7 +101,8 @@ export async function POST(request: NextRequest) {
         }
         case "customer.subscription.deleted": {
           const sub = event.data.object as Stripe.Subscription;
-          const email = (sub as unknown as { customer_email?: string }).customer_email?.trim().toLowerCase();
+          const rawEmail = (sub as unknown as { customer_email?: string }).customer_email;
+          const email = rawEmail?.trim().toLowerCase();
           if (email) {
             await kv.delete(`site:gemilab:email:${email}`);
           }
