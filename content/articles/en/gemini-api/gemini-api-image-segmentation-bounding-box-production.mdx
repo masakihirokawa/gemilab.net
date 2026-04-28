@@ -1,0 +1,505 @@
+---
+title: "Production-Grade Spatial Understanding with Gemini 2.5 Pro: Bounding Boxes and Segmentation Done Right"
+slug: "gemini-api-image-segmentation-bounding-box-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-28T12:00"
+author: "Gemini Lab"
+description: "A production-focused guide to wiring Gemini 2.5 Pro's bounding-box and segmentation outputs into mobile and web apps — covering coordinate normalization, mask decoding, hallucination detection, and automatic fallback to YOLO."
+tags: ["gemini-2-5-pro", "image-understanding", "bounding-box", "segmentation", "computer-vision", "production", "multimodal", "ai-app"]
+highlights:
+  - "If you've been frustrated by bogus coordinates from Gemini's spatial outputs, you'll walk away with prompts and parsers that produce reliable results"
+  - "You'll have complete production code that renders bounding boxes on screen and persists segmentation masks in the right coordinate space"
+  - "You'll learn how to detect hallucinated coordinates and design automatic fallbacks to traditional CV models like YOLO"
+---
+
+"Tell me where the products are on this shelf." "Highlight the area on this receipt that contains the total amount." For a long time, those "where is what in this image" jobs belonged firmly to dedicated computer vision (CV) models. When I needed object detection in a mobile app, my first move was always to reach for YOLO or a CoreML detector. Gemini 2.5 Pro's improved spatial understanding has shifted that calculus, but pulling it into a real production app is, honestly, a bit trickier than the marketing pages suggest.
+
+This article distills the implementation patterns I rely on to take Gemini's bounding-box and segmentation outputs from "neat demo" to "stable feature in shipping software." That includes the surprising 0–1000 coordinate convention, the base64-PNG quirk in mask outputs, and the hallucinated-coordinate problem that the official docs barely touch on.
+
+## Why Gemini's Spatial Understanding Is a "When to Use It" Tool
+
+Let me set expectations first. Gemini 2.5 Pro's spatial understanding is **not** a drop-in replacement for YOLO or Detectron2. From hands-on experience, the strengths and weaknesses divide cleanly.
+
+Gemini shines when you need to point at things using conceptual queries. Asking "where is the total amount written on this receipt?" or "crop just the knobs of the gas range in this kitchen photo" leans on semantic interpretation that purpose-built detectors can't do without retraining. Gemini handles those zero-shot.
+
+It is weak at latency and throughput. A request takes hundreds of milliseconds to a few seconds, and you pay tokens per image. If you need 30 fps real-time detection, Gemini is the wrong tool. The sweet spot is "user takes one photo, we analyze it" or "an image was uploaded, label it asynchronously" — low frequency, high semantic complexity.
+
+In practice, I split the workload: dedicated detectors do the high-frequency, low-latency work, and Gemini handles the conceptual queries. The fallback design later in this article assumes that hybrid setup.
+
+There's also a meta point worth saying out loud: the cost-per-detection numbers swing wildly depending on what you ask for. A simple "find all bottles" against a 1280-pixel image costs a fraction of a cent, but multi-object detection with masks against a 4K photo can climb into the cents. If your app does this thousands of times a day, that adds up. I track per-image cost in the same telemetry table as per-image latency so I can spot regressions when prompts or image sizes change.
+
+
+## Asking for Bounding Boxes the Right Way
+
+There are three traps to know before you write any code.
+
+First, coordinates come back as **integers in the 0–1000 range**, not 0–1. The image's top-left is `(0, 0)` and the bottom-right is `(1000, 1000)`. Second, the order is `[ymin, xmin, ymax, xmax]` — Y comes first. I burned an afternoon once because my rendered boxes looked rotated and I assumed Gemini was broken. Third, Gemini gives you its best guess; if you ask about an object that isn't there, it can confidently fabricate coordinates. We'll handle that further down.
+
+A useful mental model: treat Gemini as a senior intern who has just looked at the image. The intern can usually point at the right thing — but won't push back when you ask for something that isn't there, and will sometimes describe what "should" be in the photo rather than what is. The schema, prompts, and validators in this article are how you turn that helpful but suggestible intern into a system you can ship.
+
+
+### Prompting and the JSON Schema
+
+If you want stable output, lean on `response_schema` to force the JSON shape. Free-form output drifts into Markdown or prose and breaks parsers in production.
+
+```python
+# requirements:
+#   pip install google-genai pillow
+# env:
+#   export GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
+
+import json
+import os
+from io import BytesIO
+from typing import List
+
+from google import genai
+from google.genai import types
+from PIL import Image, ImageDraw
+from pydantic import BaseModel, Field
+
+class Detection(BaseModel):
+    label: str = Field(description="The detected object's label")
+    box_2d: List[int] = Field(
+        description="[ymin, xmin, ymax, xmax] normalized to 0-1000",
+        min_length=4, max_length=4,
+    )
+    confidence: float = Field(description="0.0 to 1.0", ge=0, le=1)
+
+class DetectionResult(BaseModel):
+    detections: List[Detection]
+
+def detect_objects(image_path: str, target: str) -> DetectionResult:
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    image = Image.open(image_path)
+
+    prompt = (
+        f"Detect every instance of '{target}' in the image. "
+        "Return each box_2d as integers in [ymin, xmin, ymax, xmax] order, "
+        "normalized to 0-1000. Use an empty detections array if nothing matches. "
+        "Only include objects you actually see — do not guess."
+    )
+
+    resp = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=[prompt, image],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=DetectionResult,
+            temperature=0.1,  # keep low for stability
+        ),
+    )
+    # Expected output: parses cleanly into DetectionResult
+    return DetectionResult.model_validate_json(resp.text)
+
+if __name__ == "__main__":
+    result = detect_objects("./shelf.jpg", "PET bottles of beverages")
+    print(json.dumps(result.model_dump(), indent=2))
+```
+
+A few deliberate choices here. Passing a Pydantic model to `response_schema` lets Gemini absorb minor type drift on its side rather than blowing up your parser. I usually set `temperature=0.1` rather than 0; at exactly zero, Gemini gets so conservative that it skips legitimate detections. The "don't guess" instruction in the prompt is your first line of defense against hallucinated coordinates.
+
+### Converting 0–1000 Coordinates to Pixels
+
+To draw boxes or crop regions, you need pixel coordinates. Wrap the conversion in a helper — getting the order wrong leaks into every downstream consumer.
+
+```python
+def to_pixel_box(box_2d: List[int], img_w: int, img_h: int):
+    """[ymin, xmin, ymax, xmax] (0-1000) -> (x1, y1, x2, y2) in pixels."""
+    ymin, xmin, ymax, xmax = box_2d
+    x1 = round(xmin / 1000 * img_w)
+    y1 = round(ymin / 1000 * img_h)
+    x2 = round(xmax / 1000 * img_w)
+    y2 = round(ymax / 1000 * img_h)
+    # Clamp into image bounds
+    x1, x2 = max(0, x1), min(img_w, x2)
+    y1, y2 = max(0, y1), min(img_h, y2)
+    return x1, y1, x2, y2
+
+def render_detections(image_path: str, detections: List[Detection], out_path: str):
+    img = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+    for d in detections:
+        x1, y1, x2, y2 = to_pixel_box(d.box_2d, w, h)
+        if (x2 - x1) < 4 or (y2 - y1) < 4:
+            continue  # discard pinprick boxes that are usually noise
+        draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+        draw.text((x1, max(0, y1 - 14)), f"{d.label} {d.confidence:.2f}", fill="red")
+    img.save(out_path)
+```
+
+The clamp matters because Gemini occasionally returns values that nudge past 1000 (1003 isn't unusual). If you trust the raw output, downstream cropping will throw `IndexError` on the edges.
+
+## Working with Segmentation Masks
+
+Bounding boxes are rectangles, but for many use cases — clean product cutouts, irregular shapes — you want the actual silhouette. Gemini 2.5 Pro can return segmentation masks too, and they're the right tool when a rectangle simply isn't precise enough.
+
+### Mask Format and Base64 PNG Decoding
+
+Gemini returns each mask as a small PNG sized to fit the bounding box, embedded as a base64 string. To use it on the original image, you must decode it, resize it to the box's pixel dimensions, and paste it onto a full-size canvas. Skip that resize step and you'll see a tiny ghost mask floating in the upper-left of your image.
+
+```python
+import base64
+from PIL import Image
+from io import BytesIO
+
+class Segment(BaseModel):
+    label: str
+    box_2d: List[int]
+    mask: str = Field(description="data:image/png;base64,... mask")
+
+class SegmentationResult(BaseModel):
+    segments: List[Segment]
+
+def segment_objects(image_path: str, target: str) -> SegmentationResult:
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    image = Image.open(image_path)
+
+    prompt = (
+        f"For each instance of '{target}' in the image, return its bounding box "
+        "and a segmentation mask. Each mask must be a data:image/png;base64,... "
+        "PNG sized to fit its box_2d. Return an empty segments array if nothing "
+        "matches."
+    )
+    resp = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=[prompt, image],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=SegmentationResult,
+            temperature=0.1,
+        ),
+    )
+    return SegmentationResult.model_validate_json(resp.text)
+
+def decode_mask_to_full_image(seg: Segment, img_w: int, img_h: int) -> Image.Image:
+    """Expand the box-fitted base64 mask into a full-image binary mask."""
+    b64 = seg.mask.split(",", 1)[1] if "," in seg.mask else seg.mask
+    box_png = Image.open(BytesIO(base64.b64decode(b64))).convert("L")
+
+    x1, y1, x2, y2 = to_pixel_box(seg.box_2d, img_w, img_h)
+    box_w, box_h = max(1, x2 - x1), max(1, y2 - y1)
+
+    # The small mask fits the box — resize to the box's pixel size
+    box_png = box_png.resize((box_w, box_h), Image.NEAREST)
+
+    # Compose onto a black, full-image canvas
+    full = Image.new("L", (img_w, img_h), 0)
+    full.paste(box_png, (x1, y1))
+    return full
+```
+
+`Image.NEAREST` is intentional. Masks are effectively binary (or grayscale that you'll threshold), and bilinear interpolation introduces gray pixels along edges that wobble after thresholding. If you need anti-aliased composites, do the threshold first and add edge softening as a final step.
+
+In product apps you typically use the mask to crop the object cleanly, then push the cutout into a thumbnail or a search index. The "snap a photo, send a clean cutout to the search backend" loop is exactly the kind of workflow that this format unlocks.
+
+One more practical tip: keep the original image and the mask side by side in storage when you persist a result. A mask without its origin frame is hard to reuse — re-rendering, debugging detection regressions, or training a future custom detector all become much easier when you can recompose the cutout from the source image at any time.
+
+
+## Four Checks That Suppress Hallucinated Coordinates
+
+This is the single most important section for production. Gemini will, sometimes, confidently fabricate coordinates for objects that are not actually in the image. If you ship that to users, an "AI shopping assistant" tells them about products that don't exist on the shelf — credibility is gone in one shot.
+
+The defense I use has four layers.
+
+**Check 1: Confidence floor.** Ask the model for `confidence` in the schema and discard anything under 0.5. The numbers aren't calibrated probabilities, but in practice 0.95-class detections behave very differently from 0.55-class ones.
+
+**Check 2: Sanity bounds on box size.** A box covering 99% of the frame, or 5×5 pixels of nothing, is almost always noise. I drop anything with `area_ratio < 0.001 or area_ratio > 0.95`.
+
+**Check 3: Consistency across runs.** Run detection two or three times with slightly different temperatures and only keep boxes that overlap (IoU ≥ 0.5) across runs. Cost goes up, but for accuracy-critical pipelines this works.
+
+**Check 4: Re-verification with the model itself.** Send the cropped detection back and ask "does this image actually show X — yes or no?" Doubles your bill, but for medical or financial extraction it can be the right trade.
+
+```python
+def iou(a: List[int], b: List[int]) -> float:
+    """IoU between [ymin, xmin, ymax, xmax] boxes."""
+    ay1, ax1, ay2, ax2 = a
+    by1, bx1, by2, bx2 = b
+    iy1, ix1 = max(ay1, by1), max(ax1, bx1)
+    iy2, ix2 = min(ay2, by2), min(ax2, bx2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    area_a = (ay2 - ay1) * (ax2 - ax1)
+    area_b = (by2 - by1) * (bx2 - bx1)
+    return inter / (area_a + area_b - inter)
+
+def filter_hallucinations(
+    detections: List[Detection],
+    img_w: int, img_h: int,
+    min_conf: float = 0.5,
+) -> List[Detection]:
+    out = []
+    for d in detections:
+        if d.confidence < min_conf:
+            continue
+        x1, y1, x2, y2 = to_pixel_box(d.box_2d, img_w, img_h)
+        bw, bh = x2 - x1, y2 - y1
+        if bw <= 0 or bh <= 0:
+            continue
+        ratio = (bw * bh) / float(img_w * img_h)
+        if ratio < 0.001 or ratio > 0.95:
+            continue
+        out.append(d)
+    return out
+
+def cross_check(detections_run1, detections_run2, iou_threshold: float = 0.5):
+    """Keep only detections that match across two runs (same label, IoU >= threshold)."""
+    consistent = []
+    for d1 in detections_run1:
+        for d2 in detections_run2:
+            if d1.label == d2.label and iou(d1.box_2d, d2.box_2d) >= iou_threshold:
+                consistent.append(d1)
+                break
+    return consistent
+```
+
+In my own tests, this combined filter dropped "plausible-but-fake" detections from roughly one or two per ten down to nearly zero, at the cost of a few percent recall. That trade-off is almost always worth it: in product UX, "showed a wrong thing" hurts trust far more than "missed something."
+
+## Stabilizing Large Images and Many Objects
+
+Real photos often run 4000×3000 pixels or more. Sending that straight to Gemini wastes tokens and seems to nudge spatial precision down (the docs don't quantify this, but my experiments do). Resize the long edge to 1024–1536 first.
+
+```python
+def smart_resize(img: Image.Image, max_side: int = 1280) -> Image.Image:
+    w, h = img.size
+    longest = max(w, h)
+    if longest <= max_side:
+        return img
+    scale = max_side / longest
+    return img.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
+```
+
+Because `box_2d` is normalized 0–1000, you can resize the input freely and still convert back to original pixels with `to_pixel_box`. That separation between "input size for the model" and "display size for the user" is one of the cleaner aspects of this API.
+
+When the count of target objects gets large (think 100+), Gemini may truncate its output. The honest answer is to tile the image into 2×2 or 3×3 tiles, run detection per tile, and merge with overlap-aware deduplication. In practice, most real apps don't need that extreme scale — instead, ask for "the top N most prominent" and accept the limit.
+
+Another stabilizing trick is to anchor the prompt with the expected image scale. If you tell Gemini the image is "a wide-angle shot of a supermarket aisle" or "a vertical phone photo of a single receipt," the model's spatial reasoning improves measurably. The model has the metadata, but spelling it out in prose helps. I keep a small library of "scene priors" that I prepend per workflow, and that alone tends to lift detection quality more than tweaking model parameters does.
+
+
+## Designing Automatic Fallback to a Dedicated Detector
+
+In production, Gemini will sometimes fail (rate limit, transient 5xx, zero detections). Your app can't stop. The fallback I run on Cloudflare Workers looks like this.
+
+```typescript
+// Cloudflare Workers
+import { GoogleGenAI } from "@google/genai";
+
+interface DetectInput {
+  imageUrl: string;
+  target: string;
+}
+
+interface Detection {
+  label: string;
+  box_2d: [number, number, number, number];
+  confidence: number;
+  source: "gemini" | "yolo";
+}
+
+const SOFT_FAIL_PATTERNS = [
+  /quota/i,
+  /rate.?limit/i,
+  /server.?error/i,
+];
+
+async function detectWithGemini(input: DetectInput, env: Env): Promise<Detection[]> {
+  const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+  const imageBytes = await (await fetch(input.imageUrl)).arrayBuffer();
+  const result = await ai.models.generateContent({
+    model: "gemini-2.5-pro",
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: `Detect '${input.target}' in this image. box_2d is [ymin,xmin,ymax,xmax] (0-1000).`,
+          },
+          {
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: btoa(String.fromCharCode(...new Uint8Array(imageBytes))),
+            },
+          },
+        ],
+      },
+    ],
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "object",
+        properties: {
+          detections: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                label: { type: "string" },
+                box_2d: { type: "array", items: { type: "integer" } },
+                confidence: { type: "number" },
+              },
+              required: ["label", "box_2d", "confidence"],
+            },
+          },
+        },
+        required: ["detections"],
+      },
+      temperature: 0.1,
+    },
+  });
+  const parsed = JSON.parse(result.text ?? "{\"detections\":[]}");
+  return parsed.detections.map((d: Detection) => ({ ...d, source: "gemini" as const }));
+}
+
+async function detectWithYolo(input: DetectInput, env: Env): Promise<Detection[]> {
+  // Hosted YOLO endpoint (Replicate, Modal, your own GPU box, etc.)
+  const r = await fetch(env.YOLO_ENDPOINT, {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${env.YOLO_TOKEN}` },
+    body: JSON.stringify({ image_url: input.imageUrl, target: input.target }),
+  });
+  if (!r.ok) return [];
+  const json = await r.json<{ detections: Detection[] }>();
+  return json.detections.map((d) => ({ ...d, source: "yolo" }));
+}
+
+export async function detect(input: DetectInput, env: Env): Promise<Detection[]> {
+  try {
+    const dets = await detectWithGemini(input, env);
+    if (dets.length > 0) return dets;
+    // Don't trust an empty result blindly — confirm with YOLO
+    const fallback = await detectWithYolo(input, env);
+    return fallback;
+  } catch (e: any) {
+    const msg = String(e?.message ?? e);
+    const recoverable = SOFT_FAIL_PATTERNS.some((p) => p.test(msg));
+    if (recoverable) {
+      console.warn("Gemini soft-fail, falling back to YOLO:", msg);
+      return detectWithYolo(input, env);
+    }
+    throw e;
+  }
+}
+```
+
+The non-obvious bit is "if Gemini returns zero, ask YOLO anyway." Gemini's calibration leans toward false negatives when the prompt requests caution, so empty results are not as confidence-inducing as they look. YOLO covering for that lifts recall back up. If Gemini says yes and YOLO says no, you have a soft signal to lower the surfaced confidence or hold the result until further verification.
+
+## A Testing Strategy That Catches Detection Regressions
+
+A subtle problem with shipping Gemini-based detection is that the model itself can shift behavior under your feet — a new model version, an updated prompt, or even seasonal load changes can move detection quality. You need a regression suite, but a traditional unit test framework feels awkward here.
+
+What works for me is a **fixture-driven snapshot test**: keep a folder of representative images, each with an expected set of detections (label + approximate box), and a test that runs detection and compares to the expected set with IoU as the matching criterion.
+
+```python
+import json
+from pathlib import Path
+
+def evaluate(predicted, expected, iou_thr=0.4):
+    # Returns (precision, recall) treating IoU >= iou_thr + same label as a match.
+    matched_pred = set()
+    matched_exp = set()
+    for i, e in enumerate(expected):
+        for j, p in enumerate(predicted):
+            if j in matched_pred:
+                continue
+            if e["label"] != p["label"]:
+                continue
+            if iou(e["box_2d"], p["box_2d"]) >= iou_thr:
+                matched_pred.add(j)
+                matched_exp.add(i)
+                break
+    precision = len(matched_pred) / max(1, len(predicted))
+    recall = len(matched_exp) / max(1, len(expected))
+    return precision, recall
+
+def run_regression_suite(fixtures_dir: str, threshold_p: float = 0.7, threshold_r: float = 0.7):
+    failures = []
+    for case in Path(fixtures_dir).glob("*.json"):
+        spec = json.loads(case.read_text())
+        result = detect_objects(spec["image_path"], spec["target"])
+        precision, recall = evaluate(
+            [d.model_dump() for d in result.detections],
+            spec["expected"],
+        )
+        if precision < threshold_p or recall < threshold_r:
+            failures.append({
+                "case": case.name,
+                "precision": precision,
+                "recall": recall,
+            })
+    return failures
+```
+
+Run this in CI on a small fixed image set. When you bump models or prompts, the suite tells you whether quality moved in the wrong direction before users find out. I would rather pay for a few hundred extra detection calls per release than be debugging a "the AI suddenly stopped finding products" Slack thread on a Friday night.
+
+## Cost and Latency Notes from the Field
+
+Concrete numbers shift faster than any article can keep current, so treat these as illustrative rather than authoritative. With Gemini 2.5 Pro on a 1280-pixel image, single-target detection that returns five to ten boxes lands somewhere in the few-cents range and completes in 1–2 seconds end to end. Adding segmentation masks roughly doubles the latency and bumps cost noticeably because the model emits significantly more output tokens.
+
+What that means for product decisions: detection-only is cheap enough to put on every uploaded image, but masks should be opt-in — a "show contour" toggle in the UI, or only requested when the next step actually needs the mask. The latency mix also matters; if your UX shows results inline, prefer detection-only, and if you can hide the wait inside an upload progress sheet, masks become usable.
+
+For very high-volume pipelines, I shift to Gemini 2.5 Flash for first-pass detection and only escalate to 2.5 Pro for difficult cases (low confidence or zero results). The Flash-to-Pro escalator pattern, combined with the YOLO fallback, gives you a three-layer pipeline that balances cost, latency, and accuracy in a way no single model can.
+
+## Practical Scenarios for Mobile Camera Apps
+
+Here are a few places this combo earns its keep, drawn from years of running indie mobile apps.
+
+For e-commerce "find this product" features, you can pass the user's shelf photo to Gemini with a natural-language target like "snack bars" or "cleaning sprays," crop the detected region, and feed those crops into your product search index. Gemini's zero-shot semantic targeting is the right tool for arbitrary user queries that you can't preregister with a YOLO class list.
+
+For receipt and invoice OCR, asking Gemini to box specifically the "total amount" region and then OCR-ing only that high-resolution crop gave me materially better accuracy than running OCR over the full image and post-processing. The two-stage pipeline (box → OCR) is worth the small extra latency.
+
+For wallpaper, mood, and lifestyle apps — where "the impressive subject in this photo" is the kind of vague concept users actually express — Gemini handles requests no purpose-built detector can. Crop, frame, and effect pipelines benefit massively here.
+
+Run the call during a transition moment — the post-shutter loading screen, the upload progress sheet — so 1–2 second latency feels justified rather than wasted. That's the UX seam where this API fits cleanly.
+
+If you're building accessibility features — describing scenes, narrating what's in front of a camera for low-vision users — Gemini's spatial outputs let you say "there is a cup on the left edge, a phone in the center, and a notebook to the right" rather than the generic "this image contains objects." That spatial-aware narration is one of the more meaningful applications I've seen for this API, and it's the kind of feature that's nearly impossible to build with a fixed-class detector.
+
+
+For deeper grounding in classical CV alongside this, I still recommend [Programming Computer Vision with Python by Jan Erik Solem](https://www.amazon.co.jp/dp/4873116074/?tag=pinocchio-22) — knowing what's happening behind the curtain makes diagnosing bad detections a lot more productive.
+
+## Common Pitfalls
+
+These are the traps that have cost me real time.
+
+**Pitfall 1: Treating coordinates as `(x, y)`.** Gemini returns `[ymin, xmin, ymax, xmax]`. If you read `box_2d[0]` as X, your boxes look rotated or escape the image. Centralize the conversion in a helper like `to_pixel_box` so the mistake can only happen once.
+
+**Pitfall 2: Pasting masks at the wrong scale.** The base64 PNG is sized to the box, not the full image. Without `decode_mask_to_full_image`, you'll see a small ghost in the corner. Resize-to-box-then-composite is mandatory.
+
+**Pitfall 3: Setting temperature to zero.** Tempting in the name of "deterministic," but it makes detection so conservative that users complain it's blind. 0.1–0.2 is the sweet spot.
+
+**Pitfall 4: Trusting the confidence as a probability.** It's an ordering signal, not a calibrated probability. Use it to threshold, never to make statistical claims to users.
+
+**Pitfall 5: Sending huge images raw.** Past 4000-ish pixels, you waste tokens and lose a touch of precision. Apply `smart_resize` to 1024–1536 by default.
+
+**Pitfall 6: Ignoring "the object isn't there" cases.** Gemini sometimes fabricates rather than admit nothing matches. Combine an explicit "return empty if absent" instruction with the `filter_hallucinations` pass downstream.
+
+**Pitfall 7: Hammering the API with concurrent requests.** Naive UI wiring ("detect on every selection") triggers rate limits when users tap fast. Debounce and use AbortController to cancel obsolete in-flight calls. Both UX and cost benefit.
+
+**Pitfall 8: Forgetting to log the raw model output.** Once you start filtering and post-processing, you lose the ability to diagnose detection regressions later. Persist the raw JSON response in object storage with a hash of the input image as the key. When users report "the AI marked the wrong thing," you can replay exactly what the model returned without paying for a re-detection.
+
+
+For the surrounding production concerns, [the Gemini API rate-limiting and quota-management guide](/en/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) and [the streaming-cancel + AbortController guide](/en/articles/gemini-api/gemini-api-streaming-cancel-abortcontroller-guide) round out the playbook nicely.
+
+## Operational Concerns You'll Hit on Day Two
+
+After the first release, several smaller issues tend to surface. Documenting them up front saves the inevitable second sprint of "we didn't think about that" patches.
+
+**Image privacy and retention.** Gemini's terms allow image data to be processed for the request, but you should still treat user images as sensitive. Keep them in your own storage with explicit retention windows, never hand-roll API requests that log raw image data, and strip EXIF metadata before sending. I scrub GPS coordinates and device serial numbers from EXIF specifically, because nothing surfaces a privacy issue faster than an indie app's image pipeline accidentally surfacing a user's home address.
+
+**Multi-language UI implications.** If your app serves Japanese, English, and Spanish users, each will phrase the same target differently — "PET bottles," "ペットボトル," "botellas de plástico." You can either translate the user's input to a canonical language before prompting Gemini, or feed the original phrase straight to the model. In my experience, English target labels behave the most consistently across image content, but native phrases work fine for clearly visible objects. The painful cases are loanwords and brand names — those benefit from a small translation step.
+
+**Model version pinning.** When Gemini publishes a new model alias, your detections may change subtly even if your code did not. I pin a specific model version in my production config and only roll forward after running the regression suite from the previous section. The alternative — silently inheriting the latest model — has bitten me twice with quality regressions that took days to attribute.
+
+**On-device caching.** If the same image is uploaded multiple times (think app users retrying after a network failure), you don't need to re-detect. A simple hash of the image bytes plus the target string makes a clean cache key. I keep this in Cloudflare KV with a 24-hour TTL, which removes a meaningful chunk of cost in apps where users retry frequently.
+
+**Observability.** Beyond per-call cost and latency, I emit a structured event for every detection: target string, image hash, model used, raw box count, filtered box count, confidence histogram, and which fallback path fired. That log lets me answer questions like "is detection getting worse over time?" or "how often does the YOLO fallback save us?" without a one-off investigation. The cost of logging this is negligible; the cost of not having it is that you debug detection regressions blind.
+
+## Wrapping Up — Your Next Step
+
+Thanks for reading this far. If I can ask one specific action: take an image you actually have lying around and run `detect_objects` on it. The 0–1000, Y-first coordinate convention is the kind of thing that only sticks once you've handled it once with your own eyes.
+
+Then, before you ship, layer in `filter_hallucinations`, `cross_check`, and the YOLO fallback. Gemini's spatial understanding isn't a replacement for dedicated detectors — it's a complement that shines on conceptual queries. Wiring both into one pipeline is what makes this practical in real apps.
