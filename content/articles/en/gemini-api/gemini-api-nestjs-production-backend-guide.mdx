@@ -1,0 +1,186 @@
+---
+title: "Building a Production-Grade Gemini API Backend with NestJS — DI, Filters, and Guards"
+slug: "gemini-api-nestjs-production-backend-guide"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-29T06:30"
+author: "Gemini Lab"
+description: "A practical pattern for wrapping the Gemini API in a NestJS backend. Covers DI-based service design, SSE streaming, exception filters for 429/safety errors, and guards for API-key auth and rate limiting."
+tags: ["gemini-api", "nestjs", "typescript", "backend", "sse"]
+---
+
+If you spin up a Gemini API endpoint with Express or a thin Hono handler, the first few weeks feel great. The pain shows up later — when the surrounding concerns (auth, rate limiting, multi-model fallbacks, structured error messages) start to pile up inside controllers. Across both my own indie projects and the production work I help with, this is usually the moment I switch the codebase to NestJS. Its DI container, decorators, exception filters, and guards happen to map almost one-to-one onto the messy outside layers of an AI backend.
+
+This article shares the layout I keep coming back to when wiring Gemini into NestJS — kept short on purpose, with a deliberate note on *why* each piece is there rather than only the *how*.
+
+## Why NestJS suits the Gemini API specifically
+
+NestJS borrows its design language from Angular and forces a Module / Controller / Provider split through DI. That structure pays off precisely when your service has lots of external moving parts.
+
+There are three concrete reasons I reach for it. First, registering the `GoogleGenerativeAI` client as a Provider lets you swap it for a mock in tests without touching controllers. Second, NestJS exception filters with `@Catch()` give you one place to translate Gemini's varied errors — 429 quota, 503 overloaded, 400 safety blocks — into a stable shape for the client. Third, Guards keep auth and per-user rate limits out of your handler bodies entirely. Doing the same in Express tends to drift into middleware-ordering pain.
+
+## Project layout: a single GeminiModule
+
+The minimal version is a `GeminiModule` that exposes a `GeminiService` wrapping the SDK client.
+
+```ts
+// src/gemini/gemini.module.ts
+import { Module } from '@nestjs/common';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GeminiService } from './gemini.service';
+import { GeminiController } from './gemini.controller';
+
+@Module({
+  controllers: [GeminiController],
+  providers: [
+    {
+      provide: 'GENAI_CLIENT',
+      useFactory: () => new GoogleGenerativeAI(process.env.GEMINI_API_KEY!),
+    },
+    GeminiService,
+  ],
+  exports: [GeminiService],
+})
+export class GeminiModule {}
+```
+
+Note that the SDK client itself is a Provider. In tests you replace `useFactory` with a mock and never touch the network. If you instead `new GoogleGenerativeAI(...)` directly inside a controller, that escape hatch disappears.
+
+The service should own one job: pick a model, format the prompt, normalize the response. Splitting one-shot and streaming into separate methods keeps the SSE controller below clean.
+
+```ts
+// src/gemini/gemini.service.ts
+import { Inject, Injectable } from '@nestjs/common';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+@Injectable()
+export class GeminiService {
+  constructor(
+    @Inject('GENAI_CLIENT') private readonly client: GoogleGenerativeAI,
+  ) {}
+
+  async generate(prompt: string, model = 'gemini-2.5-flash') {
+    const m = this.client.getGenerativeModel({ model });
+    const res = await m.generateContent(prompt);
+    return res.response.text();
+  }
+
+  async *stream(prompt: string, model = 'gemini-2.5-flash') {
+    const m = this.client.getGenerativeModel({ model });
+    const res = await m.generateContentStream(prompt);
+    for await (const chunk of res.stream) {
+      yield chunk.text();
+    }
+  }
+}
+```
+
+Returning an async generator from `stream()` keeps the transport layer free — you can pipe it into SSE, WebSockets, or a worker queue later without rewriting this code.
+
+## Streaming responses with `@Sse()`
+
+NestJS exposes Server-Sent Events through the `@Sse()` decorator. By returning an `Observable`, you get automatic teardown when the client disconnects — no manual `AbortController` plumbing needed.
+
+```ts
+// src/gemini/gemini.controller.ts
+import { Body, Controller, Post, Sse, MessageEvent } from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { GeminiService } from './gemini.service';
+
+@Controller('gemini')
+export class GeminiController {
+  constructor(private readonly gemini: GeminiService) {}
+
+  @Sse('stream')
+  stream(@Body() body: { prompt: string }): Observable<MessageEvent> {
+    return new Observable((subscriber) => {
+      (async () => {
+        try {
+          for await (const text of this.gemini.stream(body.prompt)) {
+            subscriber.next({ data: { text } });
+          }
+          subscriber.complete();
+        } catch (err) {
+          subscriber.error(err);
+        }
+      })();
+    });
+  }
+}
+```
+
+One thing worth knowing: calling `subscriber.error()` does *not* route through your exception filter. SSE treats errors as a stream-end event. If you need the client to react to mid-stream Gemini failures, send a typed payload like `subscriber.next({ data: { error: 'rate_limited' } })` and let the front-end decide what to do.
+
+## A single exception filter for Gemini errors
+
+Gemini's failure modes — 429 quota, 503 overloaded, 400 safety — all want different client-side handling. Doing this with try/catch in every controller adds noise. Centralize it in a `@Catch()` filter.
+
+```ts
+// src/gemini/gemini-exception.filter.ts
+import { ArgumentsHost, Catch, ExceptionFilter, HttpStatus } from '@nestjs/common';
+import { Response } from 'express';
+
+@Catch()
+export class GeminiExceptionFilter implements ExceptionFilter {
+  catch(exception: any, host: ArgumentsHost) {
+    const res = host.switchToHttp().getResponse<Response>();
+    const msg = String(exception?.message ?? exception);
+
+    if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429')) {
+      return res.status(HttpStatus.TOO_MANY_REQUESTS).json({
+        error: 'rate_limited',
+        retryAfter: 30,
+      });
+    }
+    if (msg.includes('SAFETY') || msg.includes('blocked')) {
+      return res.status(HttpStatus.BAD_REQUEST).json({
+        error: 'content_blocked',
+      });
+    }
+    return res.status(HttpStatus.INTERNAL_SERVER_ERROR).json({
+      error: 'gemini_failure',
+      detail: process.env.NODE_ENV === 'production' ? undefined : msg,
+    });
+  }
+}
+```
+
+Wire it up globally with `app.useGlobalFilters(new GeminiExceptionFilter())` in `bootstrap()`. Normalizing Gemini's errors into a stable shape makes both retry logic and front-end UX dramatically easier — and hiding raw `detail` outside development prevents leaking internal traces.
+
+## Guards keep auth and rate limits out of controllers
+
+For a public-facing wrapper, you don't want auth code mixed into business logic. A Guard does the trick:
+
+```ts
+// src/gemini/api-key.guard.ts
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
+
+@Injectable()
+export class ApiKeyGuard implements CanActivate {
+  canActivate(ctx: ExecutionContext): boolean {
+    const req = ctx.switchToHttp().getRequest();
+    const key = req.headers['x-api-key'];
+    if (!key || key !== process.env.PUBLIC_API_KEY) {
+      throw new UnauthorizedException('invalid api key');
+    }
+    return true;
+  }
+}
+```
+
+For rate limits, layer on `@nestjs/throttler`. If you need per-user (rather than per-IP) throttling, subclass `ThrottlerGuard` and override `getTracker()` to return `req.headers['x-api-key']`. Putting a soft limit one layer in front of Gemini's own quota stops a single noisy client from torching your billing or cascading a 429 storm into your other endpoints.
+
+## Three things that bite people in production
+
+The setup above is functionally complete, but here are three traps I keep seeing right before launch.
+
+The first is buffered streaming. On Cloud Run, Fargate, or anything fronted by Nginx/ALB, SSE often appears to "freeze" for several seconds. The fix is usually `X-Accel-Buffering: no` on the response, or an LB-level setting that allows streaming. If your first chunk takes 3+ seconds to appear, suspect this before suspecting Gemini.
+
+The second is forgetting `ConfigModule.forRoot({ isGlobal: true })` in `AppModule`, which leaves `process.env.*` references scattered everywhere. Going through `ConfigService` from day one means swapping in Vault or Secret Manager later is a one-file diff instead of a hunt.
+
+The third is unit tests that talk to the real API because `GoogleGenerativeAI` was never mocked. CI runs burn quota and money. The whole reason the SDK client is a Provider in the first place is so your test module can do `{ provide: 'GENAI_CLIENT', useValue: mock }` and stay offline.
+
+## Where to go next
+
+Moving Gemini onto NestJS feels heavy for the first day or two, but somewhere around the third feature addition it pays off in obvious ways. Start with a single `/gemini/stream` endpoint, then layer the exception filter and guards on top. If you want to add observability afterward, my companion piece [Production-Grade Observability for the Gemini API with Langfuse](/en/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide) plugs straight into this layout. Curious how it compares to an edge-first approach? [Building Edge-Ready AI APIs with Gemini × Hono.js](/en/articles/gemini-api/gemini-api-hono-cloudflare-edge-ai-guide) walks through the alternative.

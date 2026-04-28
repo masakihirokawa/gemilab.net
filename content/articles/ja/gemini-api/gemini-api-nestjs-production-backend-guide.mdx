@@ -1,0 +1,188 @@
+---
+title: "NestJS で Gemini API バックエンドを設計する — DI・例外フィルタ・ガードを活かす実装パターン"
+slug: "gemini-api-nestjs-production-backend-guide"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-29T06:30"
+author: "Gemini Lab"
+description: "NestJS の DI・例外フィルタ・ガードを活用して、保守しやすい Gemini API バックエンドを構築するための実装パターンを丁寧に解説します。SSE ストリーミングや認可・レート制御まで実コードでまとめます。"
+tags: ["gemini-api", "nestjs", "typescript", "backend", "sse"]
+---
+
+Gemini API を Express や薄い Hono ベースで素早く立ち上げると、最初の数週間は快適です。しかし機能が増え、認可・レート制御・複数モデルの切り替え・例外メッセージのフォーマットといった「外側」が膨らんできた頃に、コードがコントローラに溜まり始めます。私自身、個人プロダクトでも企業案件でも、ここで一度 NestJS に作り直す判断をすることが多くなりました。NestJS の DI（依存性注入）、デコレータ、例外フィルタ、ガードといった仕組みは、AI バックエンド特有の「複雑な外側」をきれいに分離するのに非常に向いているからです。
+
+この記事では、Gemini API を NestJS で扱うときに私が落ち着いた「現場で消耗しにくい」実装パターンを、なるべく短いコードで共有します。Express で書いた場合と何が違うのか、そしてなぜそうするのかまで踏み込んで解説します。
+
+## なぜ Gemini API には NestJS が向いているのか
+
+NestJS はもともと Angular に近い設計思想を持つ TypeScript 向けフレームワークで、DI と「Module / Controller / Provider」の3層構造を強制してきます。これが Gemini API のような「外部依存が多いサービス」を扱うときに効いてきます。
+
+私が NestJS を選ぶ実利的な理由は3つあります。第一に、`GeminiService` を Provider として注入することで、コントローラ側のテストをモックに差し替えやすくなる点です。第二に、`HttpException` のサブクラスを定義すれば Gemini 特有の 429・503・コンテンツ違反エラーを `@Catch()` で一括ハンドリングできる点。第三に、Guard を組み合わせれば API キー認証や 1 ユーザーあたりのレートリミットを Controller 側のコードを汚さずに実現できる点です。Express でこれを真面目にやると、ミドルウェアの順序やエラー伝播でハマりがちでした。
+
+## プロジェクト構成と GeminiModule の作り方
+
+最小構成では、`GeminiModule` を1つ作り、その中に `GeminiService`（`GoogleGenerativeAI` クライアントのラッパー）を Provider として登録するのが基本形です。
+
+```ts
+// src/gemini/gemini.module.ts
+import { Module } from '@nestjs/common';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GeminiService } from './gemini.service';
+import { GeminiController } from './gemini.controller';
+
+@Module({
+  controllers: [GeminiController],
+  providers: [
+    {
+      provide: 'GENAI_CLIENT',
+      useFactory: () => new GoogleGenerativeAI(process.env.GEMINI_API_KEY!),
+    },
+    GeminiService,
+  ],
+  exports: [GeminiService],
+})
+export class GeminiModule {}
+```
+
+`GoogleGenerativeAI` 自体を Provider として切り出しているのがポイントです。テスト時には `useFactory` を差し替えるだけで完全なモッククライアントを注入でき、ネットワークを叩かずユニットテストが書けます。`@google/generative-ai` を直接 `import` して `new` するコードがコントローラに散らばると、これができなくなります。
+
+`GeminiService` は単純に「モデル選択・プロンプト整形・レスポンス整形」の責務だけ持たせます。ストリーミングと一括取得をメソッド分割しておくと、後述の SSE 対応がきれいに書けます。
+
+```ts
+// src/gemini/gemini.service.ts
+import { Inject, Injectable } from '@nestjs/common';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+@Injectable()
+export class GeminiService {
+  constructor(
+    @Inject('GENAI_CLIENT') private readonly client: GoogleGenerativeAI,
+  ) {}
+
+  async generate(prompt: string, model = 'gemini-2.5-flash') {
+    const m = this.client.getGenerativeModel({ model });
+    const res = await m.generateContent(prompt);
+    return res.response.text();
+  }
+
+  async *stream(prompt: string, model = 'gemini-2.5-flash') {
+    const m = this.client.getGenerativeModel({ model });
+    const res = await m.generateContentStream(prompt);
+    for await (const chunk of res.stream) {
+      yield chunk.text();
+    }
+  }
+}
+```
+
+非同期ジェネレータを返す `stream` メソッドを用意しておくと、後で SSE でも WebSocket でも好きな伝送方式に流し込めます。フレームワークに依存しない形で逃げ場を作っておくのは、大事な現場のコツです。
+
+## SSE で安定したストリーミング応答を返す
+
+NestJS は `@Sse()` デコレータで Server-Sent Events を素直に返せます。コントローラ側は `Observable` を返す形で書くと、`AbortController` 不要でクライアントが切断したときに自動的に購読が解除されます。
+
+```ts
+// src/gemini/gemini.controller.ts
+import { Body, Controller, Post, Sse, MessageEvent } from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { GeminiService } from './gemini.service';
+
+@Controller('gemini')
+export class GeminiController {
+  constructor(private readonly gemini: GeminiService) {}
+
+  @Sse('stream')
+  stream(@Body() body: { prompt: string }): Observable<MessageEvent> {
+    return new Observable((subscriber) => {
+      (async () => {
+        try {
+          for await (const text of this.gemini.stream(body.prompt)) {
+            subscriber.next({ data: { text } });
+          }
+          subscriber.complete();
+        } catch (err) {
+          subscriber.error(err);
+        }
+      })();
+    });
+  }
+}
+```
+
+ここで気をつけたいのが、`subscriber.error()` を呼ぶと NestJS の例外フィルタには流れない、という点です。SSE のエラーは「イベントストリームの終端」として扱われるため、ストリーム途中の Gemini エラーをクライアントに伝える場合は、自前で `subscriber.next({ data: { error: ... } })` のような形で型分けしてフロントに渡すのが実践的です。
+
+## 例外フィルタで Gemini API のエラーを統一する
+
+Gemini API は 429（クォータ超過）、503（一時的な過負荷）、400（コンテンツポリシー違反）など、扱いの違うエラーを返してきます。コントローラ側でこれを毎回 `try/catch` するのはノイズになるので、`@Catch()` フィルタに集約します。
+
+```ts
+// src/gemini/gemini-exception.filter.ts
+import { ArgumentsHost, Catch, ExceptionFilter, HttpStatus } from '@nestjs/common';
+import { Response } from 'express';
+
+@Catch()
+export class GeminiExceptionFilter implements ExceptionFilter {
+  catch(exception: any, host: ArgumentsHost) {
+    const res = host.switchToHttp().getResponse<Response>();
+    const msg = String(exception?.message ?? exception);
+
+    if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429')) {
+      return res.status(HttpStatus.TOO_MANY_REQUESTS).json({
+        error: 'rate_limited',
+        retryAfter: 30,
+      });
+    }
+    if (msg.includes('SAFETY') || msg.includes('blocked')) {
+      return res.status(HttpStatus.BAD_REQUEST).json({
+        error: 'content_blocked',
+      });
+    }
+    return res.status(HttpStatus.INTERNAL_SERVER_ERROR).json({
+      error: 'gemini_failure',
+      detail: process.env.NODE_ENV === 'production' ? undefined : msg,
+    });
+  }
+}
+```
+
+`AppModule` 側で `app.useGlobalFilters(new GeminiExceptionFilter())` を有効化すれば、全コントローラに自動適用されます。Gemini からのメッセージを正規化してフロントに返すことで、リトライ判断や UI のメッセージ出し分けが格段にやりやすくなります。本番では `detail` を露出させないよう環境で出し分けている点も実用上のポイントです。
+
+## ガードでレート制御と API キー認証を分離する
+
+外部公開の Gemini ラッパー API を作る場合、コントローラに認証コードを書くのは避けたいところです。Guard を一枚かませると、Controller のロジックが純粋なまま保てます。
+
+```ts
+// src/gemini/api-key.guard.ts
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
+
+@Injectable()
+export class ApiKeyGuard implements CanActivate {
+  canActivate(ctx: ExecutionContext): boolean {
+    const req = ctx.switchToHttp().getRequest();
+    const key = req.headers['x-api-key'];
+    if (!key || key !== process.env.PUBLIC_API_KEY) {
+      throw new UnauthorizedException('invalid api key');
+    }
+    return true;
+  }
+}
+```
+
+レート制御は `@nestjs/throttler` を組み合わせるのが手軽です。ユーザー単位の制限が必要なら、`ThrottlerGuard` を継承して `getTracker()` を `req.headers['x-api-key']` ベースに上書きすると、IP ではなく API キー単位でクォータを管理できます。Gemini 側でも 1 分あたりのリクエスト数に上限があるため、自分のサービスでも 1 段手前のレート制御を入れておくのは、課金事故と障害伝播を同時に防ぐ意味で効果的です。
+
+## 開発で詰まりやすい3つのポイント
+
+ここまでの構成で動くものはできますが、本番投入の手前でつまずきがちなポイントを3つだけ書き残しておきます。
+
+ひとつ目は、Cloud Run や Fargate のようなコンテナ環境でストリーミングが詰まる現象です。Nginx や ALB のバッファリングが原因のことが多く、レスポンスヘッダに `X-Accel-Buffering: no` を付けるか、ロードバランサ設定でストリーミングを許可する必要があります。SSE で「最初の数秒だけ反応がない」と感じたら、まずここを疑うのが近道です。
+
+ふたつ目は、`AppModule` の `imports` に `ConfigModule.forRoot({ isGlobal: true })` を入れ忘れて `process.env` 参照が散らばることです。NestJS の作法に揃えて `ConfigService` 経由にしておくと、後で Vault や Secret Manager に切り替えるときにコード差分が最小で済みます。
+
+みっつ目は、ユニットテストで `GoogleGenerativeAI` をモックしないままテストを書いてしまうケース。CI で実 API キーを叩いてしまうとコストもクォータも消費します。冒頭で Provider として切り出したのは、まさにこれを防ぐためです。テスト側では `{ provide: 'GENAI_CLIENT', useValue: mock }` で差し替えるだけです。
+
+## 次の一歩
+
+Gemini API を NestJS に載せ替えると、最初の1〜2日は冗長に感じるかもしれませんが、機能追加が3つ目を超えたあたりから明確に楽になっていく感覚があります。まずは小さな `/gemini/stream` エンドポイントから始め、例外フィルタとガードを足していくのがおすすめです。観測まわりを整えたい場合は、私が別記事で書いた[Gemini API × Langfuse で本番運用に耐える可観測性を構築する](/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide)と組み合わせるとそのまま運用フェーズまで持っていけます。エッジ寄りの構成と比較したい方は、[Gemini API × Hono.js でエッジ対応 AI API を作る](/articles/gemini-api/gemini-api-hono-cloudflare-edge-ai-guide)も併読してみてください。
+
+NestJS の設計思想をもう一段深く理解したいなら、[実践Node.js入門 ―基礎・開発・運用（柳田健太）](https://www.amazon.co.jp/dp/4297122472/?tag=pinocchio-22)が NestJS そのものではないものの、サーバーサイド TypeScript の足場固めに役立ちます。
