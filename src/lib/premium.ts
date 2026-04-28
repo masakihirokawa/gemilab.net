@@ -52,3 +52,61 @@ export async function getPremiumAccess(): Promise<PremiumType> {
     return null;
   }
 }
+
+// ── Single Article Access ────────────────────────────────────────
+
+/**
+ * Check if the current user has purchased a specific article.
+ *
+ * Two-tier verification:
+ *   1. KV lookup: `site:gemilab:article:{email}:{slug}` — most accurate
+ *   2. Cookie fallback: `article_purchases` cookie contains JSON with slug list
+ *
+ * Cookie format (new): btoa(JSON.stringify({ email, slugs: ["slug1", "slug2"] }))
+ * Cookie format (old): btoa("email:article") — no slug info, treated as no access
+ */
+export async function getArticleAccess(slug: string): Promise<boolean> {
+  const cookieStore = await cookies();
+  const token = cookieStore.get("article_purchases")?.value;
+  if (!token) return false;
+
+  try {
+    const decoded = atob(token);
+
+    // Parse cookie — support both new JSON format and old format
+    let email: string | null = null;
+    let slugsInCookie: string[] = [];
+
+    if (decoded.startsWith("{")) {
+      // New format: { email, slugs: [...] }
+      const parsed = JSON.parse(decoded);
+      email = parsed.email || null;
+      slugsInCookie = Array.isArray(parsed.slugs) ? parsed.slugs : [];
+    } else {
+      // Old format: "email:article"
+      const [e] = decoded.split(":");
+      email = e || null;
+    }
+
+    if (!email) return false;
+
+    // Tier 1: KV lookup (most accurate, per-slug with expiry check)
+    try {
+      const kv = (() => { try { const { env } = getCloudflareContext(); return (env as Record<string, unknown>).PREMIUM_ACCESS as KVNamespace; } catch { return null; } })();
+      if (kv) {
+        const kvKey = `site:gemilab:article:${email}:${slug}`;
+        const data = await kv.get(kvKey);
+        if (!data) return false;
+        const record = JSON.parse(data);
+        return new Date(record.expires_at) > new Date();
+      }
+    } catch {
+      // KV not available — fall through to cookie check
+    }
+
+    // Tier 2: Cookie slug list (fallback when KV unavailable)
+    return slugsInCookie.includes(slug);
+  } catch {
+    return false;
+  }
+}
