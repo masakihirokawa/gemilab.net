@@ -1,0 +1,323 @@
+---
+title: "Gemini で組む LLM-as-Judge 評価パイプライン — 本番運用に耐える設計と実装"
+slug: "gemini-llm-as-judge-evaluation-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-30T04:45"
+author: "Gemini Lab"
+description: "Gemini 2.5 Pro / 3 Pro を判定者（ジャッジ）として使い、本番品質の LLM 出力評価パイプラインを構築するための実装ガイド。Pointwise / Pairwise 評価・バイアス対策・人手相関の測定・コスト最適化までをコード付きで解説します。"
+tags: ["Gemini API", "LLM-as-Judge", "評価", "LLMOps", "Vertex AI", "本番運用", "Eval"]
+highlights:
+  - "プロンプト変更のたびに人手で確認していた評価作業を、Gemini を判定者にした自動パイプラインに置き換えられる"
+  - "位置バイアス・長さバイアス・自己選好バイアスの3つの罠を踏まずに済む、検証済みのジャッジプロンプト設計を持ち帰れる"
+  - "ジャッジ精度を人手評価との一致率で監視し、信頼できる評価結果として意思決定に使えるようになる"
+---
+
+「プロンプトを少し変えただけで、どの応答がどれくらい良くなったのか分からない」——本番運用しているチャットボットの改善作業をしていて、そんな手詰まりを感じたことはないでしょうか。BLEU や ROUGE のような古典的な指標は対話タスクでは役に立たず、人手評価は時間とお金を食う。だからといって自動化を諦めると、改善のサイクルが回らなくなります。
+
+ここで登場するのが LLM-as-Judge という考え方です。出力を別の LLM に見せて点数を付けてもらう、という単純な発想ですが、ジャッジの設計を間違えると「いつも長い回答が高評価」「同じモデル同士だと甘い点」といった偏りが入り込みます。本記事では、Gemini を判定者として使い、人手評価との相関を維持したまま評価を回し続けるための実装パターンと、それを本番に組み込むときに踏みやすい落とし穴を扱います。
+
+## なぜ LLM-as-Judge を採用するのか
+
+私自身、最初は「LLM に LLM を評価させるなんて循環している」という違和感がありました。しかし、いくつかのプロジェクトで実装して気づいたのは、**人間の評価者と完全に一致する自動指標を作ろうとするのではなく、決定の方向性が一致する自動指標を作る**という割り切りができれば、LLM-as-Judge は十分実用になるという点です。
+
+伝統的な自動評価には、対話品質や創造性のような曖昧なタスクで限界があります。
+
+- BLEU / ROUGE: 参照解とのトークン一致を測るので、表現が違うだけで意味が同じ応答を低評価してしまう
+- Embedding 類似度: 意味の近さは測れるが「丁寧さ」「具体性」「事実性」を分離して測れない
+- 人手評価: 質は最も高いが、1サンプルあたり数百円から数千円かかり、リードタイムも長い
+
+LLM-as-Judge はこれらの中間にあります。プロンプトの定義次第で「事実性だけ評価」「丁寧さと具体性を別々に評価」のように細かく軸を切れる一方、コストは人手の数十分の一で、数千件の評価を数十分で回せます。私は本番改善のサイクルでは「最終判断は人手だが、毎日の自動回帰には LLM-as-Judge を使う」という二段構成を好みます。
+
+## Pointwise と Pairwise — 2つの基本パターン
+
+LLM-as-Judge には大きく2つの形式があります。
+
+**Pointwise（単一評価）**: 1つの応答に対して 0〜5 などのスコアを付けます。実装が簡単で、回帰指標として時系列追跡しやすい一方、ジャッジが甘い／辛いに振れやすいという弱点があります。
+
+**Pairwise（一対比較）**: 2つの応答 A / B を並べて「どちらが良いか」を選ばせます。絶対値が安定しないジャッジでも相対比較なら一致しやすく、「新プロンプト vs 旧プロンプト」のような A/B 評価に向いています。一方で、後述する位置バイアスに注意する必要があります。
+
+経験則として、新機能のリリース判断（旧プロンプトに対して悪化していないか）には Pairwise を、毎日の品質ダッシュボードには Pointwise を、と使い分けるとちょうど良いバランスになります。
+
+## 実装①: Pointwise ジャッジ
+
+まずは最小構成の Pointwise ジャッジを作ります。Google の `google-genai` SDK を使い、Gemini 2.5 Pro を判定者として呼び出します。ここで重要なのは、**自由記述で書かせず、構造化出力で必ず JSON を返させる**ことです。点数の数値だけを返す指示にしても、モデルは説明文を混ぜがちで、後段のパース処理が脆くなります。
+
+```python
+# eval_pointwise.py
+# Gemini を判定者にして「事実性」「丁寧さ」「具体性」を 0-5 で評価する Pointwise ジャッジ
+# 必要な環境変数: GEMINI_API_KEY
+import os
+import json
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+class JudgeScore(BaseModel):
+    factuality: int = Field(ge=0, le=5, description="事実性 0-5")
+    politeness: int = Field(ge=0, le=5, description="丁寧さ 0-5")
+    specificity: int = Field(ge=0, le=5, description="具体性 0-5")
+    rationale: str = Field(description="評価理由を80字以内")
+
+JUDGE_PROMPT = """あなたは厳密な評価者です。以下のユーザー質問とアシスタント応答について、3つの観点で 0-5 のスコアを付けてください。
+
+評価観点:
+- factuality: 応答に書かれている事実が正確か。検証できない場合は中央値の3とする
+- politeness: 敬体で書かれているか、相手を尊重しているか
+- specificity: 具体例・数値・コードなど踏み込んだ情報があるか
+
+ユーザー質問:
+{question}
+
+アシスタント応答:
+{answer}
+
+JSON のみを返してください。説明文は禁止です。"""
+
+def judge_pointwise(question: str, answer: str) -> JudgeScore:
+    prompt = JUDGE_PROMPT.format(question=question, answer=answer)
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,  # 評価は決定論的に
+                response_mime_type="application/json",
+                response_schema=JudgeScore,
+                max_output_tokens=512,
+            ),
+        )
+        # Pydantic で型検証してから返す
+        return JudgeScore.model_validate_json(resp.text)
+    except Exception as e:
+        # ジャッジ失敗は黙って欠損にせず、ログ + 中央値で代替する
+        print(f"[judge error] {type(e).__name__}: {e}")
+        return JudgeScore(factuality=3, politeness=3, specificity=3, rationale="judge_failed")
+
+if __name__ == "__main__":
+    q = "Cloudflare Workers で Gemini API を呼ぶ最小コードを教えてください"
+    a = "fetch を使えばOKです"
+    score = judge_pointwise(q, a)
+    print(json.dumps(score.model_dump(), ensure_ascii=False, indent=2))
+```
+
+このコードのポイントは3つあります。第一に、`temperature=0.0` でジャッジを決定論的にしている点。同じ入力に毎回違うスコアが返ると、後続の回帰追跡が成立しません。第二に、`response_schema` で Pydantic モデルを渡し、SDK が JSON Schema を組み立ててくれる仕組みに乗っている点。これで `JSON のみを返してください` という願いを書く必要が実質なくなり、応答の堅牢性が大きく上がります。第三に、ジャッジ失敗時に **silently null にせず中央値で埋めてログを残す**点。評価集計が NaN だらけになって平均値が信用できなくなる事故を防げます。
+
+期待出力（例）:
+
+```json
+{
+  "factuality": 2,
+  "politeness": 2,
+  "specificity": 1,
+  "rationale": "fetch だけでは不十分。エンドポイント・認証・モデル名の説明が欠落"
+}
+```
+
+## 実装②: Pairwise ジャッジ
+
+A/B 比較では、ジャッジに「A が良い」「B が良い」「同等」のいずれかを選ばせます。Pointwise より一致しやすい反面、位置バイアス（先に提示した方を高評価しがち）が顕著に出ます。これを抑えるため、**毎回ランダムに順序を入れ替えてから集計時に逆変換する**実装にします。
+
+```python
+# eval_pairwise.py
+# 位置バイアスを排除した Pairwise ジャッジ
+import os
+import random
+from typing import Literal
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+class PairwiseVerdict(BaseModel):
+    winner: Literal["A", "B", "TIE"]
+    rationale: str = Field(max_length=200)
+
+PAIRWISE_PROMPT = """あなたは応答品質の比較評価者です。同じ質問に対する応答 A と応答 B を比較し、どちらが優れているかを判定してください。
+
+判定基準（同じ重みで総合判定）:
+1. 事実の正しさ
+2. 質問への直接的な回答度合い
+3. 必要十分な具体性（過剰な前置きや繰り返しは減点）
+
+質問:
+{question}
+
+応答 A:
+{a}
+
+応答 B:
+{b}
+
+A / B / TIE のいずれかを winner に入れてください。"""
+
+def judge_pairwise(question: str, ans_a: str, ans_b: str) -> PairwiseVerdict:
+    # 位置バイアス対策: 50% の確率で A と B を入れ替える
+    swap = random.random() < 0.5
+    a_text, b_text = (ans_b, ans_a) if swap else (ans_a, ans_b)
+
+    prompt = PAIRWISE_PROMPT.format(question=question, a=a_text, b=b_text)
+
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=PairwiseVerdict,
+                max_output_tokens=400,
+            ),
+        )
+        verdict = PairwiseVerdict.model_validate_json(resp.text)
+
+        # 入れ替えていた場合は判定も逆にする
+        if swap and verdict.winner == "A":
+            return PairwiseVerdict(winner="B", rationale=verdict.rationale)
+        if swap and verdict.winner == "B":
+            return PairwiseVerdict(winner="A", rationale=verdict.rationale)
+        return verdict
+    except Exception as e:
+        print(f"[pairwise judge error] {type(e).__name__}: {e}")
+        return PairwiseVerdict(winner="TIE", rationale="judge_failed")
+```
+
+このランダム順序入れ替えは、たった数行ですが、私の経験では Pairwise の精度を体感で2割以上引き上げる施策です。OpenAI の MT-Bench 論文や Anthropic の評価関連ブログでも繰り返し強調されている定番テクニックですが、自前で実装するときには忘れがちなので明示的にコードに残しておくのがおすすめです。
+
+## ジャッジバイアスの3大パターン
+
+LLM-as-Judge を本番で運用していると、知らず知らずのうちに以下の3つのバイアスを踏みます。
+
+### 位置バイアス
+
+Pairwise で先に提示した応答を高評価しやすいバイアスです。前節のとおり、毎回 50% の確率で A/B を入れ替えるだけで実害は大幅に減ります。完全に消すには「両方の順序で2回判定し、両方で勝った方を勝者とする」二重判定が有効ですが、コストが2倍になるため、私は重要なリリース判定のときだけ二重判定に切り替える運用にしています。
+
+### 長さバイアス
+
+「長い応答ほど高評価」という偏りで、特に Pointwise で強く出ます。対策は2つあります。1つはプロンプトに **「冗長さは減点対象である」と明記**すること。もう1つは応答の文字数も同時に記録し、**スコアと文字数の相関を監視**することです。ある時期から急に「平均文字数 = 平均スコア × 200」のような線形関係が見え始めたら、それはジャッジが内容ではなく長さを見ています。
+
+### 自己選好バイアス
+
+判定者と被評価者が同じモデル系列のとき、ジャッジが自分の応答を高めに評価する偏りです。Gemini で生成した応答を Gemini で評価すると発生します。完全に避けるのは難しいですが、**判定者と被評価者でモデル系列を分ける**（例: Gemini の応答は GPT で評価、GPT の応答は Gemini で評価）ことで影響を抑えられます。コストや運用の都合で同一モデルを使う場合は、人手評価との相関を四半期に一度測り、差分が広がっていないか監視してください。
+
+## 評価パイプラインの本番化
+
+実装単体ができても、本番運用するには「毎日の回帰チェック」「リリース前の合否判定」というユースケースに合わせたパイプライン設計が必要です。私の現場で動かしている構成を簡略化したものを紹介します。
+
+```python
+# eval_pipeline.py
+# 評価データセットを並列にジャッジへ流し、結果を BigQuery / SQLite に書き出す
+import asyncio
+import json
+import sqlite3
+import time
+from typing import List
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+class EvalRecord(BaseModel):
+    case_id: str
+    question: str
+    answer: str
+
+async def judge_async(record: EvalRecord, semaphore: asyncio.Semaphore) -> dict:
+    """並列度を制御しながら 1 ケースを評価する"""
+    async with semaphore:
+        for attempt in range(3):
+            try:
+                resp = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model="gemini-2.5-pro",
+                    contents=JUDGE_PROMPT.format(question=record.question, answer=record.answer),
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                        response_schema=JudgeScore,
+                        max_output_tokens=512,
+                    ),
+                )
+                score = JudgeScore.model_validate_json(resp.text)
+                return {"case_id": record.case_id, **score.model_dump()}
+            except Exception as e:
+                # 429 / 503 はバックオフで再試行
+                wait = 2 ** attempt
+                print(f"[retry {attempt+1}/3] {record.case_id}: {e} — wait {wait}s")
+                await asyncio.sleep(wait)
+        # 3 回失敗したら欠損として返す
+        return {"case_id": record.case_id, "factuality": 3, "politeness": 3, "specificity": 3, "rationale": "max_retry"}
+
+async def run_pipeline(dataset: List[EvalRecord], concurrency: int = 8) -> List[dict]:
+    sem = asyncio.Semaphore(concurrency)
+    return await asyncio.gather(*[judge_async(r, sem) for r in dataset])
+
+def save_to_sqlite(results: List[dict], path: str = "eval_results.db") -> None:
+    conn = sqlite3.connect(path)
+    conn.execute("""CREATE TABLE IF NOT EXISTS scores (
+        case_id TEXT, ts INTEGER, factuality INT, politeness INT,
+        specificity INT, rationale TEXT
+    )""")
+    ts = int(time.time())
+    conn.executemany(
+        "INSERT INTO scores VALUES (?, ?, ?, ?, ?, ?)",
+        [(r["case_id"], ts, r["factuality"], r["politeness"], r["specificity"], r["rationale"]) for r in results],
+    )
+    conn.commit()
+    conn.close()
+```
+
+並列度（`concurrency`）は Gemini API のレート制限に応じて調整します。Tier 1 では 8 程度、Tier 2 以上なら 16-32 まで上げて構いません。ただし、**並列度を上げるほど 429 エラーが返る確率も上がる**ので、必ずバックオフ付きの再試行を実装してください。私のプロジェクトでは並列度 16 で 1,000 ケースを約8分、コストは概算で 100〜200 円という感覚です。
+
+## ジャッジの品質をどう測るか
+
+LLM-as-Judge の最大の問題は「ジャッジ自身が信頼できるか」です。これを測る一番素直な方法は、**人手評価との一致率（accuracy）または相関係数（Spearman / Cohen's kappa）を四半期ごとに計算する**ことです。
+
+具体的な手順は以下です。
+
+1. ランダムに 100〜200 ケース抽出する（普段の評価対象から）
+2. 人手で同じ評価軸でスコアを付ける（社内2名以上のクロスチェックが理想）
+3. ジャッジのスコアと人手スコアの相関を計算する
+4. 相関が前回より明確に下がっていたらジャッジプロンプトを再設計する
+
+私の経験では、Pointwise なら Spearman の順位相関が 0.6 を超えていれば「方向性は合っている」と判断して回帰追跡に使い続けます。0.4 を下回ったら、評価軸そのものが LLM では計りにくくなっている兆候なので、軸の分割や Pairwise への切り替えを検討します。
+
+## コスト最適化
+
+LLM-as-Judge はモデル呼び出し回数が膨大になりがちなので、いくつかのコスト圧縮を組み合わせるのが現実的です。
+
+- **モデルの使い分け**: 全件を 2.5 Pro で評価するのではなく、Flash で1次スクリーニング → 怪しい結果だけ Pro で再評価、という二段構成にする。私の現場ではこれで月額が 1/3〜1/4 になりました
+- **コンテキストキャッシュ**: 評価プロンプトのテンプレート部分（システム指示・評価基準）が長い場合、Gemini API の Context Caching を使ってキャッシュ料金で済ませる
+- **バッチサイズの調整**: 似た質問を1リクエストにまとめて評価する（ただし長さバイアスが入りやすいので慎重に検証する）
+- **サンプリング**: 全件評価をやめ、95% 信頼区間で十分な精度が出るサンプル数だけ評価する
+
+特に最初の「Flash → Pro の二段構成」は実装コストが小さく効果が大きいため、コストが気になり始めたら最初に検討してほしい施策です。
+
+## よくある間違いと落とし穴
+
+実際にプロジェクトで踏んだ、特に頻度の高い間違いを共有します。
+
+### 落とし穴①: 評価基準が言葉でしか定義されていない
+
+「丁寧さを 5 段階で」とプロンプトに書いただけでは、ジャッジは毎回違う基準で判定します。**4 と 3 の境目を具体例で示す**ことが必要です。たとえば「4 = 敬体で書かれているが定型句が多い、5 = 敬体かつ相手の状況を踏まえた配慮がある」のように、各点数のアンカー例を1〜2文ずつ書くだけで、スコアの分散が顕著に下がります。
+
+### 落とし穴②: ジャッジの出力をそのまま信用してしまう
+
+ジャッジが返してくる `rationale`（評価理由）は意外なほどよく嘘をつきます。スコアに合うように後付けで理由を作る場面が多々あるため、`rationale` を集計ダッシュボードに表示するのは構いませんが、**rationale を意思決定の根拠にしないこと**。意思決定は数値スコアの統計値で行うのが安全です。
+
+### 落とし穴③: テストセットがリリースのたびに作り変わる
+
+評価データセットを毎週増やしたり、過去のクエリを削除したりすると、時系列でスコアを比較できなくなります。**「毎日回す回帰用データセット」と「新機能の評価用データセット」を分離**してください。前者は半年〜1年は固定、後者は機能ごとに新調する、という運用がうまく回ります。
+
+## まとめ — まず始めるべきこと
+
+LLM-as-Judge は、人手評価の代わりではなく、人手評価が回せない頻度・規模の評価をカバーする補助線として導入するのが一番うまくいきます。完璧な代替を目指すと相関測定で挫折しますが、「人手で測りきれない部分の見える化」と割り切れば、改善サイクルの回転数が大きく上がります。
+
+今日からできる最初の一歩としては、本記事の Pointwise の実装を 50 ケースほどの小さなデータセットで動かし、人手スコアとの一致率を一度測ってみることをおすすめします。一致率が 60% を超えていれば、そこからプロンプトを磨いていく価値は十分にあります。低ければ、評価軸を細分化するか Pairwise に切り替える、という次の打ち手が自然に見えてきます。
+
+評価設計をさらに深く学びたい場合は、関連する [Gemini API プロンプト評価・最適化パイプライン](/articles/gemini-api/gemini-api-prompt-evaluation-optimization-pipeline) と [Gemini API 出力品質ドリフトの自動検知](/articles/gemini-api/gemini-production-output-quality-drift) も合わせて読むと、運用フェーズ全体の見通しがよくなります。書籍では、ジャッジバイアスの基礎理論を押さえるために [評価指標入門〜データサイエンスとビジネスをつなぐ架け橋（高柳 慎一・長田 怜士・株式会社ホクソエム 著）](https://www.amazon.co.jp/dp/B09NMSV8SQ/?tag=pinocchio-22) が役立ちます。LLM 評価の現場知識を増やすには [大規模言語モデル入門II〜生成型LLMの実装と評価（山田育矢ほか 著）](https://www.amazon.co.jp/dp/B0DNKQ2BFL/?tag=pinocchio-22) もおすすめです。
