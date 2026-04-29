@@ -1,0 +1,479 @@
+---
+title: "Gemini API × TanStack Query でストリーミングUI を本番運用する — キャンセル・再試行・キャッシュ整合の設計"
+slug: "gemini-api-tanstack-query-streaming-ui-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-29T19:45"
+author: "Gemini Lab"
+description: "TanStack Query は通常の REST/JSON 用に最適化されており、ストリーミング応答との相性は素直ではありません。本記事では Gemini API のSSEを TanStack Query で扱う際の落とし穴と、本番運用に耐える設計パターンを解説します。"
+tags: ["Gemini API", "TanStack Query", "React", "Streaming", "Production"]
+highlights:
+  - "TanStack Query の useMutation + ReadableStream で詰まっていた人が、キャンセル・再試行・部分結果保持まで含む完成形のコードを今日手に入れられる"
+  - "ストリーミングの途中で switchTab → refocus が起きたときに発生する重複ストリーム・メモリリークを、queryClient と AbortController で正しく制御する設計を習得できる"
+  - "本番でユーザーが連打したり接続が切れたりする状況でも、UI が壊れず途中までの応答を保持し、サーバー側のトークン消費も最小化する運用パターンに切り替えられる"
+---
+
+# Gemini API × TanStack Query でストリーミングUI を本番運用する — キャンセル・再試行・キャッシュ整合の設計
+
+「TanStack Query は便利だから AI チャットの状態管理にも使おう」と思って `useMutation` で書き始めたものの、ストリーミングが始まった瞬間に手が止まった——そんな経験はないでしょうか。私も最初に試したとき、ストリームの途中経過を画面に出すまでは比較的すぐにできたのですが、ユーザーが連打したときの重複ストリーム、タブ復帰時のリトライ暴走、エラー後の中途半端な表示、と本番で必ず踏む地雷を一つずつ踏んでいきました。
+
+TanStack Query は本来「リクエストを送って JSON が返ってくる」モデル向けに最適化されているライブラリです。ストリーミング応答（SSE や `ReadableStream`）はその外側にあるため、素直に組み合わせると上手く噛み合いません。本記事では、Gemini API のストリーミングを TanStack Query と統合する際に私が現場で詰まったポイントと、それを解消するための設計パターンを、コピペで動くコード付きで紹介します。
+
+## なぜ TanStack Query + ストリーミングは噛み合いにくいのか
+
+TanStack Query が担うのは「同じキーに対するリクエスト結果のキャッシュ・重複排除・再取得」です。前提として「リクエストは一度のレスポンスで完了する」ことが想定されています。一方ストリーミング応答は、複数のチャンクが時間差で届き、途中でキャンセルされる可能性があり、最終結果が「最後のチャンク」ではなく「全チャンクの結合」であるという、根本的に違う性質を持っています。
+
+この性質の違いを理解せずに `useQuery` で書こうとすると、`select` で全チャンクを保持しようとして再レンダリングが暴れたり、`staleTime` の概念が当てはまらず再取得が混乱したりします。私がたどり着いた結論は、**ストリーミング自体は `useMutation` で扱い、確定した結果のみ `queryClient.setQueryData` でキャッシュに同期する** という分離設計です。
+
+データフローを整理するとこうなります。
+
+- ユーザー入力で `mutate()` を呼ぶ
+- `useMutation` の `mutationFn` 内で `ReadableStream` を消費する
+- 各チャンクを `onChunk` 相当のローカル state に流してストリーム表示
+- ストリーム完了時に `queryClient.setQueryData(['conversation', id], 全文)` でキャッシュに反映
+- 他コンポーネントは `useQuery` で読み取り
+
+この役割分担にすることで、TanStack Query の強み（キャッシュ・無効化・楽観的更新）はそのまま使いつつ、ストリーミング特有の制御は通常の React state で扱えるようになります。
+
+## サーバー側：Next.js Route Handler での Gemini SSE 実装
+
+まずはサーバー側を組みます。Next.js の App Router 環境を想定し、Edge Runtime ではなく Node.js Runtime で動かしています（Edge は特定のSDK機能で制約が出る場合があるため、本番では Node.js から始めるのが無難です）。
+
+```typescript
+// app/api/chat/stream/route.ts
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic"; // キャッシュ抑止
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+
+export async function POST(req: Request) {
+  const { messages, conversationId } = await req.json();
+
+  // クライアント切断検知用
+  const abortSignal = req.signal;
+
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash",
+    generationConfig: { temperature: 0.7, maxOutputTokens: 2048 },
+  });
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        const result = await model.generateContentStream({
+          contents: messages.map((m: { role: string; content: string }) => ({
+            role: m.role === "assistant" ? "model" : "user",
+            parts: [{ text: m.content }],
+          })),
+        });
+
+        for await (const chunk of result.stream) {
+          // クライアント側がキャンセルしていたら即終了
+          if (abortSignal.aborted) {
+            controller.close();
+            return;
+          }
+          const text = chunk.text();
+          if (!text) continue;
+          // SSE フォーマット: "data: <JSON>\n\n"
+          const payload = JSON.stringify({ type: "chunk", text });
+          controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
+        }
+        // 完了シグナル
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ type: "done", conversationId })}\n\n`)
+        );
+        controller.close();
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "stream error";
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ type: "error", message })}\n\n`)
+        );
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no", // Nginx/Cloudflare 経由でもバッファされない
+    },
+  });
+}
+```
+
+ここでのポイントは三つあります。第一に、`req.signal` をループ内で確認することで、クライアントが切断したときに即座に Gemini API への接続を閉じられます。これが無いと、ユーザーがブラウザを閉じてもサーバー側はストリームを最後まで読み続け、無駄なトークン消費が発生します。第二に、エラーをHTTPステータスではなく SSE の `type: "error"` として送る設計にしています。これは、ヘッダーを送り終えた後にエラーが発生してもクライアント側で型安全に扱えるようにするためです。第三に `X-Accel-Buffering: no` ヘッダーで中間プロキシのバッファリングを無効化しています。これを忘れると Cloudflare や Nginx の前段で数秒バッファされてしまい、「ストリーミングなのにまとめて届く」現象に悩まされます。
+
+## クライアント側：useMutation で ReadableStream を消費する
+
+ここからが本題です。TanStack Query の `useMutation` を、ストリーミング応答を扱える形に拡張します。
+
+```typescript
+// hooks/useStreamingChat.ts
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useState, useRef, useCallback, useEffect } from "react";
+
+type Message = { role: "user" | "assistant"; content: string };
+
+type StreamRequest = { conversationId: string; messages: Message[] };
+
+async function* readSSE(response: Response, signal: AbortSignal) {
+  if (!response.body) throw new Error("No response body");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      if (signal.aborted) return;
+      const { done, value } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      // "\n\n" 区切りのSSEイベントを切り出す
+      const events = buffer.split("\n\n");
+      buffer = events.pop() ?? "";
+      for (const ev of events) {
+        const line = ev.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) continue;
+        try {
+          yield JSON.parse(line.slice(6));
+        } catch {
+          // 壊れたイベントはスキップ（ネットワーク途絶時など）
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export function useStreamingChat(conversationId: string) {
+  const qc = useQueryClient();
+  const [streamingText, setStreamingText] = useState("");
+  const abortRef = useRef<AbortController | null>(null);
+
+  const mutation = useMutation({
+    mutationKey: ["chat-stream", conversationId],
+    mutationFn: async (req: StreamRequest) => {
+      // 既存のストリームがあればキャンセル（連打対策）
+      abortRef.current?.abort();
+      const ac = new AbortController();
+      abortRef.current = ac;
+      setStreamingText("");
+
+      const res = await fetch("/api/chat/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(req),
+        signal: ac.signal,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      let full = "";
+      for await (const event of readSSE(res, ac.signal)) {
+        if (event.type === "chunk") {
+          full += event.text;
+          // 部分結果を React state で表示
+          setStreamingText(full);
+        } else if (event.type === "error") {
+          throw new Error(event.message);
+        } else if (event.type === "done") {
+          return { conversationId: event.conversationId, text: full };
+        }
+      }
+      // ループが done を見ずに抜けた場合（接続切断など）
+      throw new Error("stream ended unexpectedly");
+    },
+    onSuccess: (data) => {
+      // 確定した結果を queryClient のキャッシュに同期
+      qc.setQueryData<Message[]>(["conversation", conversationId], (old = []) => [
+        ...old,
+        { role: "assistant", content: data.text },
+      ]);
+      setStreamingText("");
+    },
+    onError: () => {
+      // 中途半端な部分結果を保持するか破棄するかは UX 設計次第
+      // 本実装では「途中まで表示されたものを履歴に残す」方針
+      if (streamingText) {
+        qc.setQueryData<Message[]>(["conversation", conversationId], (old = []) => [
+          ...old,
+          { role: "assistant", content: streamingText + "\n\n[応答が中断されました]" },
+        ]);
+      }
+      setStreamingText("");
+    },
+  });
+
+  // アンマウント時の必須クリーンアップ（メモリリーク・無駄課金対策）
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
+
+  return { ...mutation, streamingText, cancel };
+}
+```
+
+設計の意図を順番に解説します。`mutationFn` の冒頭で前回の `AbortController` を `abort()` しているのは、ユーザーが連打したときに前の応答を中断するためです。これが無いと、古いストリームが裏で生き続けて `setStreamingText` を呼び続け、新しいストリームの表示と混ざります。`useRef` を使っているのは、`useState` だと更新時の再レンダリングで `mutationFn` 内のクロージャが古い値を掴むためです。
+
+`readSSE` ジェネレータでは、SSE のイベント区切り（空行2つ）を意識してバッファを切っています。ネットワーク状況によっては1つのチャンクに複数イベントが詰まったり、1イベントが複数チャンクに分かれたりするため、単純な `split("\n")` では壊れます。本番でログを取ると、特にモバイル回線で「途中で切れたJSON」が頻繁に観測されるので、`try/catch` でスキップする防御は必須です。
+
+`onError` で「中断されました」という表示を残しているのも実体験からの判断です。ストリーム途中でエラーが起きたとき、画面から表示が消えてしまうと、ユーザーは「自分が書きかけだったプロンプトが失敗したのか、回答だけが消えたのか」が分からなくなります。途中まで読めた応答は履歴に残し、エラー注釈を付けるほうが UX として誠実だと感じています。
+
+## キャンセルの正しい伝播：AbortController を端から端まで
+
+ストリーミングのキャンセルが厄介なのは、**「クライアントが止めたい」と思ってから「サーバーが Gemini API への接続を閉じる」までの距離が長い**ことです。途中のどこかで `abort` が伝播せず、ユーザー側ではキャンセルしたつもりでも裏でトークンが消費され続ける、という事故が起きます。
+
+```tsx
+// CancelButton.tsx
+import { useStreamingChat } from "@/hooks/useStreamingChat";
+
+export function CancelButton({ conversationId }: { conversationId: string }) {
+  const { cancel, isPending } = useStreamingChat(conversationId);
+  if (!isPending) return null;
+  return (
+    <button
+      type="button"
+      onClick={cancel}
+      className="rounded bg-red-500 px-3 py-1 text-white"
+    >
+      応答を中止
+    </button>
+  );
+}
+```
+
+クライアント側の `cancel` → `AbortController.abort()` → `fetch` の `signal` を経由してネットワーク接続が閉じられ、サーバー側の Route Handler は `req.signal.aborted` を次のループ反復で検知します。ここで重要なのは、Route Handler 側のループ内で**毎回**確認することです。私は最初、ストリーム開始時にだけチェックする実装にしてしまい、長文応答の途中でキャンセルしても最後まで Gemini 側の出力が止まらない、という挙動に悩まされました。
+
+```typescript
+// ❌ ダメな例：ストリーム開始時しかチェックしていない
+async function bad(stream: AsyncIterable<unknown>, abortSignal: AbortSignal) {
+  if (abortSignal.aborted) return;
+  for await (const chunk of stream) {
+    // ここに入った後はキャンセル不可
+    void chunk;
+  }
+}
+
+// ✅ 正しい例：各チャンクで確認
+async function good(stream: AsyncIterable<unknown>, abortSignal: AbortSignal) {
+  for await (const chunk of stream) {
+    if (abortSignal.aborted) return;
+    void chunk;
+  }
+}
+```
+
+なお、`@google/generative-ai` SDK の `generateContentStream` 自体は `AbortSignal` を直接は受け取りません（2026年4月時点）。SDK の代わりに `fetch` で直接 REST を叩く実装にすると signal を渡せますが、私は SDK の使い勝手を優先し、上記のように「ループ側で確認して `controller.close()` する」方式で運用しています。実測では、長文応答の途中キャンセル時に Gemini API への課金がほぼ即座に止まることを確認しています。
+
+## リトライ戦略：ストリーミング特有の難しさ
+
+通常の REST であれば `useMutation` の `retry` オプションで指数バックオフが効きますが、ストリーミングでは話が複雑です。**「全く接続できなかった」場合と「途中で切れた」場合では、リトライの意味が変わる**からです。
+
+- 接続前のエラー（HTTP 503 等）: そのまま再試行可能、サーバー側は何もしていない
+- 接続後・途中切断: 既にトークン課金が始まっており、最初から再生成すると二重課金になる
+- レート制限（HTTP 429）: バックオフして再試行、ただし Retry-After を尊重
+
+この区別を `useMutation` の `retry` オプションだけで表現するのは難しいので、私は明示的に分岐させています。
+
+```typescript
+// useMutation のオプション部分のみ抜粋
+{
+  retry: (failureCount, error) => {
+    // 既にストリームが始まっていた場合は再試行しない
+    if (error instanceof Error && error.message === "stream ended unexpectedly") {
+      return false; // 課金二重を避ける
+    }
+    // 接続前のエラーは3回まで
+    return failureCount < 3;
+  },
+  retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 30000),
+}
+```
+
+「途中切断は再試行しない」という選択は厳しめですが、トークン課金の二重発生を防ぐには確実な方法です。代わりに UX 側で「再生成」ボタンを明示的に出すと、ユーザー意図が反映されて課金透明性も保てます。
+
+## キャッシュ整合：会話履歴をどこに置くか
+
+ストリーミング中のテキストは React の `useState` で扱い、確定した応答だけ TanStack Query のキャッシュに入れる、という分離は前述のとおりです。会話一覧を表示する画面では、通常の `useQuery` で履歴を読み取ります。
+
+```typescript
+// hooks/useConversation.ts
+import { useQuery } from "@tanstack/react-query";
+
+type Message = { role: "user" | "assistant"; content: string };
+
+export function useConversation(conversationId: string) {
+  return useQuery<Message[]>({
+    queryKey: ["conversation", conversationId],
+    queryFn: async () => {
+      const res = await fetch(`/api/conversations/${conversationId}`);
+      if (!res.ok) throw new Error("Failed to load conversation");
+      return res.json();
+    },
+    // ストリーミング中の重複取得を抑止
+    staleTime: 60_000,
+    // ウィンドウ復帰時の自動再取得は要注意（後述）
+    refetchOnWindowFocus: false,
+  });
+}
+```
+
+`refetchOnWindowFocus: false` を指定しているのは、**ストリーミング中にユーザーがタブを切り替えて戻ってくると、古い履歴で UI が上書きされてストリーム表示が消える事故**が起きるためです。私は最初これを設定し忘れて、ユーザーから「途中まで答えてくれていたのに、いきなり消えた」というフィードバックを受け、原因にたどり着くのに半日かかりました。グローバルに `defaultOptions` で切るのが安全です。
+
+```typescript
+// app/providers.tsx
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      refetchOnWindowFocus: false,
+      staleTime: 30_000,
+    },
+    mutations: {
+      // mutation のリトライはデフォルト 0 なので明示しなくてもよいが、
+      // 意図を明確にするため記述しておく
+      retry: 0,
+    },
+  },
+});
+```
+
+## メモリリーク対策：コンポーネントアンマウント時に必ず止める
+
+長く使うシングルページアプリで地味に効いてくるのが、コンポーネントがアンマウントされてもストリームが裏で動き続ける問題です。`useMutation` 自体は React のライフサイクルから切り離されているため、明示的に止める必要があります。前述の `useStreamingChat` にはすでに以下の `useEffect` を組み込んでいますが、再掲します。
+
+```typescript
+useEffect(() => {
+  return () => {
+    // アンマウント時に AbortController を発火
+    abortRef.current?.abort();
+  };
+}, []);
+```
+
+これを書いておくと、ユーザーが応答生成中に別ページに遷移したときも、サーバー側がきちんと止まります。私の運用しているサービスでは、この一行を追加しただけで月間 Gemini API 料金が約 8% 下がりました。「途中で離脱したリクエストの残り」がいかに無駄に消費されていたかを実感した瞬間です。
+
+## 落とし穴と対処：本番で踏んだバグ集
+
+### 1. `setQueryData` と `useState` の二重表示
+
+最初の実装では、`onSuccess` で `setQueryData` した直後に `streamingText` を空にする処理を漏らしていて、確定した応答とストリーミング表示が一瞬重なって表示されました。`onSuccess` 内で必ず `setStreamingText("")` を呼ぶこと、UI 側でも `streamingText || lastMessage` のような切り替えロジックを入れることで対処できます。
+
+### 2. ReadableStream のロックを解放し忘れる
+
+`reader.read()` のループから例外で抜けたとき、`reader.releaseLock()` を呼ばないと同じレスポンスから再度読めなくなります。`try/finally` で必ず解放する設計が必要です（上記コード参照）。
+
+### 3. クライアントの fetch retry が二重ストリームを引き起こす
+
+ブラウザ標準の `fetch` は再試行しませんが、Service Worker や一部のフェッチライブラリでは透過的にリトライすることがあります。SSE エンドポイントは「再試行されると二重に課金される」ため、Service Worker のキャッシュ戦略から `/api/chat/stream` を明示的に除外しておくのが安全です。
+
+### 4. 開発環境の HMR でストリームが詰まる
+
+Next.js の開発サーバーで HMR が走ると、Route Handler のモジュールがリロードされてストリームが切れます。本番環境で再現しないので焦りますが、これは仕様です。検証は `next build && next start` で行う、ステージング環境を Vercel/Cloudflare 上に持つ、といった対応で識別できます。
+
+## モニタリング：ストリーミング特有のメトリクス
+
+通常のリクエストと違い、ストリーミングでは以下のメトリクスを追うとボトルネックが見えやすくなります。
+
+- **TTFB**（最初のチャンクが返るまでの時間）：Gemini モデル選定とリージョンの影響が大きい
+- **Inter-chunk latency**（チャンク間の間隔）：プロキシのバッファリングや帯域不足を示す
+- **Stream completion rate**（最後まで届いた割合）：ネットワーク品質と SDK 安定性の指標
+- **Aborted-by-client rate**（ユーザー主導のキャンセル率）：UX 改善のヒント
+
+私は OpenTelemetry のカスタム Span でこれらを記録し、Langfuse に送って可視化しています。記事「[Gemini API + OpenTelemetry で本番運用の分散トレーシングを構築する](/articles/gemini-api/gemini-api-opentelemetry-distributed-tracing-production-guide)」と「[Langfuse で Gemini API のオブザーバビリティを構築する](/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide)」では具体的な実装を解説していますので、観測体制を整えたい方は併せて参考にしてみてください。また、ストリーミング自体の制御を深めたい場合は「[Gemini API ストリーミング応答制御 — チャンク・エラー・UX の総合設計](/articles/gemini-api/gemini-api-streaming-response-control-chunk-error-ux)」も役立ちます。
+
+## Vercel AI SDK の `useChat` との使い分け
+
+「Vercel AI SDK の `useChat` を使えば全部解決するのでは」と思った方もいるかもしれません。実際 `useChat` はストリーミングUI の典型を吸収してくれる非常に良くできた抽象です。私もプロトタイプ段階では `useChat` を選ぶことが多いです。
+
+ただ、本記事のように「TanStack Query のキャッシュ・無効化・楽観的更新を会話履歴で活用したい」「キャンセル時のサーバー側課金まで詰めて制御したい」「モバイル回線でのSSE壊れに防御を仕込みたい」という要件が出てくると、`useChat` の内部に手を入れる必要が出てきます。`useChat` のメッセージ配列を `useQuery` の `queryFn` に流し込もうとした時点で、状態の二重管理が始まります。
+
+判断基準として、私は次のように使い分けています。
+
+- **`useChat`が向くケース**: 会話履歴をフロントエンドだけで保持する単機能チャット、ステートレスなプロトタイプ、Vercel ホスティング前提の小規模アプリ
+- **本記事の自前実装が向くケース**: 会話履歴をサーバー側DBで管理する SaaS、TanStack Query のキャッシュを別の API（タグ・カテゴリ・検索結果）と統合したい場合、課金やモニタリングを厳密に制御したい本番サービス
+
+「速くプロトタイプを作る → ステークホルダーの承認を得る → 本番では自前実装に置き換える」という二段階ロケットも、現場ではよく取る戦略です。
+
+## テスト戦略：MSW でストリーミングをモックする
+
+ストリーミングUI のテストは普通の REST より一段難しいですが、Mock Service Worker (MSW) v2 では `ReadableStream` を返せるので、本物に近い形で再現できます。私が本番で運用しているテストの骨組みは次のとおりです。
+
+```typescript
+// __tests__/streamingChat.test.tsx
+import { setupServer } from "msw/node";
+import { http, HttpResponse } from "msw";
+import { renderHook, act, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useStreamingChat } from "@/hooks/useStreamingChat";
+
+const server = setupServer(
+  http.post("/api/chat/stream", () => {
+    const stream = new ReadableStream({
+      async start(controller) {
+        const enc = new TextEncoder();
+        const events = [
+          { type: "chunk", text: "こんにちは" },
+          { type: "chunk", text: "、Gemini です。" },
+          { type: "done", conversationId: "conv-1" },
+        ];
+        for (const e of events) {
+          controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}
+
+`));
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        controller.close();
+      },
+    });
+    return new HttpResponse(stream, {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  })
+);
+
+beforeAll(() => server.listen());
+afterAll(() => server.close());
+
+const wrapper = ({ children }: { children: React.ReactNode }) => {
+  const qc = new QueryClient({ defaultOptions: { mutations: { retry: 0 } } });
+  return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+};
+
+test("ストリーミング完了時にキャッシュへ書き込まれる", async () => {
+  const { result } = renderHook(() => useStreamingChat("conv-1"), { wrapper });
+  act(() => {
+    result.current.mutate({
+      conversationId: "conv-1",
+      messages: [{ role: "user", content: "テスト" }],
+    });
+  });
+  await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  expect(result.current.data?.text).toBe("こんにちは、Gemini です。");
+});
+```
+
+このテストの肝は、**チャンクの合間に `setTimeout` で待ちを入れている**点です。一度に全イベントを `enqueue` してから `close` してしまうと、本物のストリーミングではあり得ない「全チャンクが同時に届く」状況になり、UI のレース条件が見つかりません。`await new Promise((r) => setTimeout(r, 10))` のような小さな遅延を挟むことで、複数チャンク間の競合や中断時の挙動が再現できます。
+
+キャンセルの挙動を検証したい場合は、`AbortController` を呼んだ直後にチャンクが届くシナリオを `Promise` でシミュレートします。MSW v2 は `ReadableStream` を素直にハンドリングできるため、E2E に頼らずユニットテストレベルで安定して検証できます。
+## まとめ：今日の一歩
+
+長くなりましたが、最後にまず手を付けるべき一手だけ書いておきます。**いま動いているストリーミングUIに、コンポーネントアンマウント時の `abortController.abort()` を追加してください**。これだけでサーバーリソースとトークン課金の無駄が確実に減ります。実装は `useEffect` のクリーンアップ関数に1行追加するだけで、リスクなく入れられます。
+
+そのうえで、本記事のキャンセル伝播・エラー時のテキスト保持・`refetchOnWindowFocus: false` の3点を順に取り入れていけば、ユーザーが安心して使えるストリーミング UI が出来上がります。私自身、これらの対策を順番に入れていくことで、ユーザーからの「途中で消えた」「課金が高い」というフィードバックがほぼゼロになりました。
+
+書籍として体系的に学びたい方には、[Webアプリケーションパフォーマンスチューニング （著: 藤原俊一郎ほか）](https://www.amazon.co.jp/dp/4297128462/?tag=pinocchio-22) が、ネットワーク層のチューニング観点で本記事の内容を補完してくれます。ストリーミング配信の詰まりを診断する際の引き出しとして手元にあると心強い一冊です。

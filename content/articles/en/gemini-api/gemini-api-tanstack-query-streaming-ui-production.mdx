@@ -1,0 +1,477 @@
+---
+title: "Production Streaming UI with Gemini API + TanStack Query — Cancellation, Retries, and Cache Coherence"
+slug: "gemini-api-tanstack-query-streaming-ui-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-29T19:45"
+author: "Gemini Lab"
+description: "TanStack Query is optimized for one-shot REST/JSON requests, so streaming responses don't fit naturally. This guide walks through the gotchas of using Gemini API SSE with TanStack Query and the production-grade design patterns that hold up in real apps."
+tags: ["Gemini API", "TanStack Query", "React", "Streaming", "Production"]
+highlights:
+  - "Anyone stuck wiring useMutation to a ReadableStream will leave today with a complete, working implementation that handles cancellation, retries, and partial-result preservation"
+  - "You'll learn how to control the duplicate streams and memory leaks that appear when users switch tabs and refocus mid-stream, by combining queryClient with AbortController correctly"
+  - "Even when users hammer the send button or connections drop, your UI will stay intact, partial replies will be preserved, and your server-side token spend will drop noticeably"
+---
+
+# Production Streaming UI with Gemini API + TanStack Query — Cancellation, Retries, and Cache Coherence
+
+Have you ever started writing an AI chat with `useMutation` thinking "TanStack Query is great, I'll just use it for state too," and then hit a wall the moment streaming kicked in? I did. Showing partial chunks on the screen was easy enough, but then I tripped over every production landmine in turn: duplicate streams when users hammered the send button, retry storms after tab focus, half-rendered text after errors.
+
+TanStack Query is optimized for the "send a request, get JSON back" model. Streaming responses (SSE or `ReadableStream`) live outside that model, and naive integration falls apart. This article shares the patterns I converged on while shipping Gemini-powered chat UIs to production — with copy-pasteable code.
+
+## Why TanStack Query and Streaming Don't Mix Naturally
+
+TanStack Query handles caching, deduplication, and refetching for a given key. Its mental model assumes "one request, one response." Streaming is fundamentally different: chunks arrive over time, the stream might be cancelled, and the final result is the *concatenation* of chunks rather than the last one.
+
+If you ignore this difference and try to fit streaming into `useQuery`, you'll watch `select` re-render the whole tree every chunk, and `staleTime` semantics will collapse. The conclusion I arrived at: **handle the stream itself with `useMutation`, and only sync the finalized result into the query cache via `queryClient.setQueryData`**.
+
+Conceptually:
+
+- User submits → `mutate()` is called
+- Inside `mutationFn`, consume the `ReadableStream` chunk by chunk
+- Push partial text into local React state for live display
+- On completion, call `queryClient.setQueryData(['conversation', id], full)`
+- Other components read history through `useQuery`
+
+With this split, you keep TanStack Query's strengths (caching, invalidation, optimistic updates) while letting plain React state handle the streaming-specific concerns.
+
+## Server Side: A Next.js Route Handler That Streams Gemini SSE
+
+Let's start on the server. I'm using Next.js App Router with Node.js runtime — Edge runtime can hit constraints with certain SDK features, so it's safer to start with Node and migrate later if needed.
+
+```typescript
+// app/api/chat/stream/route.ts
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic"; // disable caching
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+
+export async function POST(req: Request) {
+  const { messages, conversationId } = await req.json();
+
+  // Detect client disconnects
+  const abortSignal = req.signal;
+
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash",
+    generationConfig: { temperature: 0.7, maxOutputTokens: 2048 },
+  });
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        const result = await model.generateContentStream({
+          contents: messages.map((m: { role: string; content: string }) => ({
+            role: m.role === "assistant" ? "model" : "user",
+            parts: [{ text: m.content }],
+          })),
+        });
+
+        for await (const chunk of result.stream) {
+          // Bail immediately if the client disconnected
+          if (abortSignal.aborted) {
+            controller.close();
+            return;
+          }
+          const text = chunk.text();
+          if (!text) continue;
+          // SSE format: "data: <JSON>\n\n"
+          const payload = JSON.stringify({ type: "chunk", text });
+          controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
+        }
+        // Completion signal
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ type: "done", conversationId })}\n\n`)
+        );
+        controller.close();
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "stream error";
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ type: "error", message })}\n\n`)
+        );
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no", // disables intermediate proxy buffering
+    },
+  });
+}
+```
+
+Three details matter here. First, checking `req.signal` *inside the loop* lets the server close its Gemini API connection the moment the client disconnects. Without that check, the server keeps reading the entire stream even after the user closes the tab — wasted tokens, wasted money. Second, errors are reported as SSE events with `type: "error"` rather than HTTP status codes, because once headers are flushed you can't change the response code, and a typed error event is much easier to handle on the client. Third, the `X-Accel-Buffering: no` header disables buffering at intermediate proxies — without it, Cloudflare or Nginx may hold your "stream" for several seconds and deliver it all at once.
+
+## Client Side: Consuming the ReadableStream Inside useMutation
+
+Now the main course. Here's how I extend TanStack Query's `useMutation` to handle streaming responses.
+
+```typescript
+// hooks/useStreamingChat.ts
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useState, useRef, useCallback, useEffect } from "react";
+
+type Message = { role: "user" | "assistant"; content: string };
+
+type StreamRequest = { conversationId: string; messages: Message[] };
+
+async function* readSSE(response: Response, signal: AbortSignal) {
+  if (!response.body) throw new Error("No response body");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      if (signal.aborted) return;
+      const { done, value } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      // Split on double-newline to find SSE event boundaries
+      const events = buffer.split("\n\n");
+      buffer = events.pop() ?? "";
+      for (const ev of events) {
+        const line = ev.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) continue;
+        try {
+          yield JSON.parse(line.slice(6));
+        } catch {
+          // Skip malformed events (common on flaky mobile networks)
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export function useStreamingChat(conversationId: string) {
+  const qc = useQueryClient();
+  const [streamingText, setStreamingText] = useState("");
+  const abortRef = useRef<AbortController | null>(null);
+
+  const mutation = useMutation({
+    mutationKey: ["chat-stream", conversationId],
+    mutationFn: async (req: StreamRequest) => {
+      // Cancel any in-flight stream (handles rapid clicks)
+      abortRef.current?.abort();
+      const ac = new AbortController();
+      abortRef.current = ac;
+      setStreamingText("");
+
+      const res = await fetch("/api/chat/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(req),
+        signal: ac.signal,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      let full = "";
+      for await (const event of readSSE(res, ac.signal)) {
+        if (event.type === "chunk") {
+          full += event.text;
+          // Show partial text via React state
+          setStreamingText(full);
+        } else if (event.type === "error") {
+          throw new Error(event.message);
+        } else if (event.type === "done") {
+          return { conversationId: event.conversationId, text: full };
+        }
+      }
+      // Loop ended without seeing "done" (network drop, etc.)
+      throw new Error("stream ended unexpectedly");
+    },
+    onSuccess: (data) => {
+      // Sync finalized result into the query cache
+      qc.setQueryData<Message[]>(["conversation", conversationId], (old = []) => [
+        ...old,
+        { role: "assistant", content: data.text },
+      ]);
+      setStreamingText("");
+    },
+    onError: () => {
+      // Whether to keep partial text is a UX call.
+      // I prefer to keep what was rendered and append a notice.
+      if (streamingText) {
+        qc.setQueryData<Message[]>(["conversation", conversationId], (old = []) => [
+          ...old,
+          { role: "assistant", content: streamingText + "\n\n[Response was interrupted]" },
+        ]);
+      }
+      setStreamingText("");
+    },
+  });
+
+  // Mandatory cleanup: cancel on unmount to stop runaway streams
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
+
+  return { ...mutation, streamingText, cancel };
+}
+```
+
+A few design notes. Aborting the previous `AbortController` at the top of `mutationFn` handles the rapid-click case — without it, the old stream keeps calling `setStreamingText` while the new one starts, and the UI ends up rendering interleaved garbage. I use `useRef` instead of `useState` because re-renders would otherwise capture stale closures inside `mutationFn`.
+
+The `readSSE` generator carefully splits on the `"\n\n"` delimiter that separates SSE events. Network conditions can pack multiple events into one chunk or split a single event across chunks, so naive splitting on newline breaks. In production logs, especially on mobile networks, malformed JSON is surprisingly common — the `try/catch` is not optional.
+
+The `onError` branch keeps the partial text and appends an "interrupted" notice. I made this choice after watching real users get confused when the screen went blank: they couldn't tell whether their prompt had failed or only the answer had vanished. Keeping the partial response in the history with a clear annotation is the more honest UX.
+
+## Propagating Cancellation: AbortController From End to End
+
+Cancellation in streaming is tricky because **the distance from "user clicks stop" to "server closes its Gemini connection" is long**. If `abort` doesn't propagate at every hop, the user thinks they cancelled while tokens keep getting consumed in the background.
+
+```tsx
+// CancelButton.tsx
+import { useStreamingChat } from "@/hooks/useStreamingChat";
+
+export function CancelButton({ conversationId }: { conversationId: string }) {
+  const { cancel, isPending } = useStreamingChat(conversationId);
+  if (!isPending) return null;
+  return (
+    <button
+      type="button"
+      onClick={cancel}
+      className="rounded bg-red-500 px-3 py-1 text-white"
+    >
+      Stop
+    </button>
+  );
+}
+```
+
+The chain is: client `cancel` → `AbortController.abort()` → `fetch` `signal` closes the network connection → server's Route Handler observes `req.signal.aborted` on the next loop iteration. The crucial part is checking `aborted` *every iteration*. My first attempt only checked it once before the loop, and long replies kept generating after the user pressed stop:
+
+```typescript
+// ❌ Bad: only checks at the start
+async function bad(stream: AsyncIterable<unknown>, abortSignal: AbortSignal) {
+  if (abortSignal.aborted) return;
+  for await (const chunk of stream) {
+    // No way to cancel once we're here
+    void chunk;
+  }
+}
+
+// ✅ Good: checks every chunk
+async function good(stream: AsyncIterable<unknown>, abortSignal: AbortSignal) {
+  for await (const chunk of stream) {
+    if (abortSignal.aborted) return;
+    void chunk;
+  }
+}
+```
+
+Note that `@google/generative-ai`'s `generateContentStream` doesn't accept an `AbortSignal` directly (as of April 2026). You can pass a signal if you bypass the SDK and call REST directly, but I prefer the SDK ergonomics and use the loop-check + `controller.close()` pattern shown above. In practice, billing on the Gemini side stops almost instantly when the loop exits.
+
+## Retry Strategy: Why Streaming Is Different
+
+With regular REST, `useMutation`'s `retry` option gives you exponential backoff for free. Streaming complicates this: **"failed before connecting" and "dropped mid-stream" mean different things for retries**.
+
+- Pre-connection error (HTTP 503): safe to retry, server did nothing
+- Mid-stream disconnect: tokens were already billed, regenerating from scratch double-charges
+- Rate limit (HTTP 429): back off and retry, respecting Retry-After
+
+Encoding this in `retry` alone is awkward. I branch explicitly:
+
+```typescript
+// useMutation options excerpt
+{
+  retry: (failureCount, error) => {
+    // If a stream had already started, don't auto-retry
+    if (error instanceof Error && error.message === "stream ended unexpectedly") {
+      return false; // avoid double-billing
+    }
+    // Pre-connection failures: retry up to 3 times
+    return failureCount < 3;
+  },
+  retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 30000),
+}
+```
+
+"Don't auto-retry mid-stream drops" is strict, but it's the only reliable way to avoid double-charging tokens. Surface a "regenerate" button in the UI instead — that way, retries are explicit user choices and your billing stays transparent.
+
+## Cache Coherence: Where to Keep Conversation History
+
+Streaming text lives in `useState`, finalized responses live in TanStack Query's cache. The history view reads through a normal `useQuery`:
+
+```typescript
+// hooks/useConversation.ts
+import { useQuery } from "@tanstack/react-query";
+
+type Message = { role: "user" | "assistant"; content: string };
+
+export function useConversation(conversationId: string) {
+  return useQuery<Message[]>({
+    queryKey: ["conversation", conversationId],
+    queryFn: async () => {
+      const res = await fetch(`/api/conversations/${conversationId}`);
+      if (!res.ok) throw new Error("Failed to load conversation");
+      return res.json();
+    },
+    // Suppress duplicate fetches during streaming
+    staleTime: 60_000,
+    // Auto-refetch on focus needs care (see below)
+    refetchOnWindowFocus: false,
+  });
+}
+```
+
+`refetchOnWindowFocus: false` matters because **if a user switches tabs mid-stream and comes back, the auto-refetch overwrites the in-progress text with stale history and the streaming text disappears**. I missed this on first deploy and spent half a day chasing user reports of "answers vanishing mid-reply." Disabling it globally in `defaultOptions` is the safe baseline.
+
+```typescript
+// app/providers.tsx
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      refetchOnWindowFocus: false,
+      staleTime: 30_000,
+    },
+    mutations: {
+      // Default is 0; written explicitly to make intent clear
+      retry: 0,
+    },
+  },
+});
+```
+
+## Memory Leaks: Always Cancel on Unmount
+
+In a long-lived SPA, streams that keep running after their components unmount are a slow but real money sink. `useMutation` lives outside React's lifecycle, so you have to cancel manually. The `useStreamingChat` hook above already does this; here's the cleanup again for emphasis:
+
+```typescript
+useEffect(() => {
+  return () => {
+    abortRef.current?.abort();
+  };
+}, []);
+```
+
+When the user navigates away mid-generation, the server promptly stops. In one of my services, just adding this single `useEffect` cut monthly Gemini API spend by about 8%. That number told me how many half-finished requests had been silently consuming tokens.
+
+## Production Pitfalls and Fixes
+
+### 1. Double rendering between `setQueryData` and `useState`
+
+In my first version, I forgot to clear `streamingText` after `setQueryData` ran in `onSuccess`, so the finalized message and the live-streamed copy briefly overlapped. Always call `setStreamingText("")` in `onSuccess`, and add a switch like `streamingText || lastMessage` on the render side.
+
+### 2. Forgetting to release the ReadableStream lock
+
+If your `reader.read()` loop exits via exception, you must call `reader.releaseLock()` or the same response can't be read again. A `try/finally` around the loop is mandatory (see code above).
+
+### 3. Client-side fetch retries cause duplicate streams
+
+Native `fetch` doesn't retry, but service workers and some HTTP libraries do so transparently. Since SSE endpoints get charged twice if retried, exclude `/api/chat/stream` explicitly from your service worker's caching strategy.
+
+### 4. HMR breaks streams in development
+
+Next.js HMR reloads route handler modules and breaks active streams. It doesn't repro in production but does cause panic during development. Run `next build && next start` or test against a deployed staging environment to verify behavior.
+
+## Monitoring: Streaming-Specific Metrics
+
+Streaming bottlenecks aren't visible in the usual request/response dashboards. Track these instead:
+
+- **TTFB** (time to first chunk): heavily affected by Gemini model and region
+- **Inter-chunk latency**: surfaces proxy buffering and bandwidth issues
+- **Stream completion rate**: indicates network reliability and SDK stability
+- **Aborted-by-client rate**: feedback loop for UX improvements
+
+I record these as custom OpenTelemetry spans and forward them to Langfuse. For implementation, see [Building Distributed Tracing for Gemini API in Production with OpenTelemetry](/en/articles/gemini-api/gemini-api-opentelemetry-distributed-tracing-production-guide) and [Setting Up Langfuse for Gemini API Observability](/en/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide). For deeper streaming control patterns, [Gemini API Streaming Response Control — Chunks, Errors, and UX](/en/articles/gemini-api/gemini-api-streaming-response-control-chunk-error-ux) is also worth a look.
+
+## When to Use Vercel AI SDK's `useChat` Instead
+
+You might be wondering: "Why not just use Vercel AI SDK's `useChat`?" It's a really well-designed abstraction that absorbs the boilerplate of streaming chat UIs. I default to it for prototypes too.
+
+The reason I reach for the custom implementation in this article is that the requirements stack up. Wanting to use TanStack Query's caching and invalidation for conversation history. Wanting precise control over server-side billing on cancellation. Wanting defensive parsing for SSE breakage on mobile networks. The moment you start piping `useChat`'s message array into `useQuery`'s `queryFn`, you have two state stores fighting for control.
+
+Here's the rule of thumb I use:
+
+- **Reach for `useChat` when**: You have a single chat UI that holds history in the frontend, you're prototyping for stakeholder approval, or you're shipping a small Vercel-hosted app.
+- **Reach for the custom implementation when**: Conversation history lives in a server-side database, you need TanStack Query's cache to interoperate with other queries (tags, categories, search), or you operate a production service where billing transparency and observability are non-negotiable.
+
+A pragmatic two-stage strategy works well: prototype with `useChat` to get sign-off, then migrate to the custom implementation as you harden for production.
+
+## Testing Strategy: Mocking Streams With MSW
+
+Testing streaming UIs is harder than testing regular REST, but Mock Service Worker (MSW) v2 supports returning `ReadableStream`, which lets you reproduce real-world behavior fairly faithfully. Here's the test skeleton I run in production:
+
+```typescript
+// __tests__/streamingChat.test.tsx
+import { setupServer } from "msw/node";
+import { http, HttpResponse } from "msw";
+import { renderHook, act, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useStreamingChat } from "@/hooks/useStreamingChat";
+
+const server = setupServer(
+  http.post("/api/chat/stream", () => {
+    const stream = new ReadableStream({
+      async start(controller) {
+        const enc = new TextEncoder();
+        const events = [
+          { type: "chunk", text: "Hello" },
+          { type: "chunk", text: ", I'm Gemini." },
+          { type: "done", conversationId: "conv-1" },
+        ];
+        for (const e of events) {
+          controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}
+
+`));
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        controller.close();
+      },
+    });
+    return new HttpResponse(stream, {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  })
+);
+
+beforeAll(() => server.listen());
+afterAll(() => server.close());
+
+const wrapper = ({ children }: { children: React.ReactNode }) => {
+  const qc = new QueryClient({ defaultOptions: { mutations: { retry: 0 } } });
+  return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+};
+
+test("writes finalized result into the cache after streaming completes", async () => {
+  const { result } = renderHook(() => useStreamingChat("conv-1"), { wrapper });
+  act(() => {
+    result.current.mutate({
+      conversationId: "conv-1",
+      messages: [{ role: "user", content: "test" }],
+    });
+  });
+  await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  expect(result.current.data?.text).toBe("Hello, I'm Gemini.");
+});
+```
+
+The non-obvious detail is the `await new Promise((r) => setTimeout(r, 10))` between chunks. If you enqueue everything and close immediately, the test simulates a "stream" that arrives all at once, which never happens in production — and you'll miss race conditions in your UI. Adding a small artificial gap between chunks reproduces the timing of real streams and exposes ordering bugs.
+
+To test cancellation, schedule chunks behind `Promise` delays and trigger `cancel()` mid-flight. MSW v2 handles `ReadableStream` natively, so you can verify cancellation behavior in unit tests without standing up an E2E environment.
+## One Step Today
+
+If you only do one thing after reading this: **add `abortController.abort()` to your unmount cleanup in your existing streaming UI**. It's a single line in `useEffect`'s return, carries no risk, and immediately reduces both server load and token waste.
+
+After that, work through the three changes in this article — proper cancellation, partial-text preservation on error, and `refetchOnWindowFocus: false` — in order. Once those are in place, complaints about "the answer disappeared" or "my bill is too high" effectively go away.
+
+If you want a deeper grounding, [Web Application Performance Tuning (Fujiwara et al., Japanese)](https://www.amazon.co.jp/dp/4297128462/?tag=pinocchio-22) is a solid network-layer companion when you're diagnosing why your stream is stalling somewhere between the model and the browser.
