@@ -1,0 +1,475 @@
+---
+title: "Gemini API × Inngest で耐障害性の高いAIワークフローを構築する本番運用ガイド"
+slug: "gemini-api-inngest-durable-workflow-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-29T10:30"
+author: "Gemini Lab"
+description: "Gemini APIのレート制限・タイムアウト・部分失敗に強い「耐障害性の高い」AIワークフローを、Inngestのdurable executionで実装する本番運用パターンを解説します。"
+tags: ["gemini-api", "inngest", "durable-execution", "workflow", "production"]
+highlights:
+  - "Gemini API の途中失敗・タイムアウト・レート制限で詰まっていた長時間ジョブを、Inngestの自動リトライとステップ単位の冪等性で安定稼働させられるようになる"
+  - "fan-out / fan-in・人間による承認待ち・スロットリング・dead-letter といった本番ワークフローのパターンを、コピペ可能なTypeScriptコードで習得できる"
+  - "コスト超過と暴走を防ぐ予算ガードレール、観測可能性、リプレイ可能なイベント駆動設計を、自社サービスに今日から組み込める"
+---
+
+「Gemini API を呼ぶ箇所まではうまくいくのに、その後の DB 書き込みや別サービスへの通知が落ちると、最初からやり直すしかない」——そんな相談を、ここ数ヶ月で何度か耳にしました。Gemini を本番に乗せる段階で多くの方がぶつかるのは、API 単体の使い方ではなく、その**前後の処理を含めた長時間ジョブを「途中で落ちても安全に再開できる」ように作る**部分です。
+
+私は個人のアプリ開発で数年前から似た問題に悩まされてきました。AdMob 連携、画像生成、サーバーレス CRON、外部 API のリトライ。試行錯誤の末、現在は [Inngest](https://www.inngest.com/) を使った durable execution（永続実行）に落ち着いています。Cloud Tasks や BullMQ と比べても、Gemini のような「途中で何が起きるか分からない外部 API」を組み込むワークフローには明確に向いている、というのが3週間ほど運用した上での率直な印象です。
+
+このガイドでは、Gemini API と Inngest を組み合わせて「落ちても再開できる」AI ワークフローを設計するための具体的なコードと、本番で必ず必要になる落とし穴の回避策を、実装例とともに整理します。コピペで動くコードを並べるので、手元のエディタを開きながら読み進めていただけたら嬉しいです。
+
+## なぜ Gemini API には durable execution が必要なのか
+
+「durable execution（永続実行）」は耳慣れない言葉ですが、要点は **「関数の途中の状態をエンジンが永続化し、失敗したステップだけを再実行できる」** という設計思想です。Inngest 以外にも Temporal や Restate が同じ思想で作られています。
+
+Gemini API を本番で叩いていると、以下のような現実によく遭遇します。
+
+- レート制限（HTTP 429）が瞬間的に発生し、リトライしないと処理が止まる
+- ストリーミングが途中で切れ、レスポンスの最後の chunk だけが届かない
+- マルチモーダル入力（動画・PDF）の解析中にタイムアウトする
+- Function Calling の戻り値を使って外部 API を叩く部分で別の障害が発生する
+
+ナイーブに `try/catch` と `setTimeout` でリトライを書くと、**リトライのたびにトークン消費が発生する**点が痛いところです。1万件の記事生成バッチで途中5,000件目で失敗したら、最初からやり直すと API コストが倍になります。これを「失敗したステップだけを再実行する」のが durable execution の本質です。
+
+Inngest を選んだ理由は次の3つです。
+
+第一に、**ステップ単位での冪等性が言語レベルで強制される**こと。`step.run('name', fn)` で囲んだ処理は、成功すれば結果がキャッシュされ、再実行時はスキップされます。Gemini API 呼び出し1回ごとに `step.run` で囲むだけで、無駄な再呼び出しを避けられます。
+
+第二に、**ローカル開発体験が良い**こと。`npx inngest-cli@latest dev` でローカルダッシュボードが起動し、実行中の関数のステップが時系列で可視化されます。Cloud Tasks のように「ローカルでは動かして本番でしか挙動が再現しない」という辛さがありません。
+
+第三に、**TypeScript ファースト**で型がしっかり効くこと。イベントペイロードの型を定義すれば、関数側で補完が効き、本番でペイロードのキー名が変わったときにビルドエラーで気づけます。
+
+## Step 1: 最小構成の Gemini × Inngest ワークフロー
+
+まずは「ユーザーから記事生成リクエストを受け付け、Gemini で本文を生成し、結果を DB に保存する」という最小フローを書きます。Next.js App Router での実装例です。
+
+依存関係は次の通りです。`@google/genai` は2026年4月時点での Gemini 公式 SDK 名で、旧 `@google/generative-ai` は非推奨になっています。
+
+```bash
+npm install @google/genai inngest
+npm install -D @types/node typescript
+```
+
+Inngest クライアントとイベント型の定義から始めます。
+
+```typescript
+// src/inngest/client.ts
+import { Inngest, EventSchemas } from "inngest";
+
+type Events = {
+  "article/generate.requested": {
+    data: {
+      userId: string;
+      topic: string;
+      lengthHint: "short" | "medium" | "long";
+      requestId: string; // 冪等性キー
+    };
+  };
+};
+
+export const inngest = new Inngest({
+  id: "gemilab-content-pipeline",
+  schemas: new EventSchemas().fromRecord<Events>(),
+});
+```
+
+`requestId` を必ず受け取る点が重要です。後段の処理で「同じリクエストに対する再試行か、別のリクエストか」を判別する基準になります。クライアント側で UUID v7 を発行する運用を私は好みます。
+
+次に Gemini を呼び出す関数を書きます。
+
+```typescript
+// src/inngest/functions/generate-article.ts
+import { GoogleGenAI } from "@google/genai";
+import { inngest } from "../client";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+export const generateArticle = inngest.createFunction(
+  {
+    id: "generate-article",
+    // 同じ userId からの並列実行を1件に制限（暴走防止）
+    concurrency: { key: "event.data.userId", limit: 3 },
+    // バックオフを伴うリトライ。Geminiの429は短期復旧することが多いため指数バックオフが効きやすい
+    retries: 4,
+  },
+  { event: "article/generate.requested" },
+  async ({ event, step, logger }) => {
+    const { topic, lengthHint, requestId } = event.data;
+
+    // ステップ1: アウトライン生成（失敗してもここだけ再実行される）
+    const outline = await step.run("generate-outline", async () => {
+      const res = await ai.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: `次のトピックの記事アウトラインをH2見出し5つで提案してください。\nトピック: ${topic}\n長さ目安: ${lengthHint}`,
+        config: { temperature: 0.4, responseMimeType: "text/plain" },
+      });
+      return res.text ?? "";
+    });
+
+    // ステップ2: 本文生成（outlineが既に得られていれば、再実行時はステップ1をスキップ）
+    const body = await step.run("generate-body", async () => {
+      const res = await ai.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: `以下のアウトラインに沿って記事本文を書いてください。\n\n${outline}`,
+        config: { temperature: 0.6, maxOutputTokens: 8000 },
+      });
+      return res.text ?? "";
+    });
+
+    // ステップ3: DB保存（外部APIなのでもちろん step.run で囲む）
+    await step.run("save-to-db", async () => {
+      await fetch(`${process.env.API_BASE_URL}/articles`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId, topic, body }),
+      });
+    });
+
+    logger.info("article generated", { requestId, topicLength: topic.length });
+    return { requestId, bodyLength: body.length };
+  },
+);
+```
+
+ここで一番伝えたいのは、**`step.run` で囲むかどうかが、本番で泣くか笑うかの分かれ道**だということです。`step.run` を外して書くと、retry のたびに最初の outline 生成からやり直されます。Gemini 2.5 Pro のトークン単価は決して安くないので、これは数日でコストの問題として顕在化します。
+
+最後に Next.js から Inngest 関数を公開します。
+
+```typescript
+// src/app/api/inngest/route.ts
+import { serve } from "inngest/next";
+import { inngest } from "@/inngest/client";
+import { generateArticle } from "@/inngest/functions/generate-article";
+
+export const { GET, POST, PUT } = serve({
+  client: inngest,
+  functions: [generateArticle],
+});
+```
+
+ローカルでは `npx inngest-cli@latest dev` を立ち上げ、`http://localhost:3000/api/inngest` を register URL として指定すれば、ダッシュボードからイベントを発火させてフローを目視で確認できます。
+
+## Step 2: fan-out / fan-in で並列処理を組む
+
+実際の本番ワークフローは「1リクエスト → 多数のサブタスク」という構造になりがちです。例えばニュース記事配信なら「100件のソースから取得 → 各記事を Gemini で要約 → まとめてダイジェストを生成」という流れです。Inngest では `step.invoke` と `Promise.all` を組み合わせて自然に書けます。
+
+```typescript
+// src/inngest/functions/digest-pipeline.ts
+import { inngest } from "../client";
+import { GoogleGenAI } from "@google/genai";
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+// 子関数: 1記事の要約
+const summarizeOne = inngest.createFunction(
+  {
+    id: "summarize-one",
+    // Geminiのレート制限に合わせて全体スループットを制御
+    throttle: { limit: 60, period: "1m", key: "event.data.modelTier" },
+    retries: 3,
+  },
+  { event: "digest/summarize.requested" },
+  async ({ event, step }) => {
+    const { url, modelTier } = event.data;
+    const html = await step.run("fetch", async () => {
+      const r = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+      return r.text();
+    });
+    const summary = await step.run("summarize", async () => {
+      const res = await ai.models.generateContent({
+        model: modelTier === "pro" ? "gemini-2.5-pro" : "gemini-2.5-flash",
+        contents: `次のHTMLから要点を3行で抽出してください:\n${html.slice(0, 50_000)}`,
+      });
+      return res.text ?? "";
+    });
+    return { url, summary };
+  },
+);
+
+// 親関数: 100件をfan-outしてfan-in
+const buildDigest = inngest.createFunction(
+  { id: "build-digest", retries: 2 },
+  { event: "digest/build.requested" },
+  async ({ event, step }) => {
+    const { urls } = event.data as { urls: string[] };
+
+    // fan-out: 子関数を並列起動して結果を待つ
+    const summaries = await Promise.all(
+      urls.map((url, i) =>
+        step.invoke(`summarize-${i}`, {
+          function: summarizeOne,
+          data: { url, modelTier: "flash" },
+        }),
+      ),
+    );
+
+    // fan-in: まとめてダイジェスト生成
+    const digest = await step.run("compose-digest", async () => {
+      const joined = summaries.map((s) => `- ${s.summary}`).join("\n");
+      const res = await ai.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: `以下の要約からニュースダイジェストを書いてください:\n${joined}`,
+      });
+      return res.text ?? "";
+    });
+
+    await step.run("publish", async () => {
+      await fetch(`${process.env.API_BASE_URL}/digest`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ digest }),
+      });
+    });
+
+    return { count: summaries.length };
+  },
+);
+
+export { summarizeOne, buildDigest };
+```
+
+ポイントは2つあります。`throttle` で「子関数全体としての毎分呼び出し回数」を制御している点と、`step.invoke` で起動した子関数が独立に retry される点です。100件のうち3件だけ Gemini が 429 を返した場合、その3件だけが再実行され、成功済みの97件は触られません。
+
+Cloud Tasks で同じことをやる場合、各タスクの状態管理を自分で DB に持つ必要があります。Inngest はそこを内部で抱え込んでくれるので、アプリ側のコードが大幅に減ります。これは私が乗り換えた最大の理由です。
+
+## Step 3: 人間による承認待ち（waitForEvent）
+
+AI 生成コンテンツの本番運用では、**「Gemini の出力をそのまま公開せず、人がチェックして承認したら次に進む」**というパターンが避けられません。Inngest の `step.waitForEvent` を使うと、最大数日単位の待機を関数の中に直接書けます。
+
+```typescript
+// src/inngest/functions/article-with-approval.ts
+import { inngest } from "../client";
+
+export const articleWithApproval = inngest.createFunction(
+  { id: "article-with-approval", retries: 2 },
+  { event: "article/generate.requested" },
+  async ({ event, step }) => {
+    // ... outline / body 生成は前述と同じ ...
+    const draftId: string = await step.run("save-draft", async () => {
+      // ドラフトを保存して draftId を返す
+      return crypto.randomUUID();
+    });
+
+    // 担当者にレビュー依頼通知（Slack等）
+    await step.run("notify-reviewer", async () => {
+      await fetch(`${process.env.SLACK_WEBHOOK}`, {
+        method: "POST",
+        body: JSON.stringify({ text: `レビュー待ち: /draft/${draftId}` }),
+      });
+    });
+
+    // 最大3日間、承認イベントを待つ
+    const approval = await step.waitForEvent("wait-approval", {
+      event: "article/approval.received",
+      timeout: "3d",
+      // 同じdraftIdに対する承認イベントだけを受け取る
+      if: `async.data.draftId == "${draftId}"`,
+    });
+
+    if (!approval) {
+      // タイムアウト: 自動却下
+      await step.run("auto-reject", async () => {
+        await fetch(`${process.env.API_BASE_URL}/draft/${draftId}/reject`, {
+          method: "POST",
+        });
+      });
+      return { status: "auto-rejected", draftId };
+    }
+
+    // 承認された: 公開処理
+    await step.run("publish", async () => {
+      await fetch(`${process.env.API_BASE_URL}/draft/${draftId}/publish`, {
+        method: "POST",
+      });
+    });
+    return { status: "published", draftId };
+  },
+);
+```
+
+`waitForEvent` の `if` 条件は、Inngest 側で評価される CEL ライクな式です。担当者が UI 上で「承認」ボタンを押したら、サーバーから `inngest.send({ name: "article/approval.received", data: { draftId } })` を発火させるだけで、関数の続きが再開します。
+
+裏側では Inngest が関数の状態を永続化しているので、3日間サーバーが再起動しても問題なく続行します。**「人を待つ処理」と「障害復旧」を同じメンタルモデルで扱える**のが durable execution の最大の利点だと感じています。
+
+## Step 4: 予算ガードレールと暴走防止
+
+Gemini API の本番運用で最も怖いのは、コスト暴走です。Function Calling のループや、無限再帰的なエージェントが原因で、一晩で数十万円の請求が来た事例を何度か見てきました。Inngest の `concurrency`・`throttle`・`rateLimit` の3つを使い分けることで、この恐怖をかなり抑え込めます。
+
+```typescript
+const safeAgent = inngest.createFunction(
+  {
+    id: "safe-agent",
+    // concurrency: 同時実行数の上限（同時に走る関数インスタンス数）
+    concurrency: [
+      { scope: "fn", limit: 50 }, // 関数全体で50並列まで
+      { scope: "fn", key: "event.data.userId", limit: 1 }, // ユーザーごとに1並列
+    ],
+    // throttle: 起動レートの上限（バーストを許容しない）
+    throttle: { limit: 30, period: "1m" },
+    // rateLimit: 重複イベントを単純に捨てる（厳しめ）
+    rateLimit: { limit: 1, period: "10s", key: "event.data.userId" },
+    retries: 3,
+  },
+  { event: "agent/run.requested" },
+  async ({ event, step }) => {
+    // 月次トークン予算をチェック
+    const used = await step.run("check-budget", async () => {
+      const r = await fetch(
+        `${process.env.API_BASE_URL}/usage/${event.data.userId}`,
+      );
+      return (await r.json()) as { tokensUsedThisMonth: number };
+    });
+
+    if (used.tokensUsedThisMonth > 5_000_000) {
+      // 予算オーバー: ここで明示的に止める
+      return { status: "budget-exceeded", used: used.tokensUsedThisMonth };
+    }
+
+    // ... 以下、Gemini呼び出し ...
+  },
+);
+```
+
+3種類の制御の使い分けは少し慣れが必要です。私は次のように覚えています。`concurrency` は「同時に走る数」、`throttle` は「単位時間あたりに起動できる数（超過分はキューに積まれる）」、`rateLimit` は「単位時間あたりに起動できる数（超過分は捨てる）」。Gemini のトークン上限を守りたいときは `throttle`、ユーザーの暴走を抑えたいときは `rateLimit` が向いています。
+
+加えて、`step.run("check-budget", ...)` で**毎回トークン使用量を確認してから Gemini を呼ぶ**設計を強く推奨します。サブスクリプションの月次予算を超えたら、ここで早期 return することで、Function Calling ループの暴走を確実に止められます。
+
+## Step 5: dead-letter と監視
+
+リトライを尽くしても失敗するイベントは必ず出ます。Inngest はデフォルトで失敗関数の状態を保持していますが、本番では **「何が・いつ・なぜ失敗したか」を別チャネルに通知する**運用を組んでおくのが安全です。
+
+```typescript
+import { NonRetriableError } from "inngest";
+
+const robustGeneration = inngest.createFunction(
+  {
+    id: "robust-generation",
+    retries: 5,
+    onFailure: async ({ event, error, step }) => {
+      // すべてのretryを使い切った後に呼ばれる
+      await step.run("notify-deadletter", async () => {
+        await fetch(`${process.env.OPS_WEBHOOK}`, {
+          method: "POST",
+          body: JSON.stringify({
+            severity: "high",
+            functionId: "robust-generation",
+            originalEvent: event,
+            error: error.message,
+          }),
+        });
+      });
+    },
+  },
+  { event: "article/generate.requested" },
+  async ({ event, step }) => {
+    try {
+      // ... Gemini処理 ...
+    } catch (e: unknown) {
+      // 4xx は retry してもムダ。即座に dead-letter へ
+      if (e instanceof Error && e.message.includes("INVALID_ARGUMENT")) {
+        throw new NonRetriableError("client error", { cause: e });
+      }
+      throw e;
+    }
+  },
+);
+```
+
+`NonRetriableError` を使い分けることが重要です。Gemini API が `400 INVALID_ARGUMENT` を返したケース（プロンプトの形式が不正）は、何度リトライしても結果は変わりません。即座に dead-letter に流して人間に判断を委ねる設計のほうが、無駄な API 課金を抑えられます。
+
+監視は OpenTelemetry に流すのが結局のところ一番楽でした。Inngest はステップごとの実行時間をスパンとして export できるので、`step.run("generate-body")` の p95 が伸びていれば、Gemini 側の遅延が増えていると即座に分かります。
+
+## よくある落とし穴と対処
+
+3週間ほど運用してきて、初めてだと必ず引っかかるであろう罠を3つ挙げておきます。
+
+**落とし穴1: `step.run` の中で `Date.now()` や `Math.random()` を使う**
+
+`step.run` の戻り値はキャッシュされます。再実行時はキャッシュからそのまま返るので、**「再実行時に値が変わる」関数を中で呼んでも意味がありません**。タイムスタンプや乱数は `step.run` の外で生成するか、`step.run` の戻り値として固定するのが正解です。
+
+```typescript
+// ❌ 間違い: 再実行時、キャッシュからtimestampが返るので「現在時刻」にならない
+await step.run("save", async () => {
+  await db.save({ value, timestamp: Date.now() });
+});
+
+// ✅ 正しい: timestampをstep.runの戻り値として固定
+const timestamp = await step.run("get-timestamp", async () => Date.now());
+await step.run("save", async () => {
+  await db.save({ value, timestamp });
+});
+```
+
+**落とし穴2: ストリーミングを `step.run` で囲む**
+
+Gemini のストリーミング API（`generateContentStream`）は、async iterator を返します。これを `step.run` の中で全部消費してから返すと、本来の利点（最初のトークンが早い）が消えます。Inngest はあくまで「バックエンドのジョブ実行基盤」と割り切り、ユーザーへのストリーミング応答は別経路（SSE / WebSocket）で実装する設計が正解です。
+
+**落とし穴3: `event.data` に巨大なペイロードを載せる**
+
+Inngest はイベントを永続化するため、`event.data` に PDF のバイナリや動画を載せると、ストレージ料金とイベントサイズ上限（デフォルト512KB）の両方で問題になります。**バイナリデータは Cloud Storage に置き、URL だけを `event.data` に入れる**のが鉄則です。Gemini Files API と組み合わせると自然に実装できます。
+
+書籍で体系的に学ぶなら、AI ワークフロー全般の設計思想は[実践入門 OpenAI APIによるLLMアプリ開発（吉田真吾）](https://www.amazon.co.jp/dp/4798070157/?tag=pinocchio-22)が、API呼び出しの周辺パターンは[実践 LLMアプリ開発入門（瀬戸口竜也）](https://www.amazon.co.jp/dp/4297143488/?tag=pinocchio-22)が参考になります。Inngest 自体ではなく、長時間ジョブ全般の考え方を整理したい方におすすめです。
+
+## 冪等性 — 見えにくいが土台となる原則
+
+Inngest の利点は、ダウンストリームの副作用が冪等でなければ大半が消えてしまいます。`step.run` の結果キャッシュは Gemini を二重に叩かないことを保証してくれますが、DB 書き込みや外部 API 呼び出しが「2回呼ばれても安全」でなければ意味がないからです。
+
+実務では3つの習慣でほとんどのケースをカバーできます。第一に、クライアントから冪等性トークンを受け取り、すべての外部呼び出しに引き継ぐこと。先ほどイベント `data` に入れていた `requestId` がまさにその役割です。第二に、Postgres なら `INSERT ... ON CONFLICT DO NOTHING`、BigQuery なら `MERGE` のように、`requestId` をキーにした書き込みにすること。第三に、Stripe や SendGrid のように外部 API がネイティブに `Idempotency-Key` ヘッダを受け付ける場合は、同じ `requestId` をそのまま渡すこと。
+
+```typescript
+const persist = await step.run("persist", async () => {
+  await db.execute(
+    `INSERT INTO articles (request_id, topic, body)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (request_id) DO NOTHING`,
+    [requestId, topic, body],
+  );
+});
+
+// Stripe API への冪等性キー付き呼び出し
+const charge = await step.run("charge", async () => {
+  return stripe.charges.create(
+    { amount: 250, currency: "jpy", source: "tok_visa" },
+    { idempotencyKey: requestId },
+  );
+});
+```
+
+データレイヤを冪等にできない場合（POST が常に新規作成を行うレガシー API など）には「claim パターン」が便利です。`step.run("claim-or-skip", ...)` を別ステップで設け、原子的にリクエストを「処理中」マークし、その戻り値で「これが初回試行か」を判別します。再実行時は `false` が返るので即座に短絡できます。
+
+## Inngest が向く場面・向かない場面
+
+Inngest は万能ではありません。Cloud Tasks と並行運用してきた経験から、私が現在使っている判断基準を共有します。
+
+Inngest を選ぶのは、Gemini を含む複数の API を呼び出す多段ワークフローで状態共有が必要な場合、人間や外部シグナルの待機が含まれる場合、ローカル開発と本番の挙動を一致させたい場合、各ジョブの実行時間が秒〜数分（時に数時間）程度の場合です。チーム全体が TypeScript を書いているなら、TS ネイティブの型安全性も大きな利点です。
+
+Cloud Tasks（または軽量キュー）を選ぶのは、各タスクが完全に独立・ステートレスな場合、すでに GCP の監視・IAM に深く投資している場合、もしくはワークフローの大半が「投げて忘れる」単発ジョブで、ステップ単位のリトライが不要な場合です。シンプルさで勝ちます。
+
+Temporal を選ぶのは、数日〜数週間に及ぶ深いステップツリーが必要な場合、複数言語 SDK（Go・Java・.NET）が必要な場合、または専任のプラットフォームエンジニアが運用に張り付けられる場合です。Temporal はより強力ですが、運用負荷も大きくなります。
+
+Gemini API のワークロード単体に限れば、私が経験した範囲で Inngest が手に負えなかったケースはありません。ただし業務プロセスが数週間に及ぶ（人間の承認が遅い、長期データ移行など）場合は Temporal のほうが向きます。
+
+## 本番投入前のチェックリスト
+
+ワークフローを本番に出す前に、以下を一通り確認してください。私が現場で見てきた障害の多くは、このリストのいずれかが抜けていたことに起因しています。
+
+- すべての外部呼び出しが個別の `step.run` に入っており、再実行時に Gemini を不必要に叩かない
+- すべてのイベントに安定した `requestId` が含まれ、ダウンストリームの書き込みがそれをキーに冪等
+- `concurrency` をユーザー（またはテナント）単位で設定し、特定顧客の暴走でトークン予算を食い潰されない
+- `throttle` を関数全体で設定し、Gemini の TPM クォータを尊重している
+- 関数冒頭で月次トークン予算をチェックし、超過時に短絡している
+- `INVALID_ARGUMENT` のような 4xx エラーで `NonRetriableError` を投げ、無駄な再試行を防いでいる
+- `onFailure` ハンドラが dead-letter を別チャネル（Slack・PagerDuty・Sentry）に送っている
+- OpenTelemetry でステップ単位のスパンを export し、レイテンシのドリフトが見える化されている
+- ローカル開発で `npx inngest-cli@latest dev` を使い、本番挙動を再現できている
+
+このリストのいずれかが抜けていると、durable execution だけでは救えない無制限のリスクを抱えたまま本番運用することになります。Inngest はあくまでシャシーであり、安全装具は別途取り付ける必要があります。
+
+## まとめ — まずローカルで小さく試す
+
+durable execution は、概念として聞くと「過剰」に感じる方が多いと思います。私自身そうでした。ですが、Gemini API を本番で叩くようになってから、「途中で落ちる前提でワークフローを設計する」発想が、結果としてコードを最も短く・予測可能にしてくれることに気づきました。
+
+最初の一歩として、上記のサンプルコードをそのまま手元に持ってきて、`npx inngest-cli@latest dev` でローカルダッシュボードを立ち上げてみてください。Gemini API キーを入れずに（モックで）でも、Inngest の挙動だけ確認できます。Function Calling のループを動かしてみて、「途中で `kill -9` してもデータが整合的に残る」ことを実感したら、もう自信を持って本番に投入できるはずです。
+
+次のステップとして、[Gemini API レート制限とクォータ管理の本番ガイド](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide)、[Gemini API リトライとサーキットブレーカーの本番設計](/articles/gemini-api/gemini-api-resilience-circuit-breaker-bulkhead-production-guide)、[Gemini API + Cloud Tasks 非同期ジョブキュー本番ガイド](/articles/gemini-dev/gemini-api-cloud-tasks-async-ai-job-queue-production-guide)を併せて読むと、durable execution と従来型キューシステムの使い分けが整理できます。

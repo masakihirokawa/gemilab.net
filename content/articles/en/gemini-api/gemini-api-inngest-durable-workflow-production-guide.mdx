@@ -1,0 +1,534 @@
+---
+title: "Gemini API × Inngest: Building Fault-Tolerant AI Workflows for Production"
+slug: "gemini-api-inngest-durable-workflow-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-29T10:30"
+author: "Gemini Lab"
+description: "A practical guide to building durable, fault-tolerant Gemini API workflows with Inngest — covering retries, fan-out/fan-in, human approval, throttling, and dead-letter patterns."
+tags: ["gemini-api", "inngest", "durable-execution", "workflow", "production"]
+highlights:
+  - "Anyone struggling with Gemini API timeouts, mid-job failures, and rate limits can now stabilize long-running pipelines using Inngest's automatic retries and step-level idempotency"
+  - "You'll learn fan-out / fan-in, human-in-the-loop approval gates, throttling, and dead-letter patterns through copy-pasteable TypeScript examples"
+  - "You'll be able to integrate budget guardrails, observability, and replayable event-driven design into your service starting today"
+---
+
+"The Gemini call itself works, but the moment a downstream DB write or notification fails, I have to start the whole job over." I've heard variations of that complaint many times in the last few months. The hard part of putting Gemini into production isn't usually the API call — it's making the surrounding long-running job **safely resumable when something halfway through fails**.
+
+I've wrestled with this myself for years across my own apps: AdMob webhooks, image-generation pipelines, serverless cron, retry-heavy third-party APIs. After plenty of trial and error, I've landed on [Inngest](https://www.inngest.com/) and durable execution. Compared to Cloud Tasks or BullMQ, it's noticeably better-suited to workflows that wrap an external API where "anything can happen mid-call" — that's been my honest experience after about three weeks of running it in production.
+
+This guide walks through concrete code for designing Gemini API workflows that survive partial failures, with practical patterns and pitfalls. The samples are copy-paste runnable, so it'll be easier to follow with an editor open.
+
+## Why Gemini API Needs Durable Execution
+
+"Durable execution" sounds like jargon, but the core idea is simple: **the engine persists the state of a function mid-run, so when something fails, only the failed step needs to be replayed**. Inngest, Temporal, and Restate all share this design. Several realities push Gemini workloads in this direction.
+
+You hit transient HTTP 429s and pause processing if you don't retry properly. Streaming gets cut off and the final chunk silently vanishes. Multimodal inputs (video, large PDFs) timeout mid-analysis. A function-calling result triggers another external API that itself fails for unrelated reasons.
+
+The naive approach — `try/catch` plus `setTimeout` — has one painful flaw: **every retry burns more tokens**. If a 10,000-item generation batch dies on item 5,000, restarting from scratch doubles your bill. Durable execution exists precisely to "replay only what failed," and that's where it earns its keep.
+
+I picked Inngest for three reasons. First, **step-level idempotency is enforced at the language level**. Anything wrapped in `step.run('name', fn)` caches its result on success and is skipped on retry. Wrapping each Gemini call in a single `step.run` is enough to prevent unnecessary re-invocations.
+
+Second, **the local dev loop is good**. `npx inngest-cli@latest dev` boots a dashboard that visualizes function steps over time. None of the "works locally, surprises in prod" friction I've felt with Cloud Tasks.
+
+Third, it's **TypeScript-first** with real type safety. Define your event payloads once and the function side gets autocomplete; mistyped fields surface as build errors instead of runtime mysteries.
+
+## Step 1: A Minimal Gemini × Inngest Workflow
+
+Let's start with the smallest realistic flow: receive an article-generation request, generate body text with Gemini, save the result. Next.js App Router setup.
+
+Dependencies. `@google/genai` is the current official Gemini SDK package as of April 2026; the older `@google/generative-ai` is deprecated.
+
+```bash
+npm install @google/genai inngest
+npm install -D @types/node typescript
+```
+
+Define the Inngest client and your event types:
+
+```typescript
+// src/inngest/client.ts
+import { Inngest, EventSchemas } from "inngest";
+
+type Events = {
+  "article/generate.requested": {
+    data: {
+      userId: string;
+      topic: string;
+      lengthHint: "short" | "medium" | "long";
+      requestId: string; // idempotency key
+    };
+  };
+};
+
+export const inngest = new Inngest({
+  id: "gemilab-content-pipeline",
+  schemas: new EventSchemas().fromRecord<Events>(),
+});
+```
+
+Always carry a `requestId`. Downstream code uses it to distinguish a retry of the same logical request from a brand-new one. I prefer minting UUID v7 client-side.
+
+Now the function that calls Gemini:
+
+```typescript
+// src/inngest/functions/generate-article.ts
+import { GoogleGenAI } from "@google/genai";
+import { inngest } from "../client";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+export const generateArticle = inngest.createFunction(
+  {
+    id: "generate-article",
+    // Cap parallelism per user to prevent runaway loops
+    concurrency: { key: "event.data.userId", limit: 3 },
+    // Exponential backoff retries — Gemini 429s usually clear within seconds
+    retries: 4,
+  },
+  { event: "article/generate.requested" },
+  async ({ event, step, logger }) => {
+    const { topic, lengthHint, requestId } = event.data;
+
+    // Step 1: outline. On retry, only the failed step replays.
+    const outline = await step.run("generate-outline", async () => {
+      const res = await ai.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: `Suggest a 5-H2 article outline for the topic.\nTopic: ${topic}\nLength: ${lengthHint}`,
+        config: { temperature: 0.4, responseMimeType: "text/plain" },
+      });
+      return res.text ?? "";
+    });
+
+    // Step 2: body. If the outline already succeeded, this resumes from here.
+    const body = await step.run("generate-body", async () => {
+      const res = await ai.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: `Write the full article body following this outline.\n\n${outline}`,
+        config: { temperature: 0.6, maxOutputTokens: 8000 },
+      });
+      return res.text ?? "";
+    });
+
+    // Step 3: persist (any external call belongs in step.run)
+    await step.run("save-to-db", async () => {
+      await fetch(`${process.env.API_BASE_URL}/articles`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId, topic, body }),
+      });
+    });
+
+    logger.info("article generated", { requestId, topicLength: topic.length });
+    return { requestId, bodyLength: body.length };
+  },
+);
+```
+
+The single most consequential thing in this file is **whether each external call is wrapped in `step.run`**. Without it, every retry re-runs outline generation from scratch. Gemini 2.5 Pro tokens are not cheap, and that bill becomes a real problem within days.
+
+Expose the function through Next.js:
+
+```typescript
+// src/app/api/inngest/route.ts
+import { serve } from "inngest/next";
+import { inngest } from "@/inngest/client";
+import { generateArticle } from "@/inngest/functions/generate-article";
+
+export const { GET, POST, PUT } = serve({
+  client: inngest,
+  functions: [generateArticle],
+});
+```
+
+Locally, run `npx inngest-cli@latest dev` and register `http://localhost:3000/api/inngest`. You can now fire test events from the dashboard and watch each step play out visually.
+
+## Step 2: Fan-Out / Fan-In with Parallel Steps
+
+Real workflows often look like "one request → many subtasks." A news pipeline might fetch 100 articles, summarize each one with Gemini, then compose a digest. With Inngest, the natural shape is `step.invoke` plus `Promise.all`.
+
+```typescript
+// src/inngest/functions/digest-pipeline.ts
+import { inngest } from "../client";
+import { GoogleGenAI } from "@google/genai";
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+// Child function: summarize one article
+const summarizeOne = inngest.createFunction(
+  {
+    id: "summarize-one",
+    // Throttle global summarization rate to respect Gemini's quota
+    throttle: { limit: 60, period: "1m", key: "event.data.modelTier" },
+    retries: 3,
+  },
+  { event: "digest/summarize.requested" },
+  async ({ event, step }) => {
+    const { url, modelTier } = event.data;
+    const html = await step.run("fetch", async () => {
+      const r = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+      return r.text();
+    });
+    const summary = await step.run("summarize", async () => {
+      const res = await ai.models.generateContent({
+        model: modelTier === "pro" ? "gemini-2.5-pro" : "gemini-2.5-flash",
+        contents: `Summarize the key points of this HTML in 3 lines:\n${html.slice(0, 50_000)}`,
+      });
+      return res.text ?? "";
+    });
+    return { url, summary };
+  },
+);
+
+// Parent function: fan-out 100 URLs and fan-in
+const buildDigest = inngest.createFunction(
+  { id: "build-digest", retries: 2 },
+  { event: "digest/build.requested" },
+  async ({ event, step }) => {
+    const { urls } = event.data as { urls: string[] };
+
+    // fan-out: launch all children in parallel
+    const summaries = await Promise.all(
+      urls.map((url, i) =>
+        step.invoke(`summarize-${i}`, {
+          function: summarizeOne,
+          data: { url, modelTier: "flash" },
+        }),
+      ),
+    );
+
+    // fan-in: compose the final digest
+    const digest = await step.run("compose-digest", async () => {
+      const joined = summaries.map((s) => `- ${s.summary}`).join("\n");
+      const res = await ai.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: `Compose a news digest from these summaries:\n${joined}`,
+      });
+      return res.text ?? "";
+    });
+
+    await step.run("publish", async () => {
+      await fetch(`${process.env.API_BASE_URL}/digest`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ digest }),
+      });
+    });
+
+    return { count: summaries.length };
+  },
+);
+
+export { summarizeOne, buildDigest };
+```
+
+Two things matter here. `throttle` controls aggregate calls-per-minute across all children, and each `step.invoke` retries independently. If 3 of 100 URLs hit a 429, only those 3 replay; the 97 successes are untouched.
+
+To do the same with Cloud Tasks, you'd track each task's state in your own database. Inngest absorbs that bookkeeping internally, which dramatically shrinks the application code. That alone was enough reason for me to switch.
+
+## Step 3: Human Approval Gates with `waitForEvent`
+
+For AI-generated content, the realistic production shape almost always involves **"don't publish Gemini output directly — let a human review and approve first."** Inngest's `step.waitForEvent` lets you block on a human action for days, right inside the function body.
+
+```typescript
+// src/inngest/functions/article-with-approval.ts
+import { inngest } from "../client";
+
+export const articleWithApproval = inngest.createFunction(
+  { id: "article-with-approval", retries: 2 },
+  { event: "article/generate.requested" },
+  async ({ event, step }) => {
+    // ...outline / body generation as in Step 1...
+    const draftId: string = await step.run("save-draft", async () => {
+      // persist draft and return draftId
+      return crypto.randomUUID();
+    });
+
+    // Notify the reviewer (Slack, email, etc.)
+    await step.run("notify-reviewer", async () => {
+      await fetch(`${process.env.SLACK_WEBHOOK}`, {
+        method: "POST",
+        body: JSON.stringify({ text: `Review needed: /draft/${draftId}` }),
+      });
+    });
+
+    // Block up to 3 days waiting for an approval event
+    const approval = await step.waitForEvent("wait-approval", {
+      event: "article/approval.received",
+      timeout: "3d",
+      // Only accept events tagged with the matching draftId
+      if: `async.data.draftId == "${draftId}"`,
+    });
+
+    if (!approval) {
+      // Timed out — auto-reject
+      await step.run("auto-reject", async () => {
+        await fetch(`${process.env.API_BASE_URL}/draft/${draftId}/reject`, {
+          method: "POST",
+        });
+      });
+      return { status: "auto-rejected", draftId };
+    }
+
+    // Approved — publish
+    await step.run("publish", async () => {
+      await fetch(`${process.env.API_BASE_URL}/draft/${draftId}/publish`, {
+        method: "POST",
+      });
+    });
+    return { status: "published", draftId };
+  },
+);
+```
+
+The `if` clause is a CEL-like expression evaluated by Inngest. When a reviewer hits "Approve" in your UI, your server fires `inngest.send({ name: "article/approval.received", data: { draftId } })` and the function resumes from where it paused.
+
+Behind the scenes, Inngest persists the function's state, so the workflow survives multi-day server restarts without trouble. The fact that you can model **"waiting for a human" and "recovering from failure"** with a single mental model is, for me, the most underrated benefit of durable execution.
+
+## Step 4: Budget Guardrails and Runaway Protection
+
+The scariest production failure mode for Gemini is cost runaway. I've seen function-calling loops and recursive agents rack up six-figure yen bills overnight. Inngest's `concurrency`, `throttle`, and `rateLimit` give you three different knobs to suppress that risk.
+
+```typescript
+const safeAgent = inngest.createFunction(
+  {
+    id: "safe-agent",
+    // concurrency: cap on simultaneously running function instances
+    concurrency: [
+      { scope: "fn", limit: 50 }, // 50 in flight globally
+      { scope: "fn", key: "event.data.userId", limit: 1 }, // 1 per user
+    ],
+    // throttle: cap on launches per period (excess is queued)
+    throttle: { limit: 30, period: "1m" },
+    // rateLimit: cap that drops duplicate events (strict)
+    rateLimit: { limit: 1, period: "10s", key: "event.data.userId" },
+    retries: 3,
+  },
+  { event: "agent/run.requested" },
+  async ({ event, step }) => {
+    // Check monthly token budget BEFORE calling Gemini
+    const used = await step.run("check-budget", async () => {
+      const r = await fetch(
+        `${process.env.API_BASE_URL}/usage/${event.data.userId}`,
+      );
+      return (await r.json()) as { tokensUsedThisMonth: number };
+    });
+
+    if (used.tokensUsedThisMonth > 5_000_000) {
+      // Over budget — short-circuit explicitly
+      return { status: "budget-exceeded", used: used.tokensUsedThisMonth };
+    }
+
+    // ... Gemini calls below ...
+  },
+);
+```
+
+The three knobs are easy to confuse. My mental shorthand: `concurrency` is "how many can run simultaneously," `throttle` is "how many can launch per window (excess waits)," `rateLimit` is "how many can launch per window (excess is dropped)." Use `throttle` to respect Gemini's token-per-minute quota, and `rateLimit` to suppress spammy users.
+
+Beyond those, I strongly recommend a `step.run("check-budget", ...)` step that **inspects current token usage before every Gemini call**. When monthly subscription budgets are exceeded, this short-circuit reliably stops function-calling loops from spiraling.
+
+## Step 5: Dead-Letter and Observability
+
+Some events will fail past every retry. Inngest preserves the failed function state by default, but in production you want **"what failed, when, and why" routed to a separate alerting channel**.
+
+```typescript
+import { NonRetriableError } from "inngest";
+
+const robustGeneration = inngest.createFunction(
+  {
+    id: "robust-generation",
+    retries: 5,
+    onFailure: async ({ event, error, step }) => {
+      // Called only after all retries are exhausted
+      await step.run("notify-deadletter", async () => {
+        await fetch(`${process.env.OPS_WEBHOOK}`, {
+          method: "POST",
+          body: JSON.stringify({
+            severity: "high",
+            functionId: "robust-generation",
+            originalEvent: event,
+            error: error.message,
+          }),
+        });
+      });
+    },
+  },
+  { event: "article/generate.requested" },
+  async ({ event, step }) => {
+    try {
+      // ... Gemini work ...
+    } catch (e: unknown) {
+      // 4xx errors won't get better with retries — fail fast
+      if (e instanceof Error && e.message.includes("INVALID_ARGUMENT")) {
+        throw new NonRetriableError("client error", { cause: e });
+      }
+      throw e;
+    }
+  },
+);
+```
+
+Use `NonRetriableError` deliberately. When Gemini returns `400 INVALID_ARGUMENT` (typically a malformed prompt), retries change nothing — route the case straight to dead-letter and let a human decide. That alone saves significant API spend over time.
+
+For metrics, I ended up routing everything to OpenTelemetry. Inngest exports per-step durations as spans, so a creeping p95 on `step.run("generate-body")` immediately suggests Gemini-side latency drift.
+
+## Common Pitfalls
+
+After three weeks of running this in production, three traps stand out as nearly universal for first-timers.
+
+**Pitfall 1: using `Date.now()` or `Math.random()` inside `step.run`**
+
+`step.run` results are cached. On retry the cached value is returned, so **anything whose value is supposed to change between runs is broken** if you compute it inside. Generate timestamps and random values once, and pass them in.
+
+```typescript
+// ❌ Wrong — on retry, "current time" is whatever was cached
+await step.run("save", async () => {
+  await db.save({ value, timestamp: Date.now() });
+});
+
+// ✅ Right — pin the timestamp via step.run's return value
+const timestamp = await step.run("get-timestamp", async () => Date.now());
+await step.run("save", async () => {
+  await db.save({ value, timestamp });
+});
+```
+
+**Pitfall 2: wrapping streaming in `step.run`**
+
+Gemini's streaming API (`generateContentStream`) returns an async iterator. Consuming the entire stream inside a `step.run` and returning the final text defeats the whole point — first-token latency disappears. Treat Inngest as the backend job orchestrator and ship the user-facing stream over a separate path (SSE / WebSocket).
+
+**Pitfall 3: stuffing huge payloads into `event.data`**
+
+Inngest persists every event, so packing PDF binaries or videos into `event.data` blows up both your storage bill and the per-event size limit (512KB by default). **Put binary blobs in cloud storage and reference them via URL in `event.data`.** This composes naturally with Gemini's Files API.
+
+If you want a deeper book-length take on AI workflow design beyond Inngest specifics, Chip Huyen's [Designing Machine Learning Systems](https://www.amazon.co.jp/dp/1098107969/?tag=pinocchio-22) covers the broader patterns of resilience, observability, and rollout that translate well to LLM workloads.
+
+## Idempotency: The Hidden Foundation
+
+Most of the value of Inngest evaporates if your downstream side-effects aren't idempotent. Caching `step.run` results protects you against re-running expensive Gemini calls, but only if the database write or external API call you're making can tolerate being seen twice on the rare second-attempt path.
+
+In practice, three habits cover the vast majority of cases. First, accept an idempotency token from the client and pipe it into every external call. The `requestId` we plumbed through the event payload above does exactly this. Second, use `INSERT ... ON CONFLICT DO NOTHING` (Postgres) or `MERGE` (BigQuery) when persisting Gemini outputs, keyed on the request id. Third, when you call a third-party API that supports idempotency keys natively — Stripe and SendGrid both do — pass the same `requestId` through their `Idempotency-Key` header.
+
+```typescript
+// src/inngest/functions/idempotent-write.ts
+const persist = await step.run("persist", async () => {
+  await db.execute(
+    `INSERT INTO articles (request_id, topic, body)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (request_id) DO NOTHING`,
+    [requestId, topic, body],
+  );
+});
+
+// Stripe call with idempotency key
+const charge = await step.run("charge", async () => {
+  return stripe.charges.create(
+    { amount: 250, currency: "usd", source: "tok_visa" },
+    { idempotencyKey: requestId },
+  );
+});
+```
+
+If your service can't be made idempotent at the data layer (legacy APIs that always create on POST, for example), fall back to a "claim" pattern: a separate `step.run("claim-or-skip", ...)` that atomically marks the request as in progress and returns a boolean indicating whether this is the first attempt. Subsequent retries see `false` and short-circuit.
+
+## When Inngest Wins, and When It Doesn't
+
+Inngest isn't always the right tool. After running it side-by-side with Cloud Tasks for a few months, here's the rough decision rule I use today.
+
+Choose Inngest when your workflow has multiple Gemini-or-other-API steps that need shared state, when waiting on humans or other long-lived signals is part of the flow, when you want strong local dev parity with production, and when the per-job logic is short-to-medium-running (seconds to minutes, occasionally hours). The TypeScript-native ergonomics matter most when your team writes everything in TS already.
+
+Choose Cloud Tasks (or another lightweight queue) when each task is fully self-contained and stateless, when you've already invested heavily in GCP observability and IAM, or when the workflow is dominated by trivial fire-and-forget jobs that don't need step-level retries. The lower-level model wins on simplicity for these cases.
+
+Choose Temporal when you need multi-day-or-week workflows with very deep step trees, when polyglot SDKs (Go, Java, .NET) matter to your team, or when you have dedicated platform engineers willing to operate it. Temporal is more powerful and more demanding to run.
+
+For Gemini API workloads specifically, I have not found a workload that Inngest couldn't handle, but I'd reach for Temporal if the orchestration crossed into business processes lasting weeks (slow human approvals, long-running data migrations).
+
+## A Production Readiness Checklist
+
+Before you ship a Gemini-Inngest workflow to production, walk through this checklist. Most outages I've seen on real services trace back to one of these missing.
+
+Each external call sits inside its own `step.run` so retries don't re-hit Gemini unnecessarily. Every event carries a stable `requestId`, and downstream writes are idempotent on it. `concurrency` is set per-user (or per-tenant) so a single misbehaving customer can't exhaust your token budget. `throttle` is set globally so the function as a whole respects Gemini's TPM quota. A monthly token budget check exists at the top of the function and short-circuits when exceeded. `NonRetriableError` is thrown on `INVALID_ARGUMENT` and other 4xx errors that won't recover. An `onFailure` handler routes dead-letter events to a separate alerting channel (Slack, PagerDuty, Sentry). Span data is exported via OpenTelemetry so step latency drift is visible. The local dev environment uses `npx inngest-cli@latest dev` so engineers can reproduce production behavior on their laptops.
+
+If any item on this list is missing, you're carrying an unbounded production risk that durable execution alone cannot save you from. Inngest is the chassis, but the safety harness still has to be installed.
+
+## Observability in Practice
+
+Day-to-day, what I actually look at in the Inngest dashboard is a small handful of charts. Step-level p50/p95 latency for `generate-body` is the most useful one — Gemini 2.5 Pro typically lands around 4-10 seconds for an 8,000-token output, and any drift above that range usually indicates an upstream issue rather than a code bug. The retry count distribution per function is the second — a sustained increase in retries usually points to a transient quota or auth problem worth investigating before it becomes a hard outage.
+
+For deeper analysis, exporting Inngest's spans into OpenTelemetry-compatible backends (Honeycomb, Grafana Tempo, or Datadog APM) lets you correlate Gemini latency with the surrounding fetch calls. The single most valuable view I built was a comparison of "time spent in `step.run('generate-body')`" against "time spent waiting for downstream DB writes," because it surfaced a slow Cloud SQL writer that had been adding seconds to every request without anyone noticing.
+
+```typescript
+import { trace } from "@opentelemetry/api";
+
+const tracer = trace.getTracer("gemilab");
+
+const summary = await step.run("summarize", async () => {
+  return tracer.startActiveSpan("gemini.generateContent", async (span) => {
+    span.setAttribute("model", "gemini-2.5-flash");
+    try {
+      const res = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: prompt,
+      });
+      span.setAttribute("output.tokens", res.usageMetadata?.totalTokenCount ?? 0);
+      return res.text ?? "";
+    } finally {
+      span.end();
+    }
+  });
+});
+```
+
+Wrapping each Gemini call in a custom OTel span gives you per-model latency and token-count metrics that the Inngest dashboard alone won't surface. This lets you make data-driven decisions like "switch to Flash for this step because the Pro variant adds 3x latency for marginal quality gain."
+
+## Testing Durable Workflows
+
+Testing Inngest functions is one of the things that surprised me in a good way. Because the function body is just a normal TypeScript function with `step` injected as a dependency, you can mock `step` and exercise each branch unit-test style. The Inngest team also ships `@inngest/test` which adds a higher-fidelity test runner.
+
+For unit tests of step branching logic, the lightest approach works well:
+
+```typescript
+// __tests__/generate-article.test.ts
+import { describe, it, expect, vi } from "vitest";
+import { generateArticle } from "../src/inngest/functions/generate-article";
+
+describe("generateArticle", () => {
+  it("invokes save-to-db only after both generation steps succeed", async () => {
+    const calls: string[] = [];
+    const fakeStep = {
+      run: vi.fn(async (name: string, fn: () => Promise<unknown>) => {
+        calls.push(name);
+        return fn();
+      }),
+    };
+    // Inject mocks for ai.models.generateContent and fetch ...
+    // Then call the underlying handler with fake event + step.
+    expect(calls).toEqual(["generate-outline", "generate-body", "save-to-db"]);
+  });
+});
+```
+
+For end-to-end tests, run `npx inngest-cli@latest dev` in a separate terminal, point your test runner at `localhost:3000/api/inngest`, and assert on the dashboard's recorded events. I keep one or two of these tests as smoke tests in CI — they catch issues like "we accidentally renamed an event payload field" that pure unit tests don't.
+
+The one thing to watch out for: tests that exercise the retry path need to deliberately throw inside `step.run` and inspect the engine's recorded retry count. Don't try to time-travel by mocking `setTimeout`. Inngest schedules retries in its own queue, so the only reliable way to test retry behavior is to actually run the dev server.
+
+## Deployment Considerations
+
+Deploying Inngest functions is mostly the same as deploying any Next.js app, but two specifics deserve mention.
+
+The `serve` handler at `/api/inngest` must be reachable from the Inngest cloud (or your self-hosted Inngest control plane). On Vercel and Cloudflare Workers this works out of the box. Behind a strict firewall, you'll either expose the endpoint through a reverse proxy or self-host the Inngest control plane. Self-hosting is documented and not painful, but it adds an operational surface.
+
+Function versioning is handled automatically based on the function's `id`. Renaming a function `id` creates a new function in Inngest's perspective, which means in-flight executions of the old version will continue under the old id while new events are routed to the new version. This is usually what you want for breaking changes — graceful drainage of old work — but it does mean you need to keep the old function deployed long enough for those runs to finish.
+
+For environment promotion (dev → staging → prod), Inngest supports per-environment signing keys and event keys. Configure `INNGEST_SIGNING_KEY` and `INNGEST_EVENT_KEY` per environment in your hosting provider's secrets. Don't share keys across environments — a bug in dev that fires production events is a common foot-gun.
+
+Finally, when scaling out, remember that durable execution shifts the bottleneck. Your code path is now bounded by Inngest's per-account concurrency limit (configurable in the dashboard), Gemini's TPM quota, and your downstream database's write throughput — usually in that order. Monitor all three; spending an afternoon raising the right limit is the cheapest performance win in this stack.
+
+## Closing Thoughts — Try It Locally First
+
+Durable execution sounds heavy on paper. I felt the same. But once Gemini went into production, designing every workflow with the assumption that "anything can fail mid-step" actually produced the shortest, most predictable code I've written.
+
+A pragmatic first step: clone the snippets above, run `npx inngest-cli@latest dev`, and watch the local dashboard. Even without a real Gemini key (mock the call), you can verify that `kill -9` mid-execution leaves the data layer consistent on resume. Once you've seen that with your own eyes — the dashboard quietly resuming a half-finished function after a kill signal, with cached step results intact and the next attempt picking up at exactly the right point — deploying durable workflows for production Gemini traffic feels far less daunting. The mental shift from 'don't let anything fail' to 'expect failure and recover gracefully' is, in my experience, the single most valuable lesson this stack teaches.
+
+For broader context, pair this with [Gemini API rate limiting and quota management — production guide](/en/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide), [Resilient Gemini API design with circuit breakers and bulkheads](/en/articles/gemini-api/gemini-api-resilience-circuit-breaker-bulkhead-production-guide), and [Gemini API + Cloud Tasks async job queue — production guide](/en/articles/gemini-dev/gemini-api-cloud-tasks-async-ai-job-queue-production-guide). Together they make it clear when durable execution wins and when a classic queue is enough.
