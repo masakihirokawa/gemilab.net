@@ -1,0 +1,226 @@
+---
+title: "Fixing 'Thoughts must be present in conversation history' in Gemini API: A Practical Guide to Thought Signatures in Multi-Turn Tool Calls"
+slug: "gemini-api-thoughts-not-present-conversation-history-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-04-29T09:15"
+author: "Gemini Lab"
+description: "If you're hitting 'Thoughts must be present in conversation history when using thinking signature' in Gemini 2.5/3.x with multi-turn function calling, this guide walks through what's actually happening and how to fix it in five minutes — Python SDK, REST, and streaming all covered."
+tags: ["troubleshooting", "thought-signatures", "thinking", "function-calling", "gemini-api"]
+---
+
+## If you've seen this error, you're not alone
+
+If you're building a multi-turn agent on Gemini 2.5 Pro or 3.x with thinking enabled, there's a good chance you've run into this:
+
+```
+google.api_core.exceptions.InvalidArgument: 400 ...
+Thoughts must be present in conversation history when using thinking signature.
+```
+
+The official docs mention it almost in passing — "include the `thought_signature` in the conversation history" — and leave you to figure out the rest. I burned half a day on this when one of my agents started failing on the second tool turn during a production rollout, so I want to save you that time.
+
+This guide covers exactly when this error fires and the smallest possible patch that fixes it. I'll show Python SDK and REST examples, and there's a streaming-specific section because that's where this bug likes to hide.
+
+## What's actually going on
+
+Gemini 2.5/3.x thinking models do internal reasoning during a function-calling turn and emit the result as `parts[].thought_signature` — a base64-encoded opaque token. That token holds encrypted state that the model needs in order to continue the same line of reasoning on the next turn.
+
+When you send your next request, you have to send the function-call part **with that signature still attached** as part of the conversation history. The model uses it to verify continuity. Strip it, and the API politely refuses to talk to you.
+
+In practice, the signature gets accidentally dropped in a handful of ways:
+
+- You pull the `function_call` out of the response and rebuild a fresh `Content` object around it.
+- You serialise responses to a custom dict shape before storing them.
+- You serialise to JSON and pass to a different language SDK that drops `null`-valued fields.
+- An older version of LangChain or LlamaIndex re-creates the `parts` array.
+
+The common cause: you did too much work on the response object. The fix is almost always to do less.
+
+A useful mental model: think of `thought_signature` as a chain-of-custody seal on the model's reasoning. As long as the seal travels with the function-call part it was attached to, the model can pick up where it left off. Once the seal is removed, that piece of reasoning becomes inadmissible — the API has no way to verify continuity, so it refuses the turn rather than silently producing a worse answer. That framing made the error feel less arbitrary to me, and it points the debugger straight at the layers that touch `parts[]`.
+
+## The fix in one line
+
+Here's the minimum working pattern with the `google-genai` Python SDK:
+
+```python
+import os
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+tools = [{
+    "function_declarations": [{
+        "name": "get_weather",
+        "description": "Returns the current weather for a city.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"city": {"type": "STRING"}},
+            "required": ["city"],
+        },
+    }]
+}]
+
+config = types.GenerateContentConfig(
+    tools=tools,
+    thinking_config=types.ThinkingConfig(thinking_budget=1024),
+)
+
+# Turn 1
+contents = [types.Content(
+    role="user",
+    parts=[types.Part.from_text(text="What's the weather in Tokyo right now?")],
+)]
+res1 = client.models.generate_content(
+    model="gemini-2.5-pro", contents=contents, config=config,
+)
+
+# This single line is the whole fix:
+contents.append(res1.candidates[0].content)
+
+# Run the tool and feed the result back in
+fc = res1.candidates[0].content.parts[0].function_call
+tool_result = {"city": fc.args["city"], "temp_c": 18, "summary": "Sunny"}
+
+contents.append(types.Content(
+    role="user",
+    parts=[types.Part.from_function_response(name=fc.name, response=tool_result)],
+))
+
+# Turn 2 (signature is preserved, so this succeeds)
+res2 = client.models.generate_content(
+    model="gemini-2.5-pro", contents=contents, config=config,
+)
+print(res2.text)
+# Expected: "Tokyo is sunny and 18C right now." or similar
+```
+
+The whole story is in `contents.append(res1.candidates[0].content)`. By appending the response's `Content` object verbatim — instead of unpacking it and rebuilding — every part keeps its `thought_signature` automatically.
+
+## The pattern that breaks it
+
+This is the lookalike code that triggers the error every time:
+
+```python
+# Bad: extracting just the function_call and rebuilding the Content
+fc = res1.candidates[0].content.parts[0].function_call
+contents.append(types.Content(
+    role="model",
+    parts=[types.Part(function_call=fc)],  # signature gets dropped here
+))
+```
+
+The fix is the same one-liner:
+
+```python
+# Good
+contents.append(res1.candidates[0].content)
+```
+
+If your code persists conversation history to Redis or disk as JSON, double-check the serialiser. Pydantic's `model_dump_json(exclude_none=True)` will drop fields it considers absent, and that has bitten more than one team. I switched to `exclude_none=False` and it's been stable since. When this error reappears unexpectedly, the serialisation layer is usually where I look first.
+
+## Streaming: aggregate every chunk
+
+If you're consuming responses with `generate_content_stream`, appending only the last chunk almost guarantees this error. You need to collect every part across every chunk and rebuild a single `Content` for history.
+
+```python
+final_parts = []
+function_call = None
+
+for chunk in client.models.generate_content_stream(
+    model="gemini-2.5-pro", contents=contents, config=config,
+):
+    if not chunk.candidates or not chunk.candidates[0].content.parts:
+        continue
+    for part in chunk.candidates[0].content.parts:
+        final_parts.append(part)  # don't filter — collect everything
+        if part.function_call:
+            function_call = part.function_call
+
+contents.append(types.Content(role="model", parts=final_parts))
+```
+
+In Gemini 3.x I've seen `thought_signature` arrive on intermediate chunks rather than the final one. Skipping any chunk's parts will silently delete it, and you won't know until the very next request fails. If your streaming agent is the one throwing this error, audit the chunk loop first.
+
+## REST API: same idea, watch your jq filters
+
+If you're hitting `generateContent` directly with curl or fetch, the rule is identical: take `candidates[0].content` from the response and drop it as-is into your next request's `contents` array.
+
+```bash
+RESP1=$(curl -s \
+  -H "x-goog-api-key: $GEMINI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d @req1.json \
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent")
+
+MODEL_TURN=$(echo "$RESP1" | jq '.candidates[0].content')
+jq --argjson m "$MODEL_TURN" '.contents += [$m] | .contents += [{
+  "role": "user",
+  "parts": [{"functionResponse": {"name": "get_weather", "response": {"temp_c": 18}}}]
+}]' req1.json > req2.json
+```
+
+One additional REST-specific tip: when you log requests for debugging, log the original JSON payload rather than a "pretty-printed" version that drops empty fields. I have lost an hour to a logging library that pruned `null` siblings of `thoughtSignature` and made the corresponding production payloads look identical to the broken ones.
+
+If you happen to run something like `jq 'del(.candidates[0].content.parts[].thoughtSignature)'` to "clean up" the response — even just to make logs more readable — congratulations, you've reproduced this bug. Keep `thoughtSignature` in the JSON you send back.
+
+## Reproducing it locally in 30 seconds
+
+If you want to confirm whether your code path is the one stripping signatures, here is a tiny self-contained reproduction that you can drop into a scratch file. It deliberately rebuilds the model turn the wrong way to make the error fire predictably.
+
+```python
+import os
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+tools = [{"function_declarations": [{
+    "name": "lookup",
+    "description": "Look up a value by key.",
+    "parameters": {"type": "OBJECT", "properties": {"key": {"type": "STRING"}}, "required": ["key"]},
+}]}]
+config = types.GenerateContentConfig(
+    tools=tools,
+    thinking_config=types.ThinkingConfig(thinking_budget=512),
+)
+
+contents = [types.Content(role="user", parts=[types.Part.from_text(text="Look up alpha please.")])]
+res = client.models.generate_content(model="gemini-2.5-pro", contents=contents, config=config)
+fc = res.candidates[0].content.parts[-1].function_call
+
+# Comment out ONE of these to flip between broken and working
+# contents.append(res.candidates[0].content)             # Working
+contents.append(types.Content(role="model", parts=[types.Part(function_call=fc)]))  # Broken
+
+contents.append(types.Content(
+    role="user",
+    parts=[types.Part.from_function_response(name=fc.name, response={"value": 42})],
+))
+
+client.models.generate_content(model="gemini-2.5-pro", contents=contents, config=config)
+```
+
+Run once with the broken append active and you should see the 400 within seconds. Switch the comment, rerun, and the second turn returns a normal text response. If your real codebase passes this minimal repro but still throws in production, you can be reasonably confident the issue is in serialisation, retry, or streaming — not in the basic call shape.
+
+## Checklist when nothing above works
+
+A few less common causes worth ruling out:
+
+- **SDK version.** Use `google-genai>=1.0.0`. The legacy `google-generativeai` package is EOL and won't receive thinking-mode fixes.
+- **Thinking budget set to 0.** With `thinking_budget=0`, no signature is emitted, so the error disappears — but you also lose the entire benefit of thinking. If you didn't intend to disable it, set a positive budget.
+- **Old LangChain or LlamaIndex.** Both libraries reconstruct `parts` internally; older releases dropped signatures. Upgrade to the version that explicitly mentions thought signatures in its changelog.
+- **Mixing Vertex AI and Google AI Studio.** Signatures are scoped to the endpoint that issued them. A history captured against Studio will be rejected by Vertex AI and vice versa. Keep a conversation entirely on one endpoint.
+- **Retry layers reusing partial state.** If your retry middleware rebuilds the request rather than re-sending the original payload, it can strip the signature. Retry the original `contents` verbatim.
+
+The Vertex/Studio mismatch in particular is easy to overlook during a production migration. If you're switching environments, plan to start fresh conversations rather than carrying history across.
+
+## Wrapping up
+
+Strip away the noise and this error reduces to one habit: append the response `content` to your history without modifying it. Hold to that and roughly nine out of ten cases of "thoughts not present" disappear. The remaining cases almost always live in streaming aggregation or a Vertex/Studio mix-up — work those two before suspecting anything more exotic.
+
+If you're still untangling other tool-calling issues, the symptom-by-symptom guide at [Gemini Function Calling Not Working: Complete Troubleshooting Guide](/en/articles/gemini-api/gemini-function-calling-not-working-troubleshooting) covers the surrounding territory. For agents that get stuck repeating the same call, see [Fixing Tool-Calling Infinite Loops in Gemini API](/en/articles/gemini-api/gemini-api-tool-calling-infinite-loop-troubleshooting).
+
+If you want to step back and design the long-running side of agent state more deliberately, [Implementing Domain-Driven Design (Vaughn Vernon)](https://www.amazon.co.jp/dp/4814401973/?tag=pinocchio-22) is a solid grounding in passing state between long-lived participants — useful framing for thinking-state continuity even though it predates LLM agents.
