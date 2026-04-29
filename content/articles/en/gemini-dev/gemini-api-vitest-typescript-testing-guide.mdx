@@ -1,0 +1,248 @@
+---
+title: "Testing Gemini API with Vitest — Mock Patterns and Function Calling Verification for TypeScript Projects"
+slug: "gemini-api-vitest-typescript-testing-guide"
+category: "gemini-dev"
+level: "intermediate"
+premium: false
+date: "2026-04-29T12:30"
+author: "Gemini Lab"
+description: "Practical patterns for testing TypeScript code that calls the Gemini API, using Vitest. Covers SDK mocking, Function Calling verification, and streaming response tests, drawn from a setup I run in personal projects."
+tags:
+  - "gemini-api"
+  - "vitest"
+  - "typescript"
+  - "testing"
+  - "mock"
+  - "function-calling"
+---
+
+## I changed one line of a prompt and production responses quietly broke
+
+This actually happened in one of my side projects. I tweaked the system instruction on a review-summarization function from "three bullet points" to "three points by importance," and silently lost the closing sentence of every summary for several days before I noticed. There were plenty of regression-testing articles for Pytest, but surprisingly few examples of doing the same on the TypeScript side. I ended up writing the harness on the spot.
+
+This article is a cleanup of that harness. If you're using Vitest with the `@google/generative-ai` SDK, here's what I've found works for keeping Gemini-calling code easy to refactor: the mocking shape, the Function Calling tests, the streaming tests, in roughly the order I'd build them up.
+
+I'm assuming you've been writing TypeScript with Gemini for a few weeks to a few months and want to lay down testing foundations before things grow further. The patterns are equally usable in team settings as a starting point.
+
+## Why Vitest, from a solo developer's perspective
+
+Jest can do all of this too. I still reach for Vitest first in TypeScript-and-ESM projects, for three reasons.
+
+First, ESM support is uncomplicated. Modern SDKs like `@google/generative-ai` are ESM-first, and Jest tends to need careful `transform` configuration to keep up. Vitest mostly just runs. Second, if your project already uses Vite (Astro, SvelteKit, Remix), Vitest shares the configuration. Third, Vitest starts up quickly. Tests that touch Gemini are slower than pure-logic tests, so a leaner runner gives you back a non-trivial amount of time over a working day.
+
+There are good reasons to keep Jest. React Native projects, or any codebase with a lot of Jest-specific tooling, aren't worth migrating just for this. The patterns below port to Jest with minimal edits — substitute `jest.fn` and `jest.mock` and you're mostly done.
+
+## Setup — the smallest config that works
+
+Install Vitest and the SDK:
+
+```bash
+npm install -D vitest @vitest/coverage-v8
+npm install @google/generative-ai
+```
+
+The configuration can stay tiny:
+
+```ts
+// vitest.config.ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "node",
+    globals: true,
+    coverage: { provider: "v8" },
+  },
+});
+```
+
+To stop tests from accidentally hitting the real Gemini API, I overwrite the API key in a setup file:
+
+```ts
+// tests/setup.ts
+process.env.GOOGLE_GENERATIVE_AI_API_KEY = "test-key-not-real";
+```
+
+Add `setupFiles: ["tests/setup.ts"]` under `test` in the config. Even if your `.env` has a real key, the setup file wins, so you can run the suite in CI without burning quota.
+
+## Mocking the SDK module — the first test you should write
+
+The first thing I want to lock down isn't the response text. It's that my wrapper function calls the SDK with the right arguments. The contents of the response are the model's responsibility; the call site is mine.
+
+`vi.mock` at the module level handles this cleanly. Here's a thin wrapper around Gemini:
+
+```ts
+// src/summarize.ts
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+export async function summarizeReview(text: string) {
+  const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GENERATIVE_AI_API_KEY!);
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  const result = await model.generateContent({
+    contents: [{ role: "user", parts: [{ text }] }],
+    generationConfig: { temperature: 0.2, maxOutputTokens: 200 },
+  });
+  return result.response.text();
+}
+```
+
+And the test:
+
+```ts
+// tests/summarize.test.ts
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const generateContent = vi.fn();
+vi.mock("@google/generative-ai", () => {
+  return {
+    GoogleGenerativeAI: vi.fn().mockImplementation(() => ({
+      getGenerativeModel: () => ({ generateContent }),
+    })),
+  };
+});
+
+import { summarizeReview } from "../src/summarize";
+
+beforeEach(() => {
+  generateContent.mockReset();
+});
+
+describe("summarizeReview", () => {
+  it("passes temperature 0.2 and the user text correctly", async () => {
+    generateContent.mockResolvedValue({
+      response: { text: () => "1. Fast shipping\n2. Matches description\n3. Good value" },
+    });
+
+    const out = await summarizeReview("The product was excellent.");
+
+    expect(generateContent).toHaveBeenCalledTimes(1);
+    const arg = generateContent.mock.calls[0][0];
+    expect(arg.generationConfig.temperature).toBe(0.2);
+    expect(arg.contents[0].parts[0].text).toContain("excellent");
+    expect(out).toMatch(/shipping/);
+  });
+});
+```
+
+The key discipline: don't pin the response text with strict equality. The model decides the wording, so use `toMatch` for keywords you'd reasonably expect. Pin the *input* — the call shape — and snapshot it from there. That's where most of the long-term value is.
+
+## Testing Function Calling — fixing the contract, not the model's choice
+
+When you write Function-Calling code, it's tempting to assert that "the model picked tool X." Don't. That depends on the model, and your tests will flake. I split it into two layers instead: was the tool definition assembled correctly, and once the tool returns, does my loop continue as expected.
+
+The definition side, with no model calls at all:
+
+```ts
+// tests/tools.test.ts
+import { describe, it, expect } from "vitest";
+import { buildSearchTools } from "../src/tools";
+
+describe("buildSearchTools", () => {
+  it("includes 'query' as a required parameter on the search tool", () => {
+    const tools = buildSearchTools();
+    const fn = tools[0].functionDeclarations[0];
+    expect(fn.name).toBe("search_products");
+    expect(fn.parameters.required).toContain("query");
+  });
+});
+```
+
+The continuation side uses chained `mockResolvedValueOnce` calls. Function Calling in Gemini comes back as a "use this tool" response, then a follow-up response after you provide the tool result, so two stages is the natural shape:
+
+```ts
+generateContent
+  .mockResolvedValueOnce({
+    response: {
+      functionCalls: () => [{ name: "search_products", args: { query: "tshirt" } }],
+      text: () => "",
+    },
+  })
+  .mockResolvedValueOnce({
+    response: { text: () => "Recommended: Tshirt A, B, C.", functionCalls: () => [] },
+  });
+```
+
+This way, even if the model changes its mind in production, the tool assembly and your control flow remain pinned. When something breaks, you can tell prompt drift apart from a code bug — which is the whole reason we're writing these tests.
+
+## Streaming responses — mocking AsyncIterable
+
+For code that uses `generateContentStream`, the mock needs to return an `AsyncIterable`. I tripped on this the first time, so here's the template I keep around:
+
+```ts
+async function* fakeStream(chunks: string[]) {
+  for (const c of chunks) {
+    yield { text: () => c };
+  }
+}
+
+generateContentStream.mockResolvedValue({
+  stream: fakeStream(["Hello", ", ", "world"]),
+});
+```
+
+Your call site presumably consumes this with `for await` and concatenates. Assert that the joined output is `"Hello, world"`. To test mid-stream errors, define a generator that throws partway through and inject that instead — your error-handling path gets coverage for free.
+
+## Pin the prompt as a contract using snapshots
+
+The cheapest regression check for prompts is `expect(prompt).toMatchSnapshot()`. Treat the prompt string itself as a versioned asset.
+
+```ts
+import { describe, it, expect } from "vitest";
+import { buildReviewPrompt } from "../src/prompt";
+
+describe("buildReviewPrompt", () => {
+  it("freezes the shape of the review-summary prompt", () => {
+    const p = buildReviewPrompt({ productName: "Tshirt A", review: "loved it" });
+    expect(p).toMatchSnapshot();
+  });
+});
+```
+
+When you intentionally change the prompt, run `vitest -u` to update the snapshot. When you didn't intend to, the diff shows up in the PR, and the reviewer catches it. It also raises the visibility of prompts as code: they're not just strings to twiddle, they're contracts.
+
+If you want to push beyond shape into output quality, the Pytest-side article [Don't break your Gemini prompts: regression testing patterns with Pytest](/articles/gemini-api/gemini-api-prompt-regression-testing-pytest-guide) covers an LLM-as-Judge layer over the same idea. The two-tier approach maps directly onto Vitest.
+
+## Should it fail CI, or just warn? — the practical split
+
+A small operational note. I treat code-side tests (tool assembly, streaming concatenation, error handling) as hard CI gates. They're deterministic, so red means broken, full stop.
+
+Snapshot tests on prompts I run as warnings only for the first few weeks. Updating the snapshot is on the PR author and reviewer, not the CI gate. That separates "I want to iterate on this prompt" from "I want to merge today," which keeps prompt refactors from feeling expensive. As things stabilize, tighten gradually.
+
+The same gradual approach applies to the mock layer. Module-level mocking via `vi.mock` (the setup in this article) is the right starting point. As production traffic gets serious, MSW at the HTTP layer becomes more durable across SDK upgrades. Don't pay for that complexity until the project is around to benefit.
+
+## A note on test data — keep fixtures small and named
+
+One small habit that's paid off for me: store test inputs as named fixtures, not inline strings. After the second or third test that involves "a Japanese review with a typo" or "a review that mentions a delivery problem," it gets hard to remember which one you're looking at when a snapshot diffs.
+
+```ts
+// tests/fixtures/reviews.ts
+export const reviewWithDeliveryComplaint =
+  "Item is fine, but it took two weeks to arrive even though shipping was paid extra.";
+
+export const reviewWithMixedSentiment =
+  "Material is much better than expected. The color is way off from the photos though.";
+```
+
+Importing these by name into tests makes the intent of each assertion legible at a glance, which is when you're debugging a flaky test at the end of the day. It also makes it easier to grow a small bank of "interesting cases" — edge cases I want every new prompt revision to be tested against — over time.
+
+The same pattern applies on the mock side. If you have several scenarios where the model "calls a tool, then returns text," extract the helper:
+
+```ts
+function mockToolThenAnswer(toolName: string, args: object, finalText: string) {
+  generateContent
+    .mockResolvedValueOnce({
+      response: { functionCalls: () => [{ name: toolName, args }], text: () => "" },
+    })
+    .mockResolvedValueOnce({
+      response: { text: () => finalText, functionCalls: () => [] },
+    });
+}
+```
+
+Three or four of these helpers cover most of what I write in day-to-day Gemini tests. They're not glamorous, but they make the test suite a place future-me actually wants to come back to.
+
+## Start by pinning the call shape, nothing more
+
+Thanks for reading this far. Tests can grow without limit, so the version I keep recommending for solo projects is small: write one test that fixes "what arguments does my code pass to `generateContent`," and stop there for now. With that pinned, when you iterate on prompts, you can always tell whether a regression is in your code or in the prompt itself — and that single split saves more time than any other test you'll add.
+
+If you want a broader view of what to test for, [Test-Driven Development by Example by Kent Beck](https://www.amazon.co.jp/dp/B077D2L69C/?tag=pinocchio-22) holds up well as a foundation. It's not AI-specific, but it gives you a clear sense of "what am I actually trying to protect with this test," which is the question that matters most when models are in the loop.
