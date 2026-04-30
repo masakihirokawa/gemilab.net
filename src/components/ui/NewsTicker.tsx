@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GOOGLETV — Google TV に Gemini 本格展開、Nano Banana・Veo を TV から起動して画像/動画生成（4/29）",
-    "PHOTOSEARCH — Google Photos が Gemini 検索に対応、自然言語で写真をテレビから即座に発見（4/29）",
-    "ROBOTICSEND — gemini-robotics-er-1.5-preview が 4/30 9AM PST にシャットダウン、後継版へ移行を（4/30）",
-    "GMVEHICLES — GM 車4百万台に Gemini 展開、Cadillac/Chevrolet/Buick/GMC の2022年式以降が対象（4/28）",
-    "FLASH3GA — Gemini 3 Flash 一般提供開始、SWE-bench 78% で 3 Pro を上回る効率性とコストを実現",
-    "PERSONAL — Personal Intelligence が AI Pro / AI Ultra 加入者に米国 Web/Android/iOS で順次提供開始",
+    "GEMINI31PRO — Gemini 3.1 Pro 開発者プレビュー開始、ARC-AGI-2 で 77.1% を達成し推論性能が 3 Pro の 2 倍以上に（4月）",
+    "FLASHTTS — Gemini 3.1 Flash TTS 公開、70 言語以上対応のプロンプト制御可能な表現豊かな音声合成（4月）",
+    "AISTUDIO — Google AI Pro / Ultra 加入者の AI Studio 利用枠が大幅拡大、Nano Banana Pro まで標準アクセス（4/20）",
+    "NANOBANANA2 — Nano Banana 2（Gemini 3.1 Flash Image）が Gemini アプリ・Search AI Mode・Lens のデフォルト画像エンジンに",
+    "EMBEDDING — gemini-embedding-2-preview 公開、テキスト・画像・動画・音声・PDF を扱う初の本格マルチモーダル埋め込み",
+    "APPLEDEAL — Apple × Google 提携で Siri に Gemini を採用、WWDC 2026 で刷新版が発表予定（6/8〜6/12）",
   ],
   en: [
-    "GOOGLETV — Gemini comes to Google TV with Nano Banana and Veo, generate images and videos from your couch (4/29)",
-    "PHOTOSEARCH — Google Photos gains Gemini search on Google TV, find memories in seconds with natural language (4/29)",
-    "ROBOTICSEND — gemini-robotics-er-1.5-preview shuts down on 4/30 at 9AM PST, migrate to the production successor (4/30)",
-    "GMVEHICLES — Gemini rolls out to ~4M GM vehicles (Cadillac/Chevrolet/Buick/GMC, 2022 and later) (4/28)",
-    "FLASH3GA — Gemini 3 Flash GA delivers Pro-grade reasoning at Flash speed, hits 78% on SWE-bench Verified",
-    "PERSONAL — Personal Intelligence rolls out to Google AI Pro and AI Ultra subscribers across Web, Android, and iOS in the US",
+    "GEMINI31PRO — Gemini 3.1 Pro enters developer preview hitting 77.1% on ARC-AGI-2, more than double 3 Pro reasoning (Apr)",
+    "FLASHTTS — Gemini 3.1 Flash TTS lands with 70+ languages and prompt-controlled expressive speech (Apr)",
+    "AISTUDIO — Google AI Pro and Ultra subscribers get higher AI Studio limits and Nano Banana Pro access (4/20)",
+    "NANOBANANA2 — Nano Banana 2 (Gemini 3.1 Flash Image) becomes the default image engine across Gemini app, Search AI Mode, and Lens",
+    "EMBEDDING — gemini-embedding-2-preview launches as the first true multimodal embedding model (text, image, video, audio, PDF)",
+    "APPLEDEAL — Apple partners with Google to power Siri with Gemini, revamped Siri expected at WWDC 2026 (Jun 8-12)",
   ],
 };
 
