@@ -1,0 +1,321 @@
+---
+title: "Vertex AI Agent Engine × Gemini 2.5 Pro — 本番運用エージェントのマネージドデプロイ完全ガイド"
+slug: "vertex-ai-agent-engine-gemini-production-deployment-guide"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-05-01T04:50"
+author: "Gemini Lab"
+description: "Vertex AI Agent Engine に Gemini 2.5 Pro ベースのエージェントを本番デプロイする実装ガイド。Cloud Run との違い、セッション管理、ツール呼び出し、Trace、コスト設計まで網羅。"
+tags: ["Vertex AI", "Agent Engine", "Gemini 2.5 Pro", "ADK", "production", "Google Cloud"]
+highlights:
+  - "Cloud Run に手動でエージェントを載せて運用が崩れた経験がある人が、マネージドな代替パターンを今日手に入れられる"
+  - "セッション・ツール・トレースが分散して困っていた構成を、Agent Engine の単一ランタイムに集約できる"
+  - "本番でエージェントの応答品質と運用コストを両立する具体的な設計判断（モデル選定・Memory Bank・スケール）を獲得できる"
+---
+
+エージェント開発のローカル実装が動き出したあと、本番環境に持っていく段階で多くのチームが失速します。Cloud Run に Flask で包んでデプロイし、Redis でセッションを持ち、Cloud Logging で何とかトレースを追う — 動くことは動きますが、エージェントが3〜4本に増えた瞬間に運用負荷が破綻します。私もこのパターンで2回ほど痛い目を見ました。
+
+Vertex AI Agent Engine は、この「ローカルでは動くのに本番が辛い」を埋めるためのマネージドランタイムです。本記事では、Gemini 2.5 Pro を頭脳に持つ ADK ベースのエージェントを Agent Engine にデプロイし、セッション・ツール・トレース・スケールまでを一貫した運用基盤に乗せるまでの設計と実装を、コード付きで解説します。
+
+## Agent Engine が解決する本番運用の3つの課題
+
+Agent Engine を「単なる Cloud Run の置き換え」と捉えると価値を見失います。Agent Engine は、エージェント特有の3つの本番課題を吸収するためにつくられたマネージドサービスです。
+
+ひとつ目は、長時間応答とストリーミングです。エージェントは Function Calling とモデル推論を多段に繰り返すため、平均応答時間が10秒を超えることが珍しくありません。Cloud Run でリクエスト/レスポンス型のエージェントを動かすと、ロードバランサのタイムアウトやコネクション切断との戦いになります。Agent Engine は Streaming RPC を前提にした設計で、`stream_query` メソッドで途中状態を逐次返せるようになっています。
+
+ふたつ目は、状態の持ち回りです。会話履歴・ツール結果・中間思考のいずれを残すかは設計判断ですが、これを Redis や Firestore に手動で書き分けると、リプレイ・監査・A/B テストのときに必ず破綻します。Agent Engine は Sessions API と Memory Bank を一体で提供し、永続的な会話履歴と長期記憶を分離して扱えます。
+
+みっつ目は、可観測性です。エージェントは LLM 呼び出し・ツール呼び出し・サブエージェント呼び出しが入れ子になるため、通常のリクエストログでは因果関係が追えません。Agent Engine は OpenTelemetry 互換のトレースを Cloud Trace に自動で送り出すため、`stream_query` 一発で全レイヤーのスパンが結合されたタイムラインが取れます。
+
+> 関連記事: [Gemini API オブザーバビリティ本番運用ガイド](/articles/gemini-api/gemini-api-observability-production-monitoring) では、Agent Engine 以外のスタックでオブザーバビリティを構築する手順をまとめています。Agent Engine が向かないユースケースの判断材料としても役立ちます。
+
+## Agent Builder / ADK / Agent Engine の使い分け
+
+Google Cloud には似た名前のエージェント関連プロダクトが3つあり、混乱しやすい部分です。私が現場で運用する際の判断軸を共有しておきます。
+
+- **Vertex AI Agent Builder**: ノーコード/ローコードのエージェント設計キャンバス。データソースを GUI で接続し、社内 FAQ ボットを2〜3時間で立てたい場合に最適です。詳細は [Vertex AI Agent Builder 入門ガイド](/articles/gemini-dev/vertex-ai-agent-builder) を参照してください。
+- **Agent Development Kit（ADK）**: Python/TypeScript でエージェントの振る舞いをコードとして定義するフレームワーク。テスト・バージョン管理・複数エージェント協調が必要なプロダクションコードに向きます。
+- **Vertex AI Agent Engine**: ADK や LangChain で書いたエージェントを「マネージドサービスとして稼働させる」ランタイム。Agent Builder が「設計する場所」、ADK が「コードを書く場所」、Agent Engine が「動かし続ける場所」と理解すると整理しやすいです。
+
+私個人の判断基準としては、エージェントの定義をコードでバージョン管理したい・複数チームで分担したい・本番で計装したい場合は ADK + Agent Engine の組み合わせを選びます。社内ツールのプロトタイプや、ビジネス側のメンバーが直接更新するボットには Agent Builder が向いています。
+
+## 環境準備とプロジェクト設定
+
+Agent Engine のデプロイには Vertex AI と Cloud Storage の API、それから IAM の設定が必要になります。デプロイ実行時にいきなり権限エラーで止まると進捗が消えるので、最初にまとめて整えておくのが得策です。
+
+```bash
+# プロジェクトの初期設定 — 一度きりの実行で OK
+PROJECT_ID="your-gcp-project-id"
+LOCATION="us-central1"   # Agent Engine 利用可能リージョン
+BUCKET_URI="gs://${PROJECT_ID}-agent-engine-staging"
+
+gcloud config set project "$PROJECT_ID"
+gcloud services enable aiplatform.googleapis.com storage.googleapis.com
+gcloud storage buckets create "$BUCKET_URI" --location="$LOCATION" 2>/dev/null || true
+
+# サービスアカウントに最小権限を付与
+SA_EMAIL=$(gcloud iam service-accounts list \
+  --filter="email~^service-.*@gcp-sa-aiplatform.iam.gserviceaccount.com$" \
+  --format="value(email)" | head -1)
+
+for ROLE in roles/aiplatform.user roles/storage.objectAdmin roles/logging.logWriter; do
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="$ROLE" --condition=None >/dev/null
+done
+
+echo "✅ Agent Engine 用環境を初期化しました"
+# 期待出力: ✅ Agent Engine 用環境を初期化しました
+```
+
+ここで重要なのは「Agent Engine がローカルファイルを直接デプロイしない」点です。エージェントのソースコードは一度 Cloud Storage にアップロードされ、そこからマネージドコンテナに展開されます。`BUCKET_URI` は staging 専用に切ったほうが、後からアーティファクトの世代管理がやりやすくなります。
+
+`pip install --upgrade google-cloud-aiplatform[agent_engines,adk]>=1.71` で SDK を入れたら、認証は `gcloud auth application-default login` で済ませます。ローカルとデプロイ後で同じコードが走るのが Agent Engine の強みなので、ローカル動作確認の段階で `vertexai.init()` まで通しておくとつまずきません。
+
+## ADK エージェントを Agent Engine にデプロイする最小実装
+
+ここからが本題です。ADK で書いた Gemini 2.5 Pro ベースのエージェントを、Agent Engine に載せて公開 API として呼び出せるところまでをコードで示します。
+
+```python
+# agent_app.py — ADK で定義し、Agent Engine にデプロイするエージェント本体
+import vertexai
+from vertexai import agent_engines
+from vertexai.preview.reasoning_engines import AdkApp
+from google.adk.agents import Agent
+from google.adk.tools import google_search
+
+PROJECT_ID = "your-gcp-project-id"
+LOCATION = "us-central1"
+STAGING_BUCKET = "gs://your-gcp-project-id-agent-engine-staging"
+
+vertexai.init(project=PROJECT_ID, location=LOCATION, staging_bucket=STAGING_BUCKET)
+
+# 1) エージェントの定義
+research_agent = Agent(
+    name="research_assistant",
+    model="gemini-2.5-pro",
+    description="信頼できる一次情報を引用しながら短くまとめるアシスタント",
+    instruction=(
+        "あなたは技術記事の編集者です。回答は3段落以内、引用元 URL を必ず含めてください。"
+        "不確かな場合は推測せず『一次情報が見つかりませんでした』と返答してください。"
+    ),
+    tools=[google_search],
+)
+
+# 2) ローカル動作確認 — デプロイ前に必ず通す
+app = AdkApp(agent=research_agent, enable_tracing=True)
+
+if __name__ == "__main__":
+    try:
+        for event in app.stream_query(
+            user_id="local-debug",
+            message="Gemini 2.5 Pro の context caching の最低トークン数を教えてください",
+        ):
+            print(event.get("content", {}).get("parts", [{}])[0].get("text", ""), end="")
+    except Exception as exc:
+        # ローカル段階で失敗した場合は API キー・課金・リージョンを必ず確認
+        print(f"\n[error] local run failed: {exc}")
+        raise
+
+# 期待出力（要約）:
+# Gemini 2.5 Pro の context caching は実質的に約 4,096 トークン以上の入力で
+# 有効化されます。引用元: https://ai.google.dev/...
+```
+
+ローカルで動作したらデプロイです。`agent_engines.create()` を呼ぶと裏でコンテナイメージがビルドされ、マネージドエンドポイントが立ち上がります。所要時間は5〜10分です。
+
+```python
+# deploy_agent.py — Agent Engine への本番デプロイ
+import os
+import time
+import vertexai
+from vertexai import agent_engines
+from agent_app import research_agent
+
+vertexai.init(
+    project=os.environ["GCP_PROJECT_ID"],
+    location="us-central1",
+    staging_bucket=os.environ["STAGING_BUCKET"],
+)
+
+try:
+    remote_app = agent_engines.create(
+        agent_engine=research_agent,
+        requirements=[
+            "google-cloud-aiplatform[agent_engines,adk]>=1.71",
+            "google-adk>=0.4",
+        ],
+        display_name="research-assistant-v1",
+        description="編集部向けリサーチアシスタント (gemini-2.5-pro)",
+    )
+    print(f"✅ deployed: resource_name={remote_app.resource_name}")
+except Exception as exc:
+    # 代表的なエラー: PermissionDenied / FailedPrecondition / 5xx
+    # → サービスアカウントの IAM、課金有効化、staging bucket の存在を確認
+    print(f"❌ deploy failed: {type(exc).__name__}: {exc}")
+    raise
+
+# 5〜10分後にデプロイ完了。同じスクリプトで疎通テストを回す
+for event in remote_app.stream_query(
+    user_id="ci-smoke-test",
+    message="自己紹介を1段落でしてください。",
+):
+    print(event.get("content", {}).get("parts", [{}])[0].get("text", ""), end="")
+
+# 期待出力:
+# resource_name=projects/.../reasoningEngines/123456789
+# 私は技術記事の編集者として動作するリサーチアシスタントです...
+```
+
+最初のデプロイが成功すると、`projects/{project}/locations/us-central1/reasoningEngines/{id}` という固有のリソース名が払い出されます。これが本番呼び出しのキーになるので、Secret Manager か `.env` で必ず管理してください。デプロイ毎に ID が変わる構成にしてしまうと、フロントエンドのリリースと同期が取れなくなります。
+
+## セッション管理 — Sessions API と Memory Bank を使い分ける
+
+Agent Engine の真価は、ここから発揮されます。素の Cloud Run であれば、会話履歴を Redis や Firestore に詰めるロジックを自前で書く必要がありますが、Agent Engine は二段構えのストアを最初から提供しています。
+
+Sessions API は、ひとつのスレッドの会話履歴を保持する短期メモリです。`stream_query` を呼び出すたびに `session_id` を渡せば、同じセッションの履歴を自動で連結してくれます。
+
+```python
+from vertexai import agent_engines
+
+remote_app = agent_engines.get("projects/.../reasoningEngines/123456789")
+
+# 既存セッションを再利用 — UI 側で session_id を保持しておく設計が前提
+session = remote_app.create_session(user_id="user-7821")
+
+try:
+    for event in remote_app.stream_query(
+        user_id="user-7821",
+        session_id=session.id,
+        message="先ほどの記事案を、初心者向けの語り口に書き直してください",
+    ):
+        chunk = event.get("content", {}).get("parts", [{}])[0].get("text", "")
+        print(chunk, end="")
+except Exception as exc:
+    # 代表的な落とし穴: session_id を user_id 違いで渡すと NotFound になる
+    print(f"\n[error] session run failed: {exc}")
+    raise
+```
+
+Memory Bank は、複数セッションをまたいでユーザー固有の長期事実を蓄積する仕組みです。たとえば「このユーザーは関西弁の語尾を好む」「業界は医療機器」のような恒久プロファイルを保存して、毎セッションで自動的にコンテキストへ差し込めます。
+
+私の判断としては、UI のチャットスレッドに紐付くものは Sessions、ユーザーに紐付く嗜好や禁忌は Memory Bank、と二分するのが運用しやすいです。Memory Bank に会話履歴をまるごと突っ込むと、要約の質が劣化したり、PII の取り扱いが複雑になったりします。
+
+> 個人的に効いたパターン: PII を含む可能性のある発話は事前にレッダクションしてから Memory Bank に書き戻す。詳細は [Gemini API PII レダクションと監査ログ](/articles/gemini-api/gemini-api-pii-redaction-audit-logging-production-guide) で扱っています。
+
+## ツール呼び出しと外部 API 連携の本番設計
+
+エージェントが価値を生むのはツール呼び出しの瞬間です。とはいえ、ローカルで動いた `tools=[my_function]` をそのまま本番で使えるかというと、そう単純ではありません。
+
+ツール側で外部 SaaS を叩くなら、まず VPC とアウトバウンド経路を確認します。Agent Engine は基本的にマネージド環境のパブリックネットワークから外部に出るため、許可リストにオフィス IP しか入っていないツールは即座に失敗します。本番に乗せる前に、Cloud NAT 経由で固定 IP を取るか、API ゲートウェイを挟むかを決めておくべきです。
+
+エラー設計も重要です。私は次の3層を必ず分けます。
+
+- **ツール側で吸収するエラー**: タイムアウトやレート制限など、リトライで解決する一次エラー。`tenacity` などで `2^n` の指数バックオフを 3 回まで。
+- **エージェントに返すエラー**: ツール側で構造化された `{ "status": "error", "reason": "..." }` を返し、Gemini に意思決定をさせる。
+- **ユーザーに返すエラー**: ツールの内部詳細はユーザーには見せず、「外部サービスが応答しないので別の手段を試します」のように要約された応答に変換する。
+
+```python
+# tools/jira_query.py — 構造化エラーを返すツールの例
+import time
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+def _fetch(url: str, token: str) -> dict:
+    res = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    res.raise_for_status()
+    return res.json()
+
+def fetch_jira_ticket(ticket_id: str) -> dict:
+    """Jira チケットの概要を返す。失敗時はエージェントが意思決定可能な形で返す。"""
+    try:
+        return {
+            "status": "ok",
+            "data": _fetch(f"https://example.atlassian.net/rest/api/3/issue/{ticket_id}",
+                           token=os.environ["JIRA_TOKEN"]),
+        }
+    except requests.HTTPError as e:
+        # 4xx はリトライしても回復しないため即時返却
+        return {"status": "error", "reason": f"http_{e.response.status_code}"}
+    except requests.RequestException:
+        return {"status": "error", "reason": "network_unavailable"}
+
+# 期待出力（成功時）:
+# {"status": "ok", "data": {"key": "PROJ-123", "fields": {...}}}
+# 期待出力（失敗時）:
+# {"status": "error", "reason": "http_404"}
+```
+
+エージェント側の `instruction` には、`status == "error"` を観測した場合の振る舞いを必ず明記します。「ツールが失敗した場合はユーザーに状況を伝え、代替手段を提案する」と書いておくと、ハルシネーションでツール結果を捏造する事故が減ります。
+
+## Cloud Trace で因果関係を一気に追う
+
+Agent Engine の `enable_tracing=True` を有効にしておくと、`stream_query` ごとにルートスパンが切られ、その下に LLM 呼び出し・ツール呼び出し・サブエージェントのスパンが入れ子で並びます。Cloud Trace の UI で開けば、500 ms 単位で「どこに時間を食われているか」が一目瞭然です。
+
+私が現場で必ずチェックするのは次の3点です。
+
+- **ツール呼び出しの待機時間**: 全体の半分以上をツール待ちが占めるなら、まずキャッシュかバッチング可能な箇所を探します。
+- **モデルのトークン入力長**: コンテキストが膨れている場合、過去ターンの要約戦略を見直します。素の履歴を全部突っ込むと、3〜5ターン目から指数関数的にコストが伸びます。
+- **連鎖した Function Calling の段数**: 3段以上連鎖していたら、エージェントの責務分割を疑います。サブエージェント化したほうが Trace も読みやすくなります。
+
+ログ側では、`google.cloud.logging.Client().setup_logging()` を呼んでおくと、ADK が出力するイベントが構造化ログとして自動で Cloud Logging に流れます。Severity と `trace` 属性で絞れるので、後追い障害解析が一気に楽になります。
+
+## よくある落とし穴と回避策
+
+ここからは、私や周囲が実際にハマって時間を溶かした典型例をまとめます。新規にデプロイする方は、最初から避けられるとうれしい部分です。
+
+ひとつ目は、「Cloud Run 感覚で `requirements.txt` を巨大にしてしまう」ケースです。Agent Engine は依存をデプロイ時にインストールしますが、ビルド時間がそのまま増え、デプロイのたびに5分以上待たされます。エージェント本体に不要な Web フレームワークや GUI ライブラリは外しましょう。
+
+ふたつ目は、「ローカルではうまく動くツールが本番で 503 を返す」ケースです。多くの場合、Agent Engine のサービスアカウントに対象 API への権限が降りていないことが原因です。ツールから別の Google Cloud API を叩くなら、`roles/aiplatform.user` だけでは足りません。各 API ごとに必要な IAM を割り当てる必要があります。
+
+みっつ目は、「Memory Bank に大量の生ログを書き込んで、検索結果が劣化する」ケースです。Memory Bank はベクター検索で関連事実を持ち出す設計なので、生のチャットログを丸ごと入れるとノイズが増えて検索精度が落ちます。要約済みの恒久プロファイルだけを書き込むようにしてください。
+
+よっつ目は、「`session_id` の取り回しを誤って会話が混線する」ケースです。`user_id` を端末固有 ID にしてしまうと、同じユーザーが別端末でログインしたときに履歴を見失います。`user_id` はアプリのユーザー ID、`session_id` はチャットスレッド単位、と粒度を分けて管理してください。
+
+いつつ目は、「Agent Engine のリージョンを Gemini モデルと違うリージョンに置いてしまう」ケースです。クロスリージョン呼び出しで遅延と料金が増え、最悪 quota error になります。デプロイ時に `LOCATION` を `us-central1` に揃えるのが安全策です。
+
+> Cloud Run でエージェントを動かしているチームから移行する際の判断基準は、[Gemini API × Cloud Run 従量課金 SaaS 完全ガイド](/articles/gemini-api/gemini-api-cloud-run-usage-based-saas-complete-guide) と本記事を読み比べてもらうのが早いと思います。
+
+## コスト設計と運用のベストプラクティス
+
+Agent Engine の料金は、ベースとなるコンピュートの稼働時間と、エージェントから呼ぶ Gemini API のトークン課金に分かれます。Cloud Run と違ってコールドスタートを意識する必要は少ないものの、放置すると意外と請求書が膨らみます。
+
+私が現場で守っているガイドラインは次の3つです。
+
+- **`gemini-2.5-flash` をデフォルトに、`gemini-2.5-pro` は明示的に切り替える**: ルーティングや要約は Flash で十分な品質が出ます。Pro は推論や長文の要約・コード生成に絞ると、トークン単価で 3〜5 倍の節約になります。
+- **`thinking_budget` を必ず設定する**: 推論モードを有効にする場合は、`thinking_budget=2048` のように上限を切っておきます。無制限で走らせるとトークンが青天井になり、本番事故の温床です。詳細は [Gemini 2.5 thinking budget 最適化ガイド](/articles/gemini-api/gemini-25-thinking-budget-optimization-guide) を参照してください。
+- **Sessions/Memory Bank の TTL を運用ポリシーで決める**: 90 日以上前のセッションは要約だけ残して破棄する、Memory Bank は四半期ごとに棚卸しする、といった運用ルールを最初に決めておくと、後から手戻りが発生しません。
+
+技術書では、エージェントの設計思想からテスト戦略までを横断的に押さえている [LLMアプリ開発の教科書（巣籠悠輔）](https://www.amazon.co.jp/dp/4297143836/?tag=pinocchio-22) が、Agent Engine の哲学を理解する助けになります。Agent Engine 固有の話題ではありませんが、エージェント設計の基礎体力をつけたい人にはおすすめです。
+
+## Agent Engine が向かないケース
+
+最後に、誤解されがちな「Agent Engine を使わないほうがよい場面」もはっきり書いておきます。最適でない選択をすると、コスト増・カスタムが効かない・ローカルで再現できない、といった見えにくい痛みになりがちだからです。
+
+ツール呼び出しが少なく、シンプルなリクエスト/レスポンスで完結するエージェントなら、Cloud Functions や薄い Cloud Run のほうが運用が軽くなります。マネージド機能の旨味は「会話的・多段・状態あり・観測必須」の4条件を満たしたときに最大化されます。
+
+サブ秒のレイテンシ要件があり、ツール呼び出しもほとんどない用途も別の選択肢の出番です。1ショットの分類や要約は、Cloud Functions に置いた方が単価でも素直です。
+
+完全に独自のネットワーク経路（特定のサブネットからの送出など）を要求される場合も、自前の Cloud Run + Serverless VPC Connector の方が制御しやすいです。Agent Engine の egress はマネージドなので、Cloud NAT で固定 IP を取るところまでが上限と捉えてください。
+
+## 参考アーキテクチャ — 編集アシスタントの実例
+
+抽象論を1つ具体例に落とすと、私が小さなメディアで2回ほど稼働させた「編集アシスタント」のアーキテクチャは次のような形です。
+
+フロントエンドは Next.js で、チャットスレッドごとにクライアント状態として `session_id` を保持します。ブラウザは内部 API ルートを叩き、認証済みユーザーから `user_id` を解決した上で Agent Engine に `stream_query` を投げます。ストリーミングもツール呼び出しも Memory Bank も、すべてランタイム側で処理されます。
+
+エージェント側は3つのサブエージェントを使い分けるオーケストレータ構成です。`google_search` と Wikipedia ツールでソースを集める「リサーチ係」、Gemini 2.5 Pro に thinking budget=2,048 を与えて要約する「ライター係」、出力をスクリーニングする「セーフティ係」。各サブエージェントはそれぞれ独立した ADK エージェントで、親エージェントは Function Calling で構造化的に振り分けます。
+
+状態は Sessions と Memory Bank の二段で素直に分離します。Sessions API にはチャットスレッドの履歴、Memory Bank には「Oxford comma を使う」「『unlock』『unleash』のような誇張表現を嫌う」のような編集者ごとの恒久プロファイル。ライター係はその両方を毎ターン参照するため、編集者が毎回スタイルガイドを書き直す必要がなくなります。
+
+可観測性については、Cloud Trace のスパンに `publication`, `editor_id`, `route` のタグを必ず仕込みます。これがインシデントレビューで効きます。「品質が落ちた」というクレームが届いたとき、特定の編集者だけの現象なのか全体なのかを `editor_id` で即座にフィルタできるからです。
+
+このパターンを使ったプロジェクトは、編集者1人あたり1日5ドル前後で安定しており、運用インターフェースは Resource Name 1つと小さな Terraform モジュールだけです。Agent Engine を選ぶ価値は、こういう運用密度を確保しやすい点にあります。
+
+## まとめ — 次の一歩
+
+Agent Engine は、エージェントを「動かし続ける」ための最も標準的な選択肢になりつつあります。今日試すなら、まず手元の小さな ADK エージェントを `agent_engines.create()` で1本デプロイし、Cloud Trace で `stream_query` のスパンを眺めるところから始めてください。10 分後には、「自前で Cloud Run + Redis + 自作トレースを組んでいた頃に何を頑張っていたのか」が見えてくるはずです。
+
+ADK 自体の作法を深掘りしたい方は [Gemini 2.5 Pro × ADK 永続アシスタント本番ガイド](/articles/gemini-advanced/gemini-25-pro-adk-persistent-assistant-production-guide) を、エージェント間の境界設計に踏み込みたい方は [Google ADK マルチエージェント本番アーキテクチャ](/articles/gemini-advanced/google-adk-multiagent-architecture-production-masterclass) を続けて読むと、Agent Engine への移行がより滑らかになります。

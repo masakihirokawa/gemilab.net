@@ -1,0 +1,364 @@
+---
+title: "Vertex AI Agent Engine × Gemini 2.5 Pro — A Production Deployment Guide for Managed Agents"
+slug: "vertex-ai-agent-engine-gemini-production-deployment-guide"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-05-01T04:50"
+author: "Gemini Lab"
+description: "Deploy ADK-based agents powered by Gemini 2.5 Pro on Vertex AI Agent Engine. Covers the trade-offs vs Cloud Run, sessions, tool calls, tracing, and a realistic cost model."
+tags: ["Vertex AI", "Agent Engine", "Gemini 2.5 Pro", "ADK", "production", "Google Cloud"]
+highlights:
+  - "If you have shipped an agent on Cloud Run and watched ops collapse as it grew, you'll learn a managed alternative you can apply today"
+  - "You'll consolidate scattered sessions, tools, and tracing into a single Agent Engine runtime"
+  - "You'll come away with concrete production decisions — model selection, Memory Bank usage, scaling — to balance quality and cost"
+---
+
+Most teams I've worked with hit a wall when moving an agent from a notebook to production. The pattern is familiar: wrap the agent in Flask, push it to Cloud Run, persist sessions in Redis, and try to piece together traces from Cloud Logging. It works — until you have three or four agents and the operational load buckles under its own weight. I've personally fallen into this trap twice.
+
+Vertex AI Agent Engine is Google's managed runtime designed for exactly that gap between "works on my machine" and "runs reliably in production." This guide walks through deploying an ADK agent powered by Gemini 2.5 Pro to Agent Engine, with a focus on the design decisions — sessions, tools, tracing, and scaling — that determine whether your service stays healthy six months in.
+
+## The Three Production Problems Agent Engine Solves
+
+It's tempting to think of Agent Engine as a fancier Cloud Run. That framing misses the point. Agent Engine exists because agents have three operational characteristics that ordinary HTTP services don't.
+
+The first is long, streaming responses. A real agent makes multiple LLM calls, executes tools, and waits on external services — average response times north of ten seconds are common. Standard request/response infrastructure on Cloud Run forces you to fight load balancer timeouts and dropped connections. Agent Engine is built around a streaming RPC model: you call `stream_query` and receive intermediate events, not a single blob at the end.
+
+The second is state. Should the conversation history live in Redis? Firestore? A bespoke append-only log? You can build any of these by hand, but the moment you need to replay, audit, or A/B test, the seams show. Agent Engine ships with two complementary stores out of the box: Sessions API for short-lived chat threads and Memory Bank for durable user-level facts. Keeping these separated from day one pays off massively when compliance or growth force a redesign.
+
+The third is observability. Agents nest LLM calls inside tool calls inside sub-agent calls. Plain access logs cannot reconstruct causality. Agent Engine emits OpenTelemetry-compatible spans to Cloud Trace automatically, so a single `stream_query` produces a coherent timeline that includes model latency, tool latency, and child agent latency in one view.
+
+> Related: [Production Observability for the Gemini API](/articles/gemini-api/gemini-api-observability-production-monitoring) covers how to assemble similar visibility outside Agent Engine — useful as a comparison for decisions about when to migrate.
+
+## Agent Builder vs ADK vs Agent Engine
+
+Google Cloud has three similarly named agent products, and the names hide important differences. Here is the heuristic I use on real projects.
+
+- **Vertex AI Agent Builder** is a no-code/low-code design canvas. You connect data sources through the UI, drop in tools, and ship an internal FAQ bot in a couple of hours. The companion piece is the [Vertex AI Agent Builder Quickstart](/articles/gemini-dev/vertex-ai-agent-builder).
+- **Agent Development Kit (ADK)** is a Python or TypeScript framework that lets you express agent behavior as code. Use it when you need version control, automated tests, or multi-agent collaboration.
+- **Vertex AI Agent Engine** is the managed runtime that hosts ADK or LangChain agents. Agent Builder is "where you design," ADK is "where you write code," and Agent Engine is "where it runs in production."
+
+In practice, I reach for ADK + Agent Engine whenever the agent needs to be code-reviewed, tested in CI, or owned by an engineering team. Agent Builder is the right call for prototypes and tools that business users will edit themselves.
+
+## Setting Up Your Project
+
+Agent Engine deployments touch Vertex AI, Cloud Storage, and IAM. Half the deployment failures I've seen come from missing one of these. It pays to script the setup once and re-run it whenever a new project comes online.
+
+```bash
+# One-time project setup
+PROJECT_ID="your-gcp-project-id"
+LOCATION="us-central1"   # Agent Engine is region-pinned; pick once and stay
+BUCKET_URI="gs://${PROJECT_ID}-agent-engine-staging"
+
+gcloud config set project "$PROJECT_ID"
+gcloud services enable aiplatform.googleapis.com storage.googleapis.com
+gcloud storage buckets create "$BUCKET_URI" --location="$LOCATION" 2>/dev/null || true
+
+SA_EMAIL=$(gcloud iam service-accounts list \
+  --filter="email~^service-.*@gcp-sa-aiplatform.iam.gserviceaccount.com$" \
+  --format="value(email)" | head -1)
+
+for ROLE in roles/aiplatform.user roles/storage.objectAdmin roles/logging.logWriter; do
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="$ROLE" --condition=None >/dev/null
+done
+
+echo "✅ Agent Engine environment is ready"
+# Expected output: ✅ Agent Engine environment is ready
+```
+
+A subtle but important detail: Agent Engine never deploys local files directly. Your agent source is staged through Cloud Storage and then unpacked into the managed container. Keeping a dedicated bucket for staging makes generation tracking easier later — there is real value in being able to point at a specific artifact when an incident lands on your desk.
+
+Install the SDK with `pip install --upgrade "google-cloud-aiplatform[agent_engines,adk]>=1.71"`, then authenticate using `gcloud auth application-default login`. One of the wins of Agent Engine is that the same code runs locally and in the managed runtime. Always exercise `vertexai.init()` from your laptop first — that single step removes a surprising number of "deploy completed but the agent fails" incidents.
+
+## Minimal Deployment of an ADK Agent
+
+Here is the core of the workflow: an ADK agent powered by Gemini 2.5 Pro, deployed to Agent Engine and reachable as a managed endpoint.
+
+```python
+# agent_app.py — the agent definition shared by local runs and the deployed service
+import vertexai
+from vertexai import agent_engines
+from vertexai.preview.reasoning_engines import AdkApp
+from google.adk.agents import Agent
+from google.adk.tools import google_search
+
+PROJECT_ID = "your-gcp-project-id"
+LOCATION = "us-central1"
+STAGING_BUCKET = "gs://your-gcp-project-id-agent-engine-staging"
+
+vertexai.init(project=PROJECT_ID, location=LOCATION, staging_bucket=STAGING_BUCKET)
+
+# 1) Define the agent
+research_agent = Agent(
+    name="research_assistant",
+    model="gemini-2.5-pro",
+    description="Concise research assistant that always cites primary sources",
+    instruction=(
+        "You are a technical editor. Reply in three paragraphs at most and always "
+        "include source URLs. If primary information is not available, say so "
+        "explicitly rather than guessing."
+    ),
+    tools=[google_search],
+)
+
+# 2) Smoke test locally — never skip this step
+app = AdkApp(agent=research_agent, enable_tracing=True)
+
+if __name__ == "__main__":
+    try:
+        for event in app.stream_query(
+            user_id="local-debug",
+            message="What is the minimum input size that activates context caching for Gemini 2.5 Pro?",
+        ):
+            print(event.get("content", {}).get("parts", [{}])[0].get("text", ""), end="")
+    except Exception as exc:
+        # Local failures usually mean missing keys, billing, or wrong region
+        print(f"\n[error] local run failed: {exc}")
+        raise
+
+# Expected output (abridged):
+# Context caching for Gemini 2.5 Pro becomes effective starting around 4,096 input tokens.
+# Source: https://ai.google.dev/...
+```
+
+If the local run is healthy, deploy it. Calling `agent_engines.create()` builds the container image behind the scenes and stands up a managed endpoint. Expect five to ten minutes for the first deployment.
+
+```python
+# deploy_agent.py — promoting the agent to Agent Engine
+import os
+import vertexai
+from vertexai import agent_engines
+from agent_app import research_agent
+
+vertexai.init(
+    project=os.environ["GCP_PROJECT_ID"],
+    location="us-central1",
+    staging_bucket=os.environ["STAGING_BUCKET"],
+)
+
+try:
+    remote_app = agent_engines.create(
+        agent_engine=research_agent,
+        requirements=[
+            "google-cloud-aiplatform[agent_engines,adk]>=1.71",
+            "google-adk>=0.4",
+        ],
+        display_name="research-assistant-v1",
+        description="Editorial research assistant powered by gemini-2.5-pro",
+    )
+    print(f"✅ deployed: resource_name={remote_app.resource_name}")
+except Exception as exc:
+    # Common failures: PermissionDenied, FailedPrecondition, transient 5xx
+    # Check IAM, billing, and that your staging bucket actually exists
+    print(f"❌ deploy failed: {type(exc).__name__}: {exc}")
+    raise
+
+# Five to ten minutes later, run a smoke test against the managed endpoint
+for event in remote_app.stream_query(
+    user_id="ci-smoke-test",
+    message="Introduce yourself in a single short paragraph.",
+):
+    print(event.get("content", {}).get("parts", [{}])[0].get("text", ""), end="")
+
+# Expected output:
+# resource_name=projects/.../reasoningEngines/123456789
+# I am a research assistant designed to help with technical editorial work...
+```
+
+The first successful deployment hands you a stable resource name in the form `projects/{project}/locations/us-central1/reasoningEngines/{id}`. Treat this as a long-lived configuration value: store it in Secret Manager or your environment file. If your build pipeline rotates the ID on every deploy, your front end will eventually fall out of sync and you will spend an afternoon debugging it. (Ask me how I know.)
+
+## Sessions API and Memory Bank — Two Stores, Two Purposes
+
+Agent Engine begins to feel like a real platform once you wire up state. The runtime offers two complementary stores instead of forcing you to roll your own.
+
+Sessions API is the short-lived store for an individual chat thread. Pass the same `session_id` to consecutive `stream_query` calls and the runtime stitches together history automatically. Most importantly, you don't have to invent a serialization format for tool results — that already happens for you.
+
+```python
+from vertexai import agent_engines
+
+remote_app = agent_engines.get("projects/.../reasoningEngines/123456789")
+
+# Reuse an existing session — the UI is responsible for tracking session_id
+session = remote_app.create_session(user_id="user-7821")
+
+try:
+    for event in remote_app.stream_query(
+        user_id="user-7821",
+        session_id=session.id,
+        message="Rewrite the previous draft in a beginner-friendly tone.",
+    ):
+        chunk = event.get("content", {}).get("parts", [{}])[0].get("text", "")
+        print(chunk, end="")
+except Exception as exc:
+    # Frequent foot-gun: passing a session_id under the wrong user_id returns NotFound
+    print(f"\n[error] session run failed: {exc}")
+    raise
+```
+
+Memory Bank is the long-lived store. It accumulates user-level facts that should survive across sessions: preferred tone, industry, restricted topics, and so on. Agent Engine retrieves these via vector search on each query and injects the relevant entries into the model's context.
+
+The cleanest split I've found is to use Sessions for thread-scoped chat history and Memory Bank for user-scoped preferences. Pushing entire conversation transcripts into Memory Bank degrades retrieval quality and complicates PII handling.
+
+> One pattern I've found durable: redact potentially sensitive content before writing it to Memory Bank. The mechanics are covered in [PII Redaction and Audit Logging for the Gemini API](/articles/gemini-api/gemini-api-pii-redaction-audit-logging-production-guide).
+
+## Designing Tool Calls for Production
+
+Agents earn their keep at the moment they call tools. The naive path — drop a Python function into `tools=[my_function]` and ship — only works in demos. Here is what changes when the same agent runs on Agent Engine in front of real users.
+
+If your tool reaches an external SaaS, audit the network path first. Agent Engine's outbound traffic comes from a managed pool of public IPs. If the upstream API allows traffic only from your office IP, calls will fail immediately. Decide up front whether to route through Cloud NAT for a stable IP or place an API gateway in between.
+
+Error handling deserves a layered design. I always split it into three:
+
+- **Errors absorbed inside the tool**: timeouts and rate limits worth retrying. I lean on `tenacity` with three exponential backoff attempts.
+- **Errors returned to the agent**: structured payloads such as `{ "status": "error", "reason": "..." }` so Gemini can decide how to respond.
+- **Errors surfaced to the user**: never leak internal stack traces. Translate them into "the upstream service is unavailable; let me try a different approach."
+
+```python
+# tools/jira_query.py — a tool that returns structured errors instead of raising
+import os
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+def _fetch(url: str, token: str) -> dict:
+    res = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    res.raise_for_status()
+    return res.json()
+
+def fetch_jira_ticket(ticket_id: str) -> dict:
+    """Return a Jira ticket. Failures are encoded so the agent can react gracefully."""
+    try:
+        return {
+            "status": "ok",
+            "data": _fetch(
+                f"https://example.atlassian.net/rest/api/3/issue/{ticket_id}",
+                token=os.environ["JIRA_TOKEN"],
+            ),
+        }
+    except requests.HTTPError as e:
+        # 4xx will not recover from retries; return immediately
+        return {"status": "error", "reason": f"http_{e.response.status_code}"}
+    except requests.RequestException:
+        return {"status": "error", "reason": "network_unavailable"}
+
+# Expected output (success):
+# {"status": "ok", "data": {"key": "PROJ-123", "fields": {...}}}
+# Expected output (failure):
+# {"status": "error", "reason": "http_404"}
+```
+
+In the agent's `instruction`, spell out what to do when `status == "error"`. A single line — "If a tool returns an error, acknowledge the failure to the user and propose an alternative" — drastically reduces the rate of fabricated success responses.
+
+## Reading the Trace Like a Map
+
+With `enable_tracing=True`, every `stream_query` produces a root span in Cloud Trace, with nested spans for LLM calls, tools, and sub-agents. The Cloud Trace UI shows latency at 500 ms granularity, which makes obvious where time is going.
+
+Three checks I run on every Trace I open:
+
+- **Tool latency dominance**: if external tool calls account for more than half of the total time, look for caching or batching opportunities first.
+- **Token input length**: if the input grows linearly with conversation length, your history strategy needs a summarizer. Otherwise turns 3 to 5 will already be expensive.
+- **Function-call chain depth**: chains longer than three steps usually mean the agent's responsibilities should be split. Promoting children to sub-agents also makes traces dramatically more readable.
+
+For logs, calling `google.cloud.logging.Client().setup_logging()` routes ADK events into Cloud Logging as structured records. Filtering by severity and `trace` attribute makes post-incident analysis far less painful.
+
+## Common Pitfalls
+
+A few traps I've stepped in personally — sharing them so you don't have to.
+
+The first is treating `requirements` like a Cloud Run image. Agent Engine installs dependencies during deployment, so every extra package adds wait time. Keep the agent's runtime free of unneeded web frameworks and GUI libraries.
+
+The second is "works locally, fails with 503 in production." Nine times out of ten the cause is missing IAM. The Agent Engine service account needs explicit access to whatever upstream Google Cloud APIs your tools touch — `roles/aiplatform.user` alone is rarely sufficient.
+
+The third is over-stuffing Memory Bank. Vector retrieval gets noisier as the corpus grows, so filling it with raw chat transcripts hurts quality. Save only summarized, durable preferences.
+
+The fourth is mixing up `user_id` and `session_id`. If you set `user_id` to a device ID, the same human on a different device loses their history. The cleanest split is `user_id` = your application's user identifier, `session_id` = a single chat thread within that user.
+
+The fifth is regional drift. If Agent Engine and your Gemini model live in different regions, you pay extra latency and risk quota errors. Pin both to `us-central1` (or the same region) on day one.
+
+> Teams currently running agents on Cloud Run can size up the migration by reading this guide alongside [Gemini API × Cloud Run: A Production SaaS Guide](/articles/gemini-api/gemini-api-cloud-run-usage-based-saas-complete-guide).
+
+## Cost Modeling and Operational Discipline
+
+Agent Engine bills you in two streams: managed runtime hours and the underlying Gemini API token usage. Cold starts are less of a concern than on Cloud Run, but neglected agents do pile up costs.
+
+Three rules I keep:
+
+- **Default to `gemini-2.5-flash` and switch to `gemini-2.5-pro` deliberately.** Routing, summarization, and small judgments are perfectly served by Flash. Reserve Pro for hard reasoning, long-context summarization, or code generation. The token-cost difference is three to five times.
+- **Always set `thinking_budget`.** When using thinking mode, cap it explicitly — `thinking_budget=2048` is a sensible starting point. Unbounded thinking is a recipe for runaway bills. The trade-offs are explored in detail in [Gemini 2.5 Thinking Budget Optimization](/articles/gemini-api/gemini-25-thinking-budget-optimization-guide).
+- **Define TTLs for Sessions and Memory Bank in your runbook.** "Sessions older than 90 days are summarized and pruned. Memory Bank entries are reviewed quarterly." Decide this once, codify it, and avoid the migration tax later.
+
+For deeper reading on agent design patterns, the book [LLM App Development (Yusuke Sugomori)](https://www.amazon.co.jp/dp/4297143836/?tag=pinocchio-22) covers the strategic landscape of testing, evaluation, and architecture. It is not Agent Engine-specific, but it strengthens the underlying instinct.
+
+## When Agent Engine Is Not the Right Choice
+
+I want to be clear that Agent Engine is not always the answer. Choosing it for the wrong shape of workload causes pain, and the symptoms tend to be subtle: cost surprises, awkward custom tooling, or worst of all, a runtime you cannot fully test locally.
+
+Skip Agent Engine if your agent fits a simple request/response pattern with no tool chains and no streaming. A plain Cloud Functions endpoint or a thin Cloud Run service is cheaper to operate and easier for new engineers to read. The managed primitives only earn their keep when you actually need them.
+
+Skip it if your latency budget is sub-second and your tool calls are minimal. The platform optimizes for streaming experiences and for chains involving multiple LLM steps. Single-shot classification or summarization workloads run more efficiently on Cloud Functions.
+
+Skip it if you need extremely custom networking — for example, traffic that must originate from a specific subnet you control end-to-end. Agent Engine's network egress is managed; routing through Cloud NAT works for most cases, but if you need raw packet-level control, a self-managed Cloud Run setup with a Serverless VPC Connector still beats it.
+
+In short: Agent Engine pays off when your agent is conversational, multi-step, stateful, and observability-hungry. If two of those four are missing, evaluate the simpler options first.
+
+## A Reference Architecture for an Editorial Assistant
+
+To make these abstractions concrete, here is a pattern I have shipped twice — an editorial research assistant for a small publication.
+
+The front end is a Next.js application. Each chat thread maintains its own `session_id` in client state and sends it with every user message. The browser hits an internal API route, which authenticates the user, looks up the corresponding `user_id`, and fans out a `stream_query` call to Agent Engine. The agent runtime handles the rest: streaming chunks, tool invocations, and Memory Bank lookups.
+
+On the agent side, the orchestrator routes between three sub-agents. A research agent uses `google_search` and a Wikipedia tool to gather sources. A writer agent uses Gemini 2.5 Pro with a thinking budget of 2,048 tokens to draft summaries. A safety agent screens output for sensitive content before it streams back to the front end. Each is its own ADK agent; the orchestrator picks among them with structured Function Calling.
+
+State splits cleanly between the two stores. Sessions API holds the chat thread — questions, answers, intermediate plans. Memory Bank holds editorial preferences such as "the publication uses Oxford comma" or "the user dislikes hype words like 'unlock' and 'unleash'." Both feed into the writer agent automatically; the editor never has to repeat their style guide.
+
+For observability, every span in Cloud Trace is tagged with `publication`, `editor_id`, and `route`. That tagging strategy turns out to matter a lot in incident review: filtering by `editor_id` lets us see whether a complaint about quality is system-wide or restricted to one user's instructions.
+
+This pattern runs comfortably under five dollars per editor per day at moderate use, and the operational interface is one resource name plus a small Terraform module. That is the kind of leverage I keep coming back to Agent Engine for.
+
+## Migrating From Cloud Run: A Practical Checklist
+
+If you already have agents on Cloud Run, the migration to Agent Engine is rarely as hard as it looks. The trick is to move in well-defined slices instead of a big-bang rewrite.
+
+First, isolate the agent definition. If your Cloud Run service mixes web framework code with agent logic, factor the agent out into its own module that imports nothing from Flask or FastAPI. The litmus test is whether you can call your agent's main function from a Python REPL with no HTTP layer involved. If you can, the rest of the migration is largely mechanical.
+
+Second, replace your custom session store with Sessions API in stages. Start by writing both your existing store and Sessions API in parallel for new conversations. After two weeks of dual-writing, switch reads to Sessions API while keeping the legacy store as a backup. After another two weeks, retire the legacy store. The dual-write phase is where most teams catch subtle differences in serialization between the two systems.
+
+Third, port observability gradually. The fastest path is to keep your existing logging stack in place, add Agent Engine's tracing on top, and only after a few production cycles decide whether to consolidate to Cloud Trace. Switching observability all at once during a migration is a recipe for missing the very incidents you most need to see.
+
+Finally, run the old and new endpoints side by side for at least one week with traffic mirroring. Mirror a small fraction of production traffic to the Agent Engine endpoint without serving its responses to users. Compare the responses offline. This catches the embarrassing class of bugs where the new service is twenty milliseconds faster but quietly wrong.
+
+The sequence I just described usually takes two to three weeks of part-time effort for a single agent. After the first migration, every subsequent agent moves in a day.
+
+## Testing and Evaluation Without a Local Runtime
+
+A persistent worry I hear from teams new to Agent Engine: "How do I test this without paying for the managed runtime?" The answer turns out to be reassuring. Because the same `AdkApp` instance powers both local execution and the deployed service, your test suite can run entirely on a developer machine.
+
+For unit tests, instantiate the agent locally and stub external tools. ADK exposes a hook for replacing tool implementations at construction time, so you can substitute a fake Jira client that returns canned data. Standard pytest assertions on the agent's structured output work the same way they would for any Python function.
+
+For evaluation, I run a small golden dataset of fifty prompt/response pairs against `app.stream_query` once a week. The dataset lives in a Git repository alongside the agent code, and the eval pipeline reports both quality scores from an LLM-as-judge configuration and latency breakdowns from local tracing. Quality regressions are obvious because every PR posts a diff against the previous run.
+
+The one thing local testing cannot catch is the cold-start behavior of the managed runtime. For that I keep a thin smoke test that hits the deployed endpoint with a single canonical prompt every fifteen minutes. If it fails twice in a row, an alert fires. The test is cheap — perhaps three cents a day — and has caught two outages I would otherwise have learned about from users.
+
+A pattern worth highlighting: keep your evaluation prompts in a structured format (JSONL or YAML) rather than as plain Python literals. When you want to run the same dataset against a different model or a different agent revision, structured input makes the comparison trivial. I have lost more than one afternoon untangling evaluation code that had hardcoded prompts inside Python source.
+
+## Scaling, Quotas, and Rate Limit Realities
+
+One last set of operational details that tends to bite teams late: the interaction between Agent Engine's own scale-out behavior and the underlying Gemini quota.
+
+Agent Engine autoscales the runtime tier transparently. You do not configure a min/max instance count the way you would on Cloud Run; the platform allocates capacity in response to active sessions. In practice this means the agent runtime almost never becomes the bottleneck. What does become the bottleneck is the Gemini model quota.
+
+By default, a fresh Google Cloud project has fairly low Gemini 2.5 Pro requests-per-minute and tokens-per-minute limits. Hitting them does not cause your agent to fail dramatically; instead, individual `stream_query` calls return a graceful retry-after error. If your application does not handle that signal, users will perceive the failure as flakiness. I always implement a one-shot retry with jitter on the client, plus a queue-style fallback that warns the user when sustained throttling is happening.
+
+When you are ready to grow, request a quota increase in the Google Cloud console well before traffic actually arrives. Approval can take a couple of business days for non-trivial bumps, and you do not want to be filing the request mid-incident. I keep a running estimate of "tokens per active user per hour" in our capacity model and request a 3x headroom on top of expected peak.
+
+A second subtle interaction worth knowing: the `gemini-2.5-pro` quota is shared across all agents in your project. Three agents all using Pro will collectively chew through the same pool. If you have a high-throughput summarization agent and a low-throughput strategy agent in the same project, the latter can starve when the former spikes. The mitigation is to put critical agents in their own project (with their own quota) or to switch the high-throughput agent to Flash. The same accounting logic applies to Agent Engine itself if you stack many agents in a single project — separating projects by criticality is the cleanest insulation.
+
+Finally, watch for unbounded fan-out from sub-agents. A parent agent that spawns five children, each of which makes three Gemini calls, suddenly multiplies your effective request rate by fifteen. This is a perfectly reasonable architecture, but the quota math has to account for it. I keep a small spreadsheet that maps each agent to its expected fan-out factor; whenever a new agent ships, the cell turns red if the projected RPM crosses 60% of project quota.
+
+## Wrapping Up — One Concrete Next Step
+
+Agent Engine is becoming the default place to run agents in production, and the migration cost is lower than most teams expect. If you want to feel that today, deploy a single small ADK agent with `agent_engines.create()` and open the resulting `stream_query` in Cloud Trace. Within ten minutes you'll see why piecing together Cloud Run, Redis, and a homegrown tracer was so exhausting.
+
+If you want to go deeper, follow up with [Gemini 2.5 Pro × ADK Persistent Assistant](/articles/gemini-advanced/gemini-25-pro-adk-persistent-assistant-production-guide) for ADK fundamentals, and [Google ADK Multi-Agent Architecture](/articles/gemini-advanced/google-adk-multiagent-architecture-production-masterclass) for the boundary design between agents. Together they make the move to Agent Engine close to friction-free.
