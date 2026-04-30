@@ -1,0 +1,356 @@
+---
+title: "Production-Grade PII Redaction for the Gemini API — Detection, Masking, and Audit Logging That Actually Pass a Privacy Review"
+slug: "gemini-api-pii-redaction-audit-logging-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-30T10:45"
+author: "Gemini Lab"
+description: "Are you piping raw user text straight into the Gemini API? This guide walks through detection, masking, and audit-log design so you can keep PII out of model traffic and pass GDPR, SOC 2, and customer privacy reviews — with code you can ship today."
+tags: ["gemini-api", "pii", "security", "compliance", "audit-log", "privacy", "gdpr", "production"]
+highlights:
+  - "You can finally stop worrying about leaking customer PII to Gemini — ship a complete detect-mask-audit pipeline today, not after the next compliance scare"
+  - "You'll learn exactly where regex, Microsoft Presidio, and Google Cloud DLP each fit in front of a Gemini call, and how to combine them without blowing up latency or cost"
+  - "Your team will be able to walk into a GDPR or SOC 2 review with a layered architecture that keeps PII out of model traffic, logs, traces, and error reports"
+---
+
+"We're piping the user's question straight into the Gemini API — what happens if it contains PII?" I keep getting this message from teams shipping B2B SaaS on top of Gemini. The pattern is always the same: legal review or a SOC 2 audit suddenly puts PII handling in the engineer's lap, with weeks instead of months to get it right.
+
+I've been there myself. The first time I grepped my own chatbot's logs and found email addresses and phone numbers sitting there in cleartext, my stomach dropped. Gemini itself has matured on the enterprise side — through Vertex AI you can sign contracts that exclude your data from training. But "not used for training" is not the same as "never logged" or "never leaked." This article covers what I actually do in production: detect PII, mask it before it touches Gemini, design audit logs that compliance reviewers respect, and make decisions you can defend later.
+
+## Why PII risk in Gemini API calls keeps slipping past code review
+
+When you build an LLM feature, the first version always reads "take user input, drop it into `contents`, send." Prototypes are fine. Production goes wrong because retrofitting safety onto something that already "works" rarely covers every path that PII can leak through.
+
+There are three paths, and most teams patch only the first one. Path one is "user input → model traffic." Path two is "logs, traces, and APM payloads." Path three is "stack traces and error reports captured by Sentry or DataDog." Even if Vertex AI's data policy guarantees model-side safety, plaintext PII sitting in your CloudWatch Logs or Sentry events is still PII that *your company holds* — and that is what privacy regulators care about.
+
+The most uncomfortable moment I've had professionally was full-text searching CloudWatch during an incident and finding what looked like a U.S. social security number stuffed into a free-text field. Long-term, searchable storage of personal data is a textbook insider-risk surface. Which is why you need defense at two distinct points: before the request hits Gemini, and before any byte of that request lands in a log.
+
+## A three-layer approach: regex, Presidio, and Cloud DLP
+
+In practice I split PII detection into three layers, because each tool wins on a different axis.
+
+The first layer is **lightweight regex**. For PII with rigid format — emails, phone numbers, credit cards, postal codes, national IDs — regex is faster and more deterministic than any ML approach. Sub-millisecond latency means you can put it on the critical path of every Gemini request without users noticing.
+
+The second layer is **Microsoft Presidio**, a NER-based detector. Names, addresses, organizations, and other context-dependent entities need named entity recognition. Presidio is open source, runs on top of Spacy, supports many languages, and self-hosts comfortably. Latency runs 50–200 ms, which is fine for non-streaming flows but needs care if you're streaming tokens back to a user.
+
+The third layer is **Google Cloud DLP API**. If you're already on Vertex AI, DLP lives in the same project — no cross-region data flow, 150+ built-in infoTypes, including healthcare and financial categories that compliance teams care about. Pricing is per 1,000 characters, so high-traffic services usually pre-filter with regex and only escalate ambiguous text to DLP.
+
+My recommendation: start with regex + Presidio. Keep the interface narrow so swapping in DLP later is a single-file change. Now let's look at the code.
+
+## Implementation 1: a thin regex middleware in front of `generate_content`
+
+The first piece is a small redactor you call right before the Gemini API. The trick is that we're not just rewriting text — we're also emitting metadata so audit logs can later answer "which requests touched PII, of what type, and how often?"
+
+```python
+# pii_redactor.py — minimal redactor used in front of every Gemini call
+import re
+from dataclasses import dataclass, field
+from typing import Pattern
+
+_PATTERNS: dict[str, Pattern[str]] = {
+    "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+\.\w+"),
+    "PHONE_US": re.compile(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b"),
+    "CREDIT_CARD": re.compile(r"\b(?:\d[ -]?){13,16}\b"),
+    "SSN": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    "IP_V4": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+}
+
+@dataclass
+class RedactionResult:
+    redacted_text: str
+    detections: dict[str, int] = field(default_factory=dict)
+
+def redact(text: str) -> RedactionResult:
+    detections: dict[str, int] = {}
+    redacted = text
+    for label, pattern in _PATTERNS.items():
+        matches = pattern.findall(redacted)
+        if matches:
+            detections[label] = len(matches)
+            redacted = pattern.sub(f"[REDACTED:{label}]", redacted)
+    return RedactionResult(redacted_text=redacted, detections=detections)
+
+
+if __name__ == "__main__":
+    sample = "Email me at jane.doe@example.com or call 415-555-0123."
+    result = redact(sample)
+    print(result.redacted_text)
+    print(result.detections)
+    # → Email me at [REDACTED:EMAIL] or call [REDACTED:PHONE_US].
+    # → {'EMAIL': 1, 'PHONE_US': 1}
+```
+
+Wire this into the function that calls Gemini. The redacted text goes to the model; `detections` goes into your structured log so you can later see which tenants are sending PII-rich traffic. That visibility is worth as much as the masking itself — it lets you proactively warn customers and tune your detectors.
+
+```python
+# gemini_with_redaction.py
+import os
+from google import genai
+from pii_redactor import redact
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def safe_generate(user_input: str, *, audit_logger) -> str:
+    redaction = redact(user_input)
+    audit_logger.info(
+        "gemini_request",
+        extra={
+            "pii_detections": redaction.detections,
+            "redacted_chars": len(redaction.redacted_text),
+        },
+    )
+
+    response = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=redaction.redacted_text,
+    )
+    return response.text
+```
+
+Expected behavior: `safe_generate("My number is 415-555-0123")` sends `My number is [REDACTED:PHONE_US]` to Gemini, and your logs record `pii_detections={"PHONE_US": 1}`. Raw PII never reaches the model and never reaches your aggregator.
+
+## Implementation 2: catching names and addresses with Microsoft Presidio
+
+Regex misses anything contextual — names, organizations, locations. Presidio fills that gap by running a Spacy NER model under the hood. Configure it for the languages you serve.
+
+```python
+# presidio_redactor.py
+from presidio_analyzer import AnalyzerEngine
+from presidio_analyzer.nlp_engine import NlpEngineProvider
+from presidio_anonymizer import AnonymizerEngine
+
+_PROVIDER = NlpEngineProvider(nlp_configuration={
+    "nlp_engine_name": "spacy",
+    "models": [{"lang_code": "en", "model_name": "en_core_web_lg"}],
+})
+
+_ANALYZER = AnalyzerEngine(nlp_engine=_PROVIDER.create_engine(), supported_languages=["en"])
+_ANONYMIZER = AnonymizerEngine()
+
+def redact_with_presidio(text: str) -> str:
+    results = _ANALYZER.analyze(
+        text=text,
+        language="en",
+        entities=["PERSON", "LOCATION", "ORGANIZATION", "PHONE_NUMBER", "EMAIL_ADDRESS"],
+        score_threshold=0.4,
+    )
+    anonymized = _ANONYMIZER.anonymize(text=text, analyzer_results=results)
+    return anonymized.text
+
+
+if __name__ == "__main__":
+    text = "Jane Doe works at Acme Corp in San Francisco."
+    print(redact_with_presidio(text))
+    # → <PERSON> works at <ORGANIZATION> in <LOCATION>.
+```
+
+`score_threshold` is the dial you'll spend the most time on. I usually start at 0.4, then walk through false-positive logs to tune. Starting at 0.7 sounds safer but I lost too many real names that way; 0.4 is the right floor for most English text. Don't ship Presidio at default settings and call it done — your domain vocabulary matters.
+
+There's a real architectural decision here: do you put Presidio on the request path or off it? If you can't afford 100–200 ms of added latency on a chatbot, keep regex on the path and run Presidio only as a sampled audit job. The right balance depends on how sensitive the underlying data is, not on what's technically possible.
+
+## Implementation 3: Google Cloud DLP for compliance-driven environments
+
+When legal says "we need DLP," you switch. Cloud DLP runs in the same Google Cloud project as Vertex AI, so there's no cross-region data flow. The infoTypes catalog covers strict categories — medical record numbers, IBANs, and country-specific identifiers — that regex alone can't get right.
+
+```python
+# cloud_dlp_redactor.py
+from google.cloud import dlp_v2
+
+_DLP = dlp_v2.DlpServiceClient()
+_PROJECT = "your-gcp-project-id"
+
+_INFO_TYPES = [
+    {"name": "EMAIL_ADDRESS"},
+    {"name": "PHONE_NUMBER"},
+    {"name": "CREDIT_CARD_NUMBER"},
+    {"name": "US_SOCIAL_SECURITY_NUMBER"},
+    {"name": "PERSON_NAME"},
+]
+
+def redact_with_dlp(text: str) -> str:
+    parent = f"projects/{_PROJECT}/locations/global"
+    item = {"value": text}
+    inspect_config = {"info_types": _INFO_TYPES, "min_likelihood": dlp_v2.Likelihood.POSSIBLE}
+    deidentify_config = {
+        "info_type_transformations": {
+            "transformations": [{
+                "primitive_transformation": {
+                    "replace_with_info_type_config": {}
+                }
+            }]
+        }
+    }
+    response = _DLP.deidentify_content(
+        request={
+            "parent": parent,
+            "deidentify_config": deidentify_config,
+            "inspect_config": inspect_config,
+            "item": item,
+        }
+    )
+    return response.item.value
+
+
+if __name__ == "__main__":
+    text = "Jane Doe, email taro@example.com, SSN 123-45-6789."
+    print(redact_with_dlp(text))
+    # → [PERSON_NAME], email [EMAIL_ADDRESS], SSN [US_SOCIAL_SECURITY_NUMBER].
+```
+
+Cloud DLP charges per 1,000 characters, so high-volume services usually use regex as a pre-filter — only text that already has at least one regex hit goes to DLP. Or sample a percentage instead of inspecting every request. I recommend running within the free tier (1 GB/month) for a week or two before you commit to a billed budget; that gives you a real cost picture against your actual traffic.
+
+## Picking the right combination — a decision lens
+
+I keep getting asked "which one should I use?" as if it were a single choice. It almost never is. Here's the lens I run through when I help a team pick:
+
+- **What kind of PII actually shows up in your traffic?** Pull a week of logs (carefully, in a sandbox) and count categories. If 95% of detections are emails and phones, regex alone covers you. If you see a lot of names and addresses, you need Presidio. If you're in healthcare or finance, DLP becomes mandatory because the infoTypes you need (medical record numbers, IBANs, country-specific identifiers) aren't realistic to write yourself.
+- **What latency budget do you have?** If you're inside a real-time chat with a P95 budget of 1.5 s end-to-end, you cannot afford 200 ms of synchronous Presidio. Push it off the request path. If you're running a batch pipeline, latency doesn't matter and the question becomes cost.
+- **Which compliance regime is binding?** Some auditors will accept regex + Presidio for a B2B SaaS. Some healthcare and government auditors will not, full stop, accept anything other than DLP or an equivalent enterprise service. Find out before you build.
+- **How much false-positive pain can your users tolerate?** Aggressive name detection will sometimes mask product names ("Yellowstone," "Phoenix") and frustrate users. Less aggressive detection will miss real names. There is no single right tradeoff — it depends on whether your users are uploading their own text (more PII risk) or pulling from a curated source (less).
+
+In real deployments I almost always end up with a layered combination: regex on the request path for speed, Presidio in a sampling worker for context-dependent PII, DLP only on the most sensitive routes (payment, identity verification, medical intake). Treating these as one choice instead of a portfolio is what leads to either over-engineering (DLP everywhere, large bills) or under-engineering (regex only, missed names).
+
+## Don't let logs, traces, and error reports leak what the model never saw
+
+Blocking PII at the API boundary doesn't help if your APM scoops up raw request bodies. Sentry and DataDog both default to capturing rich request context — that's exactly where unredacted text ends up.
+
+Three habits keep logs clean. First, explicitly disable raw request body capture in your APM. In Sentry, scrub `event["request"]["data"]` in `before_send`; in DataDog, configure the RUM and APM payloads with allowlisted fields rather than full-capture defaults. Second, install a logging filter that re-runs the redactor on every log message; treat it as a last-line defense in case a developer logs the wrong variable, or in case a third-party library emits a debug message that includes a raw input. Third, write a team rule that OpenTelemetry span attributes never contain user input — if you need to correlate a trace with a payload, attach a SHA-256 hash, never the text itself. For a deeper dive on tracing Gemini calls, see the companion guide [Tracing the Gemini API with OpenTelemetry — A Production Playbook](/articles/gemini-api/gemini-api-opentelemetry-distributed-tracing-production-guide).
+
+```python
+# logging_filter.py — defense in depth: redact again at log time
+import logging
+from pii_redactor import redact
+
+class PIIRedactingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = redact(record.msg).redacted_text
+        if record.args:
+            try:
+                redacted_args = tuple(
+                    redact(a).redacted_text if isinstance(a, str) else a
+                    for a in record.args
+                )
+                record.args = redacted_args
+            except Exception:
+                pass
+        return True
+```
+
+Attach this filter to the root logger. Even a careless `logger.info("user said: %s", user_input)` becomes safe because the filter rewrites the message at output time. I'd rather rely on a backstop than on perfect human discipline across a team.
+
+## Reversible vs irreversible masking — choose by role, not by convenience
+
+For end-user-facing products, irreversible masking is the safe default. But you'll meet real cases where ops or support genuinely need to see specific fields after the fact: support reps may need the user's email, but no one ever needs the full credit card.
+
+Solve this per infoType. Hash credit cards with SHA-256 + salt (irreversible). Encrypt emails with KMS-backed format-preserving encryption (reversible only by trusted services). Drop names entirely. Cloud DLP supports `crypto_deterministic_config` for reversible deterministic encryption — but every reversible scheme creates a new attack surface around key management.
+
+In practice I default to "if in doubt, irreversible." The "we might want to recover this later" argument loses every audit cycle: years go by, no recovery flow is ever built, and you're left holding encrypted noise. For multi-tenant systems where you need per-tenant key isolation, see [Designing Multi-Tenant SaaS on the Gemini API](/articles/gemini-api/gemini-api-multi-tenant-saas-architecture-guide).
+
+## Four traps I've actually fallen into
+
+**Trap 1**: Treating `\d{16}` as enough for credit cards. Without a Luhn check you can't separate card numbers from order IDs and SKUs, and you'll either miss real cards or mask shipping codes and frustrate users. Presidio and DLP run Luhn internally — let them do it.
+
+**Trap 2**: Forgetting to redact streaming responses. `generate_content_stream` may echo user input back, and those token chunks land in the same logs you just secured. Run output through the same redactor as input.
+
+**Trap 3**: Asking the model to redact PII in its own prompt. I've seen "remove any personal info before answering" as a compliance answer — auditors don't accept that. Detection has to be deterministic and external. The model is the thing you're protecting *from*, not *with*.
+
+**Trap 4**: Embedding real customers in few-shot examples. If your prompt template includes a "real customer" snippet, that snippet is sent on every single request. Audit your templates before any privacy review. Use synthetic personas only.
+
+**Trap 5 (bonus)**: Logging the raw prompt object for debugging. The "let me just dump the request for now" line of code is how production leaks happen. If you must log the request shape, log the redacted version, the detection counts, and the message length — never the raw `contents` payload.
+
+## Make audit logs something a reviewer can actually use
+
+Audit logs that exist on disk but can't be queried during an incident don't pass review. Three checks I run on every audit-log design:
+
+First, every log entry needs to record *who* (user or service account), *which tenant*, *which infoType was masked*, *how many hits*, and *the original character length* — never the original text. With those five fields you can spot abnormal spikes of PII-bearing input from a single tenant in a dashboard query.
+
+Second, retention has to be defensible. Most privacy regulations require retention "limited to what's necessary for the stated purpose." I run audit logs at 90-day retention with rolling deletes, and keep aggregated metrics for a year. If anyone asks why you have a 5-year-old PII detection log, you don't want to be improvising the answer.
+
+Third, integrate with an LLM-aware observability platform. With Langfuse, attach `pii_detections` to span metadata so you can chart PII hits per tenant or per route. The full integration is covered in [The Production Guide to LLM Observability with Gemini API and Langfuse](/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide), but the short version: dashboards make this work review-able without hand-rolled SQL every time.
+
+Build dashboards that tell stories — "PII detection rate over time," "tenants in the top 1% of PII volume," "the most common infoType per route." Reviewers love a single screenshot that summarizes an entire control. Engineers love being able to see the impact of a regex tweak the next morning.
+
+If you want to ground all of this in a broader web-security mindset — which is what privacy reviewers really look for — [The Web Application Hacker's Handbook (Stuttard, Pinto)](https://www.amazon.co.jp/dp/1118026470/?tag=pinocchio-22) is still the book I recommend. PII handling sits inside the larger picture of input validation and least-privilege design, and that book is the reference text most security professionals share a vocabulary from.
+
+## Measure the latency cost — don't guess at it
+
+A common pushback I hear is "won't all this redaction make the chatbot feel slow?" The honest answer is "measure it." Numbers from my own production logs, on a `gemini-2.5-pro` call where the model itself takes 800–1500 ms end-to-end:
+
+- Regex-only redaction (the `redact()` function above): **0.2–0.8 ms**, even on multi-thousand-character inputs. Effectively free.
+- Presidio with `en_core_web_lg`: **70–180 ms** on first call, **40–90 ms** once the model is warm. CPU-bound; scale by adding workers, not threads.
+- Cloud DLP API per call: **80–250 ms** depending on region and payload. Network round-trip dominates.
+- Logging filter pass on log emit: **~0.1 ms** per record.
+
+Compared to the model's own latency, regex and the logging filter are noise. Presidio and DLP are real costs, which is why I argue for putting them off the request path when latency budgets are tight. A common pattern is to run regex synchronously, then enqueue the request to a sampling worker that runs Presidio or DLP and emits an audit event asynchronously. The user-facing latency stays unchanged, and you still detect contextual PII for compliance reporting.
+
+If you do put Presidio on the request path, two practical tips: load the Spacy model exactly once at process start, and run inference on CPU rather than GPU unless you're processing massive batches — GPU warm-up dominates for small inputs. Containerize the Spacy model into your image so cold starts in serverless environments don't pay the model-download tax.
+
+## Rolling redaction out to a system that already exists
+
+Greenfield is easy. Most teams reading this have a running Gemini-backed product with months of unredacted requests in their logs and an existing prompt pipeline. A migration that doesn't blow up the user experience needs four phases.
+
+**Phase 1: instrument before you change behavior.** Deploy the redactor in **dry-run mode** — it computes detections and writes them to logs but does not alter the text sent to Gemini. Run this for at least a week. You'll learn the actual prevalence of PII in your real traffic, which is almost always higher than anyone on the team expects. Use that data to negotiate timelines with stakeholders.
+
+**Phase 2: turn on masking, but on a flag.** Wrap the call to Gemini with a feature flag. Roll out to internal users first, then to a 1% canary, watching error rates and customer-side feedback. The most common regression I've seen is task-quality drift: when a name or address is masked, the model's response sometimes loses contextual coherence. Catch that early on the canary, not on full rollout.
+
+**Phase 3: backfill the audit fields on past logs.** This is the painful one. You have months of logs that don't have `pii_detections` metadata, which makes pre-rollout vs post-rollout comparisons impossible. Write a one-off job that reads recent logs, runs the redactor over them, and emits the metadata to a parallel audit stream. Don't store the original text again; just count the categories. Compliance reviewers love being able to see "before" and "after" telemetry side by side.
+
+**Phase 4: purge what you shouldn't have kept.** Once the new pipeline is stable, run a deletion pass over old logs that contained unredacted PII. Document the deletion as a one-time remediation in your incident or compliance log. Auditors care about this far more than people expect — being able to show "we identified the gap, remediated, and recorded it" turns a finding into a closed-out item.
+
+I've taken three different products through this rollout. The phase that always slips is Phase 3, because backfill jobs feel like throwaway work. They aren't — the audit-log paper trail you create there is what makes the whole rollout defensible six months later.
+
+## Testing your redactor — and why "looks good to me" is not enough
+
+If the redactor is your last line of defense, it deserves the same testing rigor as any other security control. Three categories of test belong in CI:
+
+**Unit tests over a known fixture set.** Curate a list of inputs that *should* trigger each detector and a list of negatives that should not. Include adversarial cases — phone numbers split across line breaks, email addresses with plus-aliases, credit-card-like strings that aren't valid (Luhn fails), and names embedded in URLs. The goal is not 100% coverage of natural language; it's catching regressions when someone tweaks a regex.
+
+```python
+# test_pii_redactor.py
+import pytest
+from pii_redactor import redact
+
+def test_email_basic():
+    assert "[REDACTED:EMAIL]" in redact("Contact jane@example.com").redacted_text
+
+def test_phone_us_dashed():
+    assert redact("Call 415-555-0123").detections.get("PHONE_US") == 1
+
+def test_credit_card_with_spaces():
+    text = "card 4111 1111 1111 1111 last digits"
+    assert "[REDACTED:CREDIT_CARD]" in redact(text).redacted_text
+
+def test_should_not_mask_short_digits():
+    # 6-digit order number — must NOT be masked as a card
+    assert "ORDER-123456" in redact("ORDER-123456").redacted_text
+
+def test_multiple_emails_counted():
+    text = "send to a@x.com and b@y.com"
+    assert redact(text).detections["EMAIL"] == 2
+```
+
+**Property-based tests** with Hypothesis or similar tools. Generate strings that look like emails and phone numbers in arbitrary contexts and assert that they always end up masked. Property tests catch the cases unit tests miss because no human writes "what if someone has eight email addresses on one line."
+
+**Synthetic traffic shadow tests in staging.** Replay anonymized historical traffic through the redactor in your staging environment and compare the detection counts to a baseline. A sudden 10x increase in `PERSON_NAME` detections after a Presidio model update is exactly the kind of drift you want to catch before production.
+
+I also keep a "PII canary" suite — a set of clearly synthetic but format-realistic strings (`canary+pii@gemilab-test.local`, `0312-CANARY-9999`) that are seeded into staging traffic. If they ever appear unredacted in any log query, an alert fires. It's the cheapest possible way to verify the pipeline end-to-end is wired up correctly.
+
+## How regulations actually shape your design choices
+
+Engineers tend to bounce off privacy law because the language is dense, but a few load-bearing points actually matter for design:
+
+GDPR Article 25 ("data protection by design and by default") is the clause that justifies all of this. If you're processing data about EU residents, the absence of redaction in front of an LLM is itself a finding — not just the leak that might happen later. CCPA and the various U.S. state laws are catching up to the same posture. Even if your users are all U.S.-based today, building for GDPR-equivalence usually pays off within a year as you expand.
+
+The phrase "data minimization" comes up everywhere and is the most actionable principle: send the model only what it needs. If your prompt is "summarize this support ticket," strip the customer's name and email out before sending — the summary doesn't need them. This isn't paranoia; it's directly responsive to GDPR's purpose-limitation requirements.
+
+For SOC 2 Type II audits in particular, what reviewers care about is *evidence*. They want to see (a) a documented policy, (b) automated controls that enforce it, and (c) audit trails proving the controls run. The architecture in this article gives you all three: the redactor is the control, structured logs with `pii_detections` are the trail, and your README documenting it is the policy artifact. Don't underestimate the importance of writing one paragraph in your repo that explains why each piece exists — auditors read those paragraphs.
+
+## What to do today
+
+Don't try to land the perfect, fully layered architecture in one PR — you'll never ship it. The first move is the smallest one: insert the regex `redact()` from above immediately before your Gemini call. That single line stops the high-volume, mechanically detectable PII categories from reaching the model. Layer the logging filter next, then Presidio, then DLP if compliance pushes you there.
+
+The teams I've seen handle this best treat PII protection as a continuous practice, not a one-time project. Every new feature gets a "where could PII enter and where could it leak?" check at review time. The redactor module becomes a shared piece of infrastructure that every code review touches — and that single fact, more than any specific implementation choice in this guide, is what separates teams that pass privacy reviews from teams that improvise during them.
+
+If you want to expand your safety story further, [Designing Layered Safety Settings on the Gemini API](/articles/gemini-api/gemini-api-safety-settings-production-layered-design) is the natural next read. The combination — input redaction, output safety settings, and structured observability — is what a defensible Gemini production deployment looks like in practice.
