@@ -1,0 +1,198 @@
+---
+title: "Ship a Production Gemini Agent in 30 Minutes with Mastra and TypeScript"
+slug: "gemini-mastra-typescript-agent-production-guide"
+category: "gemini-dev"
+level: "intermediate"
+premium: false
+date: "2026-04-30T12:25"
+author: "Gemini Lab"
+description: "Mastra keeps the lightness of Vercel AI SDK while adding the agent primitives you actually need in production. This guide walks through building, debugging, and deploying a Gemini-powered Mastra agent end-to-end, including the Cloudflare Workers gotchas that bit me first."
+tags: ["gemini", "mastra", "typescript", "ai-agent", "vercel-ai-sdk", "cloudflare-workers"]
+---
+
+The moment you decide to write an AI agent in TypeScript, you immediately have to pick a stack — call Vercel AI SDK directly, wire up LangChain.js, try Google's TypeScript ADK, or something else. Each option has a real reason to exist, and the choice paralysis is real.
+
+After spending the past few months actually shipping with all of them, I keep coming back to [Mastra](https://mastra.ai/) for the indie-and-production sweet spot. It preserves the thinness of Vercel AI SDK while giving you a unified API for agents, tools, memory, and workflows — which fits the rhythm of a single developer iterating quickly.
+
+This guide walks you through wiring Mastra to the Gemini API, going from `npx create-mastra` to a Cloudflare Workers deployment in roughly 30 minutes, including the parts that actually tripped me up.
+
+## Why Mastra (vs. AI SDK alone, vs. LangChain.js)
+
+The shortest description I can give Mastra is: *a thin layer on top of Vercel AI SDK that adds only what an agent really needs*. It uses AI SDK's `generateText` and `streamText` under the hood, so if you already know AI SDK, the learning curve is essentially zero.
+
+Comparing the three options as I've used them:
+
+- **Vercel AI SDK alone.** Minimal and elegant for one-shot model calls, but you end up writing your own agent loop, memory store, and workflow runner. The codebase grows fast.
+- **LangChain.js.** Feature-rich but the abstractions are deep. When something goes wrong, tracing where the prompt was actually assembled tends to take more time than it should.
+- **Mastra.** Stays close to AI SDK's surface. You get `createAgent`, `createTool`, and `Workflow` primitives without losing the feeling of writing TypeScript. The built-in `mastra dev` dashboard makes agent debugging far less painful.
+
+If you've never used Vercel AI SDK with Gemini, [the Next.js + AI SDK guide](/articles/gemini-api/gemini-vercel-ai-sdk-nextjs-guide) is a smoother on-ramp before this one.
+
+## Project setup
+
+The fastest path is the official `create-mastra` scaffold. You'll want Node.js 20 or newer.
+
+```bash
+# Interactive scaffold (asks for project name / components / examples)
+npx create-mastra@latest my-gemini-agent
+
+cd my-gemini-agent
+
+# Add the Google provider for Gemini
+npm install @ai-sdk/google
+```
+
+Drop your Gemini API key into `.env`. Forgetting this gives you a "model not found" style error on first run, not a clean 401, so it's worth checking before anything else.
+
+```bash
+# .env
+GOOGLE_GENERATIVE_AI_API_KEY=YOUR_GEMINI_API_KEY
+```
+
+You can issue a key from [Google AI Studio](https://aistudio.google.com/apikey). For production we'll move it into Cloudflare Workers Secrets or Vercel environment variables, so this value is just for local dev.
+
+## A first agent on Gemini 2.5 Flash
+
+An agent in Mastra is "model + instructions + tools." We'll start with no tools and just instructions to keep things minimal.
+
+```typescript
+// src/mastra/agents/assistant.ts
+import { Agent } from "@mastra/core/agent";
+import { google } from "@ai-sdk/google";
+
+export const assistantAgent = new Agent({
+  name: "AssistantAgent",
+  instructions: `
+You are an editor-assistant for a developer blog.
+- Reply concisely.
+- If you are unsure about something, say "needs verification" rather than guessing.
+- When asked for code, always answer in TypeScript.
+  `,
+  model: google("gemini-2.5-flash"),
+});
+```
+
+Register it on the `Mastra` instance:
+
+```typescript
+// src/mastra/index.ts
+import { Mastra } from "@mastra/core";
+import { assistantAgent } from "./agents/assistant";
+
+export const mastra = new Mastra({
+  agents: { assistantAgent },
+});
+```
+
+Run `npx mastra dev` and a local dashboard opens in your browser. You can chat with the agent, but more importantly you can see every internal LLM call, the tokens used, and the latency per step. That alone makes the early tuning loop much shorter.
+
+A pragmatic note on model choice: I run on `gemini-2.5-flash` during the build phase and only switch to `gemini-2.5-pro` once I'm tightening quality. The latency and cost profile of Flash matches the trial-and-error rhythm of agent development much better than Pro.
+
+## Adding a tool so the agent can act
+
+A purely conversational agent can be written without Mastra. The leverage shows up the moment you start adding tools, because Mastra lets you declare them with Zod schemas and Gemini's function calling routes to them automatically.
+
+```typescript
+// src/mastra/tools/weather.ts
+import { createTool } from "@mastra/core/tools";
+import { z } from "zod";
+
+export const weatherTool = createTool({
+  id: "get-weather",
+  description: "Fetch the current weather for a given city",
+  inputSchema: z.object({
+    city: z.string().describe("City name, e.g. Tokyo, New York"),
+  }),
+  outputSchema: z.object({
+    temperature: z.number(),
+    description: z.string(),
+  }),
+  execute: async ({ context }) => {
+    const res = await fetch(
+      `https://wttr.in/${encodeURIComponent(context.city)}?format=j1`,
+    );
+    if (!res.ok) {
+      throw new Error(`Weather API failed: ${res.status}`);
+    }
+    const data = await res.json();
+    return {
+      temperature: Number(data.current_condition[0].temp_C),
+      description: data.current_condition[0].weatherDesc[0].value,
+    };
+  },
+});
+```
+
+Wire it to the agent:
+
+```typescript
+import { weatherTool } from "../tools/weather";
+
+export const assistantAgent = new Agent({
+  name: "AssistantAgent",
+  instructions: "...(see above)",
+  model: google("gemini-2.5-flash"),
+  tools: { weatherTool },
+});
+```
+
+The non-obvious part: write your `description` strings as if they were the only thing the model can see, because they are. Gemini decides whether and when to call a tool largely from the description, so vague descriptions cause both false positives ("called the tool when it shouldn't have") and false negatives ("ignored the tool when it should have used it"). I burned a lot of cycles on this before realizing how much weight that one string carries.
+
+## Memory: keep context without blowing up the prompt
+
+For short conversations you can stuff history into the prompt manually, but it doesn't scale — both Gemini's input limit and your bill object. Mastra's Memory abstracts this out and lets you swap storage backends without touching your agent code.
+
+```typescript
+// src/mastra/memory.ts
+import { Memory } from "@mastra/memory";
+import { LibSQLStore } from "@mastra/libsql";
+
+export const memory = new Memory({
+  storage: new LibSQLStore({
+    url: "file:./mastra.db", // swap to Turso or Cloudflare D1 in production
+  }),
+  options: {
+    lastMessages: 20,        // include the last 20 messages in the prompt
+    semanticRecall: false,   // flip to true to enable embedding-based recall
+  },
+});
+```
+
+```typescript
+export const assistantAgent = new Agent({
+  // ...
+  memory,
+});
+```
+
+Local dev runs against a SQLite file. Cloudflare Workers has no filesystem, so plan to switch to Turso (hosted libSQL) or Cloudflare D1 before you deploy — much cheaper to do that swap when there are 50 lines of code than 500.
+
+If you want a deeper comparison of memory and retrieval design, the [LangChain.js production agent guide](/articles/gemini-api/gemini-api-langchainjs-production-agent-rag-guide) is a good companion read for this section.
+
+## Tightening with `mastra dev` traces
+
+`npx mastra dev` does more than chat — it gives you a step-by-step trace per request: which tools fired, which prompts were sent, how many tokens each call used. The loop I recommend is:
+
+1. After adding a tool, run a few prompts in `mastra dev` and check the trace to see whether the tool gets selected when expected.
+2. After every instruction tweak, re-verify that tool selection still works for both positive and negative cases.
+3. When the agent picks the wrong tool, edit the `description` first — not the system prompt.
+
+Agent development comes down to a tight "instructions → run → inspect → edit" loop. Mastra's win is that this loop fits on one screen.
+
+## Cloudflare Workers deployment gotchas
+
+A few things I tripped over the first time I shipped a Mastra agent to Workers:
+
+- **`@mastra/libsql` does not run on Workers.** It assumes a filesystem. Replace it with `@mastra/cloudflare-d1` or a hosted Turso client.
+- **You need the Node.js compatibility flag.** Without `compatibility_flags = ["nodejs_compat"]` in `wrangler.toml`, `@ai-sdk/google` blows up on a `Buffer` reference.
+- **Workers don't expose `process.env`.** Read secrets from the `env` argument of the `fetch` handler. Either initialize your Mastra agent inside the handler, or inject the API key into a global once per request — both work, but mixing the two patterns gets messy.
+
+The [Hono + Cloudflare Workers + Gemini guide](/articles/gemini-api/gemini-api-hono-cloudflare-edge-ai-guide) is also a useful reference if you want a thin API gateway in front of your Mastra agent at the edge.
+
+## Wrapping up
+
+After running through this stack a few times, my honest take is that Mastra hits the rare sweet spot of "doesn't hide what AI SDK is doing, but adds the production scaffolding you'd otherwise write yourself." It's not as feature-complete as LangChain.js, but the trade-off is that you spend less time decoding abstractions and more time writing prompts and tools.
+
+If a single agent worked for you today, the natural next step is `Workflow`. Splitting "user question → research agent → summarizer → social-post formatter" into a workflow makes each agent's prompt simpler and the overall behavior much easier to reason about. That's where I'd point you next.
+
+For TypeScript developers who want to build production-grade AI systems, [*Building Effective AI Agents* by Anthropic & community](https://www.amazon.co.jp/dp/B0DFJX7QBT/?tag=pinocchio-22) (and similar systems-design books) pairs well with Mastra — the framework changes, but the agent design principles transfer.
