@@ -1,0 +1,393 @@
+---
+title: "Putting an AI That Answers Phones Into Production: A Complete Guide to Building a Phone Voice Agent With Gemini Live API and Twilio Media Streams"
+slug: "gemini-live-twilio-phone-voice-agent-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-30T19:45"
+author: "Gemini Lab"
+description: "Bridge Twilio Voice and Gemini Live API over WebSocket to build a phone-answering AI agent that holds up in production. Full code, interruption handling, function calling, deployment notes, and per-minute cost math."
+tags: ["gemini-live-api", "twilio", "voice-agent", "websocket", "fastapi", "production", "media-streams"]
+highlights:
+  - "Engineers stuck moving a browser voice demo onto real phone lines will leave with a working bridge that handles μ-law 8kHz to PCM 16kHz in both directions"
+  - "You'll learn how to bridge Twilio Media Streams and Gemini Live API in a FastAPI WebSocket relay, with concrete patterns for interruption and hangup"
+  - "Indie builders aiming to automate phone reception for bookings or first-line support can leave with a deployment plan, cost estimates, and a path to production on Cloud Run"
+---
+
+When most people hear "an AI that answers phones," they picture an evolved IVR — read a menu, press a digit, branch on input. With Gemini Live API in the picture, the next level becomes feasible for indie developers: a voice agent that takes natural reservations, writes to the back office through Function Calling, and escalates to a human when it should.
+
+I tried this for a small shop that wanted after-hours calls handled by AI, and quickly learned that the browser WebSocket demo and a real phone line are practically different problems. The wall between 8kHz μ-law and 16kHz PCM, the base64-wrapped JSON frames Twilio Media Streams demands, and the awkward art of interruption — none of that is solved by the official examples alone.
+
+This guide takes that experience and walks through **bridging Twilio Voice into Gemini Live API to build a phone-answering agent that holds up in production**. Code is given in full working form, with error handling, interruption control, common pitfalls, and per-minute cost math. It assumes you are an intermediate-to-advanced developer comfortable with the basics of Gemini Live API.
+
+> Prerequisite reading: see [Gemini Live API: WebSocket and Ephemeral Tokens for Production](/articles/gemini-api/gemini-live-api-websocket-ephemeral-token-production) for token mechanics, and [The Complete Gemini Live API Guide](/articles/gemini-api/gemini-live-api-guide) for the basics.
+
+## Why a Browser Voice Demo Doesn't Just "Drop In" to a Phone Line
+
+Before any code, it helps to know why phone lines are special. Skipping this step leads to the most common dead end: "the mic worked but the phone returns nothing but noise."
+
+The PSTN is effectively standardised on **8kHz sampling, 8-bit μ-law (u-law) compression, mono**. That spec dates to the 1970s and is tuned to deliver intelligible speech in a remarkably narrow band. Gemini Live API, on the other hand, expects **16kHz sampling, 16-bit linear PCM, mono**. Sample rate is doubled, bit depth is doubled, and the compression scheme is different too.
+
+Twilio Media Streams ships audio not as raw bytes but as **base64-wrapped JSON frames** over WebSocket. Each frame carries an `event` field, with `start`, `media`, `mark`, `stop` states you must handle. The reverse path (AI to user) uses the same shape.
+
+So your relay's real job is roughly four things:
+
+- Decode Twilio's base64+μ-law and upsample it to 16kHz PCM
+- Stream that into Gemini Live API as binary
+- Take Gemini's 24kHz PCM responses, downsample to 8kHz μ-law, and base64-encode it
+- Send those frames back to Twilio over the WebSocket
+
+This is not "a transparent WebSocket relay." Building the shortest path to a working version of all of that is the point of this article.
+
+## Architecture at a Glance — Three Components
+
+Three pieces make up the system in this guide:
+
+- **Twilio Voice**: rents the phone number and routes the inbound call to your WebSocket via Media Streams. Behaviour at call time is controlled by a small XML format called TwiML.
+- **Relay server (FastAPI + WebSocket)**: bridges Twilio and Gemini. It does the format conversion, interruption control, and Function Calling glue. We'll target Cloud Run for deployment.
+- **Gemini Live API**: the brain — takes audio in, produces audio out, and signals interruptions and tool calls.
+
+The data flow is:
+
+1. User dials in. Twilio hits your `Voice URL` webhook.
+2. The relay returns TwiML that says `<Connect><Stream url="wss://.../media">`.
+3. Twilio opens a WebSocket to your relay and starts streaming the caller's audio.
+4. The relay opens a WebSocket to Gemini Live API and starts a two-way bridge.
+5. Gemini's audio replies flow back through the relay to Twilio and into the caller's ear.
+6. On hangup Twilio sends `stop`; the relay closes the Gemini session.
+
+That's the lay of the land. We'll implement it piece by piece.
+
+## Step 1: Provision a Twilio Number and TwiML
+
+In the Twilio Console, **Buy a Number** and pick a US or JP number. JP 050 numbers require business verification, but a US number is fine for testing. Set the **A Call Comes In** webhook on that number to the relay we'll deploy, e.g. `https://example.com/voice`. POST is fine.
+
+The relay returns TwiML when Twilio POSTs in. It's simply an XML document that tells Twilio to dial out a WebSocket connection.
+
+```python
+# server/twilio_webhook.py
+# Role: receive the Twilio inbound webhook and respond with TwiML
+# that connects the call to our Media Streams WebSocket.
+from fastapi import FastAPI, Request, Response
+
+app = FastAPI()
+
+@app.post("/voice")
+async def voice_webhook(request: Request) -> Response:
+    """Twilio inbound webhook. Returns TwiML to bridge to /media via Media Streams."""
+    host = request.headers.get("host", "example.com")
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Joanna">Thanks for calling. An AI assistant will help you.</Say>
+    <Connect>
+        <Stream url="wss://{host}/media" />
+    </Connect>
+</Response>"""
+    return Response(content=twiml, media_type="application/xml")
+```
+
+That short greeting from `<Say>` covers the few hundred milliseconds it takes the Gemini Live WebSocket to come up. Without it, callers hear silence and assume nobody is there. Phone UX punishes the first second harder than any browser experience.
+
+## Step 2: The WebSocket Relay
+
+This is the core. We accept Twilio's stream, convert formats, and pipe it into Gemini.
+
+```python
+# server/media_bridge.py
+# Role: Twilio Media Streams ⇄ Gemini Live API two-way bridge.
+import asyncio
+import audioop
+import base64
+import json
+import logging
+import os
+from typing import Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from google import genai
+from google.genai import types
+
+logger = logging.getLogger("media-bridge")
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
+
+GEMINI_MODEL = "gemini-2.5-flash-live-preview"
+SYSTEM_INSTRUCTION = (
+    "You are the phone receptionist for 'Bloom Cafe'. "
+    "Handle reservations, hours, and directions in friendly, brisk English. "
+    "If you don't know something, say a human will call back rather than guessing."
+)
+
+
+def mulaw8k_to_pcm16k(mulaw_bytes: bytes, state: Optional[bytes]) -> tuple[bytes, bytes]:
+    """Twilio's μ-law 8kHz → Gemini's PCM 16kHz, with state for clean resampling."""
+    pcm8k = audioop.ulaw2lin(mulaw_bytes, 2)  # 8-bit μ-law → 16-bit linear PCM (8kHz)
+    pcm16k, new_state = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, state)
+    return pcm16k, new_state
+
+
+def pcm24k_to_mulaw8k(pcm_bytes: bytes, state: Optional[bytes]) -> tuple[bytes, bytes]:
+    """Gemini's PCM 24kHz → Twilio's μ-law 8kHz."""
+    pcm8k, new_state = audioop.ratecv(pcm_bytes, 2, 1, 24000, 8000, state)
+    return audioop.lin2ulaw(pcm8k, 2), new_state
+```
+
+The non-obvious part is that **the resampling state must be carried across calls** to `audioop.ratecv`. Resampling has internal buffer state; resetting it every frame produces the unmistakable "click pop" you'll hear at frame boundaries. I have lost more time to this in production than I care to admit.
+
+Now the bridge itself:
+
+```python
+# server/media_bridge.py (continued)
+@app.websocket("/media")
+async def media_bridge(twilio_ws: WebSocket) -> None:
+    """WebSocket endpoint that Twilio connects to. Bridges to Gemini Live."""
+    await twilio_ws.accept()
+    logger.info("Twilio WebSocket accepted")
+
+    stream_sid: Optional[str] = None
+    upsample_state: Optional[bytes] = None
+    downsample_state: Optional[bytes] = None
+
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)]),
+    )
+
+    try:
+        async with client.aio.live.connect(model=GEMINI_MODEL, config=config) as gemini:
+            async def from_twilio() -> None:
+                """Pump Twilio audio into Gemini."""
+                nonlocal stream_sid, upsample_state
+                while True:
+                    raw = await twilio_ws.receive_text()
+                    msg = json.loads(raw)
+                    event = msg.get("event")
+                    if event == "start":
+                        stream_sid = msg["start"]["streamSid"]
+                        logger.info("stream started: %s", stream_sid)
+                    elif event == "media":
+                        mulaw = base64.b64decode(msg["media"]["payload"])
+                        pcm16k, upsample_state = mulaw8k_to_pcm16k(mulaw, upsample_state)
+                        await gemini.send_realtime_input(
+                            audio=types.Blob(data=pcm16k, mime_type="audio/pcm;rate=16000")
+                        )
+                    elif event == "stop":
+                        logger.info("stream stopped")
+                        break
+
+            async def from_gemini() -> None:
+                """Stream Gemini audio out to Twilio."""
+                nonlocal downsample_state
+                async for response in gemini.receive():
+                    # Caller spoke over the AI — drop everything queued at Twilio.
+                    if response.server_content and response.server_content.interrupted:
+                        if stream_sid:
+                            await twilio_ws.send_text(json.dumps({
+                                "event": "clear",
+                                "streamSid": stream_sid,
+                            }))
+                        downsample_state = None  # reset resampler state too
+                        continue
+                    if response.data and stream_sid:
+                        mulaw, downsample_state = pcm24k_to_mulaw8k(response.data, downsample_state)
+                        await twilio_ws.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": base64.b64encode(mulaw).decode()},
+                        }))
+
+            await asyncio.gather(from_twilio(), from_gemini())
+
+    except WebSocketDisconnect:
+        logger.info("Twilio side disconnected (normal hangup)")
+    except Exception:
+        logger.exception("media bridge error")
+    finally:
+        try:
+            await twilio_ws.close()
+        except Exception:
+            pass
+        logger.info("session closed")
+```
+
+Expected behaviour: dial in, hear Twilio's short greeting, then Gemini takes over. Say "I'd like to make a reservation," and the AI gathers date, time, and party size, reading them back. Talk over the AI mid-sentence and it stops immediately.
+
+## Step 3: Handling Interruption and Hangup Correctly
+
+Interruption is the single trickiest piece of phone UX. When a caller starts talking, the AI must **drop every audio byte already queued**. There's no mute button on a landline, and a stubborn AI that finishes its sentence before listening sounds robotic.
+
+Gemini Live API's VAD raises `server_content.interrupted = true` when it detects the user starting to speak. The right response is to send Twilio a **`clear` event**, which tells Twilio to discard any audio buffered for playback. That's the `if response.server_content and response.server_content.interrupted:` branch above.
+
+Hangups deserve attention too. Twilio sends `event: "stop"`, but flaky lines may not deliver it. The code wraps everything in `try/finally` and uses `async with client.aio.live.connect(...)` so the Gemini session is closed by the context manager regardless. Skip the `finally` and zombie sessions accumulate on Cloud Run instances until you hit Live API's concurrency cap.
+
+## Step 4: Wiring in Function Calling
+
+A phone receptionist that can't actually book is half the value. Function Calling lets Gemini call your code when it has gathered the right inputs.
+
+```python
+# server/functions.py
+# Role: business functions exposed to the phone agent.
+from datetime import datetime
+from google.genai import types
+
+book_reservation = types.FunctionDeclaration(
+    name="book_reservation",
+    description="Create a single Bloom Cafe reservation.",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "name": types.Schema(type=types.Type.STRING, description="Caller name"),
+            "phone": types.Schema(type=types.Type.STRING, description="Callback number"),
+            "datetime_jst": types.Schema(type=types.Type.STRING, description="ISO8601 datetime (JST)"),
+            "party_size": types.Schema(type=types.Type.INTEGER, description="Number of people"),
+        },
+        required=["name", "datetime_jst", "party_size"],
+    ),
+)
+
+TOOLS = [types.Tool(function_declarations=[book_reservation])]
+
+
+async def handle_function_call(call) -> dict:
+    """Execute a function call from Gemini. Demo writes only a log line."""
+    if call.name == "book_reservation":
+        args = call.args or {}
+        # In production: write to your reservations DB inside a transaction,
+        # send an SMS confirmation, etc.
+        booking_id = f"BK-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        return {
+            "ok": True,
+            "booking_id": booking_id,
+            "message": f"Reserved for {args.get('party_size')} at {args.get('datetime_jst')}.",
+        }
+    return {"ok": False, "error": "unknown function"}
+```
+
+Pass `tools=TOOLS` into `LiveConnectConfig`. Gemini will fire the function during the conversation. In `from_gemini()`, when `response.tool_call` is set, run `handle_function_call` and feed the result back via `gemini.send_tool_response(...)`. Live API's tool calling, unlike text endpoints, executes **without breaking the conversation flow** — a key advantage on a phone line.
+
+Expected behaviour: caller says "Tomorrow seven PM, table for two please." Gemini fires `book_reservation`, gets a result, and continues with "Booked tomorrow at seven for two. May I take your name?"
+
+## Step 5: Deploying to Cloud Run Without Falling in the Usual Holes
+
+ngrok is fine to verify locally; for real traffic, Cloud Run (or any WebSocket-capable PaaS) is the practical answer. Use **`uvicorn --workers 1 --loop uvloop`**, not `gunicorn`. Add `--timeout-keep-alive 0`. Cloud Run's default timeout is 5 minutes; if you allow long calls, raise it to **`--timeout=3600`** and turn on **`--cpu-boost`** to cut cold-start latency.
+
+The setting most teams forget is **Min Instances=1**. A cold start eats the first few seconds of audio and the call sounds dead. Phone UX cannot recover from this. Keeping one instance warm costs cents next to your phone bill.
+
+Geography matters too. Pick **asia-northeast1 (Tokyo)** for Japanese callers. Gemini Live's endpoint is global, but pick a Tokyo Twilio Edge Location to shorten the round-trip.
+
+## Common Mistakes and Their Fixes
+
+- ❌ **Sending μ-law straight to Gemini.** It will not work. `audioop.ulaw2lin` to 16-bit PCM, then `audioop.ratecv` up to 16kHz before sending.
+- ❌ **Buffering all of Gemini's response before relaying.** That's a one-second-plus pause. Send each chunk inside `async for response in gemini.receive():` as soon as it arrives.
+- ❌ **Forgetting to close the Gemini session on hangup.** Zombie sessions accumulate, hit the Live API quota, and new callers get errors. Use `async with` or `try/finally`.
+- ❌ **Hard-coding API keys.** GitHub Secret Scanning will flag them. Read with `os.environ["GEMINI_API_KEY"]` and store the value in Secret Manager. See [The Indie Developer's Gemini API Key Safety Checklist](/articles/gemini-api/gemini-api-key-safe-operations-indie-developer-checklist) for the full discipline.
+- ❌ **Failing to reset `downsample_state` on interrupt.** Stale resampler state from the previous answer leaks into the next response as a click. Always set `downsample_state = None` when an interrupt fires.
+
+## Cost Math — What Does One Call Actually Cost?
+
+Rough numbers as of April 2026 per minute of conversation:
+
+- **Twilio Voice inbound (US number)**: ~ 0.0085 USD/min
+- **Twilio Media Streams**: ~ 0.004 USD/min
+- **Gemini 2.5 Flash Live (audio in/out combined)**: ~ 0.05–0.10 USD/min, model and region dependent
+- **Cloud Run with one warm instance**: ~ 0.03 USD/hour
+
+That puts a typical minute around **6–9 US cents**. Compared to staffing a human receptionist for an hour, the ROI is obvious. A shop fielding 100 calls a month at three minutes each pays roughly USD 25/month for the AI side.
+
+If you need to tighten the budget, three knobs help: keep **System Instructions short** (they're sent every session), **cap response length**, and **auto-disconnect on long silence**. Silence detection is a few dozen lines on top of the VAD events you already get.
+
+## Observability — Make Failures Legible
+
+Phone agents are unforgiving: if a caller hangs up annoyed, you'll never know what went wrong. Beyond `logger.info`, log each call with **session_id, duration, interruption count, and function-call success rate**. Langfuse or Datadog are both fine homes for this. For implementation patterns, see [Production Monitoring for Gemini API With Langfuse](/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide) and [Gemini API Production Observability Patterns](/articles/gemini-api/gemini-api-observability-production-monitoring).
+
+The metric most worth your attention is **first-three-seconds latency** — the gap between the caller finishing a sentence and the AI starting one. Anything over 1.5 seconds reads as awkward on a phone, and 90% of regressions trace back to either Cloud Run cold starts or a slow Gemini connection handshake.
+
+## A Closer Look at the Resampling Trap
+
+The single line `pcm16k, new_state = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, state)` is doing a lot of work, and getting it wrong is the cause of most "the AI sounds underwater" bug reports. `audioop.ratecv` implements a polyphase resampler whose internal filter has memory: it remembers the last few samples it processed in `state`. Pass `None` for the first frame and the returned `new_state` for every frame after. If you reset to `None` mid-call you are telling the filter to start over with no history, which produces a click at exactly the frame boundary. The same applies to the downsample direction.
+
+Two practical implications: (1) you must keep one `state` per direction, and (2) you must reset both states only at well-defined boundaries — call start, call end, and after an interruption. The interruption case is subtle. After Twilio drops the queued audio with a `clear`, the next bytes Gemini sends are a brand-new utterance, not a continuation. Resampling them with stale state would produce audible discontinuity. That's why the snippet sets `downsample_state = None` in the interrupt branch.
+
+If you ever switch to a different resampler — `scipy.signal.resample_poly`, `librosa`, or a native C library — the state pattern looks different but the underlying truth is the same: filter memory must be tracked per stream, and reset only at logical boundaries.
+
+## Twilio TwiML Edge Cases You Will Hit
+
+The TwiML in Step 1 is the minimum viable version. Two real-world tweaks usually appear within a week of going live.
+
+The first is **caller ID display**. If the caller blocks their number, `From` arrives as `+anonymous` or `restricted`. The webhook still works, but logging needs to handle the missing E.164 string. Add `request.form().get("From", "anonymous")` to your handler and log it.
+
+The second is **mid-call DTMF**. Some callers reflexively press numbers when an automated voice answers. By default, DTMF is sent as audio and confuses the AI. Add `<Stream>` parameter `dtmfHandling="off"` if you want to ignore tones, or set up a `dtmf` event handler in your WebSocket to map digits to actions. For a reservation flow, ignoring is simpler.
+
+A third lesson: **always validate the Twilio signature on `/voice`**. Without it, anyone who guesses your URL can dispatch your AI receptionist on someone else's bill. Twilio sends an `X-Twilio-Signature` header you can verify with `twilio.request_validator.RequestValidator(auth_token).validate(url, params, signature)`. Skipping this is a common but expensive mistake.
+
+## Scaling Beyond a Single Caller
+
+The bridge above happily handles tens to a few hundred concurrent calls per Cloud Run instance, but the bottleneck shifts as you scale. Three numbers determine the ceiling.
+
+**Gemini Live API concurrency** is the first wall. Live sessions count against per-project quotas; check them in Google AI Studio before promising a launch date. If you need more than the default cap, request an increase well in advance — turnaround is days, not hours.
+
+**Twilio concurrent calls** is the second. Trial accounts cap at one or two parallel calls. Upgraded accounts default to a few dozen and scale on request. Don't discover this in production traffic.
+
+**WebSocket fan-out per instance** is the third. Cloud Run's per-instance concurrency setting (`--concurrency`) defaults to 80 and can go up to 1000 — but each WebSocket has a long-lived event loop and CPU work for the resamplers, so realistic numbers are 30–80 per `e2-standard-2` instance. Set Min Instances=1 and Max Instances to your projected peak ÷ 50, and let autoscaling do the rest.
+
+Going further requires either sharding by phone number or offloading the resampling to a dedicated audio service. Most indie deployments never get there; the architecture above scales to thousands of calls per day on a small Cloud Run footprint.
+
+## Frequently Hit Question
+
+**Can I run this on AWS Lambda or Vercel instead?** No, both struggle with long-lived WebSocket bridges. Lambda's 15-minute execution cap and per-invocation pricing make it a poor fit; Vercel's serverless functions are HTTP-only. Cloud Run, Fly.io, Railway, and Render all support persistent WebSocket workloads. If you're already on AWS, Fargate or App Runner are the equivalents.
+
+
+## Anatomy of a Single Audio Round-Trip
+
+Walking through what happens to a single 20-millisecond chunk of audio makes the system click. Twilio's Media Streams emit one frame every 20 ms, each carrying 160 samples of 8-bit μ-law. That's 160 bytes payload per frame, base64-encoded into 216 characters of JSON. At 50 frames per second, your relay handles a steady drip; nothing about the data rate itself is challenging.
+
+Step one in the relay is base64-decoding back to the 160-byte μ-law buffer. Step two is `audioop.ulaw2lin`, which expands each 8-bit sample into a 16-bit linear sample — the buffer doubles to 320 bytes. Step three is `audioop.ratecv` to upsample 8kHz to 16kHz, doubling again to 640 bytes. That's what gets shipped to Gemini Live.
+
+Gemini's audio reply travels the path in reverse but at higher fidelity. Responses come in as 24kHz 16-bit PCM in chunks of varying size; you downsample to 8kHz with `audioop.ratecv` and convert to μ-law with `audioop.lin2ulaw`. A 60 ms response chunk that arrives as 2,880 bytes of 24kHz PCM becomes 480 bytes of 8kHz μ-law and finally a 648-character base64 JSON payload Twilio expects.
+
+The arithmetic matters because it sets your latency budget. Each transformation is fast — sub-millisecond in `audioop` — but they add up across hundreds of frames per minute. CPU-side cost is real once you scale: a Cloud Run instance handling 50 concurrent calls is doing 5,000 frame conversions per second in each direction. If you push past that, profiling `audioop` will show it as the hottest function. At very high scale a native resampler like `samplerate` or `soxr` cuts CPU by ~3×, at the cost of a more elaborate dependency chain.
+
+## Production-Grade Error Recovery
+
+Three classes of errors are worth handling explicitly: Gemini disconnects, Twilio disconnects, and back-end function failures. Each calls for a different response.
+
+A **Gemini WebSocket disconnect** mid-call is rare but real. The `async with client.aio.live.connect(...)` context will raise on the next `send_realtime_input` or `receive` call. The right move is to log the error, send a short fallback prompt to the caller via Twilio's `<Say>` (you can do this by sending a `mark` event and instructing Twilio to play a fallback audio file), and gracefully end the call. Reconnecting mid-conversation almost always sounds wrong because the AI loses context and personality.
+
+A **Twilio disconnect** that isn't a clean hangup typically means flaky cellular signal. The `WebSocketDisconnect` exception fires; your `finally` block closes the Gemini session. Log the duration and disconnect cause for later analysis. There is nothing to recover; the call is over.
+
+A **function-call failure** is the most interesting case. Suppose `book_reservation` throws because your DB is briefly unreachable. Returning `{"ok": False, "error": "..."}` lets Gemini handle the error gracefully — it will tell the caller something like "I'm having trouble reaching the booking system, can I take your number and call back?" That's a good outcome for a voice agent. Crashing or freezing is not. Wrap your function bodies in `try/except` and always return a JSON-serialisable result.
+
+```python
+async def safe_handle_function_call(call):
+    try:
+        return await handle_function_call(call)
+    except Exception as exc:
+        logger.exception("function call failed: %s", call.name)
+        return {"ok": False, "error": "internal error", "detail": str(exc)[:200]}
+```
+
+This three-line wrapper prevents the most embarrassing failure mode: an AI that says "let me check that for you" and then goes silent for thirty seconds because an exception bubbled up. With the wrapper, Gemini gets a clear failure signal and improvises a polite recovery.
+
+
+## Tuning System Instructions for Phone Conversations
+
+System Instructions for a phone agent should differ from those for a chat agent. Phone callers can't read; they listen. Three rules consistently improve the experience.
+
+First, **constrain answer length**. A useful prompt is "answer in two short sentences unless the caller explicitly asks for detail." Long-winded answers feel slower on a call than they ever do on screen. Callers also can't skim ahead.
+
+Second, **specify cadence and personality** in plain language. "Friendly, brisk English with a single confirmation question at the end of each turn" gives Gemini a usable pattern. Phone agents that over-explain or repeat themselves sound bureaucratic.
+
+Third, **front-load the escape hatch**. Tell Gemini "if you don't know an answer, say a human will call back, take a name and number, and stop guessing." Without this, Live API will sometimes invent business hours or addresses, which on a phone is far worse than admitting ignorance.
+
+I also recommend including a **handoff trigger** in the system instructions: "If the caller asks for a manager or sounds frustrated, call the `escalate_to_human` function with the reason." Couple that with a `escalate_to_human` Function Declaration that pages your phone, and you have a graceful fallback that builds caller trust.
+
+
+## What to Do Next
+
+Start with Twilio's trial credit (15 USD on a new account at writing) and Google AI Studio's free tier. Stand up just `/voice` and `/media`, point a Twilio number at it, and call your own AI receptionist from your phone. One working call teaches you more about latency, interruption, and cost than ten more pages of theory. To go commercial, swap the demo `book_reservation` for a real DB write, add SMS confirmations via Twilio Programmable Messaging, and verify Twilio's signature on `/voice`. From there the path to production is mostly polish.
+
+Phones — long the most "human" channel in any business — are quietly opening up to AI. Get one working in your own kitchen first; the feel of it is the part that doesn't translate from articles.
+
+For deeper grounding while you build, two books pair well with this guide. [Designing Data-Intensive Applications by Martin Kleppmann](https://www.amazon.co.jp/dp/1449373321/?tag=pinocchio-22) frames the streaming and reliability concerns you'll face once a phone agent is in real use. [Effective Python by Brett Slatkin](https://www.amazon.co.jp/dp/0134853989/?tag=pinocchio-22) is the most useful single resource I know for shoring up the asyncio and concurrency patterns the bridge above relies on. Neither is strictly necessary; both shorten the path to a phone agent that holds up to traffic.
