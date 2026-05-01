@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMINI31PRO — Gemini 3.1 Pro 開発者プレビュー開始、ARC-AGI-2 で 77.1% を達成し推論性能が 3 Pro の 2 倍以上に（4月）",
-    "FLASHTTS — Gemini 3.1 Flash TTS 公開、70 言語以上対応のプロンプト制御可能な表現豊かな音声合成（4月）",
-    "AISTUDIO — Google AI Pro / Ultra 加入者の AI Studio 利用枠が大幅拡大、Nano Banana Pro まで標準アクセス（4/20）",
-    "NANOBANANA2 — Nano Banana 2（Gemini 3.1 Flash Image）が Gemini アプリ・Search AI Mode・Lens のデフォルト画像エンジンに",
-    "EMBEDDING — gemini-embedding-2-preview 公開、テキスト・画像・動画・音声・PDF を扱う初の本格マルチモーダル埋め込み",
-    "APPLEDEAL — Apple × Google 提携で Siri に Gemini を採用、WWDC 2026 で刷新版が発表予定（6/8〜6/12）",
+    "IO2026 — Google I/O 2026 開幕間近（5/19-20）、基調講演で Gemini 4 / Veo 4 / Project Astra デモが期待される",
+    "TV-CREATE — Google TV に Gemini「Create」ボタン搭載、Nano Banana / Veo を音声プロンプトで操作可能に（4/29-30）",
+    "GM-AUTO — GM が Google built-in 全車種で Gemini を採用、対象は2022年式以降の Cadillac/Chevy/Buick/GMC 約400万台（4/28）",
+    "WORKSPACE — Workspace Gemini が Docs/Sheets/Slides/PDF/DOCX/XLSX/LaTeX 生成に対応、業務エージェント化が本格化",
+    "AGENTIC — Google I/O 2026 のテーマはエージェンティック AI とエージェンティックコーディング、Antigravity 関連も期待",
+    "NANOBANANA — Nano Banana 2 が Gemini アプリ・Search AI Mode・Lens のデフォルト画像エンジンとして継続展開",
   ],
   en: [
-    "GEMINI31PRO — Gemini 3.1 Pro enters developer preview hitting 77.1% on ARC-AGI-2, more than double 3 Pro reasoning (Apr)",
-    "FLASHTTS — Gemini 3.1 Flash TTS lands with 70+ languages and prompt-controlled expressive speech (Apr)",
-    "AISTUDIO — Google AI Pro and Ultra subscribers get higher AI Studio limits and Nano Banana Pro access (4/20)",
-    "NANOBANANA2 — Nano Banana 2 (Gemini 3.1 Flash Image) becomes the default image engine across Gemini app, Search AI Mode, and Lens",
-    "EMBEDDING — gemini-embedding-2-preview launches as the first true multimodal embedding model (text, image, video, audio, PDF)",
-    "APPLEDEAL — Apple partners with Google to power Siri with Gemini, revamped Siri expected at WWDC 2026 (Jun 8-12)",
+    "IO2026 — Google I/O 2026 kicks off May 19-20, with Gemini 4, Veo 4, and Project Astra demos widely expected",
+    "TV-CREATE — Google TV gains a Gemini Create button that drives Nano Banana and Veo through voice prompts (4/29-30)",
+    "GM-AUTO — GM adopts Gemini across Google built-in vehicles, covering ~4M Cadillac/Chevy/Buick/GMC cars from MY2022+ (4/28)",
+    "WORKSPACE — Workspace Gemini now generates Docs, Sheets, Slides, PDF, DOCX, XLSX, and LaTeX as a true productivity agent",
+    "AGENTIC — I/O 2026 leans into agentic AI and agentic coding, with Antigravity-related news anticipated",
+    "NANOBANANA — Nano Banana 2 remains the default image engine across the Gemini app, Search AI Mode, and Lens",
   ],
 };
 
