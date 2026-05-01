@@ -1,0 +1,202 @@
+---
+title: "Zod × Gemini API: TypeScript で構造化出力を型安全に扱う実装パターン"
+slug: "gemini-api-zod-typesafe-structured-output-validation-pattern"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-02T00:30"
+author: "Gemini Lab"
+description: "Gemini API の構造化出力を Zod スキーマで検証する実装パターンを解説します。as による型キャストの落とし穴、JSON Schema への変換、検証失敗時のリトライ設計までコード付きで紹介します。"
+tags: ["gemini-api", "zod", "typescript", "structured-output", "validation"]
+---
+
+Gemini API で `responseMimeType: "application/json"` と `responseSchema` を組み合わせて構造化出力を実装したとき、TypeScript 側で `JSON.parse(response.text) as MyType` と書いて済ませていないでしょうか。私は最初これで書いていて、本番でしばらく動かしてから気づきました——LLM が返す JSON は、ほとんどの場合スキーマに沿っているのですが、稀に外れます。フィールドの順序が違ったり、`null` が入ったり、整数のはずが文字列で返ってきたり。`as` でキャストしたコードは、その「稀」をすべて素通りさせてしまいます。
+
+この記事では、Zod を使って Gemini API のレスポンスをランタイムで検証する実装パターンをまとめます。スキーマを Zod 側に一元化することで、Gemini に渡す JSON Schema と TypeScript の型定義の両方を 1 つの真実から導けるようになります。
+
+## なぜ `as` キャストでは不十分なのか
+
+TypeScript の型キャストはコンパイル時のみのチェックです。`as MyType` と書いた瞬間、コンパイラは「この値は `MyType` だ」と信じてしまいます。実際の値がどうかは確認しません。
+
+```ts
+// ❌ 危険なパターン
+const result = await ai.models.generateContent({
+  model: "gemini-2.5-flash",
+  contents: prompt,
+  config: { responseMimeType: "application/json", responseSchema: schema },
+});
+const data = JSON.parse(result.text) as Article;
+console.log(data.title.toUpperCase()); // data.title が undefined だと実行時エラー
+```
+
+Gemini API は構造化出力の精度が高く、9 割以上のケースでスキーマ通りに返してくれます。しかし残りの数 % で落ちるアプリケーションは、ユーザーから見れば「不安定なサービス」です。本番運用では、その数 % を握りつぶさず、検出して再試行する仕組みが要ります。
+
+Zod は TypeScript エコシステムで広く使われているランタイム検証ライブラリです。スキーマ定義から型を自動生成でき、`parse()` を呼ぶと値の妥当性をチェックして、合致しなければ詳細なエラー情報を返してくれます。Gemini との相性も良く、`zod-to-json-schema` を介して Gemini が要求する JSON Schema 形式に変換できます。
+
+## Zod スキーマを Gemini API に渡す基本フロー
+
+まずは依存関係を入れます。
+
+```bash
+npm install @google/genai zod zod-to-json-schema
+```
+
+次に、レスポンスを表す Zod スキーマを定義します。商品レビューを構造化抽出する例で進めます。
+
+```ts
+// schema.ts
+import { z } from "zod";
+
+export const ReviewSchema = z.object({
+  productName: z.string().min(1).describe("レビュー対象の商品名"),
+  rating: z.number().int().min(1).max(5).describe("5 段階評価"),
+  sentiment: z.enum(["positive", "neutral", "negative"]),
+  pros: z.array(z.string()).max(5),
+  cons: z.array(z.string()).max(5),
+});
+
+export type Review = z.infer<typeof ReviewSchema>;
+```
+
+`z.infer` で TypeScript の型を取り出せるので、これ以降のコードはすべてこの 1 ファイルから派生します。スキーマを変えれば型も自動で追従します。
+
+Gemini に渡すときは `zod-to-json-schema` で JSON Schema に変換します。
+
+```ts
+// gemini.ts
+import { GoogleGenAI } from "@google/genai";
+import { zodToJsonSchema } from "zod-to-json-schema";
+import { ReviewSchema, type Review } from "./schema";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+export async function extractReview(rawText: string): Promise<Review> {
+  const jsonSchema = zodToJsonSchema(ReviewSchema, {
+    target: "openApi3", // Gemini は OpenAPI 3 互換のスキーマを受け付けます
+  });
+
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: `次のレビューを構造化してください:\n\n${rawText}`,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: jsonSchema,
+    },
+  });
+
+  const parsed = ReviewSchema.parse(JSON.parse(response.text ?? "{}"));
+  return parsed;
+}
+```
+
+ここでのポイントは 2 つあります。`responseSchema` で Gemini に「このスキーマで返して」と指示し、戻ってきたレスポンスをもう一度 `ReviewSchema.parse()` で検証する——この二重チェックが Zod 連携の本質です。Gemini 側の構造化出力は強力ですが、それだけに依存せず、自分の側でも検証することで、想定外のレスポンスを安全に検出できます。
+
+## 検証失敗時のリトライ設計
+
+`parse()` がエラーを投げた場合、ただ落とすのではなく、エラー情報を Gemini にフィードバックして再試行する設計が実用的です。
+
+```ts
+// retry.ts
+import { z } from "zod";
+
+export async function extractWithRetry<T>(
+  schema: z.ZodSchema<T>,
+  generate: (errorContext?: string) => Promise<string>,
+  maxAttempts = 3,
+): Promise<T> {
+  let lastError: string | undefined;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const text = await generate(lastError);
+    try {
+      return schema.parse(JSON.parse(text));
+    } catch (e) {
+      if (e instanceof z.ZodError) {
+        lastError = `前回のレスポンスは検証エラーになりました: ${e.issues
+          .map((i) => `${i.path.join(".")}: ${i.message}`)
+          .join("; ")}。スキーマ通りに修正してください。`;
+        if (attempt === maxAttempts) throw e;
+      } else {
+        throw e;
+      }
+    }
+  }
+  throw new Error("unreachable");
+}
+```
+
+この関数を使えば、Gemini が稀に外したときも、エラー内容をプロンプトに含めて再生成させられます。実際の運用では 2 回目で 9 割以上が通るので、最大試行を 3 回程度にしておけば十分です。
+
+## つまずきやすい 3 つのポイント
+
+実装していて私自身がはまった、共有しておきたい落とし穴があります。
+
+**1. `z.union` と `z.discriminatedUnion` の扱い**
+
+Gemini は `oneOf` を含むスキーマを部分的にしかサポートしていません。`z.union` を使うと JSON Schema 側で `oneOf` が出力され、Gemini が解釈に失敗することがあります。可能なら `z.discriminatedUnion` を使い、それでも失敗する場合は `z.enum` でタイプを表現する設計に変えるのが安全です。
+
+**2. `.describe()` を惜しまない**
+
+Zod の `.describe()` で書いた説明文は、JSON Schema の `description` フィールドに変換されて Gemini に渡ります。これが推論精度に直結します。「rating: 5 段階評価」とだけ書くより、「rating: ユーザーの満足度を 1〜5 の整数で。1 が非常に悪い、5 が非常に良い」と書いた方が、レスポンスのばらつきが減ります。
+
+**3. `z.date()` は使わない**
+
+JSON にネイティブな日付型はないため、Gemini は日付を文字列で返します。スキーマ側では `z.string().datetime()` を使い、必要なら `.transform((v) => new Date(v))` で変換するのが定石です。`z.date()` をそのまま渡すと検証失敗します。
+
+## クライアントとサーバーで型を共有する
+
+Next.js のようなフルスタックフレームワークを使っているなら、Zod スキーマを `lib/schemas.ts` のような共有ファイルに置いて、サーバー側の Gemini 呼び出しとクライアント側のフォームで同じスキーマを使うのがおすすめです。型の真実が 1 ヶ所にあるので、フィールド追加のときに片側だけ更新する事故を防げます。
+
+実装の流れを整理すると、API ルートで Gemini からレスポンスを受け取って Zod で検証し、クライアントに JSON で返します。クライアントは届いた JSON をもう一度同じスキーマで検証してから React の状態に入れる、という二重防御が現実的です。型定義は `z.infer` で取り出すので、フロントエンドとバックエンドで一切ズレません。
+
+レスポンスの実装パターンをさらに深めたい方には、関連記事として [Gemini API のレスポンススキーマ検証を本番運用する設計](/articles/gemini-api/gemini-api-response-schema-validation-production) と [TypeScript で型安全な AI アプリケーションを設計する](/articles/gemini-api/gemini-api-typescript-typesafe-ai-application-architecture) が参考になります。Zod ではなく Python で同じパターンを実装したい場合は [Gemini API × Pydantic で型安全な構造化出力を作る](/articles/gemini-api/gemini-api-pydantic-structured-output-type-safe-production) が役立ちます。
+
+## API クォータを使わずにテストする
+
+Zod スキーマを持っているもう一つの利点は、テストで Gemini を呼ばずに検証できる点です。典型的なレスポンス（あるいはエッジケース）を表す JSON をフィクスチャとして用意し、テストで `ReviewSchema.parse()` を実行する——スキーマを変更したとき、フィクスチャがまだ妥当かをテストが教えてくれます。API コールを 1 回も消費せずに、です。
+
+```ts
+// schema.test.ts
+import { describe, it, expect } from "vitest";
+import { ReviewSchema } from "./schema";
+
+describe("ReviewSchema", () => {
+  it("妥当なレスポンスを受け入れる", () => {
+    const fixture = {
+      productName: "ワイヤレスイヤホン X",
+      rating: 4,
+      sentiment: "positive",
+      pros: ["バッテリーが長持ち", "装着感が良い"],
+      cons: ["アプリが不安定"],
+    };
+    expect(() => ReviewSchema.parse(fixture)).not.toThrow();
+  });
+
+  it("不正な sentiment を拒否する", () => {
+    const fixture = { productName: "X", rating: 3, sentiment: "okay", pros: [], cons: [] };
+    expect(() => ReviewSchema.parse(fixture)).toThrow();
+  });
+});
+```
+
+厳密なスキーマと、代表的なフィクスチャを数件持っておくだけで、多くのリグレッションは LLM 呼び出しに到達する前に捕まえられます。
+
+## `parse` と `safeParse` の使い分け
+
+`parse()` は不正な値で例外を投げます。リトライで包まれたサービス内なら、これで構いません。一方、try/catch のコストを払わずに結果を分岐したい場面では `safeParse()` が便利です。判別共用体（discriminated union）を返すので、`success` のフラグでパターンマッチできます。
+
+```ts
+const result = ReviewSchema.safeParse(JSON.parse(text));
+if (!result.success) {
+  logger.warn({ issues: result.error.issues }, "validation failed");
+  return fallbackReview;
+}
+return result.data;
+```
+
+サーバレスハンドラのように、ユーザーに 500 を返すよりは穏やかにフォールバックしたい状況で特に役立ちます。文脈に応じて、リトライで守られたホットパスでは `parse` を、呼び出し側で成否を分岐したい場合は `safeParse` を選ぶのがおすすめです。
+
+## まずは小さなスキーマから始める
+
+Zod 連携の良いところは、最小から始めて段階的に拡張できることです。最初は 2〜3 フィールドの単純なオブジェクトから入って、慣れてきたらネストや配列、enum を足していくのが続けやすいやり方です。今日のアプリで使っている Gemini の構造化出力に、まず 1 つだけ Zod の `parse()` を挟んでみてください。それだけでも、これまで気づかなかった微妙なずれが見えてくるはずです。
+
+書籍で体系的に Zod や TypeScript の設計パターンを学びたい方には [プロを目指す人のためのTypeScript入門（鈴木 僚太）](https://www.amazon.co.jp/dp/4297127474/?tag=pinocchio-22) が、Zod の `transform` や条件付き型の使いこなしにつながります。
