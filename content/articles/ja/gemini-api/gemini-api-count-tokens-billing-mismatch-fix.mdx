@@ -1,0 +1,232 @@
+---
+title: "Gemini API の count_tokens 推定と実課金トークン数がズレる5つの原因 — 個人開発者向け原因切り分けと再計算パターン"
+slug: "gemini-api-count-tokens-billing-mismatch-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-01T09:15"
+author: "Gemini Lab"
+description: "「count_tokens で 1,200 と出たのに、Cloud Console を見たら 4,800 トークン課金されていた」— このズレ、私もハマりました。Thinking・ツール・マルチモーダル・キャッシュの観点から原因を切り分け、見積もりを実課金に近づける再計算パターンを紹介します。"
+tags: ["gemini-api", "count-tokens", "billing", "cost-management", "troubleshooting"]
+---
+
+「`count_tokens()` で 1,200 トークンと出たから、月のコスト試算もそれをベースに組んだのに、月末の Cloud Console を見たら4倍近く課金されていた」— これは、私が個人開発で Gemini API を使い始めて2か月目にやらかした失敗の話です。試算とのズレが見えなかった結果、無料枠超過の通知メールで初めて気づきました。
+
+`count_tokens()` は便利な API ですが、これが返す数値と実際の課金トークン数（`usage_metadata.total_token_count`）は同じではありません。むしろ「同じになる方が稀」と言ってよいくらい、5つほどの要因がトークン数を膨らませます。本記事では、その5要因を再現コードとともに切り分け、最終的に「課金額を事前にほぼ言い当てられる」レベルまで見積もり精度を上げる手順を共有します。
+
+## まず数字のズレを正確に観測する
+
+トラブルシューティングの第一歩は、思い込みを捨てて両方の数字を並べることです。`count_tokens()` の結果と、実際にリクエストした後の `usage_metadata` を1リクエスト内で比較するスクリプトを作っておくと、後々の原因切り分けが一気に楽になります。
+
+```python
+# tools/compare_token_count.py
+# 目的: count_tokens の予測値と usage_metadata の実測値を1ファイルで突き合わせる
+import os
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+MODEL = "gemini-2.5-flash"
+
+def compare(prompt: str, system_instruction: str | None = None, tools: list | None = None):
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        tools=tools,
+    )
+
+    # ① 事前推定（課金されない無料の Tokenizer 呼び出し）
+    estimated = client.models.count_tokens(model=MODEL, contents=prompt).total_tokens
+
+    # ② 実リクエスト
+    res = client.models.generate_content(model=MODEL, contents=prompt, config=config)
+    usage = res.usage_metadata
+
+    print(f"prompt        : {prompt[:40]}...")
+    print(f"count_tokens  : {estimated}")
+    print(f"usage prompt  : {usage.prompt_token_count}")
+    print(f"usage thoughts: {getattr(usage, 'thoughts_token_count', 0)}")
+    print(f"usage output  : {usage.candidates_token_count}")
+    print(f"usage TOTAL   : {usage.total_token_count}")
+    print(f"diff (est→real): {usage.total_token_count - estimated:+d}")
+
+compare("Gemini API のトークン課金についてかんたんに説明してください。")
+```
+
+このスクリプトを使って自分のユースケースで一度実測してみてください。差分が大きいほど、これから紹介する5要因のどれかに当てはまっている可能性が高いです。
+
+## 原因1: Thinking モデルは「思考トークン」が別カウントで課金される
+
+最初に押さえてほしいのが、Gemini 2.5 系の Thinking モデル（`gemini-2.5-pro` / `gemini-2.5-flash`）には **`thoughts_token_count`** という独立した課金項目がある点です。`count_tokens()` は入力プロンプトのトークンしか数えないので、ここは原則として見積もりから漏れます。
+
+実測すると、長文の論理的タスクでは思考トークンが出力トークンの2〜3倍に膨らむことも珍しくありません。`gemini-2.5-pro` の場合、思考トークンは出力トークンと同じ単価で課金されるため、ここを見落とすと請求額が2〜3倍になります。
+
+```python
+# 思考トークンを抑えたい時の代表的なパラメータ
+config = types.GenerateContentConfig(
+    thinking_config=types.ThinkingConfig(
+        thinking_budget=512,  # 思考トークンの上限を明示
+        include_thoughts=False,  # 思考要約を返さない
+    ),
+)
+```
+
+私はチャット系アプリでは `thinking_budget=512` を上限にして月のコスト変動幅を圧縮しています。逆にコード生成・分析タスクではここを絞りすぎると品質が落ちるので、用途別にプリセットを分けるのが現実的です。詳しい設計指針は [Gemini 2.5 の Thinking Budget 最適化ガイド](/articles/gemini-api/gemini-25-thinking-budget-optimization-guide) で書いています。
+
+## 原因2: ツール定義（Function Calling）が「見えないプロンプト」として加算される
+
+意外と多いのがこのパターンです。`tools=[my_function]` のように渡した関数定義は、内部的にプロンプトの一部として送信され、課金対象になります。`count_tokens()` 単体では `contents` しか見ていないので、ツール定義分はカウントに乗りません。
+
+```python
+# 検証コード: ツール定義が課金トークンを膨らませることを確認
+def get_weather(location: str) -> str:
+    """指定都市の現在の天気を返します"""
+    return "sunny"
+
+# ツールあり / なし で比較
+for has_tools in [False, True]:
+    cfg = types.GenerateContentConfig(tools=[get_weather] if has_tools else None)
+    r = client.models.generate_content(
+        model=MODEL,
+        contents="今日は出かけても大丈夫？",
+        config=cfg,
+    )
+    label = "with tools" if has_tools else "no tools"
+    print(f"{label}: prompt_tokens={r.usage_metadata.prompt_token_count}")
+```
+
+私の手元では、関数を1つ追加するごとにおおよそ50〜120トークンの追加が観測されます。OpenAPI スキーマの `description` フィールドが長いほど膨らむので、実運用では「ツール定義は短く・必要最小限に」が鉄則です。Function Calling 全般の設計は [Gemini API のシステム指示が無視される7つの原因](/articles/gemini-api/gemini-api-system-instruction-ignored-troubleshooting) と合わせて読むと、システム指示とツール定義の役割分担が見えてきます。
+
+## 原因3: 画像・動画・音声は「タイル方式」で固定トークンになる
+
+マルチモーダル入力で見積もりが大きくズレる原因がこれです。テキストはバイト数におおむね比例しますが、画像・動画・音声は異なる計算式が使われます。
+
+公式ドキュメントから引用した、私が普段試算に使っている近似値です。
+
+- **画像**: 768×768px 以下なら約258トークン固定。それ以上は768pxのタイルに分割され、タイル数 × 258トークン
+- **動画**: 1秒あたり約263トークン（Gemini 2.5 Flash の場合、解像度設定により変動）
+- **音声**: 1秒あたり約32トークン
+
+`count_tokens(contents=[image_part])` は対応していますが、URI 経由のファイルでは `file_data` にしか対応せず、ローカルファイルでは事前に File API へのアップロードが必要です。動画長や画像サイズで一気に数千トークン乗ることもあるので、見積もり時は必ずマルチモーダルパートも投入してください。
+
+```python
+# マルチモーダル入力のトークン推定
+import pathlib
+from google.genai import types
+
+img = types.Part.from_bytes(
+    data=pathlib.Path("./screenshot.png").read_bytes(),
+    mime_type="image/png",
+)
+prompt_parts = [img, "この画面のエラー原因を3つ挙げてください。"]
+
+est = client.models.count_tokens(model=MODEL, contents=prompt_parts).total_tokens
+print(f"multimodal estimated: {est}")
+```
+
+マルチモーダル特有のコスト最適化は [Gemini API のマルチモーダル入力最適化と運用](/articles/gemini-api/gemini-api-multimodal-input-optimization-token-cost-production) で詳しく扱っています。
+
+## 原因4: System Instruction とチャット履歴は毎回フルで再送される
+
+見落としがちですが、`system_instruction` と過去のチャット履歴は **毎リクエストで再送される** ため、リクエストの度にそのトークンも課金されます。
+
+「200トークンの system_instruction を入れて、200ターンの会話を行うチャット」を素直に作ると、最後のターンでは過去すべての履歴が再送されるため、1リクエストで数千〜数万トークンに膨らむのはよくある話です。`count_tokens()` でこれを正確に出すには、本番リクエストと同じ `contents` リスト（履歴 + 新メッセージ）を渡す必要があります。
+
+```python
+# チャット履歴を含めた現実的な見積もり
+history = [
+    types.Content(role="user", parts=[types.Part.from_text("最初の質問")]),
+    types.Content(role="model", parts=[types.Part.from_text("最初の回答")]),
+    # ... ターンが伸びるほど課金トークンも伸びる
+]
+new_user_msg = types.Content(role="user", parts=[types.Part.from_text("追加の質問")])
+contents = history + [new_user_msg]
+
+est = client.models.count_tokens(model=MODEL, contents=contents).total_tokens
+print(f"with history: {est}")
+```
+
+実運用では、履歴を毎ターン素直に積み上げる設計はコスト的にすぐ破綻します。私は「直近Nターンだけ残し、それ以前は要約に置き換える Rolling Summary 方式」を採用することが多いです。これは効果が見えやすく、初心者の方にもおすすめできます。
+
+## 原因5: Context Caching を使うと「キャッシュ済みトークン」が別単価で計上される
+
+最後の落とし穴が Context Caching です。`cached_content` を使うと、`usage_metadata` に `cached_content_token_count` という項目が増え、ここは通常の入力トークンの **約25%程度の単価** で課金されます（モデルによって異なります）。
+
+つまり、キャッシュを使っているのに「`count_tokens()` がキャッシュ前のトークンしか返さない」状態だと、見積もりが過大になります。逆にキャッシュ未使用のリクエストでキャッシュ単価で計算すると過小見積もりになります。両方の単価を意識した見積もり計算式が必要です。
+
+```python
+# 課金額の正確な見積もり関数（料金は常に最新の公式ページで確認してください）
+PRICE_INPUT = 0.30 / 1_000_000        # 例: $0.30 / 1M tokens
+PRICE_CACHED_INPUT = 0.075 / 1_000_000 # 例: $0.075 / 1M tokens
+PRICE_OUTPUT = 2.50 / 1_000_000        # 例: $2.50 / 1M tokens
+PRICE_THOUGHTS = 2.50 / 1_000_000      # Thinking モデルは output と同単価
+
+def estimate_cost(usage) -> float:
+    cached = getattr(usage, "cached_content_token_count", 0) or 0
+    fresh_input = usage.prompt_token_count - cached
+    thoughts = getattr(usage, "thoughts_token_count", 0) or 0
+    output = usage.candidates_token_count
+    return (
+        fresh_input * PRICE_INPUT
+        + cached * PRICE_CACHED_INPUT
+        + output * PRICE_OUTPUT
+        + thoughts * PRICE_THOUGHTS
+    )
+```
+
+Context Caching の運用設計は [Gemini API の Context Caching コスト最適化](/articles/gemini-api/gemini-api-context-caching-cost-optimization) で深掘りしています。
+
+## 見積もり精度を上げる「本番に近い試算」テンプレート
+
+ここまでの5要因を踏まえて、私が新規プロジェクトで必ず作る「本番に近い試算スクリプト」のテンプレートを共有します。これは個人開発の小さなアプリでも、サービス化する前段階でぜひ作っておくと安心です。
+
+```python
+# tools/realistic_estimate.py
+# 目的: 本番と同じ条件で count_tokens し、5要因を補正したコストを出す
+from dataclasses import dataclass
+
+@dataclass
+class CostEstimate:
+    prompt_tokens: int
+    expected_output: int
+    expected_thoughts: int
+    cached_tokens: int
+
+    def total_cost(self) -> float:
+        fresh = self.prompt_tokens - self.cached_tokens
+        return (
+            fresh * PRICE_INPUT
+            + self.cached_tokens * PRICE_CACHED_INPUT
+            + self.expected_output * PRICE_OUTPUT
+            + self.expected_thoughts * PRICE_THOUGHTS
+        )
+
+# 使用例
+prompt_tokens = client.models.count_tokens(
+    model=MODEL,
+    contents=full_contents_with_history_and_tools_and_media,
+).total_tokens
+
+estimate = CostEstimate(
+    prompt_tokens=prompt_tokens,
+    expected_output=400,    # 過去ログから 95 パーセンタイル
+    expected_thoughts=600,  # Thinking モデルなら計測値を入れる
+    cached_tokens=0,         # キャッシュ使用時のみ加算
+)
+print(f"per request: ${estimate.total_cost():.6f}")
+```
+
+「期待出力トークン」と「期待思考トークン」は最初は推測で構いませんが、本番投入してからは過去ログの 95 パーセンタイルで置き換えていくと、月末の請求額をほぼ言い当てられるようになります。
+
+## 詰まりやすいポイントの整理
+
+最後に、私が相談を受けてよく出会う3つの誤解を整理しておきます。
+
+ひとつめは「`count_tokens()` の結果で予算アラートを設定すれば安心」という誤解です。これは原因1〜5すべてを見落としており、実際の課金額より大幅に小さい数字を基準にしてしまうため、月の途中で予算を一気に突破します。アラートは必ず `usage_metadata.total_token_count` の累積値で組んでください。
+
+ふたつめは「無料ティアでテストしているから課金は気にしなくていい」という誤解です。無料ティアにはレート制限があり、ここを超えると 429 エラーで止まりますが、有料ティアに移行した瞬間に上記のすべての要因が課金として顕在化します。本番移行のタイミングで予算を一気に突破するパターンが、相談で一番多いです。
+
+みっつめは「Thinking を切れば思考トークンは課金されない」という誤解です。`gemini-2.5-flash` では `thinking_config.thinking_budget=0` を明示しないと、内部的には少量の思考が走ってトークンが消費されます。完全にゼロにしたい場合は `thinking_budget=0` を明示してください。
+
+## 次の一歩
+
+まず手元のアプリで `usage_metadata` を本番ログに必ず保存するところから始めてみてください。1週間ログを取れば、`count_tokens()` の予測値と実測値の比率がほぼ安定して見えてきます。その比率を見ながら、本記事で紹介した5要因のどれが効いているかを切り分けて、見積もり式に補正係数を入れていく — これが私のおすすめのアプローチです。詳細な計測手法は [Gemini API の usage_metadata を使ったコスト追跡](/articles/gemini-api/gemini-api-usage-metadata-cost-tracking-production) も合わせて参考にしていただけると幸いです。
