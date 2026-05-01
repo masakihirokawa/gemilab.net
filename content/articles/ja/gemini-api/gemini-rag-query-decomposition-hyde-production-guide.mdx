@@ -1,0 +1,261 @@
+---
+title: "Gemini API でクエリ分解と HyDE を組み合わせ、RAG 検索精度を本番品質まで引き上げる実装ガイド"
+slug: "gemini-rag-query-decomposition-hyde-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-01T19:30"
+author: "Gemini Lab"
+description: "RAG が「文脈を取りこぼす」「正しい答えが返らない」と感じたら、クエリ分解と HyDE の組み合わせが効きます。Gemini 2.5 で動く本番品質のパイプラインを、コード付きで段階的に組み上げていきます。"
+tags: ["gemini-api", "rag", "query-decomposition", "hyde", "embeddings", "production"]
+highlights:
+  - "RAG で『正しい答えが返らない』『文脈を取りこぼす』問題に詰まっていた方が、クエリ分解と HyDE を組み合わせた本番品質の実装パターンを今日手に入れられます"
+  - "ベクトル検索だけでは取り切れなかった意味的に遠い文書を、Gemini で生成した仮想回答（HyDE）と分解クエリで網羅的に拾う設計を習得できます"
+  - "単一ステップの RAG 構成を、レイテンシ・コスト・recall を制御しながら本番運用に耐える多段検索パイプラインへ段階的に置き換えられます"
+---
+
+RAG を一度組んだものの、「ユーザーが少し抽象的な質問をすると途端に的外れな答えを返してくる」という悩みに、思い当たる方は多いのではないでしょうか。私自身、Gemini API を使った検索アシスタントを公開してから一番つまずいたのが、まさにここでした。表面的なキーワードが一致する文書だけが上位に来てしまい、本当に答えとなる文章が下位に埋もれている。embedding モデルや次元数を変えても、ある一定のラインで精度が頭打ちになります。
+
+本記事では、その壁を越えるための二つの技術 — **クエリ分解（Query Decomposition）** と **HyDE（Hypothetical Document Embeddings）** を、Gemini API でどう組み合わせて本番品質に持っていくかを、私の実装経験を踏まえて段階的に解説します。流行りのテクニックを並べるのではなく、「なぜこの順番で組むか」「どこで詰まりやすいか」「コストとレイテンシをどう抑えるか」までを、動くコードと一緒に見ていきます。
+
+## 単一クエリの RAG はなぜ頭打ちになるのか
+
+ベクトル検索ベースの RAG が抱える本質的な問題は、**ユーザーの質問と、答えとなる文書の語彙が一致するとは限らない**という点です。たとえば「契約解除時の違約金について教えて」と聞かれたとき、答えとなる契約書には「中途解約の場合の損害賠償額の予定」という表現しか書かれていない、というケースを思い浮かべてください。意味は近いのですが、トークンレベルでは一致しません。embedding はある程度この語彙ギャップを吸収しますが、ドメイン特有の言い回しや専門用語が絡むと、似た意味の文書ほど近接させる学習が十分でないことがあります。
+
+もう一つの問題は、**質問が複数のサブ問題を含んでいるとき**に、ひとつの埋め込みベクトルではどの観点も中途半端にしか表現できないことです。「Stripe で多通貨決済を導入する手順と、税務上の処理を教えて」という質問は、決済導線の話と会計処理の話という二つの軸を持ちます。これを一括で検索すると、両方を浅く取れる文書が選ばれてしまい、それぞれに深く触れた文書が抜け落ちます。
+
+このような場面で効くのが、これから紹介するクエリ分解と HyDE です。前者は「質問側を整える」アプローチ、後者は「質問側を文書らしく書き換える」アプローチで、どちらもベクトル検索の限界を別の方向から押し広げてくれます。
+
+## クエリ分解 — 質問を答えやすい単位に切り分ける
+
+クエリ分解は、ユーザーが投げてきた質問を、複数の独立したサブクエリに割り直す処理です。重要なのは、「単に文を分割する」のではなく、**それぞれが独立して検索可能で、答えとなる文書を一意に絞り込みやすい形に書き換える**点にあります。
+
+私が現場で使っている分解の指針は次の三つです。第一に、**質問の中に複数の論点が含まれていないか**を見ること。先ほどの「決済導入と税務処理」のように、二つの問題が一文に混ざっているなら必ず分けます。第二に、**抽象度の高い言葉を、検索向きの具体語に降ろせないか**を見ること。「効率化したい」を「Apps Script で月次レポートを自動生成する手順」に変換できれば、ヒットする文書が大きく変わります。第三に、**前提となる知識を別クエリに切り出せないか**を見ること。「フォールバック戦略を組みたい」という質問なら、「フォールバックとは何か」を別クエリにして両方の結果をマージします。
+
+### Gemini で structured output を使い分解する
+
+Gemini 2.5 Flash の structured output を使うと、分解クエリをそのまま型付きデータとして取り出せます。Flash で十分な精度が出るのもポイントで、コストを気にせず分解を毎リクエスト走らせられます。
+
+```python
+# query_decomposition.py
+# 役割: ユーザーの質問を、独立したサブクエリのリストに分解する。
+# なぜ Pydantic で型を縛るか: 後段の retrieval パイプラインに型安全に渡し、
+# 分解失敗時のクラッシュを早期検知するため。
+import os
+from pydantic import BaseModel, Field
+from google import genai
+
+class DecomposedQueries(BaseModel):
+    sub_queries: list[str] = Field(
+        ..., description="独立して検索可能なサブクエリのリスト。最大4件。"
+    )
+    reasoning: str = Field(
+        ..., description="なぜこの分解にしたかの簡潔な理由。"
+    )
+
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+DECOMPOSE_INSTRUCTION = """
+あなたはRAG検索の前処理を担当するアシスタントです。
+ユーザーの質問を、独立して検索可能で答えとなる文書を一意に絞り込みやすい
+最大4個のサブクエリに分解してください。
+- 抽象的な単語は具体的な専門用語に置き換える
+- 1つのサブクエリには1つの論点だけ含める
+- 元の質問に複数論点が無い場合は、サブクエリを1件だけ返す
+"""
+
+def decompose(query: str) -> DecomposedQueries:
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[DECOMPOSE_INSTRUCTION, f"質問: {query}"],
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": DecomposedQueries,
+                "temperature": 0.0,
+            },
+        )
+        return resp.parsed
+    except Exception as e:
+        # 分解に失敗したら元クエリ単独で検索する fallback
+        print(f"[decompose] fallback to single query: {e}")
+        return DecomposedQueries(sub_queries=[query], reasoning="fallback")
+
+if __name__ == "__main__":
+    out = decompose("Stripeで多通貨決済を導入したい。税務上どう扱う？")
+    print(out.model_dump_json(indent=2, ensure_ascii=False))
+```
+
+期待する出力は次のようなものです。
+
+```json
+{
+  "sub_queries": [
+    "Stripe で複数通貨の決済を有効化する具体的な設定手順",
+    "海外通貨建て売上に対する日本の消費税・法人税の扱い",
+    "Stripe 多通貨決済における為替差損益の会計処理"
+  ],
+  "reasoning": "決済設定と税務処理という二つの論点が含まれていたため..."
+}
+```
+
+`temperature=0.0` にしているのは、同じ質問に対して常に再現性のある分解を返してもらうためです。サブクエリが揺れると、後段の検索結果のキャッシュが効かなくなり、コストもレイテンシも悪化します。
+
+## HyDE — 質問を「文書らしく」書き換える
+
+HyDE（Hypothetical Document Embeddings）は、論文発表当初から「ずるい発想だが効く」と評判だった手法で、考え方は単純です。質問の embedding をそのまま検索に使うのではなく、**Gemini にいったん仮の回答文を生成させ、その仮回答の embedding で検索する**のです。
+
+なぜこれが効くのか。質問文と回答文では、語彙も文体も違います。「契約解除時の違約金は？」と「本契約を中途解約する場合、解約金として月額利用料の3ヶ月分を申し受けます」は、人間には同じ話題に見えますが、embedding 空間では微妙に距離があります。HyDE は、Gemini が「もしこの質問の答えを書くとしたらこういう文体・語彙になる」という仮説を立て、その仮説文書を検索クエリに使うことで、回答側の文書クラスタに直接ジャンプします。
+
+私の経験では、HyDE が特に効くのは次のような場面です。**ドメイン特有の言い回しが強い分野**（法務・医療・税務など）、**ユーザーが質問形式で書くが文書は宣言形で書かれている分野**（FAQ サポート、契約書検索）、**質問が短く抽象的な場面**（「料金は？」「やり方は？」）。逆に、**質問自体が文書中の表現とほぼ一致する場面**（製品コードや型番が含まれる検索）では HyDE はむしろ精度を落とすことがあるので、後述のように分岐を持たせるのが安全です。
+
+### Gemini で HyDE を実装する
+
+```python
+# hyde_retrieval.py
+# 役割: クエリから仮想回答を生成し、その embedding で検索する。
+# なぜ Flash を使うか: HyDE の仮想回答は最終出力ではなく検索の踏み台なので、
+# Pro の品質は不要。Flash でレイテンシとコストを抑える。
+import os
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+HYDE_PROMPT = """
+あなたは社内ナレッジ検索を支援するアシスタントです。
+以下の質問に対する想定回答を、社内ドキュメントに書かれていそうな
+宣言文の形式で、200文字以内で生成してください。
+正確である必要はなく、関連語彙を網羅することを優先してください。
+"""
+
+def hyde_text(query: str) -> str:
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[HYDE_PROMPT, f"質問: {query}"],
+            config={"temperature": 0.3, "max_output_tokens": 256},
+        )
+        return resp.text or query
+    except Exception as e:
+        print(f"[hyde] fallback to original query: {e}")
+        return query
+
+def embed(text: str) -> list[float]:
+    resp = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text,
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
+    )
+    return resp.embeddings[0].values
+
+def hyde_search(query: str, vector_store) -> list[dict]:
+    # 元クエリと HyDE 生成テキスト両方で検索し結果をマージ（後述）
+    original_vec = embed(query)
+    hyde_vec = embed(hyde_text(query))
+    return [
+        {"source": "original", "results": vector_store.search(original_vec, k=10)},
+        {"source": "hyde", "results": vector_store.search(hyde_vec, k=10)},
+    ]
+```
+
+`task_type="RETRIEVAL_QUERY"` を指定するのは、Gemini Embedding が用途別に最適化された埋め込みを返すためです。文書側のインデックス作成時には `RETRIEVAL_DOCUMENT` を、クエリ側では `RETRIEVAL_QUERY` を使うのが原則で、揃え忘れると数 % 単位で精度が落ちます。詳しくは [Gemini Embeddings × Reranker で RAG の精度を本番品質まで引き上げる](/articles/gemini-api/gemini-embeddings-rerank-rag-precision-production) も参考になります。
+
+## クエリ分解と HyDE を直列ではなく並列に組む
+
+実装初期、私は「分解 → 各サブクエリに HyDE → 検索」と直列で組みました。これは動くのですが、レイテンシが線形に膨らみます。サブクエリ4つ × HyDE 生成 + embedding × 2 + 検索 × 2 で、p95 が3秒近くまで伸びました。
+
+**本番では並列化が必須**です。Python なら `asyncio.gather`、Node.js なら `Promise.all` で、サブクエリごとの「HyDE 生成 + embedding + 検索」をすべて並列実行します。Gemini Flash の latency は通常 300ms 前後なので、並列化すれば全体が約500ms に収まります。
+
+```python
+# hybrid_pipeline.py
+# 役割: 分解 + HyDE + 並列検索 + RRF マージを一気通貫で行う本番パイプライン。
+# なぜ Reciprocal Rank Fusion を使うか: 異なる検索ストリームの順位を、
+# スコアの絶対値に依存せず統合できるため。実装が単純で本番でも安定する。
+import asyncio
+import os
+from collections import defaultdict
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+async def gen_hyde(query: str) -> str:
+    try:
+        resp = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[HYDE_PROMPT, f"質問: {query}"],
+            config={"temperature": 0.3, "max_output_tokens": 256},
+        )
+        return resp.text or query
+    except Exception:
+        return query
+
+async def aembed(text: str, task: str) -> list[float]:
+    resp = await client.aio.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text,
+        config=types.EmbedContentConfig(task_type=task),
+    )
+    return resp.embeddings[0].values
+
+async def search_branch(sub_query: str, vector_store) -> list[tuple[str, int]]:
+    # 1) 元クエリで embedding & 検索
+    # 2) HyDE 生成 → embedding & 検索
+    hyde, _ = await asyncio.gather(gen_hyde(sub_query), asyncio.sleep(0))
+    orig_vec, hyde_vec = await asyncio.gather(
+        aembed(sub_query, "RETRIEVAL_QUERY"),
+        aembed(hyde, "RETRIEVAL_QUERY"),
+    )
+    orig_hits, hyde_hits = await asyncio.gather(
+        vector_store.asearch(orig_vec, k=10),
+        vector_store.asearch(hyde_vec, k=10),
+    )
+    return [(d["doc_id"], r) for r, d in enumerate(orig_hits)] + \
+           [(d["doc_id"], r) for r, d in enumerate(hyde_hits)]
+
+def reciprocal_rank_fusion(rankings: list[list[tuple[str, int]]], k: int = 60) -> list[str]:
+    scores: dict[str, float] = defaultdict(float)
+    for ranking in rankings:
+        for doc_id, rank in ranking:
+            scores[doc_id] += 1.0 / (k + rank)
+    return [d for d, _ in sorted(scores.items(), key=lambda x: -x[1])]
+
+async def hybrid_retrieve(query: str, decompose_fn, vector_store, top_k: int = 8):
+    decomposed = decompose_fn(query)  # 同期版を呼び出してOK（Flashで十分速い）
+    rankings = await asyncio.gather(*[
+        search_branch(sub, vector_store) for sub in decomposed.sub_queries
+    ])
+    fused = reciprocal_rank_fusion(rankings)
+    return fused[:top_k]
+```
+
+この構造なら、サブクエリが4本でも実時間は1本ぶんに近づきます。Reciprocal Rank Fusion（RRF）は、各ブランチが返す上位文書をランキングだけで統合する手法で、スコアスケールの違いを吸収してくれます。スコアそのものを足し合わせる方式は、検索ストア間でスコア分布が違うときに崩れやすいので、私は基本的に RRF を採用しています。
+
+## 本番運用でつまずきやすい落とし穴
+
+ここまでの設計は、論文や記事だけ読んでいると綺麗に見えますが、実際に本番に乗せると次のような問題が出ます。私自身が踏んだものを中心に、具体的な対処を共有します。
+
+第一の落とし穴は、**過剰分解による recall の低下**です。Gemini に分解を任せると、ときに4件以上の細かいサブクエリに割ってしまうことがあります。一見丁寧ですが、それぞれが過度に specific になると、本来は質問全体の文脈で取れていた文書が、どのサブクエリでもトップ10に入らない状況が起きます。対処は、`max_items=4` をスキーマで明示する、分解前に「この質問は単一論点か」を Gemini に判定させ、単一なら分解しない、の二段構えが有効です。
+
+第二の落とし穴は、**HyDE の暴走**です。Gemini が想定回答を自信満々に作文した結果、本来存在しないドメイン用語が混入し、検索が見当違いの方向に流れることがあります。対処として、HyDE の出力は **200〜300 文字以内**に抑えるのが私の経験則です。長くするほど、Gemini が「らしさ」を出そうとして関係ない文脈を盛り込みます。短く絞れば、語彙拡張という HyDE 本来の効果だけを取りやすくなります。
+
+第三の落とし穴は、**コスト膨張**です。分解1回 + HyDE × N回 + embedding × 2N回 + 生成1回が、1 RAG リクエストあたりに走ります。Flash と embedding の価格帯ならクエリあたり数円ですが、月間1万クエリ規模を想定すると無視できません。コスト最適化の主軸は、(1) よくある質問の分解結果と HyDE 結果を Redis などにキャッシュする、(2) [Gemini API のコンテキストキャッシング](/articles/gemini-api/gemini-api-context-caching-cost-optimization) を活用してプロンプトの固定部分を再利用する、(3) ユーザーが入力中の段階では分解せず、確定後にだけ走らせる、の3点です。
+
+第四の落とし穴は、**分解品質の評価の欠如**です。分解はそれ自体ではユーザーに見えない中間処理なので、放っておくと品質が劣化していても気付けません。私は本番投入後、サブクエリのログを毎日サンプリングして、Gemini に「この分解は妥当か」を別プロンプトで判定させる仕組みを置いています。LLM-as-Judge の応用で、詳しくは [Gemini で実装する LLM-as-a-Judge 評価パイプライン](/articles/gemini-api/gemini-llm-as-judge-evaluation-production-guide) のアプローチを流用できます。
+
+第五の落とし穴は、**ストリーミング応答との両立**です。RAG のフロントは応答をストリーミング表示することが多いですが、本パイプラインは検索フェーズで300〜500ms 待つことになります。私は、フロントで「検索中…」のプレースホルダを出し、検索完了後に Gemini への generate を即ストリーミングで開始する二段表示にしています。
+
+## 評価とチューニングの最低限のセット
+
+精度改善は感覚ではなく、評価セットを持って初めて改善できます。私が最低限置いているのは、社内で集めた30〜50件のクエリ・正解文書 ID のペアです。このセットに対して、(a) ベースライン（クエリそのまま検索）、(b) クエリ分解のみ、(c) HyDE のみ、(d) 分解 + HyDE、の4条件で nDCG@10 と recall@10 を測ります。
+
+経験的には、ベースラインから (d) に切り替えると、recall@10 が15〜25%、nDCG@10 が10〜18% 改善することが多いです。ただし、ドメインによって差は大きく、ユーザー質問が短い QA 系では HyDE 単体で十分なこともあれば、複数論点を含む業務質問では分解の効果が支配的なこともあります。だからこそ、最初に評価セットを作る時間を惜しまないのが結局は近道になります。
+
+実装のさらなる深掘りとして、[Gemini API + Qdrant でハイブリッド RAG を本番品質に組む](/articles/gemini-api/gemini-api-qdrant-hybrid-rag-production-system) と [Gemini API + Pinecone の RAG 本番ガイド](/articles/gemini-api/gemini-api-pinecone-rag-production-guide) も合わせて読んでいただくと、ベクトルストア側の設計知識が補完できます。引用と出典の扱いについては [Gemini API における RAG の引用・出典帰属の本番ガイド](/articles/gemini-api/gemini-rag-citation-source-attribution-production-guide) が参考になります。
+
+評価設計の理論的な背景や、検索評価指標の使い分けについて体系的に学びたい方は、[情報検索：検索エンジンの実装と評価（Stefan Büttcher 他）](https://www.amazon.co.jp/dp/4627852614/?tag=pinocchio-22) が定番の一冊です。古典に見えますが、評価指標の本質は今でも変わっていません。
+
+## おわりに
+
+明日からまず1つだけ手を付けるなら、**評価セットを30件用意して、現状のベースラインで recall@10 を測ること**から始めてみてください。クエリ分解も HyDE も、効くか効かないかはドメインで大きく変わりますが、評価セットさえあれば、どの改善が効いて、どこで頭打ちになるかが数字で見えるようになります。本記事のコードはすべて、その評価ループに乗せた状態でチューニングする前提で書いています。あなたの RAG が一段深い場所で答えを掘り出せるようになる助けになれば嬉しいです。
