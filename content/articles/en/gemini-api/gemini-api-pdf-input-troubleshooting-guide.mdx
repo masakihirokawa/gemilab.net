@@ -1,0 +1,152 @@
+---
+title: "Gemini API PDF Input Troubleshooting: When Your Document Just Won't Read"
+slug: "gemini-api-pdf-input-troubleshooting-guide"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-02T09:22"
+author: "Gemini Lab"
+description: "When Gemini returns nothing for your PDF, hits the 20MB ceiling, or quietly skips pages, the symptom usually points to one of five very specific causes. Here's how to narrow it down quickly."
+tags: ["gemini", "gemini-api", "pdf", "troubleshooting", "files-api"]
+---
+
+"I sent a PDF as `inline_data` and got an empty string back." "The upload succeeded but the model can't read a single line." If you've spent any time wiring PDFs through the Gemini API, you've probably hit this kind of silent failure. Errors would be easier to debug; the harder cases are the ones where everything looks fine and nothing comes back.
+
+This guide collects the traps I've personally walked into while shipping PDF pipelines on `gemini-2.5-pro` and `gemini-2.5-flash`. The samples use the Python `google-genai` SDK, but the same reasoning maps cleanly to the Node.js client.
+
+## Symptom-first triage
+
+Before diving into causes, here are the four patterns that cover most of what you'll see in the wild.
+
+- Empty response or "the PDF can't be read" → likely a scanned/image-only PDF, OCR needed, or corrupted inline data
+- `400 INVALID_ARGUMENT: request payload size exceeds the limit` → over the 20MB inline ceiling
+- `400 The document has too many pages` → past the 1,000-page cap, or extreme per-page token cost
+- Only the first half of the document seems to register → output token cap and per-page token economics
+
+Let's walk through each. The order roughly matches how often I encounter them in real codebases—causes 1 and 2 cover the majority of incoming questions, and the rest come up once you start handling more exotic documents.
+
+## Cause 1: You're sending a scan, not a text PDF
+
+PDFs come in two shapes: those with a real text layer, and those that are just scanned images glued together (anything that came out of a copier or scanner). With the first kind, Gemini uses both the text layer and visual reasoning. With the second, it effectively sees a stack of images, and recognition quality drops sharply depending on resolution and language.
+
+The cheapest way to tell which kind you have is a local extraction check.
+
+```python
+# pip install pypdf
+from pypdf import PdfReader
+
+reader = PdfReader("sample.pdf")
+text = "".join(page.extract_text() or "" for page in reader.pages)
+print(f"Extracted characters: {len(text)}")
+# If this is 0 or very small, you almost certainly have a scan-only PDF
+```
+
+If the count is near zero, give Gemini a hand. In one of my projects, simply prefacing the request with "This PDF is image-only. Please transcribe the text on each page." pushed accuracy from "I can't read this" to genuinely usable output on Japanese scans through `gemini-2.5-flash`. A single line of system instruction does a lot of work here.
+
+For higher-quality OCR on tricky scans (faint text, mixed languages, rotated pages), I usually preprocess with a dedicated OCR tool first—Tesseract for quick batch jobs, or Google Cloud Document AI when the document layout matters. Once you have a clean text layer, re-embed it back into the PDF (or just send the extracted text directly to Gemini) and the rest of the pipeline behaves like normal text input.
+
+## Cause 2: You've hit the 20MB inline ceiling
+
+When you embed a PDF as `inline_data`, the entire request payload has to stay under 20MB. Base64 encoding inflates the bytes by roughly 1.33×, so anything over about 15MB on disk should already make you nervous.
+
+The standard fix is to switch to the Files API (`client.files.upload`) and pass a file URI instead. Files API supports up to 2GB per file and lets you reuse the same upload across multiple calls, which is a nice bonus.
+
+```python
+from google import genai
+
+client = genai.Client()
+
+# For PDFs over 20MB, go through the Files API
+uploaded = client.files.upload(file="large_report.pdf")
+print(f"State: {uploaded.state}")  # Wait until ACTIVE
+
+# Polling for ACTIVE makes things stable
+import time
+while uploaded.state == "PROCESSING":
+    time.sleep(2)
+    uploaded = client.files.get(name=uploaded.name)
+
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents=[uploaded, "Summarize this PDF as three bullet points of key takeaways."],
+)
+print(response.text)
+```
+
+If you skip the state check and call `generate_content` immediately, you'll occasionally get a `FAILED_PRECONDITION` error. Adding the `PROCESSING` → `ACTIVE` guard cuts down on those mystery failures. Also worth knowing: Files API uploads are auto-deleted after 48 hours, so anything that spans longer sessions needs a re-upload path. I've written more about that case in the [Files API URI lost after restart fix](/articles/gemini-api/gemini-api-file-uri-not-found-after-restart-fix).
+
+## Cause 3: The 1,000-page cap and token math
+
+Gemini API caps a single PDF request at 1,000 pages. On top of that, text gets tokenized normally, while image regions are billed as roughly 258 tokens per image area—page counts blow up the input token budget faster than people expect.
+
+A common pattern in real projects: someone hands a 500-page PDF to `gemini-2.5-pro`, the response comes back surprisingly short, and the second half of the document feels like it was ignored. The PDF technically fits inside the 1M-token context window, but the output cap (8,192 tokens by default) forces the model to compress so aggressively that later pages effectively vanish.
+
+Chunking is the boring, correct answer.
+
+```python
+from pypdf import PdfReader, PdfWriter
+
+def split_pdf(src: str, chunk_size: int = 100):
+    reader = PdfReader(src)
+    chunks = []
+    for start in range(0, len(reader.pages), chunk_size):
+        writer = PdfWriter()
+        for i in range(start, min(start + chunk_size, len(reader.pages))):
+            writer.add_page(reader.pages[i])
+        out_path = f"{src}.part{start//chunk_size}.pdf"
+        with open(out_path, "wb") as f:
+            writer.write(f)
+        chunks.append(out_path)
+    return chunks
+```
+
+Splitting into 100-page chunks, summarizing each chapter, then composing a meta-summary at the end will dramatically stabilize results on long documents. I cover the chunking strategy in more depth in [chapter-level chunked summarization for long PDFs](/articles/gemini-api/gemini-api-long-pdf-chapter-chunked-summarization).
+
+## Cause 4: MIME types and "extension only" matches
+
+This one catches more people than it should. When you assemble `inline_data` and accidentally set `mime_type` to `application/octet-stream` instead of `application/pdf`, Gemini receives an opaque binary blob and never tries to parse it as a document. The same applies when using `Part.from_bytes`—always set `mime_type` explicitly.
+
+```python
+from google.genai import types
+
+with open("report.pdf", "rb") as f:
+    pdf_bytes = f.read()
+
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=[
+        types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+        "In one paragraph, summarize the goal of this PDF and its intended audience.",
+    ],
+)
+```
+
+Also keep in mind that a `.pdf` extension is no guarantee. The file might be encrypted, or it might be a PDF/A variant that even `pypdf` refuses to open. If you see `pypdf.errors.PdfReadError`, run it through `qpdf --decrypt` once to clean it up before re-uploading.
+
+Another subtle case I've seen in the wild: a Cloudflare R2 or S3 download where the response was returned with `Content-Type: text/html` because of a misconfigured rule. The bytes were a perfectly valid PDF, but somewhere upstream the content got tagged wrong, and that tag survived all the way into the API call. Always derive the MIME type from your own code, not from response headers you don't control.
+
+## Cause 5: Tables and equations come back mangled
+
+Sometimes the PDF reads correctly but the output is garbled around tables or math. That's a different class of problem—it's an output formatting issue, not a reading failure—and the fix sits on the prompt side.
+
+Three things have worked reliably for me in production:
+
+- **Ask for explicit structure instead of Markdown**: "Return tables as bullet lists in `field: value` format, one per row" gives you something downstream code can re-render
+- **Combine with `response_mime_type="application/json"`**: Locking the table shape into a schema basically eliminates Markdown drift
+- **Request LaTeX for equations**: "Wrap all equations in `$$ ... $$` and use TeX notation" produces consistent LaTeX even when the source equations were rendered as images
+
+## When nothing above explains it
+
+Still stuck? Run through this short checklist before you escalate:
+
+- Does the same PDF work in Google AI Studio (the web playground)? If no, the PDF is the problem; if yes, the request side is the problem.
+- Does a tiny, text-layer-only PDF go through with the same code? Reducing to a minimum reproducer almost always pinpoints the culprit.
+- Log `usage_metadata.prompt_token_count`. If the input token count is way smaller than you expected, the PDF likely isn't being recognized at all.
+
+If you want a broader view of error patterns across the API, the [Gemini API common errors and fixes guide](/articles/gemini-api/gemini-api-error-fix-guide) approaches the same ground from a different angle and pairs well with this one.
+
+PDF processing rewards patient debugging. If you want to push `gemini-2.5-pro` multimodal work further in production, [Hands-On Large Language Models (Jay Alammar & Maarten Grootendorst)](https://www.amazon.co.jp/dp/1098150961/?tag=pinocchio-22) and [LangChain in Action (Ben Auffarth)](https://www.amazon.co.jp/dp/183546837X/?tag=pinocchio-22) both have practical chapters on combining text, image, and table extraction in real pipelines.
+
+Start by checking `len(text)` on your PDF locally. In my experience, "I was sending a scan" or "the MIME type was wrong" accounts for more than half of these reports. Once you've narrowed the cause to one, the fix is usually a one-liner.
+
+One last habit worth picking up: log the file size in bytes, the page count, and the resulting `prompt_token_count` for every PDF you process. That tiny piece of telemetry pays for itself the first time you need to figure out why a customer's 200-page report came back half-empty—you can correlate the symptom with the actual numbers instead of guessing. PDF input is one of the few areas where Gemini fails quietly rather than loudly, and disciplined logging is the closest thing we have to error messages.
