@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "IO2026 — Google I/O 2026 開幕間近（5/19-20）、基調講演で Gemini 4 / Veo 4 / Project Astra デモが期待される",
-    "TV-CREATE — Google TV に Gemini「Create」ボタン搭載、Nano Banana / Veo を音声プロンプトで操作可能に（4/29-30）",
-    "GM-AUTO — GM が Google built-in 全車種で Gemini を採用、対象は2022年式以降の Cadillac/Chevy/Buick/GMC 約400万台（4/28）",
-    "WORKSPACE — Workspace Gemini が Docs/Sheets/Slides/PDF/DOCX/XLSX/LaTeX 生成に対応、業務エージェント化が本格化",
-    "AGENTIC — Google I/O 2026 のテーマはエージェンティック AI とエージェンティックコーディング、Antigravity 関連も期待",
-    "NANOBANANA — Nano Banana 2 が Gemini アプリ・Search AI Mode・Lens のデフォルト画像エンジンとして継続展開",
+    "DEEP_RESEARCH — Deep Research エージェント新版が登場、共同プランニング・MCP統合・File Search に対応（4月）",
+    "FLASH_TTS — Gemini 3.1 Flash TTS Preview リリース、低コストで表現力ある音声生成を実現",
+    "ROBOTICS — gemini-robotics-er-1.6-preview 公開、計器読取と空間・物理推論能力を強化",
+    "FILE_GEN — Docs / Sheets / Slides / PDF / DOCX / XLSX / LaTeX 直接生成機能が安定運用フェーズへ",
+    "ENTERPRISE — Macquarie Bank が Gemini Enterprise で7ヶ月13万時間削減を達成と発表",
+    "IO2026 — Google I/O 2026（5/19-20）目前、Gemini 4 / Veo 4 / Astra デモに期待が集まる",
   ],
   en: [
-    "IO2026 — Google I/O 2026 kicks off May 19-20, with Gemini 4, Veo 4, and Project Astra demos widely expected",
-    "TV-CREATE — Google TV gains a Gemini Create button that drives Nano Banana and Veo through voice prompts (4/29-30)",
-    "GM-AUTO — GM adopts Gemini across Google built-in vehicles, covering ~4M Cadillac/Chevy/Buick/GMC cars from MY2022+ (4/28)",
-    "WORKSPACE — Workspace Gemini now generates Docs, Sheets, Slides, PDF, DOCX, XLSX, and LaTeX as a true productivity agent",
-    "AGENTIC — I/O 2026 leans into agentic AI and agentic coding, with Antigravity-related news anticipated",
-    "NANOBANANA — Nano Banana 2 remains the default image engine across the Gemini app, Search AI Mode, and Lens",
+    "DEEP_RESEARCH — New Deep Research agent ships with collaborative planning, MCP integration, and File Search (Apr)",
+    "FLASH_TTS — Gemini 3.1 Flash TTS Preview launches as a cost-efficient, expressive text-to-speech model",
+    "ROBOTICS — gemini-robotics-er-1.6-preview adds instrument reading and stronger spatial and physical reasoning",
+    "FILE_GEN — Direct generation of Docs, Sheets, Slides, PDF, DOCX, XLSX, and LaTeX moves into stable rollout",
+    "ENTERPRISE — Macquarie Bank reports 130,000 hours saved over seven months with Gemini Enterprise",
+    "IO2026 — Google I/O 2026 (5/19-20) is imminent, with Gemini 4, Veo 4, and Project Astra demos widely anticipated",
   ],
 };
 
