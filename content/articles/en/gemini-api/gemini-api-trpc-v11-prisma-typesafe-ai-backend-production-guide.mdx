@@ -1,0 +1,914 @@
+---
+title: "Building a Type-Safe AI Backend with Gemini API, tRPC v11, and Prisma — Real-Time Streaming, Auth Middleware, and Production Deployment"
+slug: "gemini-api-trpc-v11-prisma-typesafe-ai-backend-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-04T04:45"
+author: "Gemini Lab"
+description: "Learn how to integrate Gemini API streaming into tRPC v11 subscriptions, persist conversations type-safely with Prisma, and handle auth middleware, rate limiting, and common production pitfalls — all with working code examples."
+tags: ["gemini", "gemini-api", "trpc", "prisma", "typescript", "nextjs", "backend"]
+highlights:
+  - "Developers stuck on connecting Gemini API streaming to tRPC subscriptions can walk away with copy-paste-ready type definitions and implementation patterns"
+  - "Learn the complete Prisma schema design and migration strategy for AI chat persistence, from session modeling to streaming status tracking"
+  - "Avoid the production pitfalls that trip up most teams: Edge Runtime incompatibility, broken type inference, and the for-await DB update trap"
+---
+
+If you've used tRPC to build a type-safe API and then tried to add Gemini API streaming on top of it, you've probably hit a wall somewhere. Maybe the `observable` types don't line up with your response shape, or the `for await` loop and Prisma updates don't play well together, or the whole thing breaks the moment you try Edge Runtime. Each piece works individually — but combining them reliably takes some trial and error.
+
+I ran into all of these issues while integrating this exact stack into a personal SaaS project. This guide shares what I learned: not just the happy path, but the reasons behind each design decision, and the specific spots where things tend to fall apart in production.
+
+## Why tRPC + Gemini API Works Well Together
+
+The main value of tRPC is that your client and server share types automatically. When you call Gemini API directly with `fetch`, the response shape tends to be loosely typed, which means your frontend handling becomes brittle. Routing your Gemini calls through tRPC lets you normalize and shape the response on the server, then push those types all the way to the client.
+
+Prisma pairs naturally with this setup too. AI chat data has a clear hierarchical structure — sessions contain messages, messages have roles — and that maps cleanly to a relational schema. When Prisma's generated types flow into tRPC's type inference, you get IDE autocompletion for things like `session.messages[0].role` on the client without any manual type definitions.
+
+The combination isn't without tradeoffs, and we'll get to those later. But for a Next.js-based AI product with a TypeScript-first team, this stack is genuinely ergonomic once it's wired up correctly.
+
+## Project Setup
+
+Install the core dependencies. tRPC v11 splits its packages between server and client:
+
+```bash
+npm install @trpc/server@^11 @trpc/client@^11 @trpc/react-query@^11
+npm install @tanstack/react-query@^5
+npm install @prisma/client prisma
+npm install @google/genai
+npm install zod superjson
+
+# Initialize Prisma
+npx prisma init
+```
+
+The directory structure for a Next.js App Router project:
+
+```
+src/
+  server/
+    trpc.ts             # tRPC instance and procedure definitions
+    routers/
+      _app.ts           # Root router
+      chat.ts           # Chat feature router
+  app/
+    api/
+      trpc/
+        [trpc]/
+          route.ts      # Next.js Route Handler
+  lib/
+    prisma.ts           # Prisma client singleton
+  trpc/
+    client.ts           # Client-side tRPC setup
+```
+
+## Prisma Schema Design for AI Chat
+
+The schema needs to track three things: users, chat sessions, and individual messages. The key design choice here is adding a `status` field to messages — this lets you track whether a message is still streaming (`PENDING`), finished (`COMPLETED`), or failed (`FAILED`).
+
+```prisma
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  MODEL
+  SYSTEM
+}
+
+enum MessageStatus {
+  PENDING    // Currently streaming
+  COMPLETED  // Stream finished
+  FAILED     // Error during streaming
+}
+
+model User {
+  id        String        @id @default(cuid())
+  email     String        @unique
+  createdAt DateTime      @default(now())
+  sessions  ChatSession[]
+}
+
+model ChatSession {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String    @default("New conversation")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages  Message[]
+
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+model Message {
+  id         String        @id @default(cuid())
+  sessionId  String
+  role       Role
+  content    String        @db.Text
+  status     MessageStatus @default(PENDING)
+  tokenCount Int?
+  createdAt  DateTime      @default(now())
+  session    ChatSession   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+}
+```
+
+The `PENDING → COMPLETED` transition matters for recovery scenarios. If a user reloads mid-stream, the frontend can check the message status and know to show a "this message was interrupted" indicator rather than empty content.
+
+Run the migration:
+
+```bash
+npx prisma migrate dev --name init
+npx prisma generate
+```
+
+## tRPC Instance, Context, and Middleware
+
+The context wires authentication into every tRPC procedure. We read a Bearer token from the `Authorization` header and look up the user ID. For the rate limiter, we track request counts per user with an in-memory map — fine for development and single-instance deployments, but needs Redis in a multi-instance setup.
+
+```typescript
+// src/server/trpc.ts
+import { initTRPC, TRPCError } from "@trpc/server";
+import type { FetchCreateContextFnOptions } from "@trpc/server/adapters/fetch";
+import { prisma } from "@/lib/prisma";
+import superjson from "superjson";
+
+export async function createContext({ req }: FetchCreateContextFnOptions) {
+  const authHeader = req.headers.get("Authorization");
+  const token = authHeader?.replace("Bearer ", "");
+  const userId = token ? await verifyToken(token) : null;
+
+  return { userId, prisma, req };
+}
+
+export type Context = Awaited<ReturnType<typeof createContext>>;
+
+const t = initTRPC.context<Context>().create({
+  transformer: superjson,
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.cause instanceof ZodError ? error.cause.flatten() : null,
+      },
+    };
+  },
+});
+
+export const router = t.router;
+export const publicProcedure = t.procedure;
+
+// Require authentication
+export const protectedProcedure = t.procedure.use(({ ctx, next }) => {
+  if (!ctx.userId) {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+  return next({ ctx: { ...ctx, userId: ctx.userId } });
+});
+
+// In-memory rate limiter (replace with Redis in production)
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+
+export const rateLimitedProcedure = protectedProcedure.use(({ ctx, next }) => {
+  const now = Date.now();
+  const windowMs = 60_000;
+  const limit = 20;
+
+  const entry = rateLimitMap.get(ctx.userId) ?? {
+    count: 0,
+    resetAt: now + windowMs,
+  };
+
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + windowMs;
+  }
+  entry.count++;
+  rateLimitMap.set(ctx.userId, entry);
+
+  if (entry.count > limit) {
+    throw new TRPCError({
+      code: "TOO_MANY_REQUESTS",
+      message: `Rate limit exceeded. Retry in ${Math.ceil((entry.resetAt - now) / 1000)}s`,
+    });
+  }
+
+  return next({ ctx });
+});
+
+async function verifyToken(token: string): Promise<string | null> {
+  try {
+    // Replace with JWT verification or NextAuth.js session lookup
+    return Buffer.from(token, "base64").toString("utf-8") || null;
+  } catch {
+    return null;
+  }
+}
+```
+
+## Chat Router: Integrating Gemini API
+
+The chat router handles session management, message persistence, and Gemini API calls. The non-streaming `sendMessage` mutation is a good starting point before tackling subscriptions:
+
+```typescript
+// src/server/routers/chat.ts
+import { z } from "zod";
+import { router, protectedProcedure, rateLimitedProcedure } from "../trpc";
+import { GoogleGenAI } from "@google/genai";
+import { observable } from "@trpc/server/observable";
+import { TRPCError } from "@trpc/server";
+
+const genai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+export const chatRouter = router({
+  listSessions: protectedProcedure.query(async ({ ctx }) => {
+    return ctx.prisma.chatSession.findMany({
+      where: { userId: ctx.userId },
+      orderBy: { updatedAt: "desc" },
+      take: 50,
+      include: { _count: { select: { messages: true } } },
+    });
+  }),
+
+  createSession: protectedProcedure
+    .input(z.object({ title: z.string().max(100).optional() }))
+    .mutation(async ({ ctx, input }) => {
+      return ctx.prisma.chatSession.create({
+        data: { userId: ctx.userId, title: input.title ?? "New conversation" },
+      });
+    }),
+
+  sendMessage: rateLimitedProcedure
+    .input(
+      z.object({
+        sessionId: z.string().cuid(),
+        content: z.string().min(1).max(10_000),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const session = await ctx.prisma.chatSession.findFirst({
+        where: { id: input.sessionId, userId: ctx.userId },
+        include: {
+          messages: {
+            orderBy: { createdAt: "asc" },
+            take: 20,
+            where: { status: "COMPLETED" },
+          },
+        },
+      });
+
+      if (!session) throw new TRPCError({ code: "NOT_FOUND" });
+
+      const userMessage = await ctx.prisma.message.create({
+        data: {
+          sessionId: input.sessionId,
+          role: "USER",
+          content: input.content,
+          status: "COMPLETED",
+        },
+      });
+
+      const aiMessage = await ctx.prisma.message.create({
+        data: {
+          sessionId: input.sessionId,
+          role: "MODEL",
+          content: "",
+          status: "PENDING",
+        },
+      });
+
+      try {
+        const history = session.messages.map((msg) => ({
+          role: msg.role === "USER" ? "user" : "model",
+          parts: [{ text: msg.content }],
+        }));
+
+        const chat = genai
+          .getGenerativeModel({ model: "gemini-2.5-pro" })
+          .startChat({ history });
+
+        const result = await chat.sendMessage(input.content);
+        const responseText = result.response.text();
+        const tokenCount = result.response.usageMetadata?.candidatesTokenCount;
+
+        const updated = await ctx.prisma.message.update({
+          where: { id: aiMessage.id },
+          data: { content: responseText, status: "COMPLETED", tokenCount },
+        });
+
+        await ctx.prisma.chatSession.update({
+          where: { id: input.sessionId },
+          data: { updatedAt: new Date() },
+        });
+
+        return { userMessage, aiMessage: updated };
+      } catch (error) {
+        await ctx.prisma.message.update({
+          where: { id: aiMessage.id },
+          data: { status: "FAILED", content: "An error occurred." },
+        });
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to get AI response",
+        });
+      }
+    }),
+```
+
+## Real-Time Streaming with tRPC Subscriptions
+
+This is the part most developers struggle with. The key is being explicit about the union type passed to `observable` — without it, type narrowing on the client breaks.
+
+```typescript
+  streamMessage: rateLimitedProcedure
+    .input(
+      z.object({
+        sessionId: z.string().cuid(),
+        content: z.string().min(1).max(10_000),
+      })
+    )
+    .subscription(({ ctx, input }) => {
+      return observable<
+        | { type: "chunk"; text: string }
+        | { type: "done"; messageId: string; tokenCount: number }
+        | { type: "error"; message: string }
+      >((emit) => {
+        let cancelled = false;
+        let aiMessageId: string | null = null;
+        let fullText = "";
+
+        const run = async () => {
+          try {
+            const session = await ctx.prisma.chatSession.findFirst({
+              where: { id: input.sessionId, userId: ctx.userId },
+              include: {
+                messages: {
+                  orderBy: { createdAt: "asc" },
+                  take: 20,
+                  where: { status: "COMPLETED" },
+                },
+              },
+            });
+
+            if (!session) {
+              emit.next({ type: "error", message: "Session not found" });
+              emit.complete();
+              return;
+            }
+
+            await ctx.prisma.message.create({
+              data: {
+                sessionId: input.sessionId,
+                role: "USER",
+                content: input.content,
+                status: "COMPLETED",
+              },
+            });
+
+            const placeholder = await ctx.prisma.message.create({
+              data: {
+                sessionId: input.sessionId,
+                role: "MODEL",
+                content: "",
+                status: "PENDING",
+              },
+            });
+            aiMessageId = placeholder.id;
+
+            const history = session.messages.map((msg) => ({
+              role: msg.role === "USER" ? "user" : "model",
+              parts: [{ text: msg.content }],
+            }));
+
+            const chat = genai
+              .getGenerativeModel({ model: "gemini-2.5-pro" })
+              .startChat({ history });
+
+            const stream = await chat.sendMessageStream(input.content);
+
+            for await (const chunk of stream.stream) {
+              if (cancelled) break;
+              const text = chunk.text();
+              if (text) {
+                fullText += text;
+                emit.next({ type: "chunk", text });
+              }
+            }
+
+            const finalResponse = await stream.response;
+            const tokenCount =
+              finalResponse.usageMetadata?.candidatesTokenCount ?? 0;
+
+            if (!cancelled) {
+              await ctx.prisma.message.update({
+                where: { id: aiMessageId },
+                data: {
+                  content: fullText,
+                  status: "COMPLETED",
+                  tokenCount,
+                },
+              });
+
+              await ctx.prisma.chatSession.update({
+                where: { id: input.sessionId },
+                data: { updatedAt: new Date() },
+              });
+
+              emit.next({ type: "done", messageId: aiMessageId, tokenCount });
+              emit.complete();
+            }
+          } catch (error) {
+            if (aiMessageId) {
+              await ctx.prisma.message
+                .update({
+                  where: { id: aiMessageId },
+                  data: {
+                    status: "FAILED",
+                    content: fullText || "An error occurred.",
+                  },
+                })
+                .catch(() => {});
+            }
+
+            emit.next({
+              type: "error",
+              message:
+                error instanceof Error ? error.message : "Streaming failed",
+            });
+            emit.complete();
+          }
+        };
+
+        run();
+
+        // Called when the client disconnects
+        return () => {
+          cancelled = true;
+        };
+      });
+    }),
+});
+```
+
+The `cancelled` flag is essential. When a client disconnects, tRPC calls the cleanup function returned from `observable`. Setting `cancelled = true` breaks the `for await` loop on the next iteration, so you stop processing chunks even if Gemini is still returning data. Note that Gemini's API has already received the request by this point, so billing still applies — but you avoid wasting server CPU and creating orphaned DB writes.
+
+## Route Handler and Client Configuration
+
+The Next.js Route Handler wires tRPC into the App Router:
+
+```typescript
+// src/app/api/trpc/[trpc]/route.ts
+import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
+import { appRouter } from "@/server/routers/_app";
+import { createContext } from "@/server/trpc";
+
+const handler = (req: Request) =>
+  fetchRequestHandler({
+    endpoint: "/api/trpc",
+    req,
+    router: appRouter,
+    createContext: ({ req, resHeaders }) => createContext({ req, resHeaders }),
+    onError:
+      process.env.NODE_ENV === "development"
+        ? ({ path, error }) => console.error(`tRPC error on ${path}:`, error)
+        : undefined,
+  });
+
+export { handler as GET, handler as POST };
+```
+
+The client uses `splitLink` to route subscriptions through SSE and regular queries/mutations through HTTP batch:
+
+```typescript
+// src/trpc/client.ts
+"use client";
+import {
+  createTRPCClient,
+  httpBatchStreamLink,
+  unstable_httpSubscriptionLink,
+  splitLink,
+} from "@trpc/client";
+import type { AppRouter } from "@/server/routers/_app";
+import superjson from "superjson";
+
+const url = `${process.env.NEXT_PUBLIC_APP_URL}/api/trpc`;
+
+export const trpc = createTRPCClient<AppRouter>({
+  links: [
+    splitLink({
+      condition: (op) => op.type === "subscription",
+      true: unstable_httpSubscriptionLink({ url, transformer: superjson }),
+      false: httpBatchStreamLink({
+        url,
+        transformer: superjson,
+        headers() {
+          const token =
+            typeof window !== "undefined"
+              ? localStorage.getItem("auth_token")
+              : null;
+          return token ? { Authorization: `Bearer ${token}` } : {};
+        },
+      }),
+    }),
+  ],
+});
+```
+
+A minimal React component to kick off a streaming session:
+
+```tsx
+// src/components/ChatInput.tsx
+"use client";
+import { useState } from "react";
+import { trpc } from "@/trpc/client";
+
+export function ChatInput({ sessionId }: { sessionId: string }) {
+  const [input, setInput] = useState("");
+  const [streaming, setStreaming] = useState(false);
+  const [streamedText, setStreamedText] = useState("");
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || streaming) return;
+
+    setStreaming(true);
+    setStreamedText("");
+
+    trpc.chat.streamMessage.subscribe(
+      { sessionId, content: input },
+      {
+        onData(data) {
+          if (data.type === "chunk") {
+            setStreamedText((prev) => prev + data.text);
+          } else if (data.type === "done" || data.type === "error") {
+            setStreaming(false);
+          }
+        },
+        onError() {
+          setStreaming(false);
+        },
+        onComplete() {
+          setStreaming(false);
+        },
+      }
+    );
+
+    setInput("");
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        disabled={streaming}
+        placeholder="Type a message..."
+      />
+      <button type="submit" disabled={streaming || !input.trim()}>
+        {streaming ? "Sending..." : "Send"}
+      </button>
+      {streamedText && <p className="streaming-text">{streamedText}</p>}
+    </form>
+  );
+}
+```
+
+## Common Pitfalls (and How to Avoid Them)
+
+**Pitfall 1: Edge Runtime breaks Prisma**
+
+If you add `export const runtime = "edge"` to your Route Handler, Prisma stops working. Prisma Client depends on Node.js APIs (`fs`, native bindings) that aren't available in the V8 isolate environment that Edge Runtime uses.
+
+```typescript
+// ❌ Breaks Prisma
+export const runtime = "edge";
+
+// ✅ Use Node.js runtime (or omit — it's the default)
+export const runtime = "nodejs";
+```
+
+Gemini API itself works fine on Edge Runtime, so if you want the performance benefits of Edge for some routes, split your API: put Gemini-only calls on Edge and DB-touching calls on Node.js. Alternatively, use [Prisma Accelerate](https://www.prisma.io/accelerate) or an HTTP-based database driver (Neon serverless, PlanetScale) which do work on Edge.
+
+**Pitfall 2: Missing type annotation on `observable` breaks client narrowing**
+
+Without an explicit union type on `observable`, `emit.next()` accepts `any`, and the client loses the ability to narrow `data.type`:
+
+```typescript
+// ❌ Types are lost — client can't narrow data.type
+return observable((emit) => { ... });
+
+// ✅ Explicit union type — narrowing works on the client
+return observable<
+  | { type: "chunk"; text: string }
+  | { type: "done"; messageId: string; tokenCount: number }
+  | { type: "error"; message: string }
+>((emit) => { ... });
+```
+
+This is the single most common tRPC subscription mistake I've seen in codebases. The missing type doesn't cause a runtime error — it just silently disables the type safety you were counting on.
+
+**Pitfall 3: Calling Prisma inside the `for await` loop**
+
+It's tempting to update the message content in the database on every chunk — "so the user can resume if they close the tab." But this creates a DB query for every streaming chunk, which can easily mean 50–100 queries per message.
+
+```typescript
+// ❌ 100 DB writes for a 100-chunk response
+for await (const chunk of stream.stream) {
+  fullText += chunk.text();
+  await prisma.message.update({ where: { id }, data: { content: fullText } });
+}
+
+// ✅ One DB write after the stream completes
+for await (const chunk of stream.stream) {
+  fullText += chunk.text();
+  emit.next({ type: "chunk", text: chunk.text() });
+}
+await prisma.message.update({
+  where: { id: aiMessageId },
+  data: { content: fullText, status: "COMPLETED" },
+});
+```
+
+If you genuinely need mid-stream persistence for recovery, write a snapshot at intervals (every 10 seconds or every 500 characters) rather than every chunk. Most chat applications don't need this.
+
+## Handling Conversation History Correctly
+
+One area where Gemini API integrations go wrong in production is conversation history management. The naive approach — sending all messages in a session as history — breaks down in two ways: it increases latency as sessions grow, and it risks hitting the context window limit on very long conversations.
+
+The schema above uses `take: 20` to limit history to the last 20 completed messages. This is a reasonable default for most chat applications. If you need longer context, use `take: 50` but watch your average response times — each additional message adds tokens that Gemini must process.
+
+A more sophisticated approach is to implement a "sliding window with summary" pattern:
+
+```typescript
+// src/server/lib/buildHistory.ts
+import type { Message } from "@prisma/client";
+
+const MAX_HISTORY_MESSAGES = 20;
+const SUMMARIZE_THRESHOLD = 40; // summarize when we exceed this
+
+export async function buildConversationHistory(
+  messages: Message[],
+  summarizer?: (text: string) => Promise<string>
+) {
+  const completed = messages.filter((m) => m.status === "COMPLETED");
+
+  if (completed.length <= MAX_HISTORY_MESSAGES) {
+    // Short enough — use directly
+    return completed.map((msg) => ({
+      role: msg.role === "USER" ? "user" : "model",
+      parts: [{ text: msg.content }],
+    }));
+  }
+
+  if (completed.length > SUMMARIZE_THRESHOLD && summarizer) {
+    // Summarize the oldest half, keep the recent half verbatim
+    const splitAt = Math.floor(completed.length / 2);
+    const oldMessages = completed.slice(0, splitAt);
+    const recentMessages = completed.slice(splitAt);
+
+    const oldText = oldMessages
+      .map((m) => `${m.role}: ${m.content}`)
+      .join("
+");
+    const summary = await summarizer(oldText);
+
+    return [
+      { role: "user" as const, parts: [{ text: "Earlier in our conversation:" }] },
+      { role: "model" as const, parts: [{ text: summary }] },
+      ...recentMessages.map((msg) => ({
+        role: msg.role === "USER" ? "user" as const : "model" as const,
+        parts: [{ text: msg.content }],
+      })),
+    ];
+  }
+
+  // Default: use the most recent MAX_HISTORY_MESSAGES
+  return completed.slice(-MAX_HISTORY_MESSAGES).map((msg) => ({
+    role: msg.role === "USER" ? "user" as const : "model" as const,
+    parts: [{ text: msg.content }],
+  }));
+}
+```
+
+The `summarizer` function can itself call Gemini API with a cheap model like `gemini-2.5-flash` to produce the summary. This keeps conversation context meaningful without blowing up token costs.
+
+## Multi-Session Isolation and Security
+
+One subtle security issue with the chat router above: it queries the session with `userId` in the `where` clause, which correctly prevents users from accessing each other's sessions. But make sure this pattern is consistent everywhere. A common mistake is checking ownership in some mutations but not others:
+
+```typescript
+// ❌ Forgot ownership check — any authenticated user can delete any session
+deleteSession: protectedProcedure
+  .input(z.object({ sessionId: z.string().cuid() }))
+  .mutation(async ({ ctx, input }) => {
+    await ctx.prisma.chatSession.delete({ where: { id: input.sessionId } });
+  }),
+
+// ✅ Always include userId in the where clause
+deleteSession: protectedProcedure
+  .input(z.object({ sessionId: z.string().cuid() }))
+  .mutation(async ({ ctx, input }) => {
+    const deleted = await ctx.prisma.chatSession.deleteMany({
+      where: { id: input.sessionId, userId: ctx.userId },
+    });
+    if (deleted.count === 0) {
+      throw new TRPCError({ code: "NOT_FOUND" });
+    }
+  }),
+```
+
+Using `deleteMany` instead of `delete` lets you silently handle the case where the record doesn't exist or belongs to someone else — returning `count: 0` instead of throwing a Prisma `RecordNotFound` error that would bubble up as a 500.
+
+## Token Usage Tracking and Cost Visibility
+
+If you're building a product where users have token budgets or you want to track API costs, the `tokenCount` field in the Message model is your foundation. Here's a simple aggregation to show per-user usage:
+
+```typescript
+// Usage stats procedure
+getUsageStats: protectedProcedure
+  .input(
+    z.object({
+      since: z.date().optional(), // e.g., start of current month
+    })
+  )
+  .query(async ({ ctx, input }) => {
+    const since = input.since ?? new Date(new Date().setDate(1)); // Default: this month
+
+    const result = await ctx.prisma.message.aggregate({
+      _sum: { tokenCount: true },
+      _count: { id: true },
+      where: {
+        session: { userId: ctx.userId },
+        role: "MODEL", // Count output tokens only
+        status: "COMPLETED",
+        createdAt: { gte: since },
+      },
+    });
+
+    const outputTokens = result._sum.tokenCount ?? 0;
+    const messageCount = result._count.id;
+
+    // Gemini 2.5 Pro pricing (output): approximately $15 per 1M tokens
+    const estimatedCostUsd = (outputTokens / 1_000_000) * 15;
+
+    return {
+      outputTokens,
+      messageCount,
+      estimatedCostUsd,
+      period: { from: since, to: new Date() },
+    };
+  }),
+```
+
+This is the kind of data that makes your per-user pricing model defensible — whether you're charging a flat monthly fee or building a usage-based system. Storing token counts at write time is much cheaper than re-computing them later from API logs.
+
+## Testing tRPC Procedures with Gemini API
+
+Testing procedures that call Gemini API requires mocking the AI client to avoid incurring costs in CI. Here's a pattern that keeps tests fast and deterministic:
+
+```typescript
+// src/server/routers/chat.test.ts
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { createCallerFactory } from "@trpc/server";
+import { appRouter } from "./_app";
+import { prisma } from "@/lib/prisma";
+
+// Mock the Gemini AI client
+vi.mock("@google/genai", () => ({
+  GoogleGenAI: vi.fn().mockImplementation(() => ({
+    getGenerativeModel: vi.fn().mockReturnValue({
+      startChat: vi.fn().mockReturnValue({
+        sendMessage: vi.fn().mockResolvedValue({
+          response: {
+            text: () => "Mocked AI response",
+            usageMetadata: { candidatesTokenCount: 42 },
+          },
+        }),
+      }),
+    }),
+  })),
+}));
+
+const createCaller = createCallerFactory(appRouter);
+
+describe("chatRouter.sendMessage", () => {
+  beforeEach(async () => {
+    // Clean up test data between tests
+    await prisma.chatSession.deleteMany({ where: { userId: "test-user" } });
+  });
+
+  it("creates user and AI messages in the database", async () => {
+    // Create a test context with a known userId
+    const caller = createCaller({
+      userId: "test-user",
+      prisma,
+      req: new Request("http://localhost"),
+    });
+
+    // Create a session first
+    const session = await caller.chat.createSession({ title: "Test" });
+
+    // Send a message
+    const result = await caller.chat.sendMessage({
+      sessionId: session.id,
+      content: "Hello",
+    });
+
+    expect(result.userMessage.content).toBe("Hello");
+    expect(result.aiMessage.content).toBe("Mocked AI response");
+    expect(result.aiMessage.status).toBe("COMPLETED");
+    expect(result.aiMessage.tokenCount).toBe(42);
+  });
+
+  it("throws NOT_FOUND when session belongs to another user", async () => {
+    const caller = createCaller({
+      userId: "different-user",
+      prisma,
+      req: new Request("http://localhost"),
+    });
+
+    const otherUserSession = await prisma.chatSession.create({
+      data: { userId: "test-user", title: "Private session" },
+    });
+
+    await expect(
+      caller.chat.sendMessage({
+        sessionId: otherUserSession.id,
+        content: "Trying to access",
+      })
+    ).rejects.toThrow("NOT_FOUND");
+  });
+});
+```
+
+The `createCallerFactory` pattern from tRPC v11 gives you a direct function caller for tests — no HTTP server needed, and the full middleware chain (including auth checks) still runs. This is particularly useful for verifying that the ownership checks we discussed earlier are actually enforced.
+
+## Production Deployment Considerations
+
+On Vercel, tRPC's SSE subscriptions use Vercel's Streaming Response feature. The free tier has a 60-second response timeout, which means very long Gemini responses may hit the limit. The Gemini 2.5 Pro model typically completes in 5–15 seconds for conversational inputs, so this usually isn't a problem — but watch for it if you're generating long-form content.
+
+For the database connection, add Prisma's migration step to your build:
+
+```json
+{
+  "scripts": {
+    "build": "prisma generate && prisma migrate deploy && next build",
+    "postinstall": "prisma generate"
+  }
+}
+```
+
+The in-memory rate limiter in the middleware above is intentionally simple. In production with multiple server instances, replace `rateLimitMap` with Redis using Upstash or similar. The interface stays the same — just swap the underlying store.
+
+For error handling strategies specific to Gemini API (exponential backoff, retry logic for 429s), see [Gemini API Error Handling and Rate Limiting in Production](/articles/gemini-dev/gemini-api-error-handling-rate-limit-production-patterns) — it covers the patterns that work best when Gemini is embedded inside a tRPC mutation or subscription.
+
+## Structuring System Instructions per Session
+
+One feature worth adding early is per-session system instructions. Rather than hardcoding a single system prompt, storing it in the session lets you support different AI personas, languages, or task modes without schema changes.
+
+Add a `systemInstruction` field to `ChatSession`:
+
+```prisma
+model ChatSession {
+  id                String   @id @default(cuid())
+  userId            String
+  title             String   @default("New conversation")
+  systemInstruction String?  @db.Text  // Optional, per-session persona
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages          Message[]
+
+  @@index([userId, createdAt(sort: Desc)])
+}
+```
+
+Then pass it to the Gemini model initialization:
+
+```typescript
+const model = genai.getGenerativeModel({
+  model: "gemini-2.5-pro",
+  systemInstruction: session.systemInstruction ?? undefined,
+});
+const chat = model.startChat({ history });
+```
+
+This opens the door to use cases like "a coding assistant that only answers in Python" or "a customer support bot with a specific tone guide" — all controlled per session, not per deployment.
+
+For the full-stack implementation connecting these patterns to a production Next.js application, [Gemini API with Next.js 15 App Router — Full-Stack Production Guide](/articles/gemini-dev/gemini-api-nextjs15-app-router-fullstack-production) walks through the deployment configuration and server component integration in more detail.
+
+## Next Step
+
+Get the `sendMessage` mutation working first — make sure the type flows from Prisma through tRPC to your React component before adding streaming. Once you see IDE autocomplete on `aiMessage.tokenCount` in the frontend, you'll know the type chain is working. From there, swap in the `streamMessage` subscription and you'll already understand why each piece is there.
+
+If you want to go deeper on TypeScript patterns for AI application backends, [Programming TypeScript](https://www.amazon.co.jp/dp/4873120101/?tag=pinocchio-22) covers the type system fundamentals that make tRPC's inference work — particularly the chapters on mapped types and conditional types.
