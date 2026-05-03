@@ -1,0 +1,395 @@
+---
+title: "Gemini API × Cloudflare Workers で月額課金SaaSを構築する完全実装ガイド — 2026年版"
+slug: "gemini-api-cloudflare-workers-subscription-saas-complete-build"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-03T12:30"
+author: "Gemini Lab"
+description: "Gemini API・Stripe・Cloudflare Workers を組み合わせて月額課金SaaSを構築する完全実装ガイドです。Webhook処理・Cloudflare KVでのアクセス制御・利用上限・本番運用で必ず詰まるエッジケースまで、実コード付きで解説します。"
+tags: ["Gemini API", "Stripe", "Cloudflare Workers", "SaaS", "実装"]
+highlights:
+  - "Gemini API（Flash/Pro/Ultra）を切り替え可能な構成で組み込み、低コストの優位性を実装に反映する完全な構成例"
+  - "Stripe Checkout + Webhook + Cloudflare KV でアクセス制御を実装する具体コード（idempotency対策込み）"
+  - "Geminiの低コストを活かしたヘビーユーザー対応設計（『使い放題プラン』を成立させるための設計判断）"
+---
+
+[前編のGemini API有料サービス立ち上げロードマップ](/articles/gemini-api/gemini-api-paid-service-launch-roadmap-2026)で書いた通り、Gemini APIの強みは圧倒的な低コストです。本記事はその実装編で、Cloudflare Workers上でStripe決済とGemini API呼び出しを組み合わせた月額課金SaaSを構築する完全な手順をまとめます。
+
+私が運営するGemini Lab・Claude Lab・Antigravity Lab・Rork Labの4サイトは、すべてこの構成で動いています。本番でWebhookが失敗したとき・解約処理で詰まったとき・Cloudflare KVのレートリミットに引っかかったときの対処を含め、個人開発で実際に踏むエッジケースの解決策まで書き残します。
+
+コードはNext.js 16 (App Router) + Cloudflare Workers (OpenNext) + Stripe v15 + @google/generative-ai SDK を前提にしています。Anthropic SDKを使う[Claude × Stripe実装ガイド](/articles/api-sdk/claude-stripe-subscription-saas-complete-implementation)と構造はほぼ同じですが、Gemini固有の判断（モデル切り替え・大きな上限設定・Vertex AI互換性）が随所に入ってきます。
+
+## 全体アーキテクチャ
+
+最終構成は次の通りです。
+
+- **認証**: NextAuth.js（メール+OAuth）
+- **決済**: Stripe Checkout（月額サブスクと買い切り両対応）
+- **アクセス制御**: Stripe Webhook → Cloudflare KV（ユーザーごとの権限フラグ）
+- **API実行層**: Cloudflare Workers + @google/generative-ai SDK
+- **モデル切り替え**: 利用上限内はFlash、上限超過時はProフォールバック（オプション）
+
+KVをアクセス制御の単一の真実の源とするのが、個人開発で最も軽量です。Stripe APIに毎リクエスト問い合わせる構成は、レートリミットとレイテンシの両面で筋が悪いです。
+
+## ステップ1: Stripeのプロダクト設計
+
+Geminiベースのサービスは「月額1,500円使い放題」が成立するという特殊な強みを持っています。これを反映したプロダクト構成にします。
+
+- **Pro月額（JPY）**: 商品名「Pro Unlimited」、価格 ¥1,500/月、月額サブスク
+- **Pro月額（USD）**: 商品名「Pro Unlimited」、価格 $10/月、月額サブスク
+- **単発購入（JPY/USD）**: 価格 ¥350 / $3、買い切り
+
+通貨ごとにプロダクトを分けるのは、Stripe Checkoutに表示される商品名・説明文をロケール別に出し分けるためです（STUMBLING_POINTS #79）。Geminiの場合、「Unlimited」という売り文句が他社モデルでは出しにくい強みなので、商品名にも明示的に入れます。
+
+Stripe Dashboardで作成したprice_idを `wrangler.toml` に環境変数として登録します。
+
+```toml
+[vars]
+STRIPE_PRICE_PRO_JPY = "price_..."
+STRIPE_PRICE_PRO_USD = "price_..."
+SITE_URL = "https://gemilab.net"
+
+# secrets は wrangler secret put で別管理
+# - STRIPE_SECRET_KEY
+# - STRIPE_WEBHOOK_SECRET
+# - GEMINI_API_KEY
+# - NEXTAUTH_SECRET
+```
+
+## ステップ2: Checkoutセッション生成API
+
+```typescript
+// app/api/checkout/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import Stripe from 'stripe';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/lib/auth';
+
+export const runtime = 'edge';
+
+export async function POST(req: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) {
+    return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+  }
+
+  const { plan, locale } = await req.json();
+  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+    apiVersion: '2025-10-31',
+  });
+
+  const isJa = locale === 'ja';
+  const isPro = plan === 'pro';
+
+  const params: Stripe.Checkout.SessionCreateParams = {
+    mode: isPro ? 'subscription' : 'payment',
+    success_url: `${process.env.SITE_URL}/${locale}/thanks?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${process.env.SITE_URL}/${locale}/membership`,
+    customer_email: session.user.email,
+    line_items: [{
+      price_data: {
+        currency: isJa ? 'jpy' : 'usd',
+        recurring: isPro ? { interval: 'month' } : undefined,
+        unit_amount: isPro ? (isJa ? 1500 : 1000) : (isJa ? 350 : 300),
+        product_data: {
+          name: isPro
+            ? (isJa ? 'Pro Unlimited（月額）' : 'Pro Unlimited (Monthly)')
+            : (isJa ? '単発購入' : 'Single Purchase'),
+          description: isPro
+            ? (isJa ? 'Gemini APIの全機能を月間使い放題' : 'Unlimited monthly access to all Gemini features')
+            : (isJa ? '24時間有効な単発利用権' : '24-hour single-use access'),
+          images: [`${process.env.SITE_URL}/images/stripe-product.png`],
+        },
+      },
+      quantity: 1,
+    }],
+    metadata: {
+      plan_type: plan,
+      user_email: session.user.email,
+    },
+  };
+
+  const checkoutSession = await stripe.checkout.sessions.create(params);
+  return NextResponse.json({ url: checkoutSession.url });
+}
+```
+
+`metadata.plan_type` を必ず付けることが重要です。Webhookで受け取ったときにサブスクと単発購入を区別する手がかりになります（STUMBLING_POINTS #14.5）。
+
+## ステップ3: Stripe Webhook処理
+
+```typescript
+// app/api/stripe/webhook/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import Stripe from 'stripe';
+import { getCloudflareContext } from '@opennextjs/cloudflare';
+
+export const runtime = 'edge';
+
+export async function POST(req: NextRequest) {
+  const sig = req.headers.get('stripe-signature');
+  const body = await req.text();
+  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+    apiVersion: '2025-10-31',
+  });
+
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      body, sig!, process.env.STRIPE_WEBHOOK_SECRET!
+    );
+  } catch (e) {
+    return NextResponse.json({ error: 'invalid signature' }, { status: 400 });
+  }
+
+  const { env } = getCloudflareContext();
+  const kv = env.MEMBERSHIP_KV;
+
+  // 冪等性チェック - 重複イベントは無視
+  const eventKey = `site:gemilab:webhook:${event.id}`;
+  const seen = await kv.get(eventKey);
+  if (seen) {
+    return NextResponse.json({ received: true, duplicate: true });
+  }
+  await kv.put(eventKey, '1', { expirationTtl: 86400 * 7 });
+
+  switch (event.type) {
+    case 'checkout.session.completed': {
+      const s = event.data.object as Stripe.Checkout.Session;
+      const planType = s.metadata?.plan_type;
+      const email = s.customer_email ?? s.metadata?.user_email;
+      if (!email) break;
+
+      if (planType === 'pro') {
+        const subscription = await stripe.subscriptions.retrieve(s.subscription as string);
+        await kv.put(
+          `site:gemilab:member:${email}`,
+          JSON.stringify({
+            plan: 'pro',
+            current_period_end: subscription.current_period_end,
+            subscription_id: subscription.id,
+          }),
+          { expirationTtl: subscription.current_period_end - Math.floor(Date.now() / 1000) + 86400 * 3 }
+        );
+      } else if (planType === 'single') {
+        // 単発購入: 24時間アクセス権
+        await kv.put(
+          `site:gemilab:single:${email}`,
+          '1',
+          { expirationTtl: 86400 }
+        );
+      }
+      break;
+    }
+    case 'customer.subscription.deleted': {
+      const sub = event.data.object as Stripe.Subscription;
+      const customer = await stripe.customers.retrieve(sub.customer as string);
+      if ('email' in customer && customer.email) {
+        await kv.delete(`site:gemilab:member:${customer.email}`);
+      }
+      break;
+    }
+  }
+  return NextResponse.json({ received: true });
+}
+```
+
+TTL設計のポイント: 月額契約は「次回更新日 + 3日」のバッファを取ることで、Webhookが何らかの理由で失敗してもKVが自動的に失効します。単発購入は24時間有効なので、TTL=86400秒で勝手に消えます。Geminiの低コストを活かして「24時間使い放題」の単発購入を成立させているのがポイントです。
+
+## ステップ4: アクセス制御ヘルパー
+
+```typescript
+// lib/premium.ts
+import { getCloudflareContext } from '@opennextjs/cloudflare';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/lib/auth';
+
+export async function canViewPremium(): Promise<boolean> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return false;
+  try {
+    const { env } = getCloudflareContext();
+    const raw = await env.MEMBERSHIP_KV.get(`site:gemilab:member:${session.user.email}`);
+    if (raw) {
+      const data = JSON.parse(raw);
+      if (data.plan === 'pro') return true;
+    }
+    // 単発購入のチェック
+    const single = await env.MEMBERSHIP_KV.get(`site:gemilab:single:${session.user.email}`);
+    return single === '1';
+  } catch (e) {
+    // KV不可時はdeny by default
+    return false;
+  }
+}
+```
+
+`return false` がフォールバック挙動なのは絶対に変えないでください。`return true` にすると、KVアクセスエラーが出るたびに全プレミアム機能が誰でも使える状態になります。アクセス制御は deny by default が鉄則です（STUMBLING_POINTS #89）。
+
+## ステップ5: Gemini APIを呼び出す（モデル切り替え対応）
+
+ここがGemini固有の部分です。Flash・Pro・Ultraを動的に切り替える構成を実装します。
+
+```typescript
+// lib/gemini.ts
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+type ModelTier = 'flash' | 'pro' | 'ultra';
+
+const MODEL_NAMES: Record<ModelTier, string> = {
+  flash: 'gemini-3.2-flash',
+  pro: 'gemini-3.2-pro',
+  ultra: 'gemini-3.2-ultra',
+};
+
+export async function generateWithGemini(
+  prompt: string,
+  tier: ModelTier = 'flash'
+): Promise<string> {
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+  const model = genAI.getGenerativeModel({
+    model: MODEL_NAMES[tier],
+    generationConfig: {
+      maxOutputTokens: 2000,
+      temperature: 0.7,
+    },
+  });
+
+  const result = await model.generateContent(prompt);
+  const response = result.response;
+  return response.text();
+}
+
+// 自動選択ヘルパー: タスクの複雑さに応じて自動でモデルを選ぶ
+export async function smartGenerate(prompt: string, complexity: number): Promise<string> {
+  // complexity 0-3: Flash, 4-7: Pro, 8-10: Ultra
+  if (complexity <= 3) return generateWithGemini(prompt, 'flash');
+  if (complexity <= 7) return generateWithGemini(prompt, 'pro');
+  return generateWithGemini(prompt, 'ultra');
+}
+```
+
+`maxOutputTokens` は必ず明示してください。これを設定しないと、無限ループのバグでAPI予算を一気に使い切る事故が起こります。
+
+## ステップ6: APIエンドポイントで利用上限を実装
+
+Geminiの「使い放題プラン」を実装する場合でも、レート制限は必要です。「使い放題」と「無制限に並列リクエスト」は違います。
+
+```typescript
+// app/api/generate/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/lib/auth';
+import { canViewPremium } from '@/lib/premium';
+import { generateWithGemini } from '@/lib/gemini';
+import { getCloudflareContext } from '@opennextjs/cloudflare';
+
+export const runtime = 'edge';
+
+export async function POST(req: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) {
+    return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+  }
+
+  const isPro = await canViewPremium();
+  if (!isPro) {
+    return NextResponse.json({ error: 'subscription_required' }, { status: 402 });
+  }
+
+  // 1分間あたり10リクエストにレート制限
+  const { env } = getCloudflareContext();
+  const minuteKey = `rate:${session.user.email}:${Math.floor(Date.now() / 60000)}`;
+  const current = parseInt((await env.MEMBERSHIP_KV.get(minuteKey)) ?? '0', 10);
+  if (current >= 10) {
+    return NextResponse.json(
+      { error: 'rate_limit', retryAfter: 60 },
+      { status: 429 }
+    );
+  }
+  await env.MEMBERSHIP_KV.put(minuteKey, String(current + 1), { expirationTtl: 120 });
+
+  const { prompt, tier = 'flash' } = await req.json();
+
+  // tier=ultra は管理者のみに制限する場合
+  if (tier === 'ultra' && !session.user.email?.endsWith('@gemilab.net')) {
+    return NextResponse.json({ error: 'tier_restricted' }, { status: 403 });
+  }
+
+  const text = await generateWithGemini(prompt, tier);
+  return NextResponse.json({ text });
+}
+```
+
+ここでは「Pro契約者なら使い放題」を実装していますが、レート制限（1分10リクエスト）は別途設けています。これにより、APIキーを盗まれた場合や、悪意あるユーザーがループ呼び出しを仕掛けた場合の被害を最小化できます。
+
+## ステップ7: 解約フローとエッジケース
+
+本番運用で必ず詰まる項目です。
+
+**契約解除直後の駆け込み利用** — Stripe Customer Portal経由で解約された場合、`customer.subscription.updated`（cancel_at_period_end=true）でいったん「解約予約」状態を扱い、`customer.subscription.deleted`受信時に最終的にKVから削除します。これにより、契約期間終了までは引き続きアクセスできます。
+
+**重複Webhook** — Stripeは稀に同一イベントを複数回送ります。`event.id` をKVに記録しておく冪等性チェックは必須です（ステップ3で実装済み）。
+
+**Geminiクォータ超過** — Gemini APIには地域別・プロジェクト別のクォータがあります。本番運用で超過すると500エラーが返るので、リトライロジックとフォールバック（FlashからProへの一時切り替えなど）を入れておくと安心です。
+
+```typescript
+async function generateWithFallback(prompt: string, tier: 'flash' | 'pro'): Promise<string> {
+  try {
+    return await generateWithGemini(prompt, tier);
+  } catch (e: any) {
+    if (e.message?.includes('quota')) {
+      // クォータ超過時は別tierにフォールバック
+      const fallbackTier = tier === 'flash' ? 'pro' : 'flash';
+      return await generateWithGemini(prompt, fallbackTier);
+    }
+    throw e;
+  }
+}
+```
+
+## ステップ8: Cloudflareエッジキャッシュ対策
+
+これは個人開発SaaSでもっとも見落とされる罠です。Cloudflare WorkersでHTMLをキャッシュすると、ログイン状態や課金状態に関係なく同じHTMLが配信されます。
+
+`cache-worker.js` で `premium_token` Cookieを持つリクエストはキャッシュをバイパスする必要があります（STUMBLING_POINTS #73）。
+
+```javascript
+addEventListener('fetch', event => {
+  const req = event.request;
+  const cookie = req.headers.get('cookie') || '';
+
+  if (cookie.includes('premium_token')) {
+    event.respondWith(fetch(req));
+    return;
+  }
+  event.respondWith(handleCachedRequest(event));
+});
+```
+
+これを忘れると「課金してもメンバーシップCTAが消えない」というクレームが大量に届きます。
+
+## 本番投入前のチェックリスト
+
+実装が終わったら、本番デプロイ前に必ず次の項目を確認してください。
+
+- Stripe Webhookエンドポイントが本番URLを指している
+- `STRIPE_WEBHOOK_SECRET` `GEMINI_API_KEY` が本番モードのものに切り替わっている
+- KVのkey prefixが `site:gemilab:` で他サイトと衝突しないことを確認
+- Gemini側で月間予算アラートを設定（Google Cloud Console）
+- Stripe Test Modeでサブスク作成 → 解約 → 再購入の3パスを通している
+- レート制限が実際に動作することをcurlで確認
+- `cache-worker.js` で `premium_token` Cookieバイパスが効いている
+
+## まとめ — Geminiならではの強みを実装に反映する
+
+この実装ガイドの中で、Gemini固有の判断ポイントは次の3つです。
+
+1. **「使い放題プラン」が成立する** — 低単価のおかげで、ヘビーユーザーが乗ってもコストが破綻しない
+2. **モデルの動的切り替え** — Flash/Pro/Ultraを使い分けることで、品質とコストのバランスが取れる
+3. **24時間有効な単発購入** — 月額会員になりたくないユーザーへの低価格な受け皿が成立する
+
+これら3点はClaude APIやOpenAI APIのコストでは成立しにくい設計で、Geminiを使う最大の戦略的メリットです。本記事の構成をそのまま使えば、初日からこれらの強みを活かしたSaaSを立ち上げられます。
+
+実装で詰まったら、Gemini Lab・Claude Lab・Antigravity Lab・Rork Labのリポジトリ群が同じ構成で動いている実例として参考になるはずです。
