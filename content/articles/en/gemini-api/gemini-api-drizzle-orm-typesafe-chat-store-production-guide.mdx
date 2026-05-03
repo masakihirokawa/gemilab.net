@@ -1,0 +1,659 @@
+---
+title: "Building a Type-Safe Gemini Chat Store with Drizzle ORM — Multi-Turn Persistence, Branching Threads, and Vector Search in Production"
+slug: "gemini-api-drizzle-orm-typesafe-chat-store-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-03T19:45"
+author: "Gemini Lab"
+description: "A production-grade design for persisting Gemini API multi-turn conversations with Drizzle ORM. Covers streaming saves, branching threads, function calling history, pgvector integration, and the migration strategy you actually need."
+tags: ["gemini", "gemini-api", "drizzle-orm", "postgres", "typescript", "chat-store"]
+highlights:
+  - "If you've been stuck on how to model Gemini's multi-turn history in your database, you'll come away with a schema that captures parts arrays and roles in a fully type-safe way"
+  - "You'll learn how to wire Drizzle's schema inference into the Gemini SDK's types so that every layer — handlers, services, DB — runs without a single any"
+  - "Streaming responses cut off mid-flight, broken thread branches, function-calling replays that fail with type errors — you'll have a reproducible playbook for avoiding all three"
+---
+
+"Building a chat feature on top of the Gemini API is the easy part. Persisting that conversation history at production quality is where everything falls apart." If that line resonates, you're in good company. I've hit this wall myself several times in solo projects. The first attempt always shoves entire conversations into a single JSON column. Then user counts grow, schema changes get painful, branch management quietly corrupts itself, and you end up rewriting the whole layer. Once you live through it, you understand: the data layer of an AI chat app is a different beast from a regular CRUD application.
+
+What follows is a production design for persisting Gemini API multi-turn conversations with **Drizzle ORM** in a fully type-safe way, with code you can copy into a real project. The focus is the data layer underneath your chat UI, not the UI itself. We'll thread Gemini's `Content[]` type through Drizzle's schema inference, then walk through streaming-aware writes, branching threads, function-call history replay, semantic search via pgvector, cost telemetry, and the operational pitfalls you'll inevitably hit.
+
+## Why an AI chat data layer differs from regular CRUD
+
+In a regular CRUD app, records are simply created, read, updated, and deleted. AI chat history has a few properties that break this model.
+
+First, **messages are nested**. A Gemini `Content` carries a `role` and an array of `parts`. Those parts mix `text` with `inlineData` (images), `functionCall`, and `functionResponse`. If your schema treats messages as plain text, the moment a user sends an image or a tool gets involved you're rebuilding everything.
+
+Second, **conversations branch**. When a user says "actually, take a different direction from three turns back," you usually don't want to overwrite history — you want a new branch from that point. The data shape resembles a Git commit tree more than a linear log.
+
+Third, **streamed responses get interrupted**. In production, network drops, rate limits, and timeouts cut off generation midway. You need to know how much state to persist while a stream is still in flight so the UI can recover gracefully.
+
+Fourth, **search is semantic, not literal**. "Show me where we discussed that API again" maps poorly to substring matching. Embedding-based similarity search is what users actually want.
+
+Defer any of these and you'll pay for it later. They're cheaper to build in from day one than to retrofit.
+
+What unites these traits is one design question: how do you fit a fundamentally tree-shaped, partially structured conversational domain into a relational schema? I've solved a similar problem in MongoDB before, and while you get JSON freedom, you give up clean transactions and joins. Postgres with JSONB strikes a much better balance between relational rigor and flexible nested data, which makes it especially well-suited to AI chat. Drizzle ORM is one of the few options that lets TypeScript reach all the way down into that layer without friction.
+
+## Why Drizzle — when and why I'd pick it over Prisma
+
+I've shipped backends in both Prisma and Drizzle. For a system that has to interlock with something as type-rich as the Gemini SDK, Drizzle is currently easier to work with. Three reasons.
+
+First, Drizzle **infers TypeScript types directly from your schema**. `InferSelectModel<typeof messages>` gives you a row type that you can return straight from API handlers. Since the Gemini SDK is also strongly typed in TypeScript, you avoid the cast hell that pops up when you try to bridge a strict external library with a loosely-typed ORM.
+
+Second, Drizzle's query builder reads like SQL. AI workloads tend toward queries like "rank by vector similarity, filter by user permissions and visibility, take the most recent N." Writing those as Prisma `findMany` calls is harder to follow than the SQL-shaped equivalent in Drizzle.
+
+Third, **Drizzle's runtime is thin**. It runs comfortably on Cloudflare Workers and Vercel Edge Functions. Since you usually want Gemini calls to live close to the user (i.e. at the edge), having your data layer in the same place is a real win.
+
+Prisma still has plenty going for it: auto-generated migrations, Studio for browsing data, Accelerate for connection pooling. For a team backend that needs that operational surface, picking Prisma is entirely reasonable. The scenario I'm optimizing for here is a solo or small-team developer who wants to put AI features in front of users quickly.
+
+There's a second, quieter advantage: **Drizzle queries are predictable at the SQL level**. With Prisma, I sometimes opened the slow log in production and was surprised by the query shape. Drizzle's `select`, `join`, and `where` map cleanly onto SQL, so my mental model and the execution plan agree. For composite AI queries — "fetch the last N history messages, then aggregate the most recent M under a different filter" — that transparency is a major comfort. Switching to Drizzle cut my pre-deploy query review time by roughly an order of magnitude, which matters most when you're the only reviewer.
+
+## Schema design — let Gemini's Content shape the table
+
+Start by reviewing the Gemini `Content` type. Roughly:
+
+```typescript
+// Simplified Gemini SDK types
+interface Content {
+  role: 'user' | 'model';
+  parts: Part[];
+}
+
+type Part =
+  | { text: string }
+  | { inlineData: { mimeType: string; data: string } }
+  | { functionCall: { name: string; args: Record<string, unknown> } }
+  | { functionResponse: { name: string; response: Record<string, unknown> } };
+```
+
+Storing pure text is trivial. The pain begins with multimodal parts and tool calls. The recurring question is whether to normalize these into separate tables or stuff them into a JSON column.
+
+My recommendation is a hybrid: **one row per message, parts stored in JSONB, but break out into dedicated columns the fields you query or aggregate on**. The reason is that Google keeps extending the `parts` shape, and you don't want to ship a migration every time. Meanwhile, queries like "find messages with images" or "count turns that used a tool" come up constantly, so promoting `has_image` and `has_function_call` to boolean columns pays for itself.
+
+In Drizzle:
+
+```typescript
+// db/schema.ts
+import {
+  pgTable,
+  uuid,
+  text,
+  timestamp,
+  jsonb,
+  boolean,
+  integer,
+  index,
+} from 'drizzle-orm/pg-core';
+import type { Part } from '@google/genai';
+
+export const threads = pgTable(
+  'threads',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    userId: uuid('user_id').notNull(),
+    title: text('title').notNull().default('New chat'),
+    parentMessageId: uuid('parent_message_id'),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => ({
+    userIdx: index('threads_user_idx').on(t.userId, t.updatedAt),
+  })
+);
+
+export const messages = pgTable(
+  'messages',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    threadId: uuid('thread_id')
+      .notNull()
+      .references(() => threads.id, { onDelete: 'cascade' }),
+    role: text('role', { enum: ['user', 'model', 'system'] }).notNull(),
+    parts: jsonb('parts').$type<Part[]>().notNull(),
+    // promoted columns for indexing & analytics
+    textPreview: text('text_preview'),
+    hasImage: boolean('has_image').notNull().default(false),
+    hasFunctionCall: boolean('has_function_call').notNull().default(false),
+    inputTokens: integer('input_tokens'),
+    outputTokens: integer('output_tokens'),
+    // streaming state
+    status: text('status', {
+      enum: ['streaming', 'completed', 'failed', 'cancelled'],
+    })
+      .notNull()
+      .default('completed'),
+    finishReason: text('finish_reason'),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+  },
+  (t) => ({
+    threadIdx: index('messages_thread_idx').on(t.threadId, t.createdAt),
+    statusIdx: index('messages_status_idx').on(t.status),
+  })
+);
+
+export type Message = typeof messages.$inferSelect;
+export type NewMessage = typeof messages.$inferInsert;
+export type Thread = typeof threads.$inferSelect;
+```
+
+Putting `parentMessageId` on the thread is the key to branch support. As long as a new thread can record which message it forked from, the UI can rebuild the branching tree later.
+
+Calling `.$type<Part[]>()` on the JSONB column makes the row type carry Gemini's `Part[]` directly. From the front end down to the DB layer, you reuse one type rather than re-modeling messages at every boundary.
+
+The hybrid pays off in **logarithmic, not linear, schema-change cost**. New `Part` variants land in `parts` for free. Promoted columns can be added with cheap, online migrations as needs evolve. The opposite design — `text_part_1`, `image_url_1`, etc. — assumes Gemini's part vocabulary is frozen, which is empirically false. Live API, code execution, and spatial understanding have all added new variants in the last year alone.
+
+## Streaming responses — write incrementally so interruptions don't strand rows
+
+`generateContentStream` returns chunks, and the canonical pattern in production is to forward each chunk to the client while accumulating server-side, then commit the final state to the DB at the end. The problem: clients close tabs, networks die, rate limits hit. "Commit at the end" frequently never happens.
+
+The pattern I run in production is: **insert the model row up front in `streaming` state, update its `parts` periodically as chunks arrive, and flip it to `completed` when generation finishes**. If the stream cuts off, the row is still there in `streaming` state — perfect for a "resume from where you left off?" flow.
+
+```typescript
+// app/api/chat/route.ts
+import { GoogleGenAI } from '@google/genai';
+import { db } from '@/db';
+import { messages } from '@/db/schema';
+import { eq } from 'drizzle-orm';
+
+export async function POST(req: Request) {
+  const { threadId, userMessage } = await req.json();
+  const ai = new GoogleGenAI({ apiKey: process.env.YOUR_GEMINI_API_KEY! });
+
+  // 1) Persist the user turn immediately
+  await db.insert(messages).values({
+    threadId,
+    role: 'user',
+    parts: [{ text: userMessage }],
+    textPreview: userMessage.slice(0, 200),
+    status: 'completed',
+    completedAt: new Date(),
+  });
+
+  // 2) Pre-create the model row in streaming state
+  const [modelRow] = await db
+    .insert(messages)
+    .values({
+      threadId,
+      role: 'model',
+      parts: [],
+      status: 'streaming',
+    })
+    .returning({ id: messages.id });
+
+  // 3) Pull completed history into the contents array
+  const history = await db.query.messages.findMany({
+    where: (m, { eq, and }) =>
+      and(eq(m.threadId, threadId), eq(m.status, 'completed')),
+    orderBy: (m, { asc }) => asc(m.createdAt),
+  });
+  const contents = history.map((m) => ({
+    role: m.role === 'model' ? 'model' : 'user',
+    parts: m.parts as { text: string }[],
+  }));
+
+  // 4) Stream and persist incrementally
+  const stream = await ai.models.generateContentStream({
+    model: 'gemini-2.5-pro',
+    contents,
+  });
+
+  const collected: string[] = [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let finishReason: string | undefined;
+
+  const transformStream = new TransformStream({
+    async transform(chunk: any, controller) {
+      const text = chunk.text ?? '';
+      if (text) {
+        collected.push(text);
+        controller.enqueue(new TextEncoder().encode(text));
+      }
+      if (chunk.usageMetadata) {
+        inputTokens = chunk.usageMetadata.promptTokenCount ?? inputTokens;
+        outputTokens = chunk.usageMetadata.candidatesTokenCount ?? outputTokens;
+      }
+      if (chunk.candidates?.[0]?.finishReason) {
+        finishReason = chunk.candidates[0].finishReason;
+      }
+      // Mid-flight save every ~20 chunks
+      if (collected.length % 20 === 0) {
+        await db
+          .update(messages)
+          .set({ parts: [{ text: collected.join('') }] })
+          .where(eq(messages.id, modelRow.id));
+      }
+    },
+    async flush() {
+      const fullText = collected.join('');
+      await db
+        .update(messages)
+        .set({
+          parts: [{ text: fullText }],
+          textPreview: fullText.slice(0, 200),
+          inputTokens,
+          outputTokens,
+          status: 'completed',
+          finishReason: finishReason ?? 'STOP',
+          completedAt: new Date(),
+        })
+        .where(eq(messages.id, modelRow.id));
+    },
+  });
+
+  return new Response(
+    (stream as any).readable.pipeThrough(transformStream),
+    { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
+  );
+}
+```
+
+The key choice is the **two-tier write cadence**: every 20 chunks plus a final commit. Per-chunk writes hammer the DB; a single end-of-stream write loses everything on disconnect. Twenty chunks works out to a few writes per second on Gemini 2.5 Pro and is easy on Postgres.
+
+Detect interruptions on the side. On edge runtimes, listen on `req.signal.aborted` and flip `status` to `cancelled`. On Node, do the same with the request stream events. Skip this and stale `streaming` rows pile up, breaking any "show in-progress messages" logic downstream.
+
+After we shipped this, complaints about "the assistant got stuck on Loading and never recovered" went from a daily occurrence to essentially zero. Once the row carries explicit state, every triage starts in the database, and the troubleshooting tree collapses to one branch. Tiny design choice, large operational payoff.
+
+If you want even more reliability, blend a **time-based trigger** with the chunk count: persist whenever 3 seconds have elapsed since the last save. Gemini's pace varies by model and load, and a hybrid trigger keeps your save cadence stable across slow and fast windows. `pg_stat_statements` is the right tool to dial in the exact thresholds.
+
+## Branching threads — Git-style history without the headache
+
+To support "rewind three turns and try a different direction," fork the thread. Create a new thread, record the source message in its `parentMessageId`, and either copy or reference ancestor messages.
+
+```typescript
+// lib/forkThread.ts
+import { db } from '@/db';
+import { threads, messages } from '@/db/schema';
+
+export async function forkThread(params: {
+  sourceThreadId: string;
+  forkAtMessageId: string;
+  userId: string;
+}) {
+  const sourceMessage = await db.query.messages.findFirst({
+    where: (m, { eq }) => eq(m.id, params.forkAtMessageId),
+  });
+  if (!sourceMessage) throw new Error('Source message not found');
+
+  const [newThread] = await db
+    .insert(threads)
+    .values({
+      userId: params.userId,
+      title: 'Forked chat',
+      parentMessageId: params.forkAtMessageId,
+    })
+    .returning();
+
+  const ancestors = await db.query.messages.findMany({
+    where: (m, { and, eq, lte }) =>
+      and(
+        eq(m.threadId, params.sourceThreadId),
+        lte(m.createdAt, sourceMessage.createdAt)
+      ),
+    orderBy: (m, { asc }) => asc(m.createdAt),
+  });
+
+  if (ancestors.length > 0) {
+    await db.insert(messages).values(
+      ancestors.map((m) => ({
+        threadId: newThread.id,
+        role: m.role,
+        parts: m.parts,
+        textPreview: m.textPreview,
+        hasImage: m.hasImage,
+        hasFunctionCall: m.hasFunctionCall,
+        inputTokens: m.inputTokens,
+        outputTokens: m.outputTokens,
+        status: m.status,
+        finishReason: m.finishReason,
+        completedAt: m.completedAt,
+      }))
+    );
+  }
+
+  return newThread;
+}
+```
+
+Copy or reference is a real design call. Copying lets each branch evolve independently but grows storage linearly. Reference keeps storage tight at the cost of trickier reads. **For most apps, branching is rare; I default to copy and revisit only when usage data demands it.** Once you have real numbers, the right cutover point becomes a measurement problem rather than a guess.
+
+In practice, branching turns out to be a "must-have" rather than a "nice-to-have." Users regenerate the last paragraph constantly, and without a proper branch model they end up regenerating the entire response. With `parentMessageId` in place, the UI just needs a "fork from here" button — no further schema work required.
+
+## Function calling history — preserve it carefully or replay breaks
+
+Function calls add a wrinkle: **the next turn must contain both the `functionCall` and its `functionResponse` for Gemini to stay grounded.** Drop one, and the model loses track of what tool it just invoked.
+
+The schema doesn't need to change — `parts: jsonb('parts').$type<Part[]>()` already accepts function-call parts. The replay path is where you have to be careful: roles need to be normalized so that any turn containing a `functionResponse` is sent back as `role: 'user'`. Get this wrong and Gemini returns "Invalid role for functionResponse." I once burned two hours on this exact symptom.
+
+```typescript
+// lib/replayHistory.ts
+import type { Content, Part } from '@google/genai';
+
+export function rebuildContents(
+  messages: { role: string; parts: Part[] }[]
+): Content[] {
+  return messages.map((m) => {
+    const hasFunctionResponse = m.parts.some((p) => 'functionResponse' in p);
+    const role = hasFunctionResponse
+      ? 'user'
+      : m.role === 'model'
+        ? 'model'
+        : 'user';
+    return { role, parts: m.parts };
+  });
+}
+```
+
+A subtler trap: **what happens if the tool call itself fails?** If you record `functionCall` but never write a corresponding `functionResponse`, the next turn confuses the model. My fix: **always write a `functionResponse` even on failure**, with `{ error: "..." }` in the response payload. Gemini handles that gracefully and tends to suggest a retry or alternative path — a rare case where surfacing an error to the model improves UX.
+
+Treat tool arguments as logs. `args` is persisted as JSONB and ends up in any log you ship downstream. Don't put PII directly in tool args; pass IDs and let the tool fetch the sensitive data through an authenticated channel. This decision has to be made up front — once secrets land in JSONB, they tend to stay.
+
+## Adding semantic search with pgvector
+
+To search by meaning rather than substring, store an embedding per message. Postgres + `pgvector` is the standard combination, and Drizzle has solid community support for the type. If you want to dive deeper into pgvector operations, [Building a Production-Grade Semantic Search Engine with Gemini API and pgvector](/en/articles/gemini-api/gemini-api-pgvector-semantic-search-engine) is a good companion read.
+
+```typescript
+// db/schema-vector.ts
+import { pgTable, uuid, text, index } from 'drizzle-orm/pg-core';
+import { vector } from 'drizzle-orm/pg-core';
+import { messages } from './schema';
+
+export const messageEmbeddings = pgTable(
+  'message_embeddings',
+  {
+    messageId: uuid('message_id')
+      .primaryKey()
+      .references(() => messages.id, { onDelete: 'cascade' }),
+    embedding: vector('embedding', { dimensions: 768 }).notNull(),
+    model: text('model').notNull().default('gemini-embedding-001'),
+  },
+  (t) => ({
+    embeddingIdx: index('embedding_hnsw_idx').using(
+      'hnsw',
+      t.embedding.op('vector_cosine_ops')
+    ),
+  })
+);
+```
+
+Generate embeddings asynchronously after a message reaches `completed`:
+
+```typescript
+// lib/embedMessage.ts
+import { GoogleGenAI } from '@google/genai';
+import { db } from '@/db';
+import { messageEmbeddings } from '@/db/schema-vector';
+
+const ai = new GoogleGenAI({ apiKey: process.env.YOUR_GEMINI_API_KEY! });
+
+export async function embedAndStore(messageId: string, text: string) {
+  if (!text.trim()) return;
+  try {
+    const result = await ai.models.embedContent({
+      model: 'gemini-embedding-001',
+      contents: text.slice(0, 8000),
+    });
+    const embedding = result.embeddings?.[0]?.values;
+    if (!embedding) return;
+    await db
+      .insert(messageEmbeddings)
+      .values({ messageId, embedding })
+      .onConflictDoUpdate({
+        target: messageEmbeddings.messageId,
+        set: { embedding },
+      });
+  } catch (err) {
+    // Embedding failures must not block the main response
+    console.error('Embedding failed:', messageId, err);
+  }
+}
+```
+
+And the search query:
+
+```typescript
+import { sql, eq } from 'drizzle-orm';
+import { messages, threads } from '@/db/schema';
+
+export async function searchSimilarMessages(
+  queryEmbedding: number[],
+  userId: string,
+  limit = 10
+) {
+  return db
+    .select({
+      messageId: messageEmbeddings.messageId,
+      threadId: messages.threadId,
+      preview: messages.textPreview,
+      similarity: sql<number>`1 - (${messageEmbeddings.embedding} <=> ${queryEmbedding}::vector)`,
+    })
+    .from(messageEmbeddings)
+    .innerJoin(messages, eq(messages.id, messageEmbeddings.messageId))
+    .innerJoin(threads, eq(threads.id, messages.threadId))
+    .where(eq(threads.userId, userId))
+    .orderBy(sql`${messageEmbeddings.embedding} <=> ${queryEmbedding}::vector`)
+    .limit(limit);
+}
+```
+
+`<=>` is the cosine-distance operator; flip it to similarity with `1 - distance`. With an HNSW index, search returns in tens of milliseconds even past hundreds of thousands of messages. Always scope by `userId` (we're joining `threads` here precisely for that reason).
+
+Two operational notes from running this in production. First, **embedding timing matters**. Generating embeddings synchronously delays the user-visible response. Move it to a queue (Cloudflare Workers Queues, BullMQ, whatever your stack offers) and the perceived speed improves immediately. Second, **plan for re-embedding**. Embedding models evolve. The `model` column on `messageEmbeddings` is what makes a staged backfill possible — replace last year's vectors with the current model in batches, while keeping the old ones online for queries that haven't been migrated yet.
+
+## Cost telemetry — know what each user actually spends
+
+Operating an AI app in production teaches you fast that **not knowing per-user spend leads to bill surprises**. The `inputTokens` and `outputTokens` columns on `messages` exist precisely so you can run a one-shot SQL query for it.
+
+```typescript
+// lib/usage-report.ts
+import { sql, gte, eq, and } from 'drizzle-orm';
+import { db } from '@/db';
+import { messages, threads } from '@/db/schema';
+
+const PRICE_PER_M_TOKENS = { input: 1.25, output: 5.0 };
+
+export async function userMonthlyCost(userId: string, monthStart: Date) {
+  const result = await db
+    .select({
+      inputTokens: sql<number>`SUM(${messages.inputTokens})::int`,
+      outputTokens: sql<number>`SUM(${messages.outputTokens})::int`,
+      messageCount: sql<number>`COUNT(*)::int`,
+    })
+    .from(messages)
+    .innerJoin(threads, eq(threads.id, messages.threadId))
+    .where(
+      and(
+        eq(threads.userId, userId),
+        eq(messages.role, 'model'),
+        gte(messages.createdAt, monthStart)
+      )
+    );
+  const row = result[0];
+  const inputUsd = (row.inputTokens / 1_000_000) * PRICE_PER_M_TOKENS.input;
+  const outputUsd = (row.outputTokens / 1_000_000) * PRICE_PER_M_TOKENS.output;
+  return {
+    inputTokens: row.inputTokens ?? 0,
+    outputTokens: row.outputTokens ?? 0,
+    messageCount: row.messageCount ?? 0,
+    estimatedUsd: Number((inputUsd + outputUsd).toFixed(4)),
+  };
+}
+```
+
+Roll that up nightly into a per-user usage table and you can run policies like "show a heads-up at \$2 of monthly spend on the free tier" or "talk to anyone in the top 1% of usage." Don't let `usageMetadata` slip away during streaming — once the row is closed without it, you can't recover the numbers without re-prompting. To bring real costs down further, pair this telemetry with prompt caching — [Optimizing Costs with Gemini API Context Caching](/en/articles/gemini-api/gemini-api-context-caching-cost-optimization) walks through the trade-offs.
+
+## Test strategy — exercise the data layer without calling Gemini
+
+A side benefit of Drizzle is that **the data layer is easy to test in isolation**. Build fixtures shaped like Gemini's responses, write them straight into the table, and verify your thread/branch logic.
+
+```typescript
+// __tests__/thread-fork.test.ts
+import { describe, it, expect, beforeEach } from 'vitest';
+import { db } from '@/db';
+import { threads, messages } from '@/db/schema';
+import { forkThread } from '@/lib/forkThread';
+
+describe('forkThread', () => {
+  beforeEach(async () => {
+    await db.delete(messages);
+    await db.delete(threads);
+  });
+
+  it('copies ancestor messages up to the fork point', async () => {
+    const userId = '00000000-0000-0000-0000-000000000001';
+    const [thread] = await db
+      .insert(threads)
+      .values({ userId, title: 'Source' })
+      .returning();
+    const inserted = await db
+      .insert(messages)
+      .values([
+        { threadId: thread.id, role: 'user', parts: [{ text: 'Q1' }] },
+        { threadId: thread.id, role: 'model', parts: [{ text: 'A1' }] },
+        { threadId: thread.id, role: 'user', parts: [{ text: 'Q2' }] },
+        { threadId: thread.id, role: 'model', parts: [{ text: 'A2' }] },
+      ])
+      .returning();
+
+    const fork = await forkThread({
+      sourceThreadId: thread.id,
+      forkAtMessageId: inserted[1].id,
+      userId,
+    });
+
+    const forkMessages = await db.query.messages.findMany({
+      where: (m, { eq }) => eq(m.threadId, fork.id),
+      orderBy: (m, { asc }) => asc(m.createdAt),
+    });
+    expect(forkMessages.length).toBe(2);
+    expect(fork.parentMessageId).toBe(inserted[1].id);
+  });
+});
+```
+
+In CI, spin up Postgres in Docker, apply the schema with `drizzle-kit push`, and run the suite. Schema changes and code changes get reviewed together by construction. Keep the few real-Gemini E2E tests behind a daily smoke job — they're too flaky and too expensive to run on every commit.
+
+## Authorization — defense in depth via app filters and RLS
+
+Chat history is sensitive. Prompt injection regularly attempts the "show me someone else's chat" trick, and one layer of authorization isn't enough. **Combine app-layer `userId` filters with Postgres Row Level Security.**
+
+```sql
+ALTER TABLE threads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY threads_owner_only ON threads
+  FOR ALL
+  USING (user_id = current_setting('app.current_user_id', true)::uuid);
+
+CREATE POLICY messages_via_thread ON messages
+  FOR ALL
+  USING (
+    thread_id IN (
+      SELECT id FROM threads
+      WHERE user_id = current_setting('app.current_user_id', true)::uuid
+    )
+  );
+```
+
+In Drizzle, set the session variable per request before issuing queries:
+
+```typescript
+// lib/db-with-user.ts
+import { db } from '@/db';
+import { sql } from 'drizzle-orm';
+
+export async function withUser<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+  await db.execute(sql`SET LOCAL app.current_user_id = ${userId}`);
+  return fn();
+}
+```
+
+If an app-layer filter goes missing, RLS still stops the leak. If `SET LOCAL` is forgotten, the app filter still applies. CI is the right place to enforce that RLS is enabled on the right tables — it's far more reliable than catching missing `WHERE` clauses in code review.
+
+## Migrations — don't try to rewrite JSONB shapes inside migrations
+
+`drizzle-kit generate` automates schema migrations beautifully. The trap is that **JSONB content shape is not something it can rewrite**. If you decide to rename `text` to `content` inside `parts`, drizzle-kit will not migrate the JSONB rows for you.
+
+My rule: **store whatever Gemini's SDK gives you, exactly as-is, and remap on read in application code if you need a different shape**. JSONB rewrites in migrations mean full table scans on millions of rows, which means production downtime.
+
+The exception is when a new `Part` variant lands and you want to backfill a promoted column like `has_image`. Limit those backfills to recent rows — `created_at >= NOW() - INTERVAL '30 days'` is usually enough — and use simple text matching, not `jsonb_path_exists`, for speed:
+
+```typescript
+import { db } from '@/db';
+import { sql } from 'drizzle-orm';
+
+await db.execute(sql`
+  UPDATE messages
+  SET has_video = true
+  WHERE has_video = false
+    AND parts::text LIKE '%"mimeType":"video/%'
+    AND created_at >= NOW() - INTERVAL '30 days'
+`);
+```
+
+LIKE-on-JSONB-as-text is intentional. For straight existence checks it's faster than jsonb path queries.
+
+## Three pitfalls you'll hit in production
+
+### 1. JSONB rows tip into TOAST and queries get sluggish
+
+Postgres pushes any row larger than ~2KB to external TOAST storage. Long completions or bundled `inlineData` (base64 images) easily exceed it, and `SELECT *` quietly slows down.
+
+Two fixes. First, **store images outside `parts`** — upload to S3 or R2 and keep only the URL in JSONB. Second, **never `SELECT parts` when listing**. Build the list view from `textPreview` and only fetch `parts` for the open conversation.
+
+### 2. Stranded `streaming` rows accumulate
+
+`status: 'streaming'` rows stick around any time a server restart, deploy, or client disconnect interrupts a generation. Without cleanup they show up in user history as "Loading…" forever.
+
+Fix: a cron sweeper. Every five minutes, flip any row that's been in `streaming` for more than 10 minutes to `failed`. Cloudflare Workers Cron Triggers and Vercel Cron both make this a one-liner.
+
+```typescript
+import { and, eq, lte } from 'drizzle-orm';
+await db
+  .update(messages)
+  .set({ status: 'failed', finishReason: 'TIMEOUT' })
+  .where(
+    and(
+      eq(messages.status, 'streaming'),
+      lte(messages.createdAt, new Date(Date.now() - 10 * 60 * 1000))
+    )
+  );
+```
+
+### 3. `with` clauses in Drizzle's relational queries trigger N+1
+
+`db.query.threads.findMany({ with: { messages: true } })` is convenient, but it can expand to multiple queries under the hood. For "list threads + each thread's most recent message," explicit JOIN + LATERAL subquery is usually faster:
+
+```typescript
+const threadsWithLastMessage = await db.execute(sql`
+  SELECT t.*, m.text_preview AS last_preview, m.created_at AS last_message_at
+  FROM threads t
+  LEFT JOIN LATERAL (
+    SELECT text_preview, created_at
+    FROM messages
+    WHERE thread_id = t.id AND status = 'completed'
+    ORDER BY created_at DESC
+    LIMIT 1
+  ) m ON true
+  WHERE t.user_id = ${userId}
+  ORDER BY t.updated_at DESC
+  LIMIT 50
+`);
+```
+
+Drizzle accepts raw SQL with type hints, so the right call is to mix the two abstractions where each fits best. For chat list views in particular, raw SQL almost always wins. If you want to enforce structured outputs at the schema level too, [Type-Safe Structured Outputs with Gemini API and Pydantic in Production](/en/articles/gemini-api/gemini-api-pydantic-structured-output-type-safe-production) covers the patterns you'll need.
+
+## Wrapping up — the next concrete step
+
+Thanks for reading this far. The data layer of an AI chat app is one of those areas where the design you ship in the first week determines most of the operational overhead you'll carry for years. The single most useful next step is to **stand up local Postgres, implement just the `messages` schema in Drizzle, and wire it to your existing Gemini call**. Once you have a feel for storing parts as JSONB, layer in streaming saves, then branching, then pgvector — one capability per session — and you'll arrive at a production-grade store without the rewrite cycle most projects go through.
+
+Streaming UI gets all the attention in chat-app talks, but it's the data layer that decides how long the product survives. Trust Drizzle's type inference, refuse to write `any` in your AI backend, and you'll find that adding the next feature feels much less risky than it used to. That confidence compounds.
+
+If you want to deepen the schema-design intuition that makes JSONB-vs-promoted-column tradeoffs feel obvious rather than arbitrary, [SQL Antipatterns, Volume 1: Avoiding the Pitfalls of Database Programming (Bill Karwin)](https://www.amazon.co.jp/dp/1934356557/?tag=pinocchio-22) is the book I keep returning to. The patterns it flags — and the alternatives it offers — translate directly to the choices in this article.
