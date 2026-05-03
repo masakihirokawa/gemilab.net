@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEEP_RESEARCH — Deep Research エージェント新版が登場、共同プランニング・MCP統合・File Search に対応（4月）",
-    "FLASH_TTS — Gemini 3.1 Flash TTS Preview リリース、低コストで表現力ある音声生成を実現",
-    "ROBOTICS — gemini-robotics-er-1.6-preview 公開、計器読取と空間・物理推論能力を強化",
-    "FILE_GEN — Docs / Sheets / Slides / PDF / DOCX / XLSX / LaTeX 直接生成機能が安定運用フェーズへ",
-    "ENTERPRISE — Macquarie Bank が Gemini Enterprise で7ヶ月13万時間削減を達成と発表",
-    "IO2026 — Google I/O 2026（5/19-20）目前、Gemini 4 / Veo 4 / Astra デモに期待が集まる",
+    "CARSGEMINI — Gemini が Google Built-in 搭載カーに展開開始、米国英語から順次グローバル拡大（5月）",
+    "WORKTOOL — Gemini がチャットからワークツールへ進化、ファイル生成・書類草案・タスク自動化を担う（5月）",
+    "PROACTIVE — Gemini ベータ版にプロアクティブ機能追加、Gmail・Calendar を分析しリアルタイム提案（5月）",
+    "CLOUDNEXT — Google Cloud Next 2026 開催、第8世代 TPU と Gemini Enterprise Agent Platform 発表",
+    "APRIL26DROP — Gemini アプリ 4月アップデート公開、複数機能改善＆ UI 強化（4月）",
+    "GEMINI3.1PRO — Gemini 3.1 Pro リリース、コード＆データ分析の推論能力を大幅強化（4月）",
   ],
   en: [
-    "DEEP_RESEARCH — New Deep Research agent ships with collaborative planning, MCP integration, and File Search (Apr)",
-    "FLASH_TTS — Gemini 3.1 Flash TTS Preview launches as a cost-efficient, expressive text-to-speech model",
-    "ROBOTICS — gemini-robotics-er-1.6-preview adds instrument reading and stronger spatial and physical reasoning",
-    "FILE_GEN — Direct generation of Docs, Sheets, Slides, PDF, DOCX, XLSX, and LaTeX moves into stable rollout",
-    "ENTERPRISE — Macquarie Bank reports 130,000 hours saved over seven months with Gemini Enterprise",
-    "IO2026 — Google I/O 2026 (5/19-20) is imminent, with Gemini 4, Veo 4, and Project Astra demos widely anticipated",
+    "CARSGEMINI — Gemini rolls out to Google Built-in vehicles starting in the US (May)",
+    "WORKTOOL — Gemini evolves from chatbot to work layer: file creation, drafting & task automation (May)",
+    "PROACTIVE — Gemini beta gains Proactive Assistance, analyzing Gmail & Calendar for real-time suggestions (May)",
+    "CLOUDNEXT — Google Cloud Next 2026: 8th-gen TPUs & Gemini Enterprise Agent Platform unveiled",
+    "APRIL26DROP — Gemini app April 2026 Drop: multiple feature improvements & UI enhancements (Apr)",
+    "GEMINI3.1PRO — Gemini 3.1 Pro released with major reasoning upgrades for coding & data analysis (Apr)",
   ],
 };
 
