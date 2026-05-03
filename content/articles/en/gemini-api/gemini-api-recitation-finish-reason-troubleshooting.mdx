@@ -1,0 +1,163 @@
+---
+title: "Why Gemini API Returns RECITATION as finish_reason — and How to Fix It"
+slug: "gemini-api-recitation-finish-reason-troubleshooting"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-03T09:30"
+author: "Gemini Lab"
+description: "When Gemini API silently truncates responses with finish_reason RECITATION, the request technically succeeds with HTTP 200 — but the output is gone. Here's what actually triggers it and how to recover."
+tags: ["gemini-api", "troubleshooting", "finish-reason", "recitation", "error-handling"]
+---
+
+If you have shipped anything backed by the Gemini API, you have probably hit this scenario: the request returns HTTP 200, the SDK does not throw, yet the text is mysteriously short or empty. When you finally inspect `candidates[0].finish_reason`, you see an unfamiliar value — `RECITATION`. I bumped into this myself the first time I built a knowledge-base assistant with Gemini, and it took me longer than I want to admit to realize this was a separate failure mode entirely.
+
+RECITATION is not a safety filter. It is not a token limit. It is Gemini's own self-check declaring "my output looks too close to copyrighted training data, so I am stopping." Let's walk through what actually triggers it and how to design recovery paths that work in production.
+
+## When RECITATION Actually Fires
+
+The official documentation describes it as a stop signal triggered when the model would otherwise reproduce training data verbatim. In practice, the high-recall triggers I have observed are:
+
+- Generating song lyrics, poems, famous speeches, or scripture word-for-word (or with minimal alteration)
+- Reproducing widely-shared open-source code patterns, like the canonical TensorFlow tutorial or the typical `useEffect` cleanup snippet
+- Summarizing recipe books, textbooks, or official docs in a structure too close to the original
+- User-provided prompts that contain copyrighted text the model then echoes back
+
+The visible result varies. Sometimes the response is fully empty. Other times the model streams 400–800 characters before cutting off mid-sentence.
+
+A nuance that catches teams off guard: streaming and non-streaming endpoints surface RECITATION slightly differently. With streaming, the chunks arrive cleanly until the model decides to abort, at which point the stream closes with `finish_reason: RECITATION` in the final frame. If your client only checks the stop reason at the end, the user has already seen partial output that ends mid-sentence — a UX hole you cannot easily patch after the fact. Buffer the trailing chunks before flushing to the screen.
+
+It is also worth noting that the trigger threshold appears to be calibrated per language. In my own products I have seen English prompts trigger RECITATION on slightly looser similarity than equivalent Japanese ones, likely because the underlying training data is more concentrated for popular English texts. Multilingual products should not assume identical behavior across locales — the same prompt translated word-for-word can pass in one language and fire in another.
+
+## The First Fix: Stop Trusting `response.text` Alone
+
+Most tutorials read `response.text` directly. That hides RECITATION because a partially-truncated response still has text. The minimum diagnostic is to inspect `finish_reason` on every call.
+
+```python
+# Python (google-genai SDK) — always inspect finish_reason
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="your prompt here",
+    config=types.GenerateContentConfig(
+        temperature=0.7,
+        max_output_tokens=2048,
+    ),
+)
+
+if not response.candidates:
+    raise RuntimeError("No candidates returned — check prompt-level block.")
+
+candidate = response.candidates[0]
+finish_reason = candidate.finish_reason  # STOP / RECITATION / SAFETY / MAX_TOKENS / ...
+
+if finish_reason == "RECITATION":
+    text = candidate.content.parts[0].text if candidate.content else ""
+    print(f"⚠️ RECITATION truncation. Partial text: {text!r}")
+elif finish_reason == "SAFETY":
+    print("⚠️ Safety filter blocked")
+elif finish_reason == "STOP":
+    print("✅ OK:", response.text)
+else:
+    print(f"Other stop reason: {finish_reason}")
+```
+
+Treat only `STOP` as success. Read text via `candidate.content.parts[0].text` rather than `response.text`, because the convenience accessor's behavior on RECITATION varies between SDK versions (sometimes empty string, sometimes raises). The same applies to streaming responses: subscribe to chunks, and on the final chunk inspect `finish_reason` before flushing the full text to the user. If you are streaming to a UI, hold the last 200–400 characters in a buffer until the stream completes so you can roll back the cut-off tail rather than displaying truncated prose to the reader.
+
+## Recovery Pattern 1 — Reframe Generation as Transformation
+
+The single most effective change is to convert "free generation" tasks into "transformation" tasks. Gemini rarely fires RECITATION on transformations of user-provided input; it fires it most often on open-ended generation like "write a Christmas song" or "give me the lyrics to a famous lullaby."
+
+```python
+# ❌ Likely to trigger RECITATION
+bad_prompt = "Write a song in the style of a classic Christmas carol."
+
+# ✅ Reframed as constrained, original generation
+good_prompt = """Compose an entirely original song using these constraints.
+Do NOT borrow phrasing from existing carols, hymns, or nursery rhymes.
+
+Theme: family warmth on a snowy morning
+Structure: 4 lines x 4 stanzas
+Rhyme scheme: ABAB
+Vocabulary: original metaphors only
+"""
+```
+
+The explicit "do not borrow phrasing" instruction matters more than it should. Gemini weights instruction adherence at decode time, so an explicit anti-recitation directive measurably reduces the trigger rate.
+
+A related trick is to provide a structural skeleton instead of a topic alone. "Write 4 stanzas of 4 lines each, where each stanza opens with a sensory detail (sight, sound, smell, touch)" gives the decoder a path that is unlikely to land on memorized lyrics, because the constraints push it off the high-frequency training corpus. The same principle applies to prose generation — explicit structural constraints are a cheap form of decorrelation from the training distribution.
+
+## Recovery Pattern 2 — Raise Temperature Off the Greedy Path
+
+RECITATION concentrates on the high-probability decode path. At `temperature=0.0–0.3`, the model often lands on a verbatim training fragment. Bumping temperature to `0.6–0.8` shifts the path enough to avoid the trigger while keeping output quality acceptable.
+
+This is not a magic switch — pushing temperature above `1.0` degrades coherence — but `0.7` is my default starting point in production. For broader strategies on filter-style blockages, [the safety-filter recovery guide](/en/articles/gemini-api/gemini-api-safety-filter-blocked-response-fix) is worth reading alongside this article since the diagnostic mindset overlaps.
+
+## Recovery Pattern 3 — Retry Loop with Prompt Rewriting
+
+In production, you want a recovery layer that detects RECITATION and automatically rewrites the prompt before retrying. Cap the retry count to avoid infinite loops, and bail out on non-retryable reasons like SAFETY immediately.
+
+```python
+# Production-ready RECITATION recovery
+def generate_with_recitation_recovery(client, model, original_prompt, max_retries=3):
+    """Detect RECITATION, escalate prompt rewrites, raise temperature gradually."""
+    prompts = [
+        original_prompt,
+        f"{original_prompt}\n\nIMPORTANT: Use only original phrasing. Do not quote or paraphrase existing works.",
+        f"Achieve the following requirement using only original wording. "
+        f"Quotations from existing songs, code, or texts are forbidden.\n"
+        f"Requirement: {original_prompt}",
+    ]
+
+    for attempt, prompt in enumerate(prompts[:max_retries]):
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.7 + 0.1 * attempt,
+                max_output_tokens=2048,
+            ),
+        )
+        if not response.candidates:
+            continue
+        finish_reason = response.candidates[0].finish_reason
+        if finish_reason == "STOP":
+            return response.text
+        if finish_reason != "RECITATION":
+            raise RuntimeError(f"Non-retryable stop reason: {finish_reason}")
+
+    raise RuntimeError("All retries hit RECITATION — revisit prompt design.")
+```
+
+For a fuller treatment of retry orchestration, including exponential backoff and jitter, see [Gemini API retry patterns](/en/articles/gemini-api/gemini-api-error-handling-retry-patterns). Layer the recitation-specific logic above the generic retry middleware rather than mixing them.
+
+## Don't Confuse RECITATION with an Empty Response
+
+Engineers conflate "empty response" and "RECITATION" because both produce short or missing text. The fixes are completely different:
+
+- `STOP` with empty text → prompt was vague or `max_output_tokens` is tiny
+- `MAX_TOKENS` → raise `max_output_tokens`
+- `SAFETY` → adjust safety category thresholds, or filter input
+- `RECITATION` → this article (prompt rewrite + temperature)
+
+For the broader empty-response decision tree, [the empty-response troubleshooting guide](/en/articles/gemini-api/gemini-api-empty-response-finish-reason-troubleshooting) covers the rest of the matrix.
+
+## Designing Around RECITATION Up Front
+
+Three design habits keep RECITATION inside the "expected" bucket instead of the "incident" bucket.
+
+First, validate user input under the assumption it will sometimes contain copyrighted material. If a chatbot accepts "translate these lyrics," the translated output itself will likely be flagged. Easier to draw the line in your spec ("translation of copyrighted works is unsupported") than to firefight later.
+
+Second, for code generation, prefer "fill in the template" over "write this from scratch." Handing the model a function signature and types makes verbatim collisions with popular OSS snippets much less likely than asking for a free-form `useEffect` example.
+
+Third, build observability for it. Always emit `finish_reason` to structured logs, then aggregate in your APM. As a rule of thumb, once RECITATION exceeds 1% of total requests, your prompt design needs surgery, not patching. For a deeper grounding on retry, fallback, and graceful-degradation patterns that apply equally to Gemini, [*LangChain Complete Introduction* (Yu Tamura)](https://www.amazon.co.jp/dp/4295202215/?tag=pinocchio-22) covers the architectural patterns well.
+
+A fourth habit, often skipped: keep a small evaluation set of prompts that historically triggered RECITATION, and replay them on every prompt change. RECITATION is sensitive to phrasing in ways that are hard to predict, and a regression suite of "known triggers" catches accidental reintroductions before they hit production traffic. Five to ten prompts is enough to catch the common regressions.
+
+## Start with One Log Line
+
+RECITATION is not exotic — it is a stop signal you will hit eventually if you ship Gemini in production. The smallest useful first step is to log `finish_reason` immediately before reading `response.text`. That single line turns "occasional short responses" from a mystery into a tractable problem you can iterate on. From there, the techniques in this article — prompt reframing, temperature adjustment, and structured retry — give you a repeatable path from detection to recovery. The teams I have seen handle RECITATION best are not the ones who never hit it, but the ones who instrumented it early enough that the first occurrence was a dashboard alert rather than a customer support ticket.
