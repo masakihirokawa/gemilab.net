@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CARSGEMINI — Gemini が Google Built-in 搭載カーに展開開始、米国英語から順次グローバル拡大（5月）",
-    "WORKTOOL — Gemini がチャットからワークツールへ進化、ファイル生成・書類草案・タスク自動化を担う（5月）",
-    "PROACTIVE — Gemini ベータ版にプロアクティブ機能追加、Gmail・Calendar を分析しリアルタイム提案（5月）",
-    "CLOUDNEXT — Google Cloud Next 2026 開催、第8世代 TPU と Gemini Enterprise Agent Platform 発表",
-    "APRIL26DROP — Gemini アプリ 4月アップデート公開、複数機能改善＆ UI 強化（4月）",
-    "GEMINI3.1PRO — Gemini 3.1 Pro リリース、コード＆データ分析の推論能力を大幅強化（4月）",
+    "REDESIGN — Gemini アプリが大規模 UI リデザイン、カラフルな脈動グラジエント背景に刷新（iOS 先行・5/4）",
+    "IO2026 — Google I/O 2026 が 5/19〜20 開催、Gemini 4.0 と Android 17 との深い統合が期待される",
+    "WORKSPACE — Gemini Workspace Intelligence が提供開始、Gmail・Calendar・Drive のリアルタイムデータを自動参照",
+    "MAC — Gemini アプリが macOS ネイティブデスクトップアプリとして公開、ブラウザ不要で AI 支援",
+    "EMBEDDING2 — Gemini Embedding 2 が Gemini API と Vertex AI で一般提供（GA）開始",
+    "CARSGEMINI — Gemini が Google Built-in 搭載カーで提供開始、GM の数百万台に展開（4/28）",
   ],
   en: [
-    "CARSGEMINI — Gemini rolls out to Google Built-in vehicles starting in the US (May)",
-    "WORKTOOL — Gemini evolves from chatbot to work layer: file creation, drafting & task automation (May)",
-    "PROACTIVE — Gemini beta gains Proactive Assistance, analyzing Gmail & Calendar for real-time suggestions (May)",
-    "CLOUDNEXT — Google Cloud Next 2026: 8th-gen TPUs & Gemini Enterprise Agent Platform unveiled",
-    "APRIL26DROP — Gemini app April 2026 Drop: multiple feature improvements & UI enhancements (Apr)",
-    "GEMINI3.1PRO — Gemini 3.1 Pro released with major reasoning upgrades for coding & data analysis (Apr)",
+    "REDESIGN — Gemini app gets massive UI overhaul: colorful pulsating gradient background rolls out on iOS (5/4)",
+    "IO2026 — Google I/O 2026 on May 19-20: Gemini 4.0 and deep Android 17 integration expected",
+    "WORKSPACE — Gemini Workspace Intelligence launches: real-time context from Gmail, Calendar & Drive",
+    "MAC — Gemini now available as a native macOS desktop app — no browser required",
+    "EMBEDDING2 — Gemini Embedding 2 reaches general availability on Gemini API and Vertex AI",
+    "CARSGEMINI — Gemini rolls out to Google Built-in vehicles in GM's millions of cars (4/28)",
   ],
 };
 
