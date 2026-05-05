@@ -4,7 +4,7 @@ import { routing } from "@/i18n/routing";
 import { ThemeProvider } from "@/components/layout/ThemeProvider";
 import { Header } from "@/components/layout/Header";
 import { Footer } from "@/components/layout/Footer";
-import { DynamicNewsTicker, DynamicScrollToTop, DynamicCookieBanner } from "@/components/layout/DynamicComponents";
+import { DynamicNewsTicker, DynamicScrollToTop, DynamicCookieBanner, DynamicMembershipPromoModal } from "@/components/layout/DynamicComponents";
 
 // Blocking script to prevent FOUC (Flash of Unstyled Content) on theme change
 const themeScript = `(function(){try{var t=localStorage.getItem('gemilab-theme');document.documentElement.setAttribute('data-theme',t||'dark')}catch(e){}})()`;
@@ -70,6 +70,7 @@ export default async function LocaleLayout({
             <main style={{ paddingTop: 99 }}>{children}</main>
             <Footer />
             <DynamicScrollToTop />
+            <DynamicMembershipPromoModal locale={locale} siteName="Gemini Lab" />
             <DynamicCookieBanner
               gaId="G-CJWM68JK57"
               privacyHref={locale === "ja" ? "/privacy" : "/en/privacy"}
