@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "IO2026 — Google I/O 2026（5/19〜20）: Gemini 4.0 で 200 万トークンコンテキスト・クロスセッションメモリが期待",
+    "REMY — Google が社内版 Gemini に「Remy」を開発中、24 時間稼働するパーソナル AI エージェントとして設計",
     "REDESIGN — Gemini アプリが大規模 UI リデザイン、カラフルな脈動グラジエント背景に刷新（iOS 先行・5/4）",
-    "IO2026 — Google I/O 2026 が 5/19〜20 開催、Gemini 4.0 と Android 17 との深い統合が期待される",
     "WORKSPACE — Gemini Workspace Intelligence が提供開始、Gmail・Calendar・Drive のリアルタイムデータを自動参照",
     "MAC — Gemini アプリが macOS ネイティブデスクトップアプリとして公開、ブラウザ不要で AI 支援",
     "EMBEDDING2 — Gemini Embedding 2 が Gemini API と Vertex AI で一般提供（GA）開始",
-    "CARSGEMINI — Gemini が Google Built-in 搭載カーで提供開始、GM の数百万台に展開（4/28）",
   ],
   en: [
+    "IO2026 — Google I/O 2026 (May 19-20): Gemini 4.0 expected with 2M token context & cross-session memory",
+    "REMY — Google builds 'Remy' inside staff Gemini: a 24/7 personal AI agent that acts on your behalf",
     "REDESIGN — Gemini app gets massive UI overhaul: colorful pulsating gradient background rolls out on iOS (5/4)",
-    "IO2026 — Google I/O 2026 on May 19-20: Gemini 4.0 and deep Android 17 integration expected",
     "WORKSPACE — Gemini Workspace Intelligence launches: real-time context from Gmail, Calendar & Drive",
     "MAC — Gemini now available as a native macOS desktop app — no browser required",
     "EMBEDDING2 — Gemini Embedding 2 reaches general availability on Gemini API and Vertex AI",
-    "CARSGEMINI — Gemini rolls out to Google Built-in vehicles in GM's millions of cars (4/28)",
   ],
 };
 
