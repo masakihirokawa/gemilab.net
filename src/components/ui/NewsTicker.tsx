@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "IO2026 — Google I/O 2026（5/19〜20）: Gemini 4.0 で 200 万トークンコンテキスト・クロスセッションメモリが期待",
-    "REMY — Google が社内版 Gemini に「Remy」を開発中、24 時間稼働するパーソナル AI エージェントとして設計",
-    "REDESIGN — Gemini アプリが大規模 UI リデザイン、カラフルな脈動グラジエント背景に刷新（iOS 先行・5/4）",
-    "WORKSPACE — Gemini Workspace Intelligence が提供開始、Gmail・Calendar・Drive のリアルタイムデータを自動参照",
-    "MAC — Gemini アプリが macOS ネイティブデスクトップアプリとして公開、ブラウザ不要で AI 支援",
-    "EMBEDDING2 — Gemini Embedding 2 が Gemini API と Vertex AI で一般提供（GA）開始",
+    "GOOGLEIO — Google I/O 2026が5月19日開幕、Gemini 4・Veo 4・Android XR発表予定（5月）",
+    "FLASH2.5 — Gemini 2.5 Flash改善版プレビュー公開、トークン消費20〜30%削減・推論精度向上（5月）",
+    "TTS — Gemini 2.5 Flash TTS/Pro TTSプレビュー、低遅延&高品質な音声合成に対応（5月）",
+    "GEMINIAPP — GeminiアプリがAndroid/iOS向け大規模リデザイン、新ホーム画面UIを近日展開（5/5）",
+    "MCP — Gemini API と SDK でMCPツール連携が正式サポート、オープンソースツールへのアクセス拡大（5月）",
+    "DEEPRESEARCH — Deep Research が2.5 Flash上で全ユーザー無料提供開始、ファイルアップロードも対応（5月）",
   ],
   en: [
-    "IO2026 — Google I/O 2026 (May 19-20): Gemini 4.0 expected with 2M token context & cross-session memory",
-    "REMY — Google builds 'Remy' inside staff Gemini: a 24/7 personal AI agent that acts on your behalf",
-    "REDESIGN — Gemini app gets massive UI overhaul: colorful pulsating gradient background rolls out on iOS (5/4)",
-    "WORKSPACE — Gemini Workspace Intelligence launches: real-time context from Gmail, Calendar & Drive",
-    "MAC — Gemini now available as a native macOS desktop app — no browser required",
-    "EMBEDDING2 — Gemini Embedding 2 reaches general availability on Gemini API and Vertex AI",
+    "GOOGLEIO — Google I/O 2026 kicks off May 19 with Gemini 4, Veo 4 & Android XR expected",
+    "FLASH2.5 — Gemini 2.5 Flash preview: 20-30% fewer tokens, stronger reasoning & multimodality (May)",
+    "TTS — Gemini 2.5 Flash TTS & Pro TTS preview: low-latency & high-quality voice synthesis (May)",
+    "GEMINIAPP — Gemini app major redesign for Android & iOS rolling out soon (5/5)",
+    "MCP — MCP tool support officially added to Gemini API & SDK for open-source integrations (May)",
+    "DEEPRESEARCH — Deep Research now free for all on Gemini 2.5 Flash with file upload support (May)",
   ],
 };
 
