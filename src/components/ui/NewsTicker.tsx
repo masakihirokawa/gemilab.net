@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GOOGLEIO — Google I/O 2026が5月19日開幕、Gemini 4・Veo 4・Android XR発表予定（5月）",
-    "FLASH2.5 — Gemini 2.5 Flash改善版プレビュー公開、トークン消費20〜30%削減・推論精度向上（5月）",
-    "TTS — Gemini 2.5 Flash TTS/Pro TTSプレビュー、低遅延&高品質な音声合成に対応（5月）",
-    "GEMINIAPP — GeminiアプリがAndroid/iOS向け大規模リデザイン、新ホーム画面UIを近日展開（5/5）",
+    "GOOGLEIO — Google I/O 2026が5月19日開幕、Gemini 4・Veo 4・Android XR・Aluminum OS発表予定（5月）",
+    "FILEGEN — Geminiがチャットから直接Docs・PDF・Excel・CSV等を生成・ダウンロード、ワーク層に進化（5月）",
+    "WORKSPACE — Workspace Intelligence登場、Gmail・Chat・Calendar・Driveをリアルタイム参照して生成（5月）",
+    "GMVEHICLE — 2022年以降のGM車400万台にGeminiを展開、業界最大規模の車載AI統合（4月）",
+    "FLASH2.5 — Gemini 2.5 Flash改善版プレビュー、トークン20〜30%削減・推論強化・6月正式GA予定（5月）",
     "MCP — Gemini API と SDK でMCPツール連携が正式サポート、オープンソースツールへのアクセス拡大（5月）",
-    "DEEPRESEARCH — Deep Research が2.5 Flash上で全ユーザー無料提供開始、ファイルアップロードも対応（5月）",
   ],
   en: [
-    "GOOGLEIO — Google I/O 2026 kicks off May 19 with Gemini 4, Veo 4 & Android XR expected",
-    "FLASH2.5 — Gemini 2.5 Flash preview: 20-30% fewer tokens, stronger reasoning & multimodality (May)",
-    "TTS — Gemini 2.5 Flash TTS & Pro TTS preview: low-latency & high-quality voice synthesis (May)",
-    "GEMINIAPP — Gemini app major redesign for Android & iOS rolling out soon (5/5)",
+    "GOOGLEIO — Google I/O 2026 kicks off May 19: Gemini 4, Veo 4, Android XR & Aluminum OS expected",
+    "FILEGEN — Gemini now generates Docs, PDFs, Excel & CSV directly in chat — evolving into a work layer (May)",
+    "WORKSPACE — Workspace Intelligence: Gemini reads Gmail, Chat, Calendar & Drive in real time (May)",
+    "GMVEHICLE — Gemini rolling out to 4M GM vehicles (2022+): industry's largest automotive AI deployment (Apr)",
+    "FLASH2.5 — Gemini 2.5 Flash preview: 20-30% fewer tokens, stronger reasoning, GA in early June (May)",
     "MCP — MCP tool support officially added to Gemini API & SDK for open-source integrations (May)",
-    "DEEPRESEARCH — Deep Research now free for all on Gemini 2.5 Flash with file upload support (May)",
   ],
 };
 
