@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GOOGLEIO — Google I/O 2026が5月19日開幕、Gemini 4・Veo 4・Android XR・Aluminum OS発表予定（5月）",
-    "FILEGEN — Geminiがチャットから直接Docs・PDF・Excel・CSV等を生成・ダウンロード、ワーク層に進化（5月）",
-    "WORKSPACE — Workspace Intelligence登場、Gmail・Chat・Calendar・Driveをリアルタイム参照して生成（5月）",
-    "GMVEHICLE — 2022年以降のGM車400万台にGeminiを展開、業界最大規模の車載AI統合（4月）",
-    "FLASH2.5 — Gemini 2.5 Flash改善版プレビュー、トークン20〜30%削減・推論強化・6月正式GA予定（5月）",
-    "MCP — Gemini API と SDK でMCPツール連携が正式サポート、オープンソースツールへのアクセス拡大（5月）",
+    "GOOGLEIO — Google I/O 2026 が 5/19〜20 開催、Gemini 3.5・Veo 4・Aluminium OS 発表予測（5月）",
+    "ANDROIDSHOW — The Android Show I/O Edition が 5/12 プレ配信、Android 17 と Gemini OS 統合を披露（5月）",
+    "GEMINI31PRO — Gemini 3.1 Pro 公開、1M 文脈・customtools 専用エンドポイント・推論強化（4〜5月）",
+    "FILEGEN — Gemini チャットから Docs/Sheets/Slides/PDF/DOCX/XLSX/CSV を直接生成可能に（5月）",
+    "APPREDESIGN — Gemini アプリ大規模リデザイン、パルセーティング背景・ピル型プロンプト導入（5月）",
+    "PERSONALIZATION — Gemini に Personalization（実験的）追加、Search 履歴を回答に反映（5月）",
   ],
   en: [
-    "GOOGLEIO — Google I/O 2026 kicks off May 19: Gemini 4, Veo 4, Android XR & Aluminum OS expected",
-    "FILEGEN — Gemini now generates Docs, PDFs, Excel & CSV directly in chat — evolving into a work layer (May)",
-    "WORKSPACE — Workspace Intelligence: Gemini reads Gmail, Chat, Calendar & Drive in real time (May)",
-    "GMVEHICLE — Gemini rolling out to 4M GM vehicles (2022+): industry's largest automotive AI deployment (Apr)",
-    "FLASH2.5 — Gemini 2.5 Flash preview: 20-30% fewer tokens, stronger reasoning, GA in early June (May)",
-    "MCP — MCP tool support officially added to Gemini API & SDK for open-source integrations (May)",
+    "GOOGLEIO — Google I/O 2026 runs May 19-20, expected Gemini 3.5, Veo 4, and Aluminium OS reveals (May)",
+    "ANDROIDSHOW — Android Show I/O Edition airs May 12 with Android 17 preview and Gemini OS integration (May)",
+    "GEMINI31PRO — Gemini 3.1 Pro launches with 1M context, customtools endpoint, and stronger reasoning (Apr-May)",
+    "FILEGEN — Gemini now generates Docs, Sheets, Slides, PDF, DOCX, XLSX, CSV directly from chat (May)",
+    "APPREDESIGN — Gemini app gets a major redesign with pulsating gradient and pill-shaped prompt box (May)",
+    "PERSONALIZATION — Gemini adds experimental Personalization that uses your Search history to refine answers (May)",
   ],
 };
 
