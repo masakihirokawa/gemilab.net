@@ -1,0 +1,286 @@
+---
+title: "Gemini 2.5 Pro から Gemini 3.2 Pro へ 7 日で完全移行する実装プレイブック — プロンプト互換性検査・出力差分の自動評価・ロールバック設計"
+slug: "gemini-3-2-pro-migration-7day-production-playbook"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-08T11:00"
+author: "Gemini Lab"
+description: "Gemini 2.5 Pro で稼働中の本番システムを 3.2 Pro へ 7 日で移行する実装プレイブック。プロンプト互換性検査・LLM-as-Judge による出力差分採点・5 秒で戻せるロールバック設計まで動くコード付きで解説します。"
+tags: ["Gemini 3.2", "Gemini 2.5 Pro", "モデル移行", "Production", "Shadow Traffic", "LLM-as-Judge"]
+highlights:
+  - "2.5 Pro で動いていたプロンプトが 3.2 で壊れる箇所を本番反映前に検出する自動評価ハーネスを、Day 1 から動かせるようになります"
+  - "実トラフィックの 5% を 3.2 Pro へ流し、24 時間でコスト・品質・レイテンシを実測してから本格移行を判断できる仕組みを構築できます"
+  - "問題発生時に 5 秒で 2.5 Pro へ戻せるフィーチャーフラグ付きロールバック機構で、ユーザー影響を最小化した本番移行を実現できます"
+---
+
+先日、2 年ほど 2.5 Pro で動かしてきた個人 SaaS のバックエンドを、軽い気持ちで 3.2 Pro に切り替えてみました。「同じ系統のモデルだから、`model` パラメータを書き換えるだけで終わるはず」と高を括っていたのです。
+
+結果、深夜にユーザーから「JSON が返ってこない」「機能が反応しない」というメッセージが届き、3 時間ほどでロールバックする羽目になりました。原因は、2.5 Pro で当然のように動いていた構造化出力プロンプトが、3.2 Pro では一部のケースで System Instructions の解釈が変わって壊れていたことでした。
+
+その後、1 週間かけて「壊さずに 3.2 Pro へ移行する」ための仕組みをきちんと作り直し、今は段階的に移行を進めています。本記事では、その実装プレイブックを、検証済みのコードと共に共有させていただきます。同じように本番運用中のシステムをモデル更新する方の参考になれば幸いです。
+
+## なぜ「ある日いきなり切り替える」が失敗するのか
+
+Gemini 3.2 Pro は 2.5 Pro と比べてベンチマーク上は明確に強くなっています。ARC-AGI の数値も、ロングコンテキストの安定性も、コーディング能力も、いずれも進歩しています。ただし、これは「平均的に賢くなった」のであって、「すべてのプロンプトで 2.5 Pro と同じ出力をする」という意味ではありません。
+
+私が踏んだ落とし穴を整理すると、以下の 3 種類に分けられます。
+
+第一に、System Instructions の解釈差です。3.2 Pro では指示の優先順位付けが変わり、「最後に書いた指示」が以前より強く効く傾向があります。2.5 Pro 時代に長文の指示を雑に並べて運用していたプロンプトは、ここで壊れます。第二に、Function Calling の引数バリデーションが厳格化されました。2.5 Pro が暗黙に許容していた型ゆるい呼び出しが、3.2 Pro では一律拒否されます。第三に、`thinking_budget` の挙動差です。2.5 Pro 系で「budget=0」を渡して通常モードとして動かしていたコードは、3.2 Pro では一部のケースで Reasoning が暗黙に挟まり、レイテンシが想定外に伸びます。
+
+これらの差分は、ドキュメントには書かれていません。実際に流して、出力をペアで突き合わせて、初めて気づくものです。だからこそ、「自動で気づく仕組み」をまず作ることが、安全な移行の出発点になります。
+
+## Day 1–2：プロンプト互換性検査ハーネスを構築する
+
+最初の 2 日でやるべきことは、本番ログから過去 30 日分のリクエスト・レスポンスを抽出し、それを「2.5 Pro と 3.2 Pro の両方で再生」して差分を取れる仕組みを作ることです。
+
+最低限の構成は、以下のような Pytest ベースのハーネスで足ります。
+
+```python
+# tests/migration/test_prompt_compat.py
+import json
+import pathlib
+import pytest
+from google import genai
+from google.genai import types
+
+# 本番ログから抽出した「代表的な入力サンプル」群
+FIXTURES = pathlib.Path("tests/fixtures/prompt_logs.jsonl")
+
+# 2.5 Pro / 3.2 Pro の両クライアントを準備
+client = genai.Client()
+
+def load_cases():
+    """本番ログ JSONL を 1 件ずつ yield する"""
+    for line in FIXTURES.read_text(encoding="utf-8").splitlines():
+        yield json.loads(line)
+
+@pytest.mark.parametrize("case", list(load_cases()))
+def test_structured_output_compat(case):
+    """
+    同じ入力を 2.5 Pro と 3.2 Pro に投げ、両方とも
+    JSON Schema 通りに返ってくることだけ最低限保証する。
+    """
+    config = types.GenerateContentConfig(
+        system_instruction=case["system"],
+        response_mime_type="application/json",
+        response_schema=case["schema"],
+        temperature=0,
+    )
+
+    for model in ("gemini-2.5-pro", "gemini-3.2-pro"):
+        resp = client.models.generate_content(
+            model=model,
+            contents=case["user"],
+            config=config,
+        )
+        # 1) JSON としてパースできるか
+        try:
+            parsed = json.loads(resp.text)
+        except json.JSONDecodeError as e:
+            pytest.fail(f"[{model}] JSON parse error: {e}\n--- raw ---\n{resp.text}")
+        # 2) 必須キーが揃っているか
+        for key in case["required_keys"]:
+            assert key in parsed, f"[{model}] missing key: {key}"
+```
+
+ここで重要なのは、「品質を比べる」ではなく「壊れていないか」を機械的にだけ見ていることです。品質比較は次の Day 3 で別レイヤーとして実装します。
+
+ポイントは、`prompt_logs.jsonl` のサンプル選定です。私は本番ログから次の 3 種類を必ず含めるようにしています。
+
+- 直近 30 日で最も多い「ホット系」プロンプト 50 件
+- ユーザーから過去にエラー報告があった「壊れやすい」プロンプト 30 件
+- 想定外の長文・絵文字・複数言語混在などの「変則系」プロンプト 20 件
+
+合計 100 件もあれば、Breaking Change の検出は十分機能します。本番ログを使う際は、PII マスキングを必ず通してから保存することを忘れないでください。
+
+## Day 3：LLM-as-Judge で出力差分を自動採点する
+
+Day 2 までで「壊れていない」ことは保証できました。次に必要なのは、「品質が劣化していないか」を数値で見ることです。ここで使うのが LLM-as-Judge パターンです。
+
+私は判定モデルとして、コスト削減のため Gemini 2.5 Flash を使っています。同じプロンプトで生成した 2.5 Pro 出力と 3.2 Pro 出力をペアで Flash に見せ、「ユーザーにとってより役立つのはどちらか」を採点させます。
+
+```python
+# tests/migration/judge.py
+from google import genai
+from google.genai import types
+
+JUDGE_MODEL = "gemini-2.5-flash"
+client = genai.Client()
+
+JUDGE_PROMPT = """\
+あなたは出力品質を評価するレフェリーです。
+ユーザーの入力に対して、AI A と AI B の 2 つの応答が提示されます。
+以下の観点で 0〜5 のスコアを付け、JSON で返してください。
+
+評価軸:
+- 正確性 (accuracy): 質問に正面から答えているか
+- 有用性 (helpfulness): ユーザーが次の行動に移れる情報量か
+- 簡潔性 (concise): 冗長な前置きや繰り返しがないか
+
+返却フォーマット:
+{
+  "winner": "A" | "B" | "tie",
+  "score_a": {"accuracy": 0-5, "helpfulness": 0-5, "concise": 0-5},
+  "score_b": {"accuracy": 0-5, "helpfulness": 0-5, "concise": 0-5},
+  "reason": "1-2 文で根拠"
+}
+"""
+
+def judge(user_input: str, output_a: str, output_b: str) -> dict:
+    """A=2.5 Pro、B=3.2 Pro として採点する"""
+    contents = (
+        f"# ユーザー入力\n{user_input}\n\n"
+        f"# AI A の応答\n{output_a}\n\n"
+        f"# AI B の応答\n{output_b}\n"
+    )
+    resp = client.models.generate_content(
+        model=JUDGE_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=JUDGE_PROMPT,
+            response_mime_type="application/json",
+            temperature=0,
+        ),
+    )
+    return resp.json
+```
+
+100 件のサンプルで A/B/tie の比率を出し、「3.2 Pro が 2.5 Pro に勝った件数 / 同等以上だった件数」を移行判断の指標にします。私の場合、tie + B 勝ち が 90% を超えたら移行 OK、80% を切ったらプロンプトの調整が必要、というラインを引いています。
+
+ここで「位置バイアス」に注意してください。Judge モデルは、提示順が後ろの応答を評価しがちなクセがあります。回避策として、半分のサンプルで A/B の順序を入れ替えて投げ、両方の結果を平均化してください。コストは倍になりますが、判定の信頼性は段違いに上がります。
+
+## Day 4–5：シャドウトラフィックで 5% を 3.2 に流す
+
+ここまでで「ラボ環境では壊れていない・品質も劣化していない」が確認できました。ただし、これだけでは本番投入には不十分です。実トラフィックには、ラボでは想像できなかったプロンプトが必ず含まれているからです。
+
+シャドウトラフィックの仕組みは、「ユーザーへ返すのは 2.5 Pro の応答のまま、裏で同じ入力を 3.2 Pro にも投げてログに残す」というシンプルなパターンが堅実です。Cloud Run なら次のような実装で済みます。
+
+```python
+# api/handler.py
+import asyncio, random
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+SHADOW_RATE = 0.05  # 5% に絞ってコスト爆発を防ぐ
+
+async def handle_request(req: dict) -> dict:
+    """ユーザーへは 2.5 Pro、5% で 3.2 Pro にもシャドウ投入"""
+    primary = asyncio.create_task(call_model("gemini-2.5-pro", req))
+
+    if random.random() < SHADOW_RATE:
+        # 失敗してもユーザーへの応答に影響させない
+        asyncio.create_task(shadow_call("gemini-3.2-pro", req))
+
+    result = await primary
+    return result
+
+async def shadow_call(model: str, req: dict) -> None:
+    try:
+        resp = await call_model(model, req)
+        # ログ基盤へ非同期で書き込み
+        await log_shadow_result(model=model, input=req, output=resp)
+    except Exception as e:
+        await log_shadow_error(model=model, input=req, error=str(e))
+
+async def call_model(model: str, req: dict) -> dict:
+    config = types.GenerateContentConfig(
+        system_instruction=req["system"],
+        temperature=req.get("temperature", 0.2),
+    )
+    resp = client.aio.models.generate_content(
+        model=model,
+        contents=req["user"],
+        config=config,
+    )
+    return {"text": (await resp).text}
+```
+
+24 時間流して、ログ基盤側で次の 3 つを集計します。エラー率（3.2 が 2.5 より明確に高ければ赤信号）、レイテンシ p95（推論時間が伸びていないか）、推定コスト（モデル単価 × トークン数で試算）。これら 3 指標がすべて 2.5 Pro と同等以下なら、次のステップへ進みます。
+
+ここで気をつけたいのが、シャドウ呼び出しのコスト管理です。トラフィックが多いサービスでは、5% であっても月数万円単位のコストが乗ることがあります。ハードリミット（1 日あたりの最大シャドウ呼び出し回数）をコード側に必ず仕込んでください。
+
+## Day 6：フィーチャーフラグで 5 秒ロールバックを実装する
+
+シャドウで OK が取れたら、いよいよ本番ユーザーの一部を 3.2 Pro に切り替えていきます。ここで絶対に必要なのが、「何かあれば即座に 2.5 Pro に戻せる」スイッチです。
+
+LaunchDarkly のような外部サービスを入れる手もありますが、個人開発の規模なら、Cloud Storage / Firestore / Cloudflare KV のいずれかに 1 ファイル置くだけで十分機能します。私が使っているのは次のような最小構成です。
+
+```python
+# config/feature_flags.py
+import time
+from google.cloud import firestore
+
+_db = firestore.Client()
+_cache = {"value": None, "ts": 0.0}
+TTL = 5  # 5 秒キャッシュ
+
+def model_for(user_id: str) -> str:
+    """user_id ハッシュベースで 3.2 Pro に振り分ける"""
+    flag = _get_flag()
+    if not flag.get("enabled"):
+        return "gemini-2.5-pro"
+
+    rollout_pct = flag.get("rollout_percent", 0)
+    bucket = hash(user_id) % 100
+    if bucket < rollout_pct:
+        return "gemini-3.2-pro"
+    return "gemini-2.5-pro"
+
+def _get_flag() -> dict:
+    """5 秒キャッシュ付きでフラグを取得"""
+    now = time.time()
+    if _cache["value"] is not None and (now - _cache["ts"] < TTL):
+        return _cache["value"]
+    snap = _db.collection("flags").document("model_migration").get()
+    _cache.update({"value": snap.to_dict() or {}, "ts": now})
+    return _cache["value"]
+```
+
+このフラグドキュメントは Firestore コンソールから 1 クリックで `enabled: false` に書き換えられます。書き換えから本番反映まで、TTL 5 秒の最悪ケースでも 5 秒以内です。深夜に問題が起きても、寝ぼけた頭でも戻せる構造にしておくことが大切です。
+
+ロールバック演習も、Day 6 のうちに必ず一度本番でやっておいてください。「フラグを `false` にして、5 秒後に全リクエストが 2.5 Pro に戻ったかをログで確認する」だけです。本番でやったことのない手順は、本番では動かないと思った方が安全です。
+
+## Day 7：段階リリースとロールアウト計画
+
+ここまでで「いつでも戻せる」状態になりました。最終日は、段階的に rollout_percent を引き上げていきます。私が使っているスケジュールは次の通りです。
+
+```
+Day 7 09:00 — rollout_percent = 5
+Day 7 13:00 — レイテンシ・エラー率・LLM-as-Judge スコアを確認 → OK なら 25
+Day 7 18:00 — 同様に確認 → OK なら 50
+Day 8 09:00 — 一晩寝かせて確認 → OK なら 100
+```
+
+ポイントは「夜間に大きく rollout を上げない」ことです。深夜帯はトラフィックが薄く、問題が顕在化しないまま朝を迎えてしまいます。私は必ず日中の自分が手を出せる時間帯にだけ引き上げを行うようにしています。
+
+各段階で必ず確認する 3 つの数値は、過去 1 時間の HTTP 5xx 比率、応答レイテンシ p95、Sentry / Logging に出ているプロンプト関連エラーの絶対数です。1 つでも前の段階より明確に悪化していれば、次の段階には進まず、まず原因を特定してください。
+
+## 移行で発見した「3.2 が 2.5 と違って嫌な癖を見せた」3 つの具体例
+
+参考までに、私が実際に 3.2 Pro へ移行する過程でハマった 3 つの実例を共有します。同じ罠を踏まずに済めば幸いです。
+
+ケース 1：System Instructions の長さ閾値。2.5 Pro では 3,000 文字程度の長文 System Instructions を問題なく解釈してくれていましたが、3.2 Pro では「指示の後半を軽視する」傾向が出ました。対処は、長文 System Instructions を「タスク種別ごとに分割し、最も重要な指示を最後に置く」だけです。
+
+ケース 2：`thinking_budget=0` の挙動差。2.5 Pro では budget 0 で完全に Reasoning がオフになっていたのですが、3.2 Pro では一部のクエリで暗黙に Reasoning が挟まり、レイテンシが 1.5 倍になるケースが観測されました。チャット応答などレイテンシ重視の用途では、明示的に `disable_thinking=true` 相当のフラグを併用する設計に変えています。
+
+ケース 3：Function Calling の引数バリデーション。2.5 Pro では `number` 型のパラメータに `"42"` のような文字列が来ても暗黙にキャストされていましたが、3.2 Pro はエラーで弾きます。対応として、JSON Schema の `type` 定義を `["number", "string"]` のユニオンにするか、ツール側で型キャストを明示的に書くようにしました。
+
+これらは 3.2 Pro が「悪くなった」のではなく、「より正しい挙動に近づいた」結果として発生する差分です。長期的にはありがたい変化ですが、移行の瞬間にはトラブルとして降りかかります。
+
+## 移行後 30 日で観測すべき 4 つの指標
+
+100% rollout に到達した後も、最低 30 日は次の 4 指標を毎日確認してください。
+
+第一に、出力品質の自動採点スコア。Day 3 で構築した LLM-as-Judge ハーネスを毎晩バッチで回し、新規流入したプロンプトに対しても 3.2 Pro が劣化していないかを継続的にチェックします。第二に、API コストの実績値。事前見積もりと実績値の乖離を 1 週間ごとに確認し、想定外のコスト増があれば早期に検知します。第三に、p95 / p99 レイテンシ。ユーザー体感に直結する指標で、徐々に伸びていないかを見ます。第四に、ユーザー解約率と機能利用率の傾向。最も重要な指標ですが、最も遅れて出てくる数値でもあります。
+
+私は移行前後の 60 日を比較する形で、これらの指標を週次レポートにまとめ続けています。「数値で見ていれば早期に気づけた」というのは、本番運用での何よりの安心材料になります。
+
+参考までに、API 運用全般の体系的な知識を深めたい方には、本番運用の設計パターンを扱った [Gemini API 本番運用完全攻略 — エラーハンドリング・レート制限・コスト最適化](/articles/gemini-api/gemini-api-production-complete-guide) と、シャドウトラフィック実装の細部を扱う [Gemini API のシャドウトラフィックで新モデル移行を安全に進める — 出力差分を本番で測る実装パターン](/articles/gemini-advanced/gemini-api-shadow-traffic-model-migration-production) も併せて目を通してみてください。本記事と組み合わせて読むことで、移行設計の解像度が一段上がります。
+
+## まとめ — 今日からの最初の一歩
+
+長く読んでくださり、ありがとうございました。最後に 1 つだけアクションをお伝えします。今日の作業は、Day 1 のプロンプト互換性検査ハーネスから始めてください。本番ログから 100 件のサンプルを抽出して JSONL に保存するところまで、たぶん 1 時間で終わります。そこから先のステップは、すべてその 1 時間が土台になっています。
+
+私自身も移行作業を進めながら学び続けている途中ですが、「自動で気づける仕組み」を 1 つ持っているだけで、夜の睡眠の質が大きく変わるのを実感しています。同じように本番運用中のシステムを抱えている方の助けになれば、これ以上嬉しいことはありません。

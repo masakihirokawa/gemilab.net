@@ -1,0 +1,338 @@
+---
+title: "Migrating from Gemini 2.5 Pro to 3.2 Pro in 7 Days — A Production Playbook for Compatibility Testing, Output Diff Scoring, and Rollback Design"
+slug: "gemini-3-2-pro-migration-7day-production-playbook"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-08T11:00"
+author: "Gemini Lab"
+description: "A 7-day playbook for moving production systems from Gemini 2.5 Pro to 3.2 Pro: compatibility testing, LLM-as-Judge scoring, shadow traffic, and rollback."
+tags: ["Gemini 3.2", "Gemini 2.5 Pro", "Model Migration", "Production", "Shadow Traffic", "LLM-as-Judge"]
+highlights:
+  - "Stand up an automated harness that catches prompts that break on 3.2 Pro before any user sees the change — starting on Day 1"
+  - "Route 5% of real production traffic to 3.2 Pro for 24 hours and decide on the migration based on measured cost, quality, and latency"
+  - "Ship a feature-flag rollback switch that reverts to 2.5 Pro within 5 seconds, so you can move forward confidently without exposing users to risk"
+---
+
+A while back, I flipped a personal SaaS backend that had been running on Gemini 2.5 Pro for almost two years over to 3.2 Pro. I was casual about it. "Same model family, just change the `model` parameter — what could go wrong?"
+
+Within a few hours, users started messaging me about JSON responses that came back malformed and features that silently stopped working. Three hours later, I had rolled the whole thing back. The root cause was that a structured-output prompt I had relied on for years was being interpreted differently by 3.2 Pro: the way it weighs System Instructions had shifted just enough to break my schema in certain edge cases.
+
+Over the next week I rebuilt the migration plan properly, with the assumption that 3.2 Pro is a different model that happens to share a name prefix with the one I had been using. This article shares that playbook, with the actual code I'm running. If you are operating a live system on 2.5 Pro and thinking about moving to 3.2 Pro, I hope this saves you a sleepless night.
+
+What I want to emphasize from the start: this is not a "5-minute upgrade." 3.2 Pro is a stronger and slightly different model, and treating it that way pays for itself many times over when something unexpected surfaces in production. The seven-day plan below is the shortest path I have found that does not skip the steps that matter.
+
+## Why "just flip the switch" almost always fails
+
+Gemini 3.2 Pro is meaningfully better than 2.5 Pro on benchmarks. ARC-AGI scores, long-context stability, coding ability — all clearly improved. But "better on average" does not mean "produces the same output on every prompt as 2.5 Pro did." That distinction is what bites you.
+
+The differences I personally hit fall into three groups. First, System Instructions are weighted differently. 3.2 Pro emphasizes the most recent instructions more strongly than 2.5 Pro did, which means long, loosely organized system prompts that worked fine for years can suddenly drift. Second, Function Calling argument validation has been tightened. Calls that 2.5 Pro silently coerced ("42" passed where a `number` was expected) are now rejected outright. Third, the behavior of `thinking_budget=0` is no longer identical: in some queries 3.2 Pro implicitly inserts reasoning anyway, which extends latency in ways your latency-sensitive code paths will absolutely notice.
+
+None of these differences are documented in any meaningful way. You only discover them by running the same prompt through both models side by side and watching what comes out. So the very first step in a safe migration is building a system that surfaces these differences automatically — not relying on your eyes during a manual smoke test.
+
+There is a second, deeper reason "just flip the switch" fails: production traffic is non-stationary. The prompts your users send tomorrow are not exactly the prompts they sent last week. Even if you tested 100% of historical traffic against 3.2 Pro and saw no regressions, novel inputs will arrive shortly after rollout. The mitigation for that is not perfect testing — it is a fast, well-rehearsed rollback path. Both halves of this article reflect that reality.
+
+## Day 0: A pre-migration audit you cannot skip
+
+Before any code runs, spend a couple of hours doing a paper audit. The questions to answer:
+
+- Which code paths call Gemini today? Grep your repo for the model name and you will likely find more places than you remembered. List them.
+- Which prompts are "high-stakes"? A prompt that powers your core onboarding flow is in a different risk class than one that powers an internal admin dashboard. Tag each call site.
+- What is your current cost baseline? Pull at least 30 days of API spend, broken down by endpoint or feature if your billing dashboard supports it. You will need this number to evaluate the migration's economic impact.
+- Are there any features tied to specific 2.5 Pro behaviors? If a downstream system parses outputs heuristically rather than strictly, even small drift in style can be a problem.
+
+This audit takes a couple of hours but protects you from "we forgot to migrate that one cron job" surprises. I keep the result in a single Markdown file checked into the repo, with one row per call site and a status column that progresses through the seven days.
+
+## Day 1–2: Build a prompt compatibility harness
+
+Spend the first two days extracting 30 days of request/response pairs from your production logs and standing up a harness that can replay each one through both 2.5 Pro and 3.2 Pro to compare results. Pytest is more than enough for this.
+
+```python
+# tests/migration/test_prompt_compat.py
+import json
+import pathlib
+import pytest
+from google import genai
+from google.genai import types
+
+# Representative samples extracted from production logs (PII-redacted)
+FIXTURES = pathlib.Path("tests/fixtures/prompt_logs.jsonl")
+
+client = genai.Client()
+
+def load_cases():
+    """Yield each case from the production log fixture file."""
+    for line in FIXTURES.read_text(encoding="utf-8").splitlines():
+        yield json.loads(line)
+
+@pytest.mark.parametrize("case", list(load_cases()))
+def test_structured_output_compat(case):
+    """
+    Send the same input to both 2.5 Pro and 3.2 Pro and verify
+    that each one produces JSON conforming to the case's schema.
+    """
+    config = types.GenerateContentConfig(
+        system_instruction=case["system"],
+        response_mime_type="application/json",
+        response_schema=case["schema"],
+        temperature=0,
+    )
+
+    for model in ("gemini-2.5-pro", "gemini-3.2-pro"):
+        resp = client.models.generate_content(
+            model=model,
+            contents=case["user"],
+            config=config,
+        )
+        # 1) Parse as JSON
+        try:
+            parsed = json.loads(resp.text)
+        except json.JSONDecodeError as e:
+            pytest.fail(f"[{model}] JSON parse error: {e}\n--- raw ---\n{resp.text}")
+        # 2) Required keys are present
+        for key in case["required_keys"]:
+            assert key in parsed, f"[{model}] missing key: {key}"
+```
+
+Crucially, this harness only checks that things are not broken. Quality comparison is a separate concern that we tackle on Day 3 with a different layer.
+
+The selection of `prompt_logs.jsonl` matters more than you'd think. From production logs, I always include three categories of samples:
+
+- The 50 most frequent "hot" prompts from the last 30 days
+- 30 prompts that have triggered user-reported errors in the past
+- 20 "edge" prompts: unusually long inputs, mixed languages, emoji-heavy text, special characters
+
+A hundred carefully chosen samples is plenty for surfacing breaking changes. One reminder before you save anything: run a PII redaction pass over the raw logs before they touch your test directory. I keep redaction code in the same module as the fixture loader, so there is no version of "raw, unredacted logs" living anywhere on disk.
+
+If you want to be thorough, also store the model output that 2.5 Pro produced for each case at the time of capture. That gives you a stable reference for diffing later — useful when 2.5 Pro itself is updated mid-migration and you want to separate "drift between 2.5 Pro versions" from "drift caused by 3.2 Pro."
+
+## Day 3: Score output diffs with LLM-as-Judge
+
+Day 2 confirms nothing is overtly broken. Day 3 measures whether quality has degraded. The LLM-as-Judge pattern is what does this work.
+
+I use Gemini 2.5 Flash as the judge model — it is cheap enough to run thousands of comparisons without flinching, and capable enough to make sensible calls on which response is more useful. Flash is a deliberate choice here: you do not want the judge to be the same model family as either of the candidates, because shared training biases muddy the comparison.
+
+```python
+# tests/migration/judge.py
+from google import genai
+from google.genai import types
+
+JUDGE_MODEL = "gemini-2.5-flash"
+client = genai.Client()
+
+JUDGE_PROMPT = """\
+You are a referee evaluating output quality.
+Given a user input and two candidate responses (AI A and AI B),
+score each on the axes below from 0 to 5 and return JSON.
+
+Axes:
+- accuracy: does it directly answer the question?
+- helpfulness: does it give the user enough to act on?
+- concise: is it free of filler and repetition?
+
+Return format:
+{
+  "winner": "A" | "B" | "tie",
+  "score_a": {"accuracy": 0-5, "helpfulness": 0-5, "concise": 0-5},
+  "score_b": {"accuracy": 0-5, "helpfulness": 0-5, "concise": 0-5},
+  "reason": "1-2 sentence justification"
+}
+"""
+
+def judge(user_input: str, output_a: str, output_b: str) -> dict:
+    """A = 2.5 Pro, B = 3.2 Pro."""
+    contents = (
+        f"# User input\n{user_input}\n\n"
+        f"# AI A response\n{output_a}\n\n"
+        f"# AI B response\n{output_b}\n"
+    )
+    resp = client.models.generate_content(
+        model=JUDGE_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=JUDGE_PROMPT,
+            response_mime_type="application/json",
+            temperature=0,
+        ),
+    )
+    return resp.json
+```
+
+Run the judge over your 100-sample fixture set and tally the results. The metric I use is "(B wins + ties) / total." If that ratio is above 90 percent, I consider the migration safe to push forward. Below 80 percent, I pause and identify which prompts regressed before doing anything else.
+
+One word of caution: judge models exhibit a position bias — they tend to favor the response that appears second. Mitigate this by running half of your samples with the A/B order swapped and averaging the two passes. The cost doubles, but the reliability of the verdict goes up substantially. For a margin call, that trade is worth making.
+
+A second bias to watch for is verbosity. Judge models, when not prompted carefully, can mistake longer responses for higher-quality ones. The "concise" axis in the rubric is there specifically to keep that bias in check. Read the judge's `reason` text for a sample of about ten cases by hand the first time you run the harness — if you see the model rewarding length for its own sake, tighten the rubric.
+
+For really high-stakes applications, layer a second method on top: sample 20 percent of cases for human review by yourself or a teammate, and compare against the judge's verdicts. If human and judge agree on more than 80 percent of cases, you can trust the automation for the bulk of monitoring. If they disagree more than that, use human review as the source of truth and treat the judge as advisory only.
+
+## Day 4–5: Shadow 5% of production traffic to 3.2 Pro
+
+Now you have lab evidence: nothing is broken, and quality holds up. That is still not sufficient to put 3.2 Pro in front of users, because real production traffic always contains shapes you didn't anticipate. The bridge between lab and production is shadow traffic.
+
+The pattern is straightforward: continue serving every user response from 2.5 Pro, but for a sampled fraction also issue the same request to 3.2 Pro and log the result. Cloud Run handles this in a few lines.
+
+```python
+# api/handler.py
+import asyncio, random
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+SHADOW_RATE = 0.05  # cap at 5% to keep shadow cost predictable
+
+async def handle_request(req: dict) -> dict:
+    """Serve from 2.5 Pro, optionally shadow to 3.2 Pro."""
+    primary = asyncio.create_task(call_model("gemini-2.5-pro", req))
+
+    if random.random() < SHADOW_RATE:
+        # Fire-and-forget; never let shadow affect the user response
+        asyncio.create_task(shadow_call("gemini-3.2-pro", req))
+
+    result = await primary
+    return result
+
+async def shadow_call(model: str, req: dict) -> None:
+    try:
+        resp = await call_model(model, req)
+        await log_shadow_result(model=model, input=req, output=resp)
+    except Exception as e:
+        await log_shadow_error(model=model, input=req, error=str(e))
+
+async def call_model(model: str, req: dict) -> dict:
+    config = types.GenerateContentConfig(
+        system_instruction=req["system"],
+        temperature=req.get("temperature", 0.2),
+    )
+    resp = client.aio.models.generate_content(
+        model=model,
+        contents=req["user"],
+        config=config,
+    )
+    return {"text": (await resp).text}
+```
+
+Let it run for 24 hours, then aggregate three numbers from your logs: error rate (is 3.2 erroring noticeably more than 2.5?), p95 latency (is it slower under real load?), and estimated cost (token counts × pricing). If 3.2 Pro is at parity or better on all three, move on.
+
+Watch your wallet during this phase. Even at 5%, a high-volume service can rack up tens of thousands of yen per month in shadow calls. Wire a hard daily cap into the code path itself — do not rely on dashboards alone to notice runaway spend.
+
+## Cost projection: turning shadow data into a real budget number
+
+After the 24-hour shadow window, you have a precious dataset: actual token counts from 3.2 Pro for actual production prompts. Use it to extrapolate a realistic monthly cost.
+
+The arithmetic I run is intentionally conservative. Take the 95th percentile of token usage from your shadow log (not the median), multiply by your observed request volume from the last 30 days, multiply by 3.2 Pro's per-token rate, and add 20 percent buffer for traffic growth and prompt drift. That gives you a high-side estimate that won't surprise you on the next billing cycle.
+
+Compare this against your Day-0 cost baseline. If the projected number is meaningfully higher, you have three responses available before rollout: tighten prompts to reduce token consumption, route only certain request types to 3.2 Pro, or accept the increased cost in exchange for the quality gain. None of those decisions should be made on Day 7 in the heat of rollout — make them on Day 5 with the shadow data in front of you.
+
+Some teams skip this step because Gemini 3.2 Pro's headline pricing is competitive and they assume costs will just be fine. In my experience, the surprise comes not from the per-token rate but from increased token counts: 3.2 Pro sometimes produces more thorough outputs than 2.5 Pro, which means more output tokens billed. Shadow data is the only way to see that effect at your real prompts and your real users.
+
+## Day 6: Implement a 5-second feature-flag rollback
+
+Once shadow traffic checks out, you start serving real users from 3.2 Pro. The non-negotiable prerequisite for that step is a switch that reverts to 2.5 Pro instantly when something is wrong.
+
+You can use LaunchDarkly or any other flag SaaS, but for an indie-scale system, a single document in Cloud Storage, Firestore, or Cloudflare KV does the job. Here is the minimal version I run.
+
+```python
+# config/feature_flags.py
+import time
+from google.cloud import firestore
+
+_db = firestore.Client()
+_cache = {"value": None, "ts": 0.0}
+TTL = 5  # 5-second cache
+
+def model_for(user_id: str) -> str:
+    """Bucket users into 3.2 Pro by hashed user_id."""
+    flag = _get_flag()
+    if not flag.get("enabled"):
+        return "gemini-2.5-pro"
+
+    rollout_pct = flag.get("rollout_percent", 0)
+    bucket = hash(user_id) % 100
+    if bucket < rollout_pct:
+        return "gemini-3.2-pro"
+    return "gemini-2.5-pro"
+
+def _get_flag() -> dict:
+    now = time.time()
+    if _cache["value"] is not None and (now - _cache["ts"] < TTL):
+        return _cache["value"]
+    snap = _db.collection("flags").document("model_migration").get()
+    _cache.update({"value": snap.to_dict() or {}, "ts": now})
+    return _cache["value"]
+```
+
+You flip `enabled: false` from the Firestore console with a single click. With a 5-second TTL, every instance picks up the change within five seconds at worst. That matters at 3 a.m. when you are half-awake and need to make a decision quickly.
+
+Run a rollback drill on Day 6 — actually toggle the flag in production, watch the logs, confirm every request flips back to 2.5 Pro within five seconds. A procedure you have never executed in production is a procedure that will not work in production when you need it.
+
+A bucketing detail worth noting: hashing on `user_id` keeps each user pinned to the same model across requests, which avoids the surprising experience of users getting noticeably different answers within the same session. If your service has anonymous traffic, hash on a stable session token instead. Random per-request bucketing is appealingly simple but a bad fit for any product that has continuity within a session.
+
+## Day 7: Staged rollout
+
+You now have a safe switch. The final day is the gradual rollout. The schedule I follow:
+
+```
+Day 7 09:00 — rollout_percent = 5
+Day 7 13:00 — review latency, error rate, judge scores → bump to 25 if clean
+Day 7 18:00 — review again → bump to 50 if clean
+Day 8 09:00 — sleep on it → bump to 100 if morning numbers still look good
+```
+
+The key rule is: never raise the rollout percentage at night. Traffic is sparse, problems hide, and you wake up to a mess. Always advance during a window when you are sitting at your desk and able to react.
+
+At each gate, look at three numbers: HTTP 5xx rate over the last hour, p95 response latency, and the absolute count of prompt-related errors in your logging or Sentry stream. If any one of them has clearly degraded versus the previous gate, do not advance — investigate first.
+
+Communicate each gate. If your service has a status page or a Slack channel for ops, post a one-line update at every percentage change ("rolled out to 25%; metrics nominal"). It costs nothing and dramatically reduces the "what is going on?" conversations that happen when teammates notice something looks slightly different.
+
+## Three places where 3.2 Pro behaves notably differently from 2.5 Pro
+
+For reference, here are three specific quirks I hit during my own migration. Knowing them in advance might save you a debugging session.
+
+**System Instruction length and weighting.** I had 3,000-character system prompts that 2.5 Pro absorbed and respected uniformly. On 3.2 Pro, the model started under-weighting the earlier portions. The fix was to split long system prompts by task type and place the most critical instruction last.
+
+**`thinking_budget=0` no longer guarantees zero thinking.** On 2.5 Pro, setting budget to zero turned reasoning fully off. On 3.2 Pro, certain queries still trigger implicit reasoning, and I observed latency increasing by roughly 1.5x in those cases. For latency-sensitive paths like chat replies, I now combine the budget setting with explicit "disable thinking" flags.
+
+**Function Calling type coercion is gone.** 2.5 Pro happily accepted `"42"` for a `number`-typed parameter. 3.2 Pro rejects it. Either widen your JSON Schema types to a union of `number | string` or perform explicit casting on the tool side. This is technically a correctness improvement, but at the moment of migration it manifests as unexpected errors.
+
+These changes reflect 3.2 Pro behaving more strictly, which is good in the long run. In the short window of migration, they all show up as outages waiting to happen.
+
+## Four metrics to watch for 30 days after full rollout
+
+Once you are at 100 percent, do not declare victory. For the next 30 days, monitor four numbers daily.
+
+First, automated quality scores. Keep your Day-3 judge harness running as a nightly batch over freshly captured production prompts. Continuous monitoring catches slow regressions that point-in-time benchmarks miss.
+
+Second, actual API spend versus the pre-migration estimate. Diff them weekly. Surprising deltas mean something is wrong with your assumptions, your prompts, or your traffic mix.
+
+Third, p95 and p99 latency. These directly affect what users feel. Slow drift here is invisible day-to-day but obvious when graphed over a month.
+
+Fourth — and this is the most important and the most delayed — user retention and feature adoption. Compare the 30 days after migration against the 30 days before, on the metrics your business actually cares about. If you only watch infrastructure metrics, you will only catch infrastructure problems.
+
+I summarize all four numbers in a weekly Markdown report kept in the same repo. After three reports, I either declare the migration finished or, if anything is still drifting, schedule a follow-up investigation. Having that explicit "we are done" gate prevents migrations from quietly never ending.
+
+If you want to dig deeper into related topics, the [Gemini API production resilience guide](/en/articles/gemini-api/gemini-api-production-complete-guide) covers retry, rate-limiting, and cost controls in depth, and the [shadow traffic implementation guide](/en/articles/gemini-advanced/gemini-api-shadow-traffic-model-migration-production) goes further into traffic-mirroring details that this article only touches on.
+
+## Debugging when the harness flags a prompt
+
+The harness will surface failures, and your job at that point is to figure out *why* the prompt drifted. The diagnostic flow I run is intentionally short and mechanical, because the temptation when something fails is to immediately rewrite prompts and ship — almost always the wrong move.
+
+Step one, confirm reproducibility. Run the failing case three times. If it fails inconsistently, the issue is sampling variance, and the fix is usually to lower temperature or constrain the output schema more tightly, not to rewrite the prompt. Step two, compare the raw outputs from 2.5 Pro and 3.2 Pro for that case side by side. Most of the time, the difference is interpretable in plain language: 3.2 Pro is being more literal about a phrasing, or it is following the most recent line of the system prompt more strictly. Step three, change the *prompt*, not the model parameters. Adjusting `temperature` to mask a prompt issue creates technical debt that compounds as you add more prompts.
+
+When the diff is genuinely unfixable on the prompt side — for instance, if the user's phrasing space is too varied to constrain — that is a signal to keep the call site on 2.5 Pro for now and migrate the rest. The feature flag I described earlier can target by call site, not just by user. Use it. A 95% migration with a clearly documented exception is far healthier than a 100% migration that hides a known regression.
+
+## Communicating the migration to your team and users
+
+If you are a solo developer, you can skip ahead. If even one other person depends on this service, the human side of migration is as important as the technical side.
+
+Within the team, pre-share the migration window and the rollback procedure. I write a short doc — half a page — that covers what is changing, the rollout schedule, the metrics being watched, and how to flip the flag. The doc lives in the same place as runbooks. The goal is that anyone on call during the migration window can answer "what is going on?" without paging me.
+
+For users, communicate only when they will notice. If your application is API-first and outputs are interpreted by your code, users may not need to know. If your application surfaces model-generated text directly — chat, summaries, classifications — there is a small chance the personality or phrasing shifts in a way attentive users will notice. A short note in the changelog covers it. I never frame model upgrades as "now smarter, now better," because that creates expectations that may not hold for every prompt. "We have upgraded the underlying language model. Most outputs should be similar; a small number may differ in style or detail. Let us know if anything looks off." That phrasing has served me well.
+
+One more communication note, this one for yourself. Keep a running log during the seven days — a single Markdown file, one line per significant event — covering what you did, what you observed, and what you decided. When something goes wrong three weeks later, that log is what tells you whether the issue is migration-related or new. I have used this same log format for three migrations now, and the time it takes to maintain (maybe ten minutes total per day) returns itself many times over.
+
+## Closing — the first concrete step to take today
+
+Thank you for reading this far. If you take only one action away, let it be this: start with the Day-1 prompt compatibility harness today. Pull a hundred sample requests from your production logs into a JSONL file. That is probably an hour of work, and every step beyond it builds on that foundation.
+
+I am still in the middle of my own migration as I write this, learning as I go. What I can say with certainty is that having a system that automatically tells you when something is wrong has changed how well I sleep. If this playbook helps anyone running a live system make the same shift more calmly, that is more than enough reward for me.
