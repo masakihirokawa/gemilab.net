@@ -15,6 +15,17 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/gemini-api/gemini-live-api-realtime-voice-app-guide", to: "/articles/gemini-api" },
   { from: "/articles/gemini-api/gemini-api-saas-monetization", to: "/articles/gemini-api" },
   { from: "/articles/gemini-dev/firebase-ai-logic-swiftui-ios-production-app-guide-2026", to: "/articles/gemini-dev" },
+  // 2026-05-09 Tax content removal (backed up to _backup/tax_content_2026-05-09/, migrated to note.com)
+  { from: "/blog/ai-tax-filing-and-fighting-injustice", to: "/blog" },
+  { from: "/blog/gemini-workspace-long-battle-evidence-archive", to: "/blog" },
+  { from: "/blog/gemini-workspace-tax-records-legal-documents", to: "/blog" },
+  { from: "/blog/japan-tax-injustice-complete-record", to: "/blog" },
+  { from: "/blog/tax-battle-complete-chronicle", to: "/blog" },
+  { from: "/blog/toyama-darkness-uozu-tax-office-kura-ai-reform", to: "/blog" },
+  { from: "/blog/toyama-tax-office-darkness-systemic-injustice", to: "/blog" },
+  { from: "/blog/toyama-tax-office-kura-recording-refusal-health-crisis", to: "/blog" },
+  { from: "/blog/uozu-tax-office-update-fighting-systemic-injustice", to: "/blog" },
+  { from: "/blog/why-ai-should-replace-tax-officials", to: "/blog" },
 ];
 
 const buildAuditRedirects = () => {
