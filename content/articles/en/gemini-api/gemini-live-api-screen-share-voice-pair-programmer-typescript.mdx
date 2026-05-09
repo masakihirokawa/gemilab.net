@@ -1,0 +1,422 @@
+---
+title: "Build a Voice + Screen-Share AI Pair Programmer with the Gemini Live API in TypeScript"
+slug: "gemini-live-api-screen-share-voice-pair-programmer-typescript"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-09T10:45"
+author: "Gemini Lab"
+description: "A practical playbook for wiring the Gemini Live API to getDisplayMedia and a microphone to build an over-the-shoulder AI pair programmer in TypeScript, with cost controls and the gotchas I hit in production."
+tags: ["gemini-api", "live-api", "typescript", "voice-ai", "screen-share", "websocket", "function-calling", "indie-dev"]
+highlights:
+  - "Engineers stuck wiring streaming audio plus screen frames to the Gemini Live API will leave with a working TypeScript implementation today"
+  - "You will learn the exact pattern for combining getDisplayMedia, AudioWorklet, WebSocket, and Function Calling into a stable bidirectional voice loop"
+  - "Solo developers will gain a practical second set of eyes during long coding sessions, with operational tactics for keeping monthly cost under five dollars"
+---
+
+Late at night, when I am stuck on a bug, the way I usually ask for help is to keep my editor open on the right and a chat window on the left, and then patiently type out what is happening on screen. After spending two weeks rebuilding that workflow on top of the Gemini 2.5 Flash Live API in April 2026, I noticed something embarrassing: most of those typed messages were trying to describe what would have taken three seconds to *show* and a single sentence to *say*.
+
+This article is the record of converting that observation into a working implementation. We pipe the screen captured through `getDisplayMedia` and the microphone audio into the Gemini Live API at the same time, and let the model speak back through native audio. The result, in plain language, is a colleague who is looking at your screen over your shoulder and answering your questions out loud. We will build it in TypeScript, on top of Node.js and a small browser client.
+
+The official [Live API documentation](https://ai.google.dev/gemini-api/docs/live) is a fine API reference, but it leaves the actual integration story (browser screen capture, bidirectional audio, cost discipline, Function Calling) for you to assemble. What follows is the shortest path I found, including the places where I had to back out and try something else.
+
+## Why a screen-aware voice partner is worth the effort for solo devs
+
+Before getting into code, here is why I believe this particular shape — screen plus voice, both streaming — is more useful than a screenshot-and-chat workflow.
+
+The moments when I want to talk to a model fall into two clusters. The first is when the screen is *moving*: a stack trace is scrolling past, an incremental test runner is updating, a UI animation flickers in a strange way. Asking yourself "should I screenshot now, or wait, or scroll back?" is itself a context switch that interrupts the debugging flow.
+
+The second is when the question is hard to type. "When I click this button, the panel on the left flashes once and then disappears — is that a re-render or a route change?" By the time I have written that sentence, I want to click the button again to confirm what I just saw. Asking out loud while the screen keeps moving is dramatically lower friction.
+
+Both situations are solved by sending screen and audio together over a single bidirectional channel. The Gemini Live API was designed for exactly that, and on Flash-tier models it lands in a price range that is realistic for a personal tool. My current setup runs about four to six dollars per month for half an hour of daily use, which compared to "a second set of eyes whenever I want one" feels like a steal.
+
+## Architecture in three pieces
+
+The system has three components.
+
+A browser client captures the screen with `getDisplayMedia` and the microphone with `getUserMedia`. It samples the screen as JPEG at one frame per second, encodes the microphone as 16 kHz PCM, and forwards both streams over a WebSocket to your own server.
+
+A relay server in Node.js (using `ws`) sits between the browser and the Gemini Live API. It holds the API key, manages frame and audio pacing, executes Function Calling tools, and tracks cost. This indirection matters: putting the Gemini API key in the browser is not safe even with short-lived tokens, because the model session itself accrues billable usage.
+
+The Gemini side is a WebSocket session against a Live-capable model such as `gemini-2.5-flash-preview-native-audio-dialog`. Responses come back as native audio chunks that the browser plays directly.
+
+I tried connecting the browser to Gemini directly first, mostly to avoid running a server. The combination of CORS, key exposure, and the inability to throttle frames centrally pushed me to the relay design within an afternoon.
+
+## Setting up the project
+
+I assume Node.js 20 or newer and a TypeScript toolchain. Initialize the project:
+
+```bash
+mkdir gemini-pair && cd gemini-pair
+npm init -y
+npm install @google/genai ws zod
+npm install -D typescript @types/node @types/ws tsx
+npx tsc --init
+```
+
+The `@google/genai` package is the unified SDK that became the canonical Gemini client in 2026, and it is the path the Live API examples are written for. If you are migrating from the older `@google/generative-ai` package, the API surface is different — I covered the migration story in [the complete Google Gen AI SDK migration guide](/en/articles/gemini-api/google-genai-python-sdk-complete-migration-masterguide), which is Python-flavored but maps cleanly to TypeScript.
+
+The API key lives in `.env` and is only read by the server.
+
+```bash
+echo "GEMINI_API_KEY=YOUR_API_KEY" > .env
+```
+
+## Browser client: capturing screen and microphone in parallel
+
+The first non-obvious part is browser capture. `getDisplayMedia` returns a video track for the screen, and `getUserMedia` returns the microphone. The trap I fell into is encoding audio: if you wrap the mic stream in `MediaRecorder` and ship webm fragments, the Gemini side cannot align them on sample boundaries. The clean approach is to push raw 16 kHz PCM through an `AudioWorklet`.
+
+```typescript
+// src/client/capture.ts
+type Sender = (data: ArrayBuffer | string) => void;
+
+export async function startCapture(send: Sender) {
+  // Screen share (browser shows a picker dialog)
+  const screen = await navigator.mediaDevices.getDisplayMedia({
+    video: { frameRate: 1, width: 1280 },
+    audio: false,
+  });
+
+  // Microphone
+  const mic = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true },
+    video: false,
+  });
+
+  // Sample one JPEG frame per second
+  const video = document.createElement("video");
+  video.srcObject = screen;
+  await video.play();
+  const canvas = new OffscreenCanvas(1280, 720);
+  const ctx = canvas.getContext("2d")!;
+
+  const frameTimer = setInterval(async () => {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0);
+    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.6 });
+    const buf = await blob.arrayBuffer();
+    send(JSON.stringify({ kind: "frame" }));
+    send(buf);
+  }, 1000);
+
+  // Stream the microphone as 16 kHz PCM
+  const audioCtx = new AudioContext({ sampleRate: 16000 });
+  await audioCtx.audioWorklet.addModule("/pcm-worklet.js");
+  const source = audioCtx.createMediaStreamSource(mic);
+  const node = new AudioWorkletNode(audioCtx, "pcm-worklet");
+  node.port.onmessage = (e) => {
+    send(JSON.stringify({ kind: "audio" }));
+    send(e.data as ArrayBuffer);
+  };
+  source.connect(node);
+
+  return () => {
+    clearInterval(frameTimer);
+    screen.getTracks().forEach((t) => t.stop());
+    mic.getTracks().forEach((t) => t.stop());
+    audioCtx.close();
+  };
+}
+```
+
+The worklet is a tiny module living in `public/`:
+
+```javascript
+// public/pcm-worklet.js
+class PCMWorklet extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input[0]) return true;
+    const f32 = input[0];
+    const i16 = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const s = Math.max(-1, Math.min(1, f32[i]));
+      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    this.port.postMessage(i16.buffer, [i16.buffer]);
+    return true;
+  }
+}
+registerProcessor("pcm-worklet", PCMWorklet);
+```
+
+After this, the browser produces a steady stream of one JPEG per second plus continuous PCM audio, all flowing through the same WebSocket. One frame per second is intentional. Bumping it to five frames did not measurably improve the model's helpfulness when reading code, but multiplied the bandwidth and cost by five.
+
+## Relay server: bridging the browser and Gemini Live
+
+The server has two WebSockets to manage: one to the browser and one to Gemini. Sessions on the Gemini side are initialized with a `setup` message that declares modalities, the system prompt, and any tool declarations. After that, you push frames and audio through `realtimeInput` and read replies from `serverContent`.
+
+```typescript
+// src/server/bridge.ts
+import { WebSocketServer, WebSocket } from "ws";
+import { GoogleGenAI, Modality } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+const wss = new WebSocketServer({ port: 8787 });
+
+wss.on("connection", async (browser) => {
+  const session = await ai.live.connect({
+    model: "gemini-2.5-flash-preview-native-audio-dialog",
+    config: {
+      responseModalities: [Modality.AUDIO],
+      systemInstruction: PAIR_PROMPT,
+      tools: [{ functionDeclarations: PAIR_TOOLS }],
+    },
+    callbacks: {
+      onmessage: (msg) => handleGeminiMessage(browser, msg),
+      onerror: (e) => console.error("[gemini]", e),
+      onclose: () => browser.close(),
+    },
+  });
+
+  // Forward browser messages to Gemini
+  let nextKind: "frame" | "audio" | null = null;
+  browser.on("message", (data, isBinary) => {
+    if (!isBinary) {
+      const ev = JSON.parse(data.toString());
+      if (ev.kind === "frame" || ev.kind === "audio") nextKind = ev.kind;
+      if (ev.kind === "text") session.sendClientContent({
+        turns: [{ role: "user", parts: [{ text: ev.text }] }],
+      });
+      return;
+    }
+    if (nextKind === "frame") {
+      session.sendRealtimeInput({
+        media: { mimeType: "image/jpeg", data: Buffer.from(data as Buffer).toString("base64") },
+      });
+    } else if (nextKind === "audio") {
+      session.sendRealtimeInput({
+        media: { mimeType: "audio/pcm;rate=16000", data: Buffer.from(data as Buffer).toString("base64") },
+      });
+    }
+    nextKind = null;
+  });
+
+  browser.on("close", () => session.close());
+});
+```
+
+The Gemini handler forwards audio chunks straight to the browser and resolves any tool calls server-side:
+
+```typescript
+async function handleGeminiMessage(browser: WebSocket, msg: any) {
+  if (msg.serverContent?.modelTurn?.parts) {
+    for (const part of msg.serverContent.modelTurn.parts) {
+      if (part.inlineData?.mimeType?.startsWith("audio/")) {
+        const buf = Buffer.from(part.inlineData.data, "base64");
+        browser.send(JSON.stringify({ kind: "audio_response" }));
+        browser.send(buf);
+      }
+      if (part.text) {
+        browser.send(JSON.stringify({ kind: "text", text: part.text }));
+      }
+    }
+  }
+  if (msg.toolCall?.functionCalls) {
+    for (const call of msg.toolCall.functionCalls) {
+      const result = await runTool(call.name, call.args);
+      // Always reply, even on failure, or the model will silently wait forever
+      session.sendToolResponse({
+        functionResponses: [{ id: call.id, name: call.name, response: { result } }],
+      });
+    }
+  }
+}
+```
+
+The non-obvious bug I tripped on here was the *ordering* of the JSON header and the binary body. Naively assuming "the JSON message that arrived just before this binary blob is its header" works most of the time, but `onmessage` events occasionally interleave under load, and you end up sending a frame as audio. The stable fix in production is to prepend a small header to every binary message and ship it as a single `ArrayBuffer`. The two-message pattern shown above is fine for a development build.
+
+## Designing the system prompt
+
+For this to feel like a partner rather than a lecturer, the system prompt does most of the heavy lifting. Live API native audio still reasons in the underlying language model, so the prompt determines tone and pacing.
+
+```typescript
+const PAIR_PROMPT = `You are a senior developer looking over the user's shoulder at their screen. Behavioral rules:
+
+- The user is sharing their screen. Trust readable text; do not invent details
+- Speak briefly. Two or three sentences per turn, then wait for a response
+- If the screen visibly changes, you may name the change in one short sentence
+- Pronounce code identifiers naturally, not as letter-by-letter spelling
+- When making assumptions, prefix them with "I can't quite tell from the screen, but..."
+- If the user says "save this" or "remember this," call the save_note tool
+- If the user asks for documentation, call the open_docs tool
+
+Protecting the user's focus is the highest priority. Silence is safe, not awkward.`;
+```
+
+The two lines that mattered most in my testing were "speak briefly" and "silence is safe, not awkward." Out of the box the model is more talkative than a real pair would be. Once I added the second instruction, it stopped narrating my own actions back to me when I was just thinking.
+
+## Function Calling: turning suggestions into actions
+
+A pair programmer earns their keep when "should we leave a note about this?" turns into an actual saved note. Function Calling closes that loop.
+
+```typescript
+const PAIR_TOOLS = [
+  {
+    name: "save_note",
+    description: "Save the current discussion as a Markdown note on the local disk",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short title for the note" },
+        body: { type: "string", description: "Markdown body" },
+      },
+      required: ["title", "body"],
+    },
+  },
+  {
+    name: "open_docs",
+    description: "Open official documentation for a product and topic",
+    parameters: {
+      type: "object",
+      properties: {
+        product: { type: "string" },
+        topic: { type: "string" },
+      },
+      required: ["product", "topic"],
+    },
+  },
+];
+
+async function runTool(name: string, args: any) {
+  if (name === "save_note") {
+    const fs = await import("node:fs/promises");
+    const safe = args.title.replace(/[^\w\-]/g, "_");
+    const path = `./notes/${Date.now()}-${safe}.md`;
+    await fs.mkdir("./notes", { recursive: true });
+    await fs.writeFile(path, `# ${args.title}\n\n${args.body}\n`);
+    return { saved: path };
+  }
+  if (name === "open_docs") {
+    const url = `https://www.google.com/search?q=${encodeURIComponent(args.product + " " + args.topic + " docs")}`;
+    return { url };
+  }
+  return { error: "unknown tool" };
+}
+```
+
+For the deeper mechanics of Function Calling — the schema constraints, parallel calls, and recovery patterns — the [Gemini API Function Calling complete guide](/en/articles/gemini-api/gemini-api-function-calling-complete-guide) covers ground we will not repeat here. The one production lesson that bears repeating is to *always* respond to a tool call. If you skip a `sendToolResponse`, the Live session waits indefinitely, the audio stops, and the user thinks the tool froze.
+
+## Four design choices that kept the bill under five dollars
+
+Cost discipline is the difference between a tool you use every day and one you use twice and turn off. My setup runs about four to six dollars per month; an early version cost me five times that for the same use.
+
+First, **lock the screen frame rate to one fps**. Treat the screen as a stream of snapshots, not video, and drop JPEG quality to 0.6. Going to five fps did not improve answers in my A/B testing — it just multiplied the cost.
+
+Second, **pause frame uploads during silence**. After thirty seconds of no microphone activity and no significant screen change, my server stops sending frames until the user speaks or the screen meaningfully updates. Reading code, watching tests, and waiting on builds are exactly the times you do not need to pay for a continuous video stream.
+
+Third, **commit to a single response modality**. I set `responseModalities` to audio only. Asking for text and audio together doubles the response cost; if you also want a transcript for note-saving, ask for it explicitly inside a tool call instead of as a default modality.
+
+Fourth, **bound your sessions deliberately**. The Live API holds context across long sessions, but you pay for it. I cap each session at thirty minutes by asking the model to call `save_note` and ending the WebSocket. The new session starts cleanly with a small primer note as context. For a fuller cost discussion, [the Gemini 2.5 Flash indie developer cost-performance report](/en/articles/gemini-api/gemini-25-flash-indie-dev-cost-performance-report-2026-may) is the number-rich companion to this article.
+
+## Three things I got wrong before getting them right
+
+Production-shaped bugs that the docs do not mention.
+
+The first was that **Chromium's tab capture is event-driven**, not clock-driven. When the user picks a tab in the `getDisplayMedia` dialog, the underlying capture only emits frames when the tab visibly changes. Calling `requestAnimationFrame` returns nothing during a quiet period. The fix is to actively call `drawImage` on a `setInterval`, which is what the code above does.
+
+The second was **audio playback clipping at chunk boundaries**. Naively decoding each `audio_response` chunk with `decodeAudioData` and playing it produces tiny pops between chunks. The fix is to build a small scheduler around `AudioBufferSourceNode` that tracks the next start time and queues chunks back-to-back: `next.start(prev.endedAt)`.
+
+The third was **Function Calling arguments truncating around ten thousand characters**. I hit this by letting `save_note` accept a long `body`. The model started cutting itself off mid-call. The lesson is to keep tool arguments short and let the server expand or join them; if you need long content, pass a reference and fetch it server-side.
+
+For the broader patterns of bidirectional streaming protocols — back-pressure, framing, recovery — the WebSocket chapter of [*Real-Time Web Engineering: WebSocket, WebRTC, SSE* by Yusuke Nakamura](https://www.amazon.co.jp/dp/4297139383/?tag=pinocchio-22) is the reference I keep returning to. The taxonomy of failure modes generalizes well beyond Gemini.
+
+## Small finishing touches that made it daily-driver quality
+
+Three additions that took the project from "neat demo" to "I open this every morning."
+
+I added **rolling local recording**: a 24-hour SQLite log of audio plus thumbnail frames, indexed by timestamp. When I cannot remember why a decision was made, replaying ninety seconds of audio with the screen alongside is much faster than reading any text note.
+
+I added **a global hotkey to start and stop**. I have not built an Electron shell; instead I install the page as a Chromium PWA with experimental flags enabled, which gives me a single keystroke entry point.
+
+I added **a topic queue via Function Calling**. When I tell the pair "let's stay on the TypeScript bug, park the Rust idea for later," the model calls a `queue_topic` tool. Twenty minutes later it can ask, "ready to come back to the Rust thing?" Tiny touch, large effect on staying in flow.
+
+
+## Testing the bridge without burning tokens
+
+Iterating on the relay code is much faster if you can simulate the Gemini side rather than reconnect to the live model on every change. I built a small mock Live server that replays a recorded session as audio chunks. The skeleton looks like this:
+
+```typescript
+// src/server/mock-live.ts
+import { WebSocketServer } from "ws";
+import { readFile } from "node:fs/promises";
+
+const wss = new WebSocketServer({ port: 8788 });
+wss.on("connection", async (ws) => {
+  const audio = await readFile("./fixtures/sample-response.pcm");
+  // Send a fake serverContent message every 200ms
+  const chunkSize = 16000 * 0.2 * 2; // 200ms of 16kHz Int16
+  for (let i = 0; i < audio.length; i += chunkSize) {
+    await new Promise((r) => setTimeout(r, 200));
+    const chunk = audio.subarray(i, i + chunkSize);
+    ws.send(JSON.stringify({
+      serverContent: {
+        modelTurn: {
+          parts: [{
+            inlineData: {
+              mimeType: "audio/pcm;rate=24000",
+              data: chunk.toString("base64"),
+            },
+          }],
+        },
+      },
+    }));
+  }
+});
+```
+
+Pointing the bridge at this mock during development cuts the iteration loop to a few seconds per change. I save real Gemini responses to disk on demand by adding a small `--record` flag to the bridge.
+
+The other piece worth scripting is a synthetic browser client that injects pre-recorded screen frames and PCM audio. With both ends mocked, the entire system can run in CI as a smoke test, asserting that the bridge does not lose binary frames or drop tool responses under simulated load.
+
+## Deployment shapes that match different intentions
+
+There are three deployment shapes I have tried, and they suit different intentions.
+
+**Local-only**, running on your own laptop with `tsx src/server/bridge.ts`. This is what I use day to day. The browser opens a local page, the WebSocket connects to `ws://localhost:8787`, and nothing leaves the machine except the encrypted Gemini traffic. It costs nothing to run beyond the API calls themselves and disappears when I close the laptop.
+
+**Personal cloud**, running on a small VM (e.g., a $5 Hetzner box) with TLS termination via Caddy. This makes the pair available from any browser I am signed into, including a tablet I sometimes use as a second monitor. The trade-off is that you now have a TLS certificate, a domain, and a server to keep patched.
+
+**Browser extension shell** wrapping the client side. With a manifest V3 extension, you can capture the active tab without the screen-share dialog every time, and you can add a global keystroke that opens a sidebar overlay rather than a separate page. I have prototyped this; it is the next thing I plan to ship publicly.
+
+For each shape, the key separation is the same: the Gemini API key never reaches the client. Even in local-only mode, the browser talks to a server it owns, not to Gemini directly.
+
+## Practical accessibility considerations
+
+A pair programmer that listens and speaks has accessibility implications worth thinking about, both as opportunities and as risks.
+
+On the opportunity side, the screen-share-plus-voice loop is genuinely useful for developers who prefer audio over reading, or who use screen readers and find dual reading tracks (their reader plus a chat panel) hard to follow. Gemini speaking aloud while the screen reader handles structural navigation is a much calmer experience than alternating between the two.
+
+On the risk side, audio output can be unwelcome in a shared space and easy to forget about. I added two safeguards. The first is a visible indicator (a small dot in the top-right corner of the page) that turns red whenever the microphone is hot, mirrored by a subtle audio cue when capture starts and stops. The second is a hard mute hotkey that immediately halts both the microphone and any in-flight audio playback, even if a Gemini response is mid-chunk.
+
+For multilingual workflows, the system prompt can request English-only or Japanese-only responses, but in my testing, the Live API tends to follow the language of the user's most recent utterance regardless. If a strict single language is important, repeat the constraint at the start of every session.
+
+## Where to push this next
+
+The version above is intentionally small enough to read in one sitting. Once it is running, the natural extensions split into two directions.
+
+The first direction is **richer tool surface**. Beyond `save_note` and `open_docs`, useful tools I have added include a "run this command in a sandbox" tool (mapped to a Docker container per session), a "search my notes" tool backed by an embedding index of past `save_note` outputs, and a "draft a commit message" tool that summarizes the current `git diff`. Each one closes a specific friction loop in my own workflow.
+
+The second direction is **smarter framing**. The one-frame-per-second baseline is a starting point; you can do meaningfully better by detecting screen change deltas client-side and only sending frames that visibly differ from the previous one. A simple `imageBitmap` diff with a similarity threshold cuts upload volume in half during reading-heavy sessions without changing the conversational quality.
+
+Both directions are independent of the core architecture. The bridge stays the same; only the tools array and the frame scheduler change.
+
+
+## A note on the model choice and what to expect from Flash native audio
+
+I default to `gemini-2.5-flash-preview-native-audio-dialog` for everything in this article, and it is worth saying why and what to expect.
+
+The Flash native audio model is fast — first-token latency under 700 ms in my measurements from Tokyo — and the audio voice is comfortable enough to listen to for thirty minutes without fatigue. That speed is the load-bearing property here. A pair programmer that takes three seconds to start replying is no longer a pair; the user has already moved on to the next thought. Native audio shaves the round trip versus generating text and synthesizing it through a separate TTS step.
+
+The trade-off is reasoning depth. For genuinely hard architectural questions, the Pro tier with explicit thinking budget is sharper. My pattern is to keep the Flash voice loop running by default and ask it to "switch to deep mode for this one" via a tool call that spins up a Pro-tier text request, summarizes the answer, and speaks the summary. The user feels one assistant; the implementation routes between two models.
+
+Audio quality at 16 kHz input is fine for clearly enunciated speech in a quiet room. A noisy environment benefits from upgrading the browser's `getUserMedia` constraints to include `autoGainControl: true` and increasing `sampleRate` to 24 kHz on the input side, at the cost of slightly higher upload bandwidth. I keep my baseline at 16 kHz because most of my sessions are at a quiet desk; for cafe sessions, the higher sample rate is noticeably more accurate.
+
+If you want to go even cheaper, the half-cascade variant of the Live API (text reasoning plus a separate TTS step on the response side) costs less per minute, at the price of more latency and a less natural prosody. I tried it for a week and switched back; the latency hit broke the conversational feel.
+
+## Try the smallest version of this on a real workday
+
+Thank you for reading this far. The implementation is medium-sized, but its core is small: stream screen and audio to Gemini, play native audio back. The harder design question is *where in your own workflow you put a second pair of eyes*, and that only becomes clear after you live with it for a day or two.
+
+The concrete next step is to spin up the minimal version above against `gemini-2.5-flash-preview-native-audio-dialog`, start a screen-share with your normal work for thirty minutes, and notice which questions you suddenly find yourself asking out loud. The questions you discover are usually the ones worth answering — and that alone has paid back the time I spent building this.
