@@ -3,11 +3,35 @@ import createNextIntlPlugin from "next-intl/plugin";
 
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 
+
+// 削除済み記事の 301 redirect（2026-05-09 品質監査により撤去 — _documents/_quality_audit/cross_site/2026-05-09_cross_site_report.md 参照）
+// localePrefix: "as-needed" のため、ja は prefix なし、en は /en/ prefix
+const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
+  { from: "/articles/gemini-api/premium-showcase-multimodal-app-development", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/google-document-ai-gemini-intelligent-document-processing-guide", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/vertex-ai-search-gemini-enterprise-rag-production-guide", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/gemini-api-cloud-run-usage-based-saas-complete-guide", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/gemini-structured-output-advanced", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/gemini-live-api-realtime-voice-app-guide", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/gemini-api-saas-monetization", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-dev/firebase-ai-logic-swiftui-ios-production-app-guide-2026", to: "/articles/gemini-dev" },
+];
+
+const buildAuditRedirects = () => {
+  const out: { source: string; destination: string; permanent: true }[] = [];
+  for (const { from, to } of REMOVED_ARTICLE_REDIRECTS_2026_05_09) {
+    out.push({ source: from, destination: to, permanent: true });
+    out.push({ source: `/en${from}`, destination: `/en${to}`, permanent: true });
+  }
+  return out;
+};
+
 const nextConfig: NextConfig = {
   compress: true,
   poweredByHeader: false,
   async redirects() {
     return [
+      ...buildAuditRedirects(),
       // Legacy/orphan URL surfaced in GSC (2026-04-25): non-existent article slug, redirect to closest match
       {
         source: "/articles/gemini-api/gemini-api-multimodal-guide",
