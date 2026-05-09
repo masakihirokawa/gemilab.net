@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GOOGLEIO — Google I/O 2026 が 5/19〜20 開催、Gemini 3.5・Veo 4・Aluminium OS 発表予測（5月）",
+    "NOTEBOOKLM — Gemini 3.1 Pro が NotebookLM に展開、Pro / Ultra プラン限定で利用可能に（5月）",
+    "FLASH3X — 匿名 Gemini Flash 3.x が LM Arena 登場、3.1 Pro と互角の性能と早期評価（5月）",
+    "EMBEDDING2 — Gemini API File Search が gemini-embedding-2 でマルチモーダル対応、画像＋テキスト統合検索（5月）",
+    "HOME31 — Google Home が Gemini 3.1 を統合、複雑な多段階音声コマンドが扱えるように（5月）",
+    "GOOGLEIO — Google I/O 2026 が Shoreline で 5/19〜20 開催、Gemini OS 統合の披露へ秒読み（5月）",
     "ANDROIDSHOW — The Android Show I/O Edition が 5/12 プレ配信、Android 17 と Gemini OS 統合を披露（5月）",
-    "GEMINI31PRO — Gemini 3.1 Pro 公開、1M 文脈・customtools 専用エンドポイント・推論強化（4〜5月）",
-    "FILEGEN — Gemini チャットから Docs/Sheets/Slides/PDF/DOCX/XLSX/CSV を直接生成可能に（5月）",
-    "APPREDESIGN — Gemini アプリ大規模リデザイン、パルセーティング背景・ピル型プロンプト導入（5月）",
-    "PERSONALIZATION — Gemini に Personalization（実験的）追加、Search 履歴を回答に反映（5月）",
   ],
   en: [
-    "GOOGLEIO — Google I/O 2026 runs May 19-20, expected Gemini 3.5, Veo 4, and Aluminium OS reveals (May)",
+    "NOTEBOOKLM — Gemini 3.1 Pro rolls out to NotebookLM for Pro / Ultra subscribers (May)",
+    "FLASH3X — Anonymous Gemini Flash 3.x candidate appears on LM Arena, early reviews call it on par with 3.1 Pro (May)",
+    "EMBEDDING2 — Gemini API File Search adds gemini-embedding-2 for native image + text multimodal search (May)",
+    "HOME31 — Google Home integrates Gemini 3.1, enabling complex multi-step voice commands (May)",
+    "GOOGLEIO — Google I/O 2026 runs May 19-20 at Shoreline, Gemini OS integration is up next (May)",
     "ANDROIDSHOW — Android Show I/O Edition airs May 12 with Android 17 preview and Gemini OS integration (May)",
-    "GEMINI31PRO — Gemini 3.1 Pro launches with 1M context, customtools endpoint, and stronger reasoning (Apr-May)",
-    "FILEGEN — Gemini now generates Docs, Sheets, Slides, PDF, DOCX, XLSX, CSV directly from chat (May)",
-    "APPREDESIGN — Gemini app gets a major redesign with pulsating gradient and pill-shaped prompt box (May)",
-    "PERSONALIZATION — Gemini adds experimental Personalization that uses your Search history to refine answers (May)",
   ],
 };
 
