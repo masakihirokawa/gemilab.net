@@ -1,0 +1,201 @@
+---
+title: "Gemini APIで tools と responseSchema を同時指定すると400になる — Function Callingと構造化出力を両立する3つの設計"
+slug: "gemini-api-tools-and-response-schema-conflict-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-09T18:15"
+author: "Gemini Lab"
+description: "Function Callingで外部APIを呼びつつ、最終回答は決まった形のJSONで受け取りたい。tools と responseSchema を両方指定すると400エラーになる仕様の理由と、本番で安定して動く3つの回避設計を実装例つきで解説します。"
+tags: ["troubleshooting", "function-calling", "structured-output", "responseSchema", "gemini-api"]
+---
+
+「Function Callingで外部APIを叩きつつ、最終回答は決まったJSON形式で受け取りたい」というのは、エージェント実装ではごく普通のニーズです。私もチャットボットに天気情報と検索結果を渡したうえで、フロントエンドが扱いやすい固定スキーマで返したくて、`tools` と `responseSchema` を同じ `generateContent` 呼び出しに渡したことがありました。結果は `400 INVALID_ARGUMENT` で、エラーメッセージは「Function calling is not enabled for models with response schema」のような短い一行だけ。原因がわかってしまえば素直な仕様ですが、初見では「片方だけしか使えないのか」と諦めかけてしまう落とし穴です。
+
+この記事では、なぜ Gemini API がこの 2 つを同時指定できないのかという仕様の背景と、本番運用で実際にうまく動いている 3 通りの設計パターンをコード付きで紹介します。読み終えたあとには、Function Calling と構造化出力を矛盾なく両立させる実装方針を、自分の用途に合わせて選べるようになるはずです。
+
+## なぜ tools と responseSchema は同時に使えないのか
+
+Gemini API における `tools`（Function Calling）と `responseSchema`（構造化出力）は、どちらも「モデルの出力形式を制約する」という同じ役割を担っています。そのため内部的にはどちらか一方しか有効にできない設計になっており、両方を指定すると以下のような 400 エラーが返ります。
+
+```
+google.api_core.exceptions.InvalidArgument: 400 Function calling is not
+enabled for models with response_schema. Please use tools or
+response_schema, but not both.
+```
+
+`tools` を有効にすると、モデルは「テキスト応答」「関数呼び出し（functionCall パート）」のどちらかを返す状態になります。一方 `responseSchema` を渡すとモデルは「指定した JSON スキーマに従ったテキスト」だけを返すモードに切り替わります。両者は「最終出力の形」を異なる規則で固定するため、共存できないわけです。
+
+ちなみに公式ドキュメントの表記は静かに変わっており、2026 年 5 月時点では `Tool` のページに「`responseSchema` を使う場合は `tools` を併用しないでください」という注意書きが追加されています。気づかずに古いサンプルから書き起こすとハマるので、エラーが出たらまず公式ガイドの最新版に当たり直すのが確実です。
+
+## パターン 1: 「最終回答用 Function」を 1 つ用意する
+
+最も実装が軽く、本番でも私がよく使うのがこの方式です。`responseSchema` の代わりに、最終回答そのものを 1 つの関数として宣言してしまいます。
+
+```python
+# Python 3.11 / google-genai >= 0.5.0
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+# 1) 外部APIを叩くツール
+get_weather = types.FunctionDeclaration(
+    name="get_weather",
+    description="指定都市の現在の天気を返す",
+    parameters={
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+)
+
+# 2) 最終回答スキーマを「関数」として表現する
+respond_to_user = types.FunctionDeclaration(
+    name="respond_to_user",
+    description="ユーザーへの最終回答。必ずこの関数を最後に呼び出す",
+    parameters={
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "description": "1〜2文の要約"},
+            "temperature_c": {"type": "number"},
+            "next_action": {
+                "type": "string",
+                "enum": ["wear_jacket", "bring_umbrella", "none"],
+            },
+        },
+        "required": ["summary", "temperature_c", "next_action"],
+    },
+)
+
+config = types.GenerateContentConfig(
+    tools=[types.Tool(function_declarations=[get_weather, respond_to_user])],
+    tool_config=types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+    ),
+)
+
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents="今日の東京の服装を提案して",
+    config=config,
+)
+# response.candidates[0].content.parts[-1].function_call.args が
+# respond_to_user のスキーマで返る
+```
+
+期待出力としては、最初の往復で `get_weather` が呼ばれ、結果を返すと最後に `respond_to_user` が決まったスキーマで戻ってきます。`respond_to_user` を「必ず最後に呼ぶ」とプロンプトでも強調しておくと、モデルがプレーンテキストで答えてしまう事故を防げます。
+
+実装の小ネタとして、`tool_config.mode` を `"ANY"` にして `allowed_function_names=["respond_to_user"]` を最後の往復だけ指定すると、強制的に最終回答だけを呼ばせることができます。複数ターンでツールを使い分ける場合の最後のひと押しに便利です。
+
+## パターン 2: ツール実行と整形を 2 回に分ける
+
+「Function Calling のフェーズ」と「整形のフェーズ」を別の `generateContent` 呼び出しに分離するのも、堅実で読みやすい設計です。
+
+```python
+# 1) 1回目: tools のみ指定してツール呼び出しを完了させる
+tool_config = types.GenerateContentConfig(
+    tools=[types.Tool(function_declarations=[get_weather])],
+)
+turn1 = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=user_input,
+    config=tool_config,
+)
+# functionCall を実行し、その結果を contents に追加して再度呼ぶ往復を実装
+
+# 2) 2回目: tools を外し、responseSchema だけ指定して最終整形させる
+schema_config = types.GenerateContentConfig(
+    response_mime_type="application/json",
+    response_schema={
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "temperature_c": {"type": "number"},
+            "next_action": {
+                "type": "string",
+                "enum": ["wear_jacket", "bring_umbrella", "none"],
+            },
+        },
+        "required": ["summary", "temperature_c", "next_action"],
+    },
+)
+final = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=conversation_so_far + [
+        types.Content(
+            role="user",
+            parts=[types.Part(text="ここまでの内容を最終JSONで返してください")],
+        )
+    ],
+    config=schema_config,
+)
+import json
+result = json.loads(final.text)
+```
+
+呼び出しが 1 回増えるためレイテンシとコストはやや上がりますが、責務が明確に分かれるためログ・監視がしやすく、整形フェーズを別モデル（例: コスト重視で Flash）に切り替えることもできます。エラー時のリトライ範囲も狭くしやすい点はチーム開発で効いてきます。本番のチャットアシスタントでは、私もこのパターンを基本にしています。
+
+## パターン 3: 自由形式で受けて Pydantic で検証する
+
+最終出力に厳密なスキーマが必要だが、エージェント側のロジックは Function Calling で完結させたい、というケースに向く折衷案です。`tools` のみを指定して関数呼び出しと最終テキストを生成させ、テキストの中から JSON を抽出してアプリ側で Pydantic 検証します。
+
+```python
+from pydantic import BaseModel, ValidationError, Field
+from typing import Literal
+import json, re
+
+class WeatherAnswer(BaseModel):
+    summary: str
+    temperature_c: float = Field(ge=-50, le=60)
+    next_action: Literal["wear_jacket", "bring_umbrella", "none"]
+
+raw = response.text  # Function Calling 完了後の最終テキスト
+match = re.search(r"\{.*\}", raw, re.DOTALL)
+try:
+    parsed = WeatherAnswer.model_validate_json(match.group(0))
+except (ValidationError, AttributeError):
+    # 失敗時は responseSchema を有効にして再実行（パターン2へフォールバック）
+    parsed = retry_with_schema(raw)
+```
+
+期待出力は `WeatherAnswer` 型のオブジェクトで、`temperature_c` の異常値や Enum 違反は ValidationError として落ちます。プロンプトに「JSON のみを返してください」と書いてもモデルが前後に説明文を付けることがあるので、抽出ロジックとフォールバックは必ずセットで実装してください。型システムをフル活用したい方は、[Gemini APIをPydanticで型安全に使う本番設計ガイド](/articles/gemini-api/gemini-api-pydantic-structured-output-type-safe-production) も合わせて読むと、Pydantic 検証の設計指針が整理しやすくなります。
+
+## 設計を選ぶときの判断基準
+
+3 つのパターンは、どれが優れているという話ではなく用途で選ぶものです。私が現場で使い分けている基準を共有します。
+
+- **シンプルなツール 1〜2 個＋固定形式の最終回答**: パターン 1 が最短コース。プロンプトとスキーマを 1 ファイルに書けるため、レビューも楽です。
+- **複数ツールを順に呼ぶエージェントで、最終 JSON を厳密に守りたい**: パターン 2。整形フェーズを別モデルにできる柔軟性が大きく、レイテンシ予算に余裕があるならこれが一番安全です。
+- **既存のテキスト出力フローを大きく変えたくない**: パターン 3。Pydantic 等の検証層を挟めるなら、`responseSchema` 抜きでも本番品質に持っていけます。
+
+なお、Function Calling 全般の設計でつまずいたら、[Gemini APIのFunction Callingが効かないときのトラブルシューティング](/articles/gemini-api/gemini-function-calling-not-working-troubleshooting) と [Gemini APIのToolループを止める実践ガイド](/articles/gemini-api/gemini-api-tool-calling-infinite-loop-troubleshooting) が参考になります。スキーマ自体で 400 が出る場合は [Function Calling のスキーマで invalid_argument が出る原因と修正パターン](/articles/gemini-api/gemini-function-calling-schema-invalid-argument-fix) で診断手順を確認してください。
+
+API 設計の根本的な考え方を体系的に学び直したい方には、[Web API: The Good Parts（水野貴明）](https://www.amazon.co.jp/dp/4873116864/?tag=pinocchio-22) が、Function Calling のスキーマ設計やエラー設計に応用できる原則を分かりやすくまとめてくれています。
+
+## 本番で時間を節約するための実装メモ
+
+どのパターンを選ぶ場合でも、共通して効いてくる小さな工夫を 4 つだけ書いておきます。あとから読み返すと当たり前に見えるのですが、最初の 1 回はだいたいここで時間を溶かします。
+
+**スキーマは早い段階で検証する**: Gemini は OpenAPI 3.0 のサブセットしか受け取りません。`additionalProperties`・`oneOf`・`$ref` などは SDK バージョンによって無視されたり 400 になったりします。エージェントループに組み込む前に、最小の `contents` で 1 回だけ `generateContent` を叩いて受理されるかを確かめるのが、後で詰まないコツです。
+
+**会話履歴はモデルが返したものと厳密に揃える**: 次の往復に渡す `contents` には、モデルが返した `functionCall` パートをそのまま append し、続けて自分で作った `functionResponse` パートを並べる必要があります。テキストだけ DB に保存して再構築すると、モデルが「どの呼び出しに対する応答か」を見失い、関数を二重に呼んだりプレーンテキストに戻ったりします。
+
+**ターン上限を必ず設ける**: プロンプトでどれだけ釘を刺しても、モデルが想定以上にツールを呼んでしまうことはあります。8 ターンなど上限を決めてループを切り、フォールバックの定型応答に落とすシンプルなカウンタを入れておくと、コスト暴走の保険になります。
+
+**生のレスポンスを必ずロギングする**: 開発初期は `response.candidates[0]` の生 JSON をそのままログに残してください。「なぜ respond_to_user が呼ばれなかったのか」を追うとき、`parts` の中身を直接読めるかどうかで原因特定の時間が桁違いに変わります。
+
+## やりがちなミスと回避策
+
+私が実際にやらかしたものを共有します。先回りで知っておくと、半日くらい得をします。
+
+- **スキーマを description に書いてしまう**: モデルは自然言語で書かれた制約を強制してくれません。固定形式が欲しいなら `parameters`（パターン 1）か `response_schema`（パターン 2）に書く必要があります。
+- **最終回答用の関数を途中で呼んでしまう**: ツールの結果が揃う前に `respond_to_user` を呼ぶと、プレースホルダのまま返ってきます。「これは必ず最後に呼ぶ」とシステムプロンプトで明確にしてください。
+- **snake_case と camelCase が混在している**: 1 つの関数宣言の中で命名規則を揃えるだけで、引数生成の精度は目に見えて上がります。
+- **`tool_config.mode` をデフォルトのままにしている**: 最終ターンだけ `"ANY"` にして `allowed_function_names` を 1 つに絞ると、最後のひと押しで揺らぎが消えます。
+
+## 次の一手
+
+明日の実装に直結するアクションを 1 つだけ挙げるなら、「いま書いている Function Calling のフローに、最終回答用の関数を 1 つ追加してパターン 1 に揃える」ことをおすすめします。最小の変更で構造化レスポンスを実現でき、責務が増えてきたらパターン 2 への移行もスムーズです。
+
+同じ場所で詰まっていた方の参考になれば幸いです。お読みいただきありがとうございました。
