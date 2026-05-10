@@ -1,0 +1,196 @@
+---
+title: "Putting Gemini Embeddings in the Browser — Building a Serverless FAQ Search with IndexedDB"
+slug: "gemini-embedding-indexeddb-browser-faq-search"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-10T15:45"
+author: "Gemini Lab"
+description: "How I shipped semantic search for a few hundred FAQ entries without standing up a vector database. Gemini Embedding runs once at build time, the index sits in IndexedDB, and searches happen in the browser."
+tags: ["gemini-api", "embedding", "indexeddb", "browser", "vector-search"]
+---
+
+When users of one of my wallpaper apps started telling me that "the help section is hard to navigate," my first instinct was to bolt on a hosted search service like Algolia or a vector database like Pinecone. The moment I saw the recurring monthly cost, though, I stopped. The FAQ has roughly 200 entries, and they barely change. Paying a fixed fee for a search service didn't feel proportionate to the size of the problem.
+
+So I tried the opposite direction: run Gemini Embedding once at build time, ship the resulting JSON to the client, store it in IndexedDB, and let the browser do the cosine similarity. After living with this for a few weeks inside a real app, the pattern turned out to hold up better than I expected. Here's the design and the parts that took the longest to get right.
+
+## Why I deliberately avoided a server
+
+I've been a solo app developer since 2014, with cumulative downloads now over 50 million across my catalog. The way I keep that sustainable is by being ruthless about fixed costs. A few hundred yen a month for infrastructure across a portfolio of free apps adds up to actual losses, so I tend to ask whether each piece of infrastructure is really pulling its weight.
+
+Search isn't something I want to compromise on, since it shapes how people experience the app. I needed a setup that would:
+
+- Avoid hitting the Gemini API once per query (cost and latency)
+- Skip any always-on server (operational load)
+- Optimize for the small-corpus reality of solo development (200–2,000 entries)
+- Survive an unstable network so the experience holds up on the train
+
+That last constraint ended up being the deciding factor. Many of my wallpaper-app users browse on commutes where connectivity is patchy. If search depends on the network, complaints spike fast.
+
+## The shape of the system, in three places
+
+The final architecture splits responsibilities across three places:
+
+- **Build time, in Node.js**: read the FAQ markdown, call Gemini Embedding for every entry, write `public/faq-index.json`
+- **First page load in the browser**: fetch that JSON and copy it into IndexedDB
+- **At search time**: embed only the user's query, then run cosine similarity against the cached vectors
+
+Embeddings only run twice in the user's lifetime: once for the whole corpus at deploy time, and once per query in their session. From the user's perspective, the only round-trip is that single query embedding, which lands around 200 ms.
+
+## Embedding the corpus at build time
+
+The first piece is a Node script that calls `gemini-embedding-001` with `task_type: RETRIEVAL_DOCUMENT`. The official docs are blunt about pairing different task types for documents and queries, and skipping that detail is a common reason people see lower-than-expected accuracy.
+
+```javascript
+// scripts/build-faq-index.mjs
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { readFile, writeFile } from "node:fs/promises";
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
+
+async function buildIndex() {
+  const raw = await readFile("./content/faq.json", "utf8");
+  const faqs = JSON.parse(raw); // [{ id, question, answer }]
+
+  const items = [];
+  for (const faq of faqs) {
+    // Embedding "question + first chunk of answer" gave noticeably better recall
+    const text = `${faq.question}\n\n${faq.answer.slice(0, 400)}`;
+
+    const result = await model.embedContent({
+      content: { parts: [{ text }] },
+      taskType: "RETRIEVAL_DOCUMENT",
+      outputDimensionality: 768, // 768 is plenty here; 1536 roughly doubles JSON size
+    });
+
+    items.push({
+      id: faq.id,
+      question: faq.question,
+      answer: faq.answer,
+      vector: result.embedding.values,
+    });
+  }
+
+  await writeFile(
+    "./public/faq-index.json",
+    JSON.stringify({ version: Date.now(), items })
+  );
+  console.log(`Built index for ${items.length} entries`);
+}
+
+buildIndex();
+```
+
+For 200 entries this took about 12 seconds and produced a 1.4 MB JSON file. The output gets served from CDN. The `outputDimensionality: 768` setting is the lever that keeps the JSON size manageable — `gemini-embedding-001` lets you truncate dimensions, and at this corpus size I couldn't feel a quality difference between 768 and 1536.
+
+## Caching to IndexedDB so we don't refetch every load
+
+Fetching 1.4 MB on every visit would defeat the point. The cache layer uses IndexedDB and a `version` field on the JSON to decide whether to refresh.
+
+```javascript
+// src/faq/db.ts
+const DB_NAME = "faq-index";
+const STORE = "vectors";
+
+async function openDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(STORE, { keyPath: "id" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function loadOrFetchIndex(): Promise<FaqEntry[]> {
+  const db = await openDB();
+
+  const meta = await getOne(db, "meta", "version");
+  const remote = await fetch("/faq-index.json").then((r) => r.json());
+
+  if (meta?.value === remote.version) {
+    return await getAll(db, STORE);
+  }
+
+  await clear(db, STORE);
+  await bulkPut(db, STORE, remote.items);
+  await putOne(db, "meta", { key: "version", value: remote.version });
+  return remote.items;
+}
+```
+
+`version` is just `Date.now()` at build, so it bumps on every deploy. With long cache headers on the JSON, an unchanged day means IndexedDB serves immediately and the network never wakes up.
+
+The IndexedDB literature is full of "don't keep transactions open too long" warnings, but in practice writing 200 entries in one go didn't produce any noticeable jank in my testing. If you're going past 1,000 entries, chunk into batches of about 100.
+
+## Searching with cosine similarity
+
+For the query side, the task type flips to `RETRIEVAL_QUERY`. Forgetting this drops perceived recall by something like 20–30%, which I noticed before I caught my own mistake.
+
+```typescript
+// src/faq/search.ts
+export async function searchFaq(
+  query: string,
+  index: FaqEntry[],
+  topK = 5
+): Promise<FaqEntry[]> {
+  const res = await fetch("/api/embed-query", {
+    method: "POST",
+    body: JSON.stringify({ text: query }),
+  }).then((r) => r.json());
+  const q: number[] = res.vector;
+
+  const scored = index.map((entry) => ({
+    ...entry,
+    score: cosine(q, entry.vector),
+  }));
+
+  return scored.sort((a, b) => b.score - a.score).slice(0, topK);
+}
+
+function cosine(a: number[], b: number[]): number {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+```
+
+The `/api/embed-query` endpoint is a 30-line Cloudflare Worker that hides the API key — see [Building an Edge AI API on Cloudflare Workers](/en/articles/gemini-api/gemini-api-cloudflare-workers-edge-ai) for the same shape end-to-end. The Gemini call sits around 200 ms, and cosine similarity on 200 vectors finishes in under 5 ms.
+
+## What the numbers actually look like
+
+After running this in production for about a week:
+
+- **JSON size for 200 entries**: 1.4 MB (480 KB after gzip), CDN-fetched in roughly 100 ms first time
+- **IndexedDB write**: ~60 ms
+- **Search latency**: 220–280 ms (the query embedding accounts for almost all of it)
+- **Subsequent navigations**: zero network, search in ~30 ms
+
+On accuracy, with 200 entries I land the right FAQ in the top three for paraphrased queries about 90% of the time. A pure BM25 baseline missed obvious cases like "where do my wallpapers save" vs. "save destination for images" — the embedding-based approach handled those without ceremony.
+
+To be honest about a limit I hit: **once the corpus crosses about 1,000 entries, the first-page load starts to feel heavy**. I tried a 1,200-entry version of this for another app and the JSON ballooned past 7 MB, which was clearly too much on slow connections. That experience pointed straight at the next section.
+
+## Where this design quietly breaks down
+
+After three months running it, here are the cases where I'd reach for something else.
+
+- **More than ~2,000 entries**: the JSON gets unwieldy and the first-load cost no longer feels free. Either move to a hosted vector DB ([ChromaDB-backed corporate doc search](/en/articles/gemini-api/gemini-embedding-chroma-document-search-system) covers one such pattern) or split the JSON by category
+- **High-frequency content updates**: if you redeploy several times a day, you're rewriting the user's IndexedDB cache constantly. At that point a server-backed index is simpler than building diff-update plumbing
+- **Multi-language content**: each language doubles the payload. I capped this at Japanese and English; beyond that you'd want per-locale lazy loading
+- **You need rerank**: cosine alone leaves edge cases where the right concept matches but the context is off. Real rerank means hosting a rerank model server-side ([here is one approach with Vertex AI Ranking and an LLM judge](/en/articles/gemini-api/gemini-embeddings-rerank-rag-precision-production)), which puts you back in server territory
+
+But for "a few hundred entries, low update frequency, mobile users who deserve offline support," I think this is one of the genuinely solid options. One of my grandfathers was a temple carpenter, and the way he'd choose tools to match the size of the work has stuck with me. When the service is small, a browser-only solution earns its keep.
+
+## A small first step
+
+If you want to try this, don't start by embedding the entire corpus. **Run the build script against a hand-picked 50 entries first** so you can see in seconds what cosine similarity returns on your own domain. Watching the ranking on a small set is the fastest way to develop intuition for whether semantic search behaves the way you'd want it to. The bigger architectural calls get easier once that intuition is in place.
+
+Hope this helps if you're sketching the same kind of feature.

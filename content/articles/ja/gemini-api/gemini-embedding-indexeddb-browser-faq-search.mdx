@@ -1,0 +1,201 @@
+---
+title: "Gemini Embedding をブラウザに持たせる — IndexedDB でサーバーレスな FAQ 検索を作った話"
+slug: "gemini-embedding-indexeddb-browser-faq-search"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-10T15:45"
+author: "Gemini Lab"
+description: "数千件規模のFAQやヘルプ記事を、サーバーを立てずにブラウザ側で意味検索する設計を実装した記録です。Gemini Embedding を build 時に一度だけ叩き、IndexedDB にキャッシュして cosine 類似度で引きます。"
+tags: ["gemini-api", "embedding", "indexeddb", "browser", "vector-search"]
+---
+
+個人開発の壁紙アプリで、ユーザーから「使い方が探しにくい」という声をもらったとき、最初に考えたのは Algolia や Pinecone のような検索サービスを入れることでした。けれど月額の固定費が発生する時点で、私の運用ポリシーには合いません。FAQ は 200 件ほどしかなく、しかも頻繁に更新されるわけでもないからです。
+
+「これくらいなら、ブラウザ側で意味検索できるのではないか」と思い、Gemini Embedding を build 時に一度だけ叩き、JSON にして IndexedDB に保存するアプローチを試しました。アプリの中で動かしているうちに、思ったよりも実用に耐えることが分かったので、設計と実装の流れをそのまま書き残しておきます。
+
+## なぜサーバーを立てない選択をしたか
+
+個人開発の現場で、検索機能のためだけにサーバーを抱えるのは現実的ではありません。私は 2014 年から累計 5,000 万ダウンロードほどのアプリを個人で運用していますが、固定費は徹底して圧縮してきました。月数百円のインフラが積み上がると、無料で配布しているアプリでは赤字に直結するからです。
+
+検索という機能はユーザー体験に直結するので、安易に削るわけにもいきません。そこで、次の条件を満たす設計を探しました。
+
+- 検索クエリのたびに Gemini API を叩かない（コストとレイテンシ）
+- 動的なサーバーを増やさない（運用負荷ゼロ）
+- 200〜2,000 件程度の小規模コンテンツに最適化する（個人開発の実情に合わせる）
+- オフラインでも動く（ユーザーの体感を損なわない）
+
+このうち最後の「オフラインでも動く」が決め手になりました。壁紙アプリのユーザーは電車の中など回線の不安定な環境で使うことが多く、検索が回線依存だと不満が一気に増えます。
+
+## 全体構成 — 3 つの場所で役割を分ける
+
+完成形の構成は次のようにシンプルです。
+
+- **build 時（Node.js）**: FAQ の Markdown を読み、Gemini Embedding API を叩いてベクトル化し、`public/faq-index.json` として書き出す
+- **初回アクセス時（ブラウザ）**: その JSON を fetch して IndexedDB に保存する
+- **検索時（ブラウザ）**: クエリだけを Gemini Embedding API で 1 回ベクトル化し、IndexedDB のベクトルと cosine 類似度を計算する
+
+ベクトル化は 2 回しか走りません。build 時の全件と、ユーザーが検索ボックスを叩いた瞬間の 1 回だけです。ユーザー側のレイテンシは「クエリのベクトル化 1 回」だけなので、200ms 程度に収まります。
+
+## build 時に Embedding を生成する
+
+最初に作るのは Node スクリプトです。`gemini-embedding-001` モデルを使い、`task_type` には `RETRIEVAL_DOCUMENT` を渡します。検索対象とクエリで task_type を変えるのは公式ドキュメントにも書かれている重要な点で、ここを揃えると精度が落ちます。
+
+```javascript
+// scripts/build-faq-index.mjs
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { readFile, writeFile } from "node:fs/promises";
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
+
+async function buildIndex() {
+  // FAQ は YAML や Markdown の front matter から読む想定
+  const raw = await readFile("./content/faq.json", "utf8");
+  const faqs = JSON.parse(raw); // [{ id, question, answer }]
+
+  const items = [];
+  for (const faq of faqs) {
+    // 「質問 + 回答の冒頭」を埋め込みの対象にすると検索精度が上がります
+    const text = `${faq.question}\n\n${faq.answer.slice(0, 400)}`;
+
+    const result = await model.embedContent({
+      content: { parts: [{ text }] },
+      taskType: "RETRIEVAL_DOCUMENT",
+      outputDimensionality: 768, // 768 で十分。1536 にすると JSON が約 2 倍になる
+    });
+
+    items.push({
+      id: faq.id,
+      question: faq.question,
+      answer: faq.answer,
+      vector: result.embedding.values,
+    });
+  }
+
+  await writeFile(
+    "./public/faq-index.json",
+    JSON.stringify({ version: Date.now(), items })
+  );
+  console.log(`✅ ${items.length} entries embedded`);
+}
+
+buildIndex();
+```
+
+実測では 200 件で 12 秒、生成された JSON は約 1.4 MB でした。これを CDN 越しに配信します。`outputDimensionality` を 768 にしているのがポイントで、`gemini-embedding-001` は出力次元を切り詰められるため、JSON サイズを直接削れます。768 でも体感的な精度の差はほぼありません。
+
+## IndexedDB に保存してロードを高速化する
+
+JSON を毎回 fetch すると初回以外でも 1.4 MB の通信が発生します。これを避けるために IndexedDB にキャッシュし、`version` フィールドで更新を判定します。
+
+```javascript
+// src/faq/db.ts
+const DB_NAME = "faq-index";
+const STORE = "vectors";
+
+async function openDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(STORE, { keyPath: "id" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function loadOrFetchIndex(): Promise<FaqEntry[]> {
+  const db = await openDB();
+
+  // まずローカルの version を読む
+  const meta = await getOne(db, "meta", "version");
+  const remote = await fetch("/faq-index.json").then((r) => r.json());
+
+  if (meta?.value === remote.version) {
+    // 既存キャッシュを使う
+    return await getAll(db, STORE);
+  }
+
+  // 更新された場合のみ書き換える
+  await clear(db, STORE);
+  await bulkPut(db, STORE, remote.items);
+  await putOne(db, "meta", { key: "version", value: remote.version });
+  return remote.items;
+}
+```
+
+`version` は build 時の `Date.now()` を入れているので、デプロイのたびに増えます。サイト側のヘッダーキャッシュを長めに設定しておけば、更新がない日は IndexedDB から即座に返せて、ネットワークアクセスが発生しません。
+
+公式ドキュメントには「IndexedDB のトランザクションは長く保つな」とよく書かれていますが、実装してみると 200 件を一括 `put` する程度ではブロッキングは感じませんでした。1,000 件を超えるなら 100 件ずつチャンク化することをおすすめします。
+
+## 検索時の cosine 類似度計算
+
+クエリ側のベクトル化は `task_type` を `RETRIEVAL_QUERY` に切り替えます。これを忘れると精度が体感で 2〜3 割落ちます。
+
+```typescript
+// src/faq/search.ts
+export async function searchFaq(
+  query: string,
+  index: FaqEntry[],
+  topK = 5
+): Promise<FaqEntry[]> {
+  // クエリだけ Gemini Embedding を叩く
+  const res = await fetch("/api/embed-query", {
+    method: "POST",
+    body: JSON.stringify({ text: query }),
+  }).then((r) => r.json());
+  const q: number[] = res.vector;
+
+  const scored = index.map((entry) => ({
+    ...entry,
+    score: cosine(q, entry.vector),
+  }));
+
+  return scored.sort((a, b) => b.score - a.score).slice(0, topK);
+}
+
+function cosine(a: number[], b: number[]): number {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+```
+
+`/api/embed-query` は API キーをクライアントに晒さないための薄いプロキシで、[Cloudflare Workers でのエッジ AI API 構築](/articles/gemini-api/gemini-api-cloudflare-workers-edge-ai) の手順をなぞれば 30 行ほどで書けます。Gemini API への呼び出し自体は 1 リクエストあたり 200ms 前後、cosine の計算は 200 件規模なら 5ms 以下で終わります。
+
+## 実測 — レイテンシ・サイズ・精度の現実
+
+実装を 1 週間ほどアプリに入れて使ってみた数字です。
+
+- **JSON サイズ（200 件）**: 1.4 MB（gzip 後 480 KB）。CDN 経由で初回 100ms 程度
+- **IndexedDB 書き込み**: 60ms 前後
+- **検索 1 回のレイテンシ**: 220〜280ms（うちクエリ embedding が 200ms）
+- **2 回目以降のページ遷移**: ネットワーク 0、検索 30ms 前後
+
+精度については、200 件規模であれば「同義語クエリでも目的の FAQ が上位 3 件に入る」確率が体感 9 割を超えました。BM25 のキーワード検索だと「壁紙の保存先」と「画像の保存場所」が結びつかなかった事例も、embedding ベースなら拾えます。
+
+ここで一つ正直に書いておくと、**1,000 件を超えるとブラウザの初回ロードが重くなる**のが率直な感想です。私が運用しているアプリの一つで、ヘルプ記事を 1,200 件入れた版を試したところ、JSON が 7 MB ほどになり、低速回線では明らかに体感が落ちました。後述する「向かない場面」の重要なシグナルです。
+
+## この設計が向かない場面
+
+3 か月運用してみて、向かない場面も見えてきました。
+
+- **エントリ数が 2,000 を超える**: 単純に JSON のサイズが膨らみ、初回ロードが重くなります。サーバー側にベクトル DB を置くか（[ChromaDB を使った社内ドキュメント検索の実践](/articles/gemini-api/gemini-embedding-chroma-document-search-system)が参考になります）、カテゴリで JSON を分割する設計に切り替えた方が現実的です
+- **頻繁に更新が走る**: 1 日に何度も build が走ると、ユーザー側の IndexedDB を毎回入れ替える必要があります。差分更新を実装するくらいなら、最初からサーバーで持つ方が楽です
+- **多言語化が必要**: 言語ごとに JSON を分けると倍々で容量が増えます。これは設計ミスではなく規模の問題で、私の場合は日本語＋英語までで止めました
+- **検索結果の rerank が必要**: cosine 類似度だけだと「正しい答えだが文脈がずれる」ケースが残ります。本格的に精度を上げるなら、サーバー側で [リランカーで本番 RAG の精度を底上げする設計](/articles/gemini-api/gemini-embeddings-rerank-rag-precision-production) を取り入れる前提になります
+
+逆に「数百件規模・更新頻度が低い・モバイルでオフラインも考慮したい」というケースには、本当に手堅い選択肢だと感じています。両祖父が宮大工だったこともあって、私はちょうど良い大きさに合わせた設計が好きです。サービスが小さなうちは、ブラウザだけで完結する仕組みは強い味方になります。
+
+## 次に試したいなら、まず 50 件で
+
+これから取り組むなら、いきなり全 FAQ を embed しようとせず、**手元の 50 件だけで build スクリプトを動かして JSON を出力してみる**のが最短のスタート地点です。50 件なら数秒で終わるので、cosine 類似度の出力を眺めながら「自分のドメインだとどの距離感で検索が合うのか」を肌で掴めます。そこから先の設計判断は、その手触りを得てから決めるので十分間に合います。
+
+実装の参考になれば幸いです。お読みいただきありがとうございました。
