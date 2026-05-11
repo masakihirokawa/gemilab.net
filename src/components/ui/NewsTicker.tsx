@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMINI4 — Google I/O 2026（5/19）で Gemini 4 発表予告、コンテキスト 2M トークン・統合画像/動画生成を搭載へ（5/11）",
-    "REMY — Gemini の新エージェント「Remy」: 仕事・学習・日常を 24/7 サポートするパーソナルアシスタント（5/11）",
-    "OMNI — Gemini UI 内に未発表の動画モデル「Omni」が検出、I/O 2026 での発表を示唆（5/11）",
-    "NOTEBOOKLM — Gemini 3.1 Pro が NotebookLM に展開、Pro / Ultra プラン限定で利用可能に（5月）",
-    "FIREBASE — Firebase Studio がエージェント型にアップグレード、自律マルチファイル編集・テスト・デプロイが可能に（5月）",
-    "GOOGLEIO — Google I/O 2026 が Shoreline で 5/19〜20 開催、Agentic AI と Android 17 の全貌が明らかに（5/19〜）",
+    "GOOGLEIO — Google I/O 2026 は 5/19 開幕。Gemini 4・Android 17・Aluminium OS・XR の発表に注目（5/19-20）",
+    "ANDROIDSHOW — The Android Show I/O Edition が本日 5/12 に配信開始、Android 17 を先行プレビュー",
+    "GEMINI4 — Gemini 4：2Mトークンコンテキスト・統合画像/動画生成・Veo 4 同時発表予定（5/19）",
+    "REMY — 「Remy」24時間パーソナルAIエージェント：仕事・学習・日常生活を包括サポートへ（Google I/O 予定）",
+    "OMNI — Gemini アプリ UI に未発表の「Omni」動画モデルがリーク、Veo 3.1 と並行展開予定（5月）",
+    "NOTEBOOKLM — Gemini 3.1 Pro が NotebookLM に展開、Pro/Ultra ユーザー向けに全面提供（5月）",
   ],
   en: [
-    "GEMINI4 — Gemini 4 expected at Google I/O 2026 (5/19): 2M token context and integrated image/video generation (5/11)",
-    "REMY — Meet Remy, Gemini's new 24/7 personal agent for work, school, and daily life (5/11)",
-    "OMNI — Leaked 'Omni' video model spotted inside Gemini UI, likely to debut at I/O 2026 (5/11)",
-    "NOTEBOOKLM — Gemini 3.1 Pro rolls out to NotebookLM for Pro / Ultra subscribers (May)",
-    "FIREBASE — Firebase Studio gets an agentic upgrade: autonomous multi-file editing, testing, and deployment (May)",
-    "GOOGLEIO — Google I/O 2026 runs May 19-20 at Shoreline: Agentic AI, Android 17, and Aluminium OS revealed (5/19-)",
+    "GOOGLEIO — Google I/O 2026 opens May 19: Gemini 4, Android 17, Aluminium OS & XR all expected (5/19-20)",
+    "ANDROIDSHOW — The Android Show I/O Edition airs today May 12 with early Android 17 preview",
+    "GEMINI4 — Gemini 4: 2M token context, integrated image/video gen & Veo 4 debut expected (5/19)",
+    "REMY — 'Remy' 24/7 personal AI agent: work, learning & daily life support all-in-one (Google I/O expected)",
+    "OMNI — 'Omni' video model leaks in Gemini UI ahead of I/O, set to launch alongside Veo 3.1 (May)",
+    "NOTEBOOKLM — Gemini 3.1 Pro rolls out to NotebookLM for Pro/Ultra users globally (May)",
   ],
 };
 
