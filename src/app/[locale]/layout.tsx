@@ -5,6 +5,7 @@ import { ThemeProvider } from "@/components/layout/ThemeProvider";
 import { Header } from "@/components/layout/Header";
 import { Footer } from "@/components/layout/Footer";
 import { DynamicNewsTicker, DynamicScrollToTop, DynamicCookieBanner, DynamicMembershipPromoModal } from "@/components/layout/DynamicComponents";
+import { getPremiumAccess } from "@/lib/premium";
 
 // Blocking script to prevent FOUC (Flash of Unstyled Content) on theme change
 const themeScript = `(function(){try{var t=localStorage.getItem('gemilab-theme');document.documentElement.setAttribute('data-theme',t||'dark')}catch(e){}})()`;
@@ -27,6 +28,7 @@ export default async function LocaleLayout({
   }
 
   const messages = (await import(`@/i18n/messages/${locale}.json`)).default;
+  const canViewPremium = !!(await getPremiumAccess());
 
   return (
     <html lang={locale} suppressHydrationWarning>
@@ -70,7 +72,7 @@ export default async function LocaleLayout({
             <main style={{ paddingTop: 99 }}>{children}</main>
             <Footer />
             <DynamicScrollToTop />
-            <DynamicMembershipPromoModal locale={locale} siteName="Gemini Lab" />
+            {!canViewPremium && <DynamicMembershipPromoModal locale={locale} siteName="Gemini Lab" />}
             <DynamicCookieBanner
               gaId="G-CJWM68JK57"
               privacyHref={locale === "ja" ? "/privacy" : "/en/privacy"}
