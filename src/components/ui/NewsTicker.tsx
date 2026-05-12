@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GOOGLEIO — Google I/O 2026 は 5/19 開幕。Gemini 4・Android 17・Aluminium OS・XR の発表に注目（5/19-20）",
-    "ANDROIDSHOW — The Android Show I/O Edition が本日 5/12 に配信開始、Android 17 を先行プレビュー",
-    "GEMINI4 — Gemini 4：2Mトークンコンテキスト・統合画像/動画生成・Veo 4 同時発表予定（5/19）",
-    "REMY — 「Remy」24時間パーソナルAIエージェント：仕事・学習・日常生活を包括サポートへ（Google I/O 予定）",
-    "OMNI — Gemini アプリ UI に未発表の「Omni」動画モデルがリーク、Veo 3.1 と並行展開予定（5月）",
-    "NOTEBOOKLM — Gemini 3.1 Pro が NotebookLM に展開、Pro/Ultra ユーザー向けに全面提供（5月）",
+    "GOOGLEIO — Google I/O 2026 は 5/19 開幕。Gemini 次世代バージョン・Android XR・Aluminum OS の大型発表に期待",
+    "REMY — 「Remy」開発中：仕事・ルーティン・アプリ連携をこなす 24 時間対応アンビエント AI エージェント",
+    "ULTRALITE — Google が「AI Ultra Lite」新プランを準備中、$20 Pro と $250 Ultra の中間帯に新サブスク層",
+    "ANDROID — Gemini が Android に深化（5/12 CNBC）、画面コンテキストを理解し複数アプリをまたぐタスクを完遂",
+    "AGENT — Google が Gemini をフルエージェント化計画、チャットボックスから脱却し汎用 AI エージェントへ進化",
+    "HOME — Google Home の 2026年5月更新、Gemini AI 連携でオートメーション条件・アクションがさらに拡充",
   ],
   en: [
-    "GOOGLEIO — Google I/O 2026 opens May 19: Gemini 4, Android 17, Aluminium OS & XR all expected (5/19-20)",
-    "ANDROIDSHOW — The Android Show I/O Edition airs today May 12 with early Android 17 preview",
-    "GEMINI4 — Gemini 4: 2M token context, integrated image/video gen & Veo 4 debut expected (5/19)",
-    "REMY — 'Remy' 24/7 personal AI agent: work, learning & daily life support all-in-one (Google I/O expected)",
-    "OMNI — 'Omni' video model leaks in Gemini UI ahead of I/O, set to launch alongside Veo 3.1 (May)",
-    "NOTEBOOKLM — Gemini 3.1 Pro rolls out to NotebookLM for Pro/Ultra users globally (May)",
+    "GOOGLEIO — Google I/O 2026 kicks off May 19: next-gen Gemini, Android XR & Aluminum OS all expected",
+    "REMY — 'Remy' in development: a 24/7 ambient AI agent handling errands, routines & connected-app tasks",
+    "ULTRALITE — Google quietly preps 'AI Ultra Lite' tier to slot between $20 Pro and $250 Ultra plans",
+    "ANDROID — Gemini deepens Android integration (CNBC 5/12): understands screen context, completes cross-app tasks",
+    "AGENT — Google plans to evolve Gemini into a full AI agent, breaking out of the chatbox entirely",
+    "HOME — Google Home May 2026 update expands Gemini AI with more automation conditions and actions",
   ],
 };
 
