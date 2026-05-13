@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GOOGLEIO — Google I/O 2026 は 5/19 開幕。Gemini 次世代バージョン・Android XR・Aluminum OS の大型発表に期待",
-    "REMY — 「Remy」開発中：仕事・ルーティン・アプリ連携をこなす 24 時間対応アンビエント AI エージェント",
-    "ULTRALITE — Google が「AI Ultra Lite」新プランを準備中、$20 Pro と $250 Ultra の中間帯に新サブスク層",
-    "ANDROID — Gemini が Android に深化（5/12 CNBC）、画面コンテキストを理解し複数アプリをまたぐタスクを完遂",
-    "AGENT — Google が Gemini をフルエージェント化計画、チャットボックスから脱却し汎用 AI エージェントへ進化",
-    "HOME — Google Home の 2026年5月更新、Gemini AI 連携でオートメーション条件・アクションがさらに拡充",
+    "GOOGLEIO — Google I/O 2026 は 5/19〜20 開幕、Gemini 4・Android 17・Android XR・Aluminium OS の大型発表に期待（5日後）",
+    "GEMINI-INTELLIGENCE — Gemini Intelligence for Android 発表（5/12）、複数アプリをまたぐタスク自動化・Gmail連携・予約を音声で完結",
+    "GOOGLEBOOKS — Google が「Googlebooks」ノートPC発表（秋発売予定）、Gemini Intelligence 専用設計・Acer/ASUS/Dell/HP/Lenovo で展開",
+    "ANDROID-AUTO — Android Auto 最大アップデート、2.5 億台の車で Gemini 連携・10年ぶりの大幅マップ刷新",
+    "ULTRA-LITE — Google が「AI Ultra Lite」プランを準備中、Pro と Ultra の中間価格帯でより多くのユーザーに高機能モデルを提供",
+    "REMY — 「Remy」エージェント開発中、仕事・ルーティン・アプリ連携をこなす 24 時間対応アンビエント AI エージェント",
   ],
   en: [
-    "GOOGLEIO — Google I/O 2026 kicks off May 19: next-gen Gemini, Android XR & Aluminum OS all expected",
-    "REMY — 'Remy' in development: a 24/7 ambient AI agent handling errands, routines & connected-app tasks",
-    "ULTRALITE — Google quietly preps 'AI Ultra Lite' tier to slot between $20 Pro and $250 Ultra plans",
-    "ANDROID — Gemini deepens Android integration (CNBC 5/12): understands screen context, completes cross-app tasks",
-    "AGENT — Google plans to evolve Gemini into a full AI agent, breaking out of the chatbox entirely",
-    "HOME — Google Home May 2026 update expands Gemini AI with more automation conditions and actions",
+    "GOOGLEIO — Google I/O 2026 opens May 19–20: Gemini 4, Android 17, Android XR & Aluminium OS all expected (5 days away)",
+    "GEMINI-INTELLIGENCE — Gemini Intelligence for Android announced (5/12): cross-app task automation, Gmail, shopping & reservations by voice",
+    "GOOGLEBOOKS — Google unveils 'Googlebooks' laptops (fall 2026): built ground-up for Gemini Intelligence with Acer, ASUS, Dell, HP & Lenovo",
+    "ANDROID-AUTO — Android Auto gets biggest maps update in a decade plus Gemini-powered in-car assistance for 250M+ cars",
+    "ULTRA-LITE — Google readies 'AI Ultra Lite' plan: new mid-tier subscription bringing advanced Gemini to more users",
+    "REMY — 'Remy' ambient AI agent in development: handles work routines and cross-app tasks around the clock",
   ],
 };
 
@@ -35,7 +35,7 @@ export function NewsTicker() {
         width: "100%",
         zIndex: 99,
         height: 35,
-        background: "color-mix(in srgb, var(--accent-coral) 4%, transparent)",
+        background: "color-mix(in srgb, var(--accent-teal) 4%, transparent)",
         borderBottom: "1px solid var(--border-subtle)",
         display: "flex",
         alignItems: "center",
@@ -64,7 +64,7 @@ export function NewsTicker() {
               gap: 12,
             }}
           >
-            <span style={{ color: "var(--accent-coral)", fontSize: 8 }}>●</span>
+            <span style={{ color: "var(--accent-teal)", fontSize: 8 }}>●</span>
             {text}
           </span>
         ))}
