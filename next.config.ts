@@ -219,6 +219,17 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/gemini-dev/gemini-code-assist-outline-feature-guide", to: "/articles/gemini-dev" },
   { from: "/articles/gemini-dev/jules-ai-google-coding-agent-guide", to: "/articles/gemini-dev" },
   { from: "/articles/gemini-workspace/google-workspace-gemini-practical-daily-workflow", to: "/articles/gemini-workspace" },
+
+  // 2026-05-15 GSC崩壊対応 Phase 3: 4+違反の重度低品質記事を削除
+  { from: "/articles/gemini-api/gemini-api-embedding-errors-troubleshooting-guide", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/gemini-api-pandas-data-analysis-guide", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/gemini-api-php-laravel-ai-guide", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/gemini-api-python-async-asyncio-guide", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/gemini-api-redis-semantic-cache-guide", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-api/gemini-multimodal-rag-pipeline-production-guide", to: "/articles/gemini-api" },
+  { from: "/articles/gemini-dev/gemini-api-react-ai-chat-ui-guide", to: "/articles/gemini-dev" },
+  { from: "/articles/gemini-dev/gemini-github-actions-ci-cd-guide", to: "/articles/gemini-dev" },
+  { from: "/articles/gemini-dev/gemini-md-setup-guide", to: "/articles/gemini-dev" },
 ];
 
 const buildAuditRedirects = () => {
