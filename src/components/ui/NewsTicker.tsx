@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GOOGLEIO — Google I/O 2026 は 5/19〜20 開幕、Gemini 4・Android 17・Android XR・Aluminium OS の大型発表に期待（5日後）",
-    "GEMINI-INTELLIGENCE — Gemini Intelligence for Android 発表（5/12）、複数アプリをまたぐタスク自動化・Gmail連携・予約を音声で完結",
-    "GOOGLEBOOKS — Google が「Googlebooks」ノートPC発表（秋発売予定）、Gemini Intelligence 専用設計・Acer/ASUS/Dell/HP/Lenovo で展開",
-    "ANDROID-AUTO — Android Auto 最大アップデート、2.5 億台の車で Gemini 連携・10年ぶりの大幅マップ刷新",
-    "ULTRA-LITE — Google が「AI Ultra Lite」プランを準備中、Pro と Ultra の中間価格帯でより多くのユーザーに高機能モデルを提供",
-    "REMY — 「Remy」エージェント開発中、仕事・ルーティン・アプリ連携をこなす 24 時間対応アンビエント AI エージェント",
+    "GOOGLEIO — Google I/O 2026 が 5/19 開幕、Gemini Omni・Android 17・Android XR グラスの発表に期待集まる",
+    "GEMINI — Gemini Omni リーク：テキスト・画像・動画生成を単一パイプラインに統合した次世代モデルが登場予定",
+    "ANDROID — Gemini Intelligence for Android 発表（5/12）、複数アプリをまたぐタスク自動化・フォーム入力が可能に",
+    "BOOKS — Google が Googlebooks（Gemini 専用ノートPC）を秋に発売、Acer・ASUS・Dell など主要メーカーと共同開発",
+    "AUTO — Android Auto が Gemini 連携で大型アップデート、運転中の夕食予約・情報検索を音声+Geminiで完結",
+    "MODEL — Google が I/O 直前に新 Gemini モデルを準備中、GPT-5.5 対抗として Gemini 4.0 相当の性能向上が見込まれる",
   ],
   en: [
-    "GOOGLEIO — Google I/O 2026 opens May 19–20: Gemini 4, Android 17, Android XR & Aluminium OS all expected (5 days away)",
-    "GEMINI-INTELLIGENCE — Gemini Intelligence for Android announced (5/12): cross-app task automation, Gmail, shopping & reservations by voice",
-    "GOOGLEBOOKS — Google unveils 'Googlebooks' laptops (fall 2026): built ground-up for Gemini Intelligence with Acer, ASUS, Dell, HP & Lenovo",
-    "ANDROID-AUTO — Android Auto gets biggest maps update in a decade plus Gemini-powered in-car assistance for 250M+ cars",
-    "ULTRA-LITE — Google readies 'AI Ultra Lite' plan: new mid-tier subscription bringing advanced Gemini to more users",
-    "REMY — 'Remy' ambient AI agent in development: handles work routines and cross-app tasks around the clock",
+    "GOOGLEIO — Google I/O 2026 opens May 19: Gemini Omni, Android 17 & Android XR glasses all expected to debut",
+    "GEMINI — Gemini Omni leaked: next-gen model unifies text, image & video generation into a single pipeline",
+    "ANDROID — Gemini Intelligence for Android announced (May 12): cross-app task automation & form-filling now possible",
+    "BOOKS — Google unveils Googlebooks, Gemini-native laptops launching this fall with Acer, ASUS & Dell",
+    "AUTO — Android Auto gets major Gemini upgrade: voice + AI handles dinner reservations while you drive",
+    "MODEL — Google readying new Gemini model before I/O to rival GPT-5.5, with Gemini 4.0-level improvements expected",
   ],
 };
 
@@ -35,7 +35,7 @@ export function NewsTicker() {
         width: "100%",
         zIndex: 99,
         height: 35,
-        background: "color-mix(in srgb, var(--accent-teal) 4%, transparent)",
+        background: "color-mix(in srgb, var(--accent-coral) 4%, transparent)",
         borderBottom: "1px solid var(--border-subtle)",
         display: "flex",
         alignItems: "center",
@@ -64,7 +64,7 @@ export function NewsTicker() {
               gap: 12,
             }}
           >
-            <span style={{ color: "var(--accent-teal)", fontSize: 8 }}>●</span>
+            <span style={{ color: "var(--accent-coral)", fontSize: 8 }}>●</span>
             {text}
           </span>
         ))}
