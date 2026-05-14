@@ -210,6 +210,15 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/gemini-updates/gemini-gmail-ai-overviews-inbox-2026", to: "/articles/gemini-updates" },
   { from: "/articles/gemini-updates/apple-google-gemini-partnership-ios-guide", to: "/articles/gemini-updates" },
   { from: "/articles/gemini-updates/gemma-4-complete-guide-2026", to: "/articles/gemini-updates" },
+  // 2026-05-15 Tax-related article removal (YMYL compliance for GSC崩壊 recovery)
+  { from: "/articles/gemini-dev/gemini-2-5-pro-niche-vertical-saas-150k-monthly", to: "/articles/gemini-dev" },
+
+  // 2026-05-15 GSC崩壊対応: TMPL_TITLE違反+他違反の記事を一括削除（Helpful Content System対応）
+  { from: "/articles/gemini-advanced/gemini-2-5-pro-deep-research-guide", to: "/articles/gemini-advanced" },
+  { from: "/articles/gemini-basics/what-is-gemma-4", to: "/articles/gemini-basics" },
+  { from: "/articles/gemini-dev/gemini-code-assist-outline-feature-guide", to: "/articles/gemini-dev" },
+  { from: "/articles/gemini-dev/jules-ai-google-coding-agent-guide", to: "/articles/gemini-dev" },
+  { from: "/articles/gemini-workspace/google-workspace-gemini-practical-daily-workflow", to: "/articles/gemini-workspace" },
 ];
 
 const buildAuditRedirects = () => {
