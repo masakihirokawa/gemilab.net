@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GOOGLEIO — Google I/O 2026 が 5/19 開幕、Gemini Omni・Android 17・Android XR グラスの発表に期待集まる",
-    "GEMINI — Gemini Omni リーク：テキスト・画像・動画生成を単一パイプラインに統合した次世代モデルが登場予定",
+    "GOOGLEIO — Google I/O 2026 が 5/19 開幕まで4日前、Gemini 3.2 Flash・Android XR グラス・Aluminium OS の正式発表に注目",
+    "FLASH — Gemini 3.2 Flash が 5/5 に iOS アプリ・AI Studio で先行公開、GPT-5.5 の 92% の性能をコスト 1/15 で実現",
     "ANDROID — Gemini Intelligence for Android 発表（5/12）、複数アプリをまたぐタスク自動化・フォーム入力が可能に",
-    "BOOKS — Google が Googlebooks（Gemini 専用ノートPC）を秋に発売、Acer・ASUS・Dell など主要メーカーと共同開発",
-    "AUTO — Android Auto が Gemini 連携で大型アップデート、運転中の夕食予約・情報検索を音声+Geminiで完結",
-    "MODEL — Google が I/O 直前に新 Gemini モデルを準備中、GPT-5.5 対抗として Gemini 4.0 相当の性能向上が見込まれる",
+    "BOOKS — Google が Googlebook（Gemini 専用ノートPC）を秋に発売、Acer・ASUS・Dell など主要メーカーと共同開発",
+    "XR — Android XR グラスが I/O 2026 で初公開予定、Gemini 搭載スマートグラスとして Android エコシステムに統合",
+    "OS — Android が「OS からインテリジェンスシステムへ」転換、Samsung・Pixel から順次 Gemini Intelligence を展開",
   ],
   en: [
-    "GOOGLEIO — Google I/O 2026 opens May 19: Gemini Omni, Android 17 & Android XR glasses all expected to debut",
-    "GEMINI — Gemini Omni leaked: next-gen model unifies text, image & video generation into a single pipeline",
-    "ANDROID — Gemini Intelligence for Android announced (May 12): cross-app task automation & form-filling now possible",
-    "BOOKS — Google unveils Googlebooks, Gemini-native laptops launching this fall with Acer, ASUS & Dell",
-    "AUTO — Android Auto gets major Gemini upgrade: voice + AI handles dinner reservations while you drive",
-    "MODEL — Google readying new Gemini model before I/O to rival GPT-5.5, with Gemini 4.0-level improvements expected",
+    "GOOGLEIO — 4 days to Google I/O 2026 (May 19): Gemini 3.2 Flash, Android XR glasses & Aluminium OS expected",
+    "FLASH — Gemini 3.2 Flash quietly launched in iOS app & AI Studio on May 5: 92% of GPT-5.5 at 1/15 the cost",
+    "ANDROID — Gemini Intelligence for Android (May 12): cross-app task automation & form-filling now possible",
+    "BOOKS — Google unveils Googlebook, Gemini-native laptops launching this fall with Acer, ASUS & Dell",
+    "XR — Android XR glasses to debut at I/O 2026, integrating Gemini-powered eyewear into the Android ecosystem",
+    "OS — Android transitions 'from OS to intelligence system'; Gemini Intelligence rolling out to Samsung & Pixel this summer",
   ],
 };
 
