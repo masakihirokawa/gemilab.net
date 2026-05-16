@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GOOGLEIO — Google I/O 2026 が 5/19 開幕まで4日前、Gemini 3.2 Flash・Android XR グラス・Aluminium OS の正式発表に注目",
-    "FLASH — Gemini 3.2 Flash が 5/5 に iOS アプリ・AI Studio で先行公開、GPT-5.5 の 92% の性能をコスト 1/15 で実現",
-    "ANDROID — Gemini Intelligence for Android 発表（5/12）、複数アプリをまたぐタスク自動化・フォーム入力が可能に",
-    "BOOKS — Google が Googlebook（Gemini 専用ノートPC）を秋に発売、Acer・ASUS・Dell など主要メーカーと共同開発",
-    "XR — Android XR グラスが I/O 2026 で初公開予定、Gemini 搭載スマートグラスとして Android エコシステムに統合",
-    "OS — Android が「OS からインテリジェンスシステムへ」転換、Samsung・Pixel から順次 Gemini Intelligence を展開",
+    "IO — Google I/O 2026 は 5/19〜20 開催、Gemini 4.0（Omni）・Android 17・Android XR グラス・Aluminium OS に期待（5/17）",
+    "MODEL — Gemini Omni: テキスト・画像・動画生成を単一パイプラインに統合した新モデルが I/O で正式発表予定（5/17）",
+    "FLASH — Gemini 3.2 Flash が先行リリース、GPT-5.5 の 92% 性能を 1/15 コストで実現、Google AI Studio で利用中（5/5）",
+    "ANDROID — Gemini Intelligence for Android 発表、アプリをまたいだ複雑タスクを自動化（5/12 The Android Show）",
+    "RACE — Google が Apple の iOS 27 AI 刷新に対抗、Android での Gemini 中核化を加速（CNBC 5/12）",
+    "CREATIVE — I/O 2026 で Veo（動画生成）・Lyria（音楽生成）の大幅アップデートが発表される見通し（Google 公式予告）",
   ],
   en: [
-    "GOOGLEIO — 4 days to Google I/O 2026 (May 19): Gemini 3.2 Flash, Android XR glasses & Aluminium OS expected",
-    "FLASH — Gemini 3.2 Flash quietly launched in iOS app & AI Studio on May 5: 92% of GPT-5.5 at 1/15 the cost",
-    "ANDROID — Gemini Intelligence for Android (May 12): cross-app task automation & form-filling now possible",
-    "BOOKS — Google unveils Googlebook, Gemini-native laptops launching this fall with Acer, ASUS & Dell",
-    "XR — Android XR glasses to debut at I/O 2026, integrating Gemini-powered eyewear into the Android ecosystem",
-    "OS — Android transitions 'from OS to intelligence system'; Gemini Intelligence rolling out to Samsung & Pixel this summer",
+    "IO — Google I/O 2026 runs May 19–20; expect Gemini 4.0 (Omni), Android 17, Android XR glasses & Aluminium OS (May 17)",
+    "MODEL — Gemini Omni: unified text, image & video generation pipeline to debut at Google I/O 2026 (May 2026)",
+    "FLASH — Gemini 3.2 Flash now available in Google AI Studio; 92% of GPT-5.5 performance at 1/15 the cost (May 5)",
+    "ANDROID — Gemini Intelligence for Android announced: cross-app task automation across Gmail, Shopping & more (May 12)",
+    "RACE — Google accelerates Gemini integration into Android core ahead of Apple's iOS 27 AI overhaul (CNBC, May 12)",
+    "CREATIVE — I/O 2026 expected to unveil major updates to Veo (video) and Lyria (music) generation (Google preview)",
   ],
 };
 
