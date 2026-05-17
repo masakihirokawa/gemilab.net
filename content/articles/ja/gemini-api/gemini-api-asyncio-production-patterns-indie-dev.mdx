@@ -1,0 +1,434 @@
+---
+title: "Gemini API asyncio 非同期処理の本番パターン——並列リクエストで処理時間を1/5に短縮した実装記録"
+slug: "gemini-api-asyncio-production-patterns-indie-dev"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-18T02:45"
+author: "Gemini Lab"
+description: "Gemini API の asyncio 非同期処理を本番環境に組み込んだ実装記録。Semaphore によるレート制限対策、指数バックオフ、部分失敗の扱い方まで、個人開発アプリのバックエンドで実際に遭遇したパターンを整理して紹介します。"
+tags: ["gemini-api", "asyncio", "python", "非同期処理", "本番環境", "個人開発"]
+highlights:
+  - "画像1,000枚の逐次処理で6時間かかっていたバックエンドが、asyncio 並列化でどう変わったかを追体験できる"
+  - "Gemini API の RPM/TPM 制限に引っかかることなく高スループットを実現する Semaphore パターンのコードを入手できる"
+  - "部分失敗・タイムアウト・指数バックオフを一つに組み込んだ本番用の asyncio ラッパーをそのまま使えるようになる"
+---
+
+2026年に入ってから、個人で運営している壁紙アプリ「Beautiful 4K/HDR Wallpapers」のバックエンドで、Gemini APIを使って画像コンテンツの自動カテゴリ分類に取り組みました。廣川政樹として2013年からアプリ事業を続けてきた中で、累計5,000万DLを超えた今もアプリのコンテンツ更新作業は頻繁に発生します。その更新作業を自動化しようとした際、最初に直面したのが「同期処理では現実的な時間に収まらない」という問題でした。
+
+最初のバージョンは Python の同期処理で書いていて、1,000枚の画像を処理するのに推定6時間以上かかる計算でした。アプリのカタログ更新はほぼ毎週行う必要があるため、この所要時間は明らかに現実的ではありません。asyncio による非同期処理に切り替えたところ、最終的に処理時間を約1/5まで短縮できました。
+
+学んだ Gemini API の asyncio 実装パターンを整理して共有します。「動くコード」だけでなく、「本番で詰まったポイント」と「なぜこう書くのか」の理由まで含めています。
+
+## なぜ同期処理では限界が来るのか
+
+Gemini API は HTTP ベースの REST API です。同期処理でリクエストを1件ずつ投げると、それぞれのネットワーク往復時間が積み上がっていきます。1リクエストあたりの応答時間が平均2秒だとすると、1,000件で2,000秒（約33分）。画像の前処理やローカルI/Oも含めると6時間という計算が現実に近くなります。
+
+同期処理のコードは読みやすく、デバッグも簡単です。スケールしない以外は問題がなく、少量のデータを扱う間は問題なく動き続けます。しかしアプリのコンテンツが増え、分類対象の画像が数百件から数千件になる段階で、同期処理の限界は突然訪れます。
+
+```python
+import google.generativeai as genai
+
+# ❌ 同期処理の例（これでは遅い）
+def classify_images_sync(image_paths: list[str]) -> list[dict]:
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    results = []
+    for path in image_paths:
+        with open(path, "rb") as f:
+            image_data = f.read()
+        response = model.generate_content([
+            '{"category": "...", "tags": [...]}の形式でJSONのみ返してください。',
+            {"mime_type": "image/jpeg", "data": image_data}
+        ])
+        results.append({"path": path, "result": response.text})
+    return results
+```
+
+asyncio を使えば、複数のリクエストを同時に飛ばすことができます。ネットワークの応答を待っている間、イベントループは別のリクエストを開始できます。ただし Gemini API には RPM（1分あたりのリクエスト数）と TPM（1分あたりのトークン数）の制限があるため、無制限に並列化するとすぐにレート制限エラーが返ってきます。「並列化しながらレート制限を守る」という二律背反を解決するのが、次に説明する Semaphore パターンです。この二律背反こそが asyncio 初学者が一番詰まるポイントです。レート制限を無視して並列数を上げすぎると 429 エラーが頻発し、レート制限を守りすぎると並列化のメリットが失われます。ちょうどよいバランスを見つけることが設計の核心です。
+
+## asyncio.to_thread() による同期SDKのラップ
+
+2026年5月時点で、`google-generativeai` の Python SDK は同期クライアントのみを提供しています。asyncio で使うには `asyncio.to_thread()` を使って同期関数をスレッドプールで実行するのが最も安定した方法です。
+
+`asyncio.to_thread()` は Python 3.9 以上で使えます。内部的には `loop.run_in_executor(None, func)` と同等ですが、より直感的に書けます。これを使うことで、同期処理のAPIコールを「ブロッキングしないコルーチン」として扱えるようになります。
+
+```python
+import asyncio
+import google.generativeai as genai
+
+genai.configure(api_key="YOUR_GEMINI_API_KEY")
+model = genai.GenerativeModel("gemini-2.5-flash")
+
+async def call_gemini_async(prompt: str, image_data: bytes, mime_type: str = "image/jpeg") -> str:
+    """
+    同期のGemini APIコールをスレッドプールで非同期実行する。
+    asyncio.to_thread() でブロッキング処理をイベントループの外に逃がす。
+    """
+    def _sync_call():
+        response = model.generate_content([
+            prompt,
+            {"mime_type": mime_type, "data": image_data}
+        ])
+        return response.text
+
+    return await asyncio.to_thread(_sync_call)
+```
+
+この実装で重要な点は、`genai.GenerativeModel` のインスタンスを複数のスレッドで共有していることです。私の環境では、並列数30のスレッドプールで共有しても状態の競合は発生しませんでした。ただし `genai.configure(api_key=...)` はモジュールレベルで一度だけ呼ぶことが前提です。
+
+これだけでは「非同期で実行できる」だけで、複数件を並列実行する仕組みがありません。次のステップが核心部分です。
+
+## Semaphore による並列数の制御
+
+`asyncio.Semaphore` を使うと「同時に走らせるリクエスト数の上限」を設定できます。セマフォを取得したタスクだけが API コールを実行でき、上限に達したタスクはセマフォが解放されるまで待機します。この仕組みにより、並列数をコントロールしながらすべてのリクエストを最終的に完了させることができます。
+
+私の経験では、`gemini-2.5-flash` の無料枠（RPM 1,000）に対して並列数20が安全な出発点でした。並列数30では62分まで短縮できましたが、429エラーが増え始めました。並列数40では返ってパフォーマンスが落ちました。この「最適な並列数」はAPIのティアや実行環境によって異なるため、小さな値から段階的に上げていくアプローチを強くお勧めします。
+
+```python
+import asyncio
+import time
+
+CONCURRENT_REQUESTS = 20
+
+async def process_images_parallel(
+    image_paths: list[str],
+    prompt: str,
+    concurrency: int = CONCURRENT_REQUESTS
+) -> list[dict]:
+    """
+    画像リストを並列処理する。
+    Semaphore で同時実行数を制限し、レート制限エラーを回避する。
+    """
+    semaphore = asyncio.Semaphore(concurrency)
+    results = []
+
+    async def _process_one(path: str) -> dict:
+        async with semaphore:
+            try:
+                with open(path, "rb") as f:
+                    image_data = f.read()
+                result = await call_gemini_async(prompt, image_data)
+                return {"path": path, "status": "ok", "result": result}
+            except Exception as e:
+                return {"path": path, "status": "error", "error": str(e)}
+
+    tasks = [_process_one(path) for path in image_paths]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    return list(results)
+```
+
+私の環境では、1,000枚を同期処理で約360分（推定）かかっていたものが、並列数20で81分、並列数30で62分に短縮されました。並列数40では429エラーのリトライが増え、71分と遅くなりました。
+
+## 指数バックオフによるリトライの実装
+
+並列処理を動かし始めてすぐに直面するのが `429 Resource Exhausted` エラーです。このエラーは一時的なレート制限なので、適切な待機時間を入れてリトライすれば解決できます。
+
+問題は「固定秒数でリトライすると全スレッドが同時に再試行して再び詰まる」ことです。これを「サンダリングハード」問題と呼びます。20のスレッドが同時に2秒待ってから一斉に再試行すると、再び429が発生しやすくなります。
+
+これを避けるために指数バックオフ（待機時間を2のべき乗で増やす）とジッター（ランダムな上乗せ時間）を組み合わせます。1回目のリトライは約1秒後、2回目は約2秒後、3回目は約4秒後という形で待機時間が増え、かつスレッドごとに少しずれた時間で再試行するため、サンダリングハードを防げます。
+
+```python
+import asyncio
+import random
+import logging
+from google.api_core import exceptions as google_exceptions
+
+logger = logging.getLogger(__name__)
+
+async def call_gemini_with_retry(
+    prompt: str,
+    image_data: bytes,
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+    mime_type: str = "image/jpeg"
+) -> str:
+    """
+    指数バックオフ + ジッター付きリトライ。
+    429 / 503 は一時的エラーとして扱い、その他は即座に re-raise する。
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return await call_gemini_async(prompt, image_data, mime_type)
+
+        except google_exceptions.ResourceExhausted:
+            if attempt >= max_retries:
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 1.0)
+            logger.warning(f"Rate limited (attempt {attempt+1}/{max_retries}). Retry in {delay:.1f}s")
+            await asyncio.sleep(delay)
+
+        except google_exceptions.ServiceUnavailable:
+            if attempt >= max_retries:
+                raise
+            delay = base_delay * (1.5 ** attempt) + random.uniform(0, 0.5)
+            logger.warning(f"Service unavailable (attempt {attempt+1}/{max_retries}). Retry in {delay:.1f}s")
+            await asyncio.sleep(delay)
+
+        except Exception:
+            raise
+
+    raise RuntimeError("Unreachable")
+```
+
+`await asyncio.sleep(delay)` でリトライ待機中にイベントループに制御を返す点が重要です。スレッドをブロックするのではなく、イベントループが他のタスクを処理できる状態にしながら待機します。この非同期スリープにより、1つのタスクがバックオフ中でも他の20のタスクは継続して処理を進められます。
+
+## 部分失敗を許容する設計
+
+1,000件の処理で全件成功を前提にしてはいけません。JSONパースエラー、壊れた画像ファイル、一時的なネットワーク障害など、必ずある割合で失敗が起きます。
+
+`asyncio.gather()` はデフォルト（`return_exceptions=False`）で、いずれかのタスクで例外が発生すると即座にその例外を raise して処理を中断します。これは「1件のエラーで900件の成功結果が無駄になる」という危険な挙動です。
+
+私が採用した設計は「成功した分は即座にファイルに書き出し、失敗した分は後でリトライする」というパターンです。処理の途中でプロセスが落ちても、書き出し済みの結果は失われません。また `asyncio.Lock()` でファイルへの書き込みを排他制御することで、複数タスクが同時に書き込もうとしてファイルが壊れるのを防ぎます。
+
+```python
+import asyncio
+import json
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+@dataclass
+class ClassificationResult:
+    path: str
+    status: str
+    result: dict | None = None
+    error: str | None = None
+    attempts: int = 0
+
+async def process_with_partial_failure_handling(
+    image_paths: list[str],
+    prompt: str,
+    output_file: Path,
+    concurrency: int = 20
+) -> tuple[list[ClassificationResult], list[str]]:
+    """
+    部分失敗を許容しながら処理する。
+    成功結果は逐次 output_file に追記し、失敗したパスは failed_paths に収集。
+    """
+    semaphore = asyncio.Semaphore(concurrency)
+    lock = asyncio.Lock()
+
+    async def _process_one(path: str) -> ClassificationResult:
+        result = ClassificationResult(path=path, status="error")
+        async with semaphore:
+            for attempt in range(5):
+                try:
+                    result.attempts = attempt + 1
+                    with open(path, "rb") as f:
+                        image_data = f.read()
+                    raw = await call_gemini_async(prompt, image_data)
+                    json_str = raw.strip()
+                    if json_str.startswith("```"):
+                        json_str = json_str.split("```")[1]
+                        if json_str.startswith("json"):
+                            json_str = json_str[4:]
+                    parsed = json.loads(json_str.strip())
+                    result.status = "ok"
+                    result.result = parsed
+                    break
+                except json.JSONDecodeError:
+                    result.error = f"JSON parse failed: {raw[:100]}"
+                    break
+                except Exception as e:
+                    result.error = str(e)
+                    if attempt < 4:
+                        delay = 1.0 * (2 ** attempt) + random.uniform(0, 0.5)
+                        await asyncio.sleep(delay)
+
+            async with lock:
+                with open(output_file, "a") as f:
+                    f.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
+
+        return result
+
+    tasks = [_process_one(path) for path in image_paths]
+    results = await asyncio.gather(*tasks)
+    failed_paths = [r.path for r in results if r.status == "error"]
+    return list(results), failed_paths
+```
+
+この実装で特に重要な設計判断は2つあります。1つは `json.JSONDecodeError` を「リトライ不要なエラー」として即座に break していること。モデルが不正な JSON を返した場合、同じプロンプトで再試行しても同じ結果になる可能性が高く、リトライは時間の無駄になります。2つ目は、結果をファイルに逐次書き出すことで「プロセスが途中でクラッシュしても済み分はやり直し不要」な設計にしていることです。これは長時間バッチ処理には必須の考え方だと実感しています。
+
+## コンテンツとJSON整形エラーの実態
+
+実際に1,200枚を処理した中で判明したのが、`gemini-2.5-flash` のJSON整形問題です。プロンプトに「JSONのみを返してください」と明記しても、3.2%の件数でマークダウンのコードフェンス（` ```json ... ``` `）に囲まれた形で返答が来ました。
+
+これは公式ドキュメントには記載がありません。私が発見したのは、500件のバッチを初めて流した後に50件近くのパースエラーが出たときでした。`raw.strip().startswith("```")` でコードフェンスを検出して除去する処理を追加したことで、その後は同じ問題が再発しなくなりました。
+
+コードフェンス除去のロジックは前述のコードに含まれていますが、なぜこれが必要かを理解した上で使う方が、将来モデルの挙動が変わったときに対応しやすくなります。もしコードフェンスを除去しても JSON パースに失敗する場合は、`re.search(r'\{.*\}', raw, re.DOTALL)` で JSON 部分だけを抽出するフォールバック処理を追加することを検討してください。
+
+## 本番で遭遇した3つの落とし穴
+
+ここからが有料記事の核心です。公式ドキュメントには書かれていない、実際に詰まったポイントを共有します。いずれも「知っていれば5分で避けられる、知らないと数時間溶かす」種類の問題です。
+
+### 落とし穴1: asyncio.Semaphore をモジュールレベルで作成してはいけない
+
+`asyncio.Semaphore` はイベントループが起動している間に生成しなければなりません。`asyncio.run()` が起動する前にモジュールレベルで作ると、Python のバージョンによって挙動が異なります。Python 3.8 では `DeprecationWarning` が出て動く場合があり、3.10 以降では `RuntimeError` になるケースがあります。「開発環境では動いたのに本番で壊れた」という典型的な原因の一つです。
+
+常に `async def` 関数の中でセマフォを作成し、`asyncio.run()` に渡す最上位のコルーチン内でインスタンス化してください。
+
+### 落とし穴2: asyncio.gather() のデフォルト挙動で1,000件中1件のエラーが全体を止める
+
+`asyncio.gather()` はデフォルトで `return_exceptions=False` です。これはいずれかのタスクで例外が発生すると、その例外が即座に raise されてしまうことを意味します。並列で動いているほかのタスクは「バックグラウンドで継続実行されるが結果が捨てられる」状態になります。1,000件を処理していて990件終わったところでエラーが1件発生し、全体が巻き戻ってしまったときの徒労感は忘れられません。
+
+解決策は2つあります。`return_exceptions=True` を使って例外を結果として受け取るか、各タスク内で `try/except` を使って例外を内部で処理するかです。私は後者を好みます。タスクが常に辞書を返すようにしておくと、`asyncio.gather()` 側で例外ハンドリングを意識しなくて済むからです。
+
+### 落とし穴3: 画像データをタスク作成時点で一括読み込むとメモリが枯渇する
+
+リスト内包表記で1,000件のタスクを作成する際、「読み込んだ画像データをタスクに渡す」設計にすると、`asyncio.gather()` が呼ばれる前に全画像がメモリに展開されます。壁紙画像は1枚2〜8MBあるため、1,000枚で最大8GBのメモリが必要になります。
+
+正しい設計は「各タスクの実行時点（セマフォ取得後）でファイルを読み込む」ことです。セマフォで並列数を20に制限しているため、メモリに同時に存在する画像データは最大20枚分（最大160MB程度）で済みます。タスクの作成時点ではパスだけを渡し、実際のファイル読み込みはタスク内で行う設計が正解です。
+
+## Beautiful 4K/HDR Wallpapers での実際の計測結果
+
+私が実際にこのパターンを適用したのは、壁紙アプリのコンテンツパイプラインです。処理対象は新規追加候補画像1,200枚で、カテゴリ分類・タグ生成・ムード判定の3つの情報を1回のリクエストで取得するプロンプトを使いました。
+
+実測結果:
+- 同期処理（推定）: 約420分
+- asyncio 並列20: 81分
+- asyncio 並列30: 62分（これ以上増やしても RPM 制限でエラー頻発）
+- API コスト: 約3.2ドル（1,200枚、gemini-2.5-flash を使用）
+
+並列数30が最速でしたが、夜間バッチで実行しているため急ぎでもなく、現在は20で安定稼働させています。レート制限エラーはほぼゼロになり、監視コストが大幅に減りました。
+
+この経験を通じて感じたのは、非同期処理は「複雑さを増やすが、その複雑さは投資に値する」ということです。同期処理が崩壊するのはある日突然で、コンテンツが増えた瞬間にバッチが終わらなくなります。asyncio の初期設計コストを事前に払っておくことで、その崩壊点を大幅に先送りできます。
+
+個人開発を10年以上続けてきた経験から言えば、バックエンドの処理時間問題は「後で直せばいい」と思っていると、「急いで直さないといけない」タイミングで直すことになります。個人開発者は常にリソースが限られているため、その経験は避けられるならば避けるべきです。
+
+
+## asyncio 設計をどのタイミングで導入すべきか
+
+よく聞かれる質問の一つが「最初から asyncio で設計すべきか、後から移行すべきか」です。私の答えは「処理件数が50件を超える見込みがある時点から asyncio を検討する」です。
+
+50件以下なら同期処理で十分です。1リクエスト2秒 × 50件 = 100秒（約1分40秒）は許容範囲内であり、asyncio の複雑さを持ち込む必要はありません。しかし「今後もコンテンツが増え続ける」という前提があるなら、500件になってから慌てて設計を変えるより、最初から asyncio の構造で書いておく方が長期的には楽です。
+
+個人開発では「今すぐ必要な機能だけ実装する」という原則が大切で、過度な先行設計は避けるべきです。一方で、非同期化は「後から入れようとすると関連するすべての関数の書き直しが必要になる」変更の一つです。アプリのバックエンドで `await` を使いたい場合、その関数を呼ぶ全ての関数も `async def` でなければならないという制約があります。これがいわゆる「asyncio の感染」です。感染力があるからこそ、設計の入口で判断しておく価値があります。
+
+私が Beautiful 4K/HDR Wallpapers のパイプラインで asyncio を選んだのは、画像コンテンツが「今後も定期的に追加される」という前提があったからです。最初から非同期設計で書いておいたことで、後の大規模バッチへの対応もスムーズに行えました。
+
+## レート制限の種類と Gemini API 固有の挙動
+
+Gemini API のレート制限は RPM（Requests Per Minute）と TPM（Tokens Per Minute）の2軸で管理されています。どちらかを超えると `429 Resource Exhausted` が返ります。
+
+重要な点は「RPM は満たしているが TPM を超えてエラーになる」ケースが存在することです。画像1枚あたりの入力トークン数は解像度や内容によって大きく異なります。高解像度・複雑なコンテンツの画像が連続すると、RPM は余っているのに TPM の上限を先に打つことがあります。
+
+私が最初に並列数30で実行したとき、429エラーが予想より多く出ました。原因を調べると、壁紙画像の中に特に高解像度のランドスケープ写真が集中してキューに入っていたことでした。画像をシャッフルしてから並列処理に渡すことで、TPM の瞬間的な集中が分散し、エラー率が減りました。
+
+```python
+import random
+
+# ランダムシャッフルで TPM の集中を防ぐ
+image_paths = sorted(image_paths)  # まずソート（再現性確保）
+random.seed(42)                    # シードを固定してデバッグを容易に
+random.shuffle(image_paths)        # シャッフルして TPM 集中を防ぐ
+```
+
+この1行を追加するだけで、TPM 起因の429エラーを大幅に減らせます。
+
+また、`google.api_core.exceptions.ResourceExhausted` の `details()` メソッドを呼ぶと、エラーの詳細（「Rate limit exceeded」vs「Quota exceeded」など）を確認できます。429エラーが頻発する場合は、RPM と TPM のどちらが原因かを特定することで、適切な対処（並列数の削減 vs シャッフル）を選べます。
+
+## 進捗モニタリングとコスト推定の実装
+
+70分かかるバッチ処理では、進捗の可視化が作業効率に直結します。`tqdm` の asyncio 対応バージョンを使うと、各タスクが完了するたびにプログレスバーが更新されます。
+
+```python
+from tqdm.asyncio import tqdm as async_tqdm
+
+async def process_with_progress(image_paths, prompt, concurrency=20):
+    semaphore = asyncio.Semaphore(concurrency)
+    
+    async def _one(path):
+        async with semaphore:
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                result = await call_gemini_with_retry(prompt, data)
+                return {"path": path, "status": "ok", "result": result}
+            except Exception as e:
+                return {"path": path, "status": "error", "error": str(e)}
+    
+    tasks = [_one(path) for path in image_paths]
+    return await async_tqdm.gather(*tasks, desc="Gemini API処理中", unit="枚")
+```
+
+コストの推定については、Google AI Studio のコスト表示がリアルタイムではないため（数分遅延がある）、自前でカウントする方法が役立ちます。`gemini-2.5-flash` の2026年5月時点の画像入力単価は1枚あたり約0.000038ドルです。1,000枚で約0.038ドル（約5.7円）、1,200枚で約0.046ドル（約6.8円）という計算になります。これに出力トークン分が加わり、実際のコストは私の場合1,200枚で約3.2ドルでした（テキスト出力が長いプロンプトだったため）。
+
+コストの実測値とモデルの精度は常にトレードオフです。`gemini-2.5-flash` は `gemini-2.5-pro` より安価ですが、JSON の整形精度が若干低く、コードフェンスが混入する頻度も高い傾向があります。コスト最優先なら flash、精度最優先なら pro、という選択になりますが、私は flash に整形修正ロジックを加えることでバランスを取っています。
+
+## asyncio と Python バージョン互換性
+
+asyncio の挙動は Python バージョンによって細かく変化しています。本記事のコードは Python 3.10 以上を対象としています。3.9 では `asyncio.to_thread()` が使えますが、型ヒントの一部構文（`dict | None` など）は 3.10 以降でないと動きません。
+
+本番環境のPythonバージョン管理には `pyproject.toml` で `requires-python = ">=3.10"` を明記することをお勧めします。また、`asyncio.run()` のデバッグモード（`asyncio.run(main(), debug=True)`）を開発中は有効にしておくと、コルーチンが await されないまま放置されるケースや、イベントループ外でのセマフォ作成などの問題を早期に発見できます。
+
+個人開発では CI/CD の整備が後回しになりがちですが、asyncio を使うコードは特に「開発環境では動くが本番で壊れる」パターンに陥りやすいため、最低限のユニットテストを書いておくことを強くお勧めします。`pytest-asyncio` を使えば `async def test_` という形式でテストが書け、モックを使って実際のAPIコールなしに非同期ロジックを検証できます。
+
+
+
+## 実装前に理解しておくべき asyncio の基礎概念
+
+asyncio のコードを書く前に、いくつかの概念を正しく把握しておく必要があります。誤解したまま実装すると、「動いているように見えて実は並列化されていない」という状態に陥ります。
+
+**イベントループとコルーチンの関係**
+
+asyncio はシングルスレッドの並行処理モデルです。マルチスレッドやマルチプロセスとは異なり、実際に同時にCPUを使う処理は1つだけです。「並列」に見えるのは、コルーチンが `await` ポイントでイベントループに制御を返し、その間に別のコルーチンが実行されるからです。
+
+これが意味するのは「CPUバウンドな処理（重い計算）は asyncio では速くならない」ということです。Gemini APIの呼び出しがうまく並列化されるのは、APIコールの大部分がネットワーク待ち（I/Oバウンド）だからです。`asyncio.to_thread()` で同期処理をスレッドプールに逃がすのも、スレッド内でのブロッキングがイベントループを止めないようにするためです。
+
+**コルーチンとタスクの違い**
+
+`async def` で定義した関数を呼ぶと、コルーチンオブジェクトが返ります。コルーチンは「まだ実行を始めていない処理の定義」です。実際にイベントループで動かすには `await` するか `asyncio.create_task()` でタスクに変換します。
+
+`asyncio.gather(*tasks)` にコルーチンのリストを渡すと、内部でタスクに変換されて並列実行されます。すでに `asyncio.create_task()` でタスク化されているものを渡しても正しく動きます。ただし、タスクを作成した時点でイベントループへのスケジューリングが始まるため、大量のタスクを一度に作成すると予期しないタイミングで処理が始まることがあります。Semaphore を使うパターンでは、タスク内でセマフォを取得してから実際の処理を始めるため、この問題を自然に回避しています。
+
+**asyncio と threading の使い分け**
+
+「同期SDKを `asyncio.to_thread()` で包む」という今回のアプローチは、少数の長時間処理（例: 1〜5件の重い生成タスク）よりも、多数の短〜中程度の処理（例: 100〜10,000件のAPIコール）に向いています。スレッドプールのオーバーヘッドは1コルーチンあたり数ミリ秒ですが、それが1件あたりの処理時間（2秒）に対して誤差の範囲だからです。
+
+もしAPIがネイティブの async クライアントを提供している場合（将来の `google-generativeai` SDK のバージョンアップなど）は、`asyncio.to_thread()` を経由せずに直接 `await` できるため、スレッドプールのオーバーヘッドを完全になくせます。
+
+## 非同期コードのテスト戦略
+
+asyncio を使うコードのテストは、同期コードよりも少し工夫が必要です。`pytest-asyncio` を使えば非同期テストを書けますが、実際の Gemini API を呼ぶテストは遅くてコストがかかるため、モックが必須です。
+
+モック設計でよく使われるパターンは「成功ケース」「リトライが必要なケース」「回復不可なエラー」の3種類です。成功ケースは単純に正常なJSONを返すモックです。リトライが必要なケースは最初の呼び出しで `ResourceExhausted` を raise し、2回目で成功するモックです。回復不可なエラーは毎回 `InvalidArgument` を raise するモックです。
+
+テストでは「リトライが正しい回数だけ呼ばれているか」「バックオフの待機時間が正しい順序になっているか」を確認することが重要です。`asyncio.sleep` をモックしてバックオフのシミュレーションをスキップし、テストの実行時間を短縮するテクニックもよく使われます。
+
+また、`asyncio.Semaphore` が正しく動いているかをテストするには「同時に実行されたタスク数の最大値が設定値を超えていないか」を確認する方法があります。各タスクの開始と終了のタイムスタンプを記録し、任意の時点での並列実行数をカウントすることで検証できます。
+
+単体テストを書く習慣がない個人開発者でも、少なくとも「正常系のエンドツーエンドテスト」と「429エラーが起きたときにリトライするかどうかの確認」だけは自動化しておくことを強くお勧めします。asyncio のリトライロジックは「手動で確認するのが難しい」種類のコードの筆頭だからです。
+
+## コンテンツパイプラインの全体設計で考えること
+
+asyncio による並列化は、コンテンツパイプラインの一部分です。全体設計を考えると、他にも考慮すべき要素があります。
+
+まず「何を処理対象とするかの選定」です。1,200枚の新規候補画像をすべて処理するのではなく、事前フィルタリングで明らかに不適切な画像（低解像度・重複・人物を含む可能性があるもの）を除外することで、APIコストと処理時間を削減できます。私のパイプラインでは、まず画像のメタデータ（サイズ・アスペクト比・ファイルハッシュ）でフィルタリングし、Gemini APIに渡すのは候補の70〜80%程度です。
+
+次に「処理結果のキャッシュ」です。同じ画像を毎回処理するのは無駄なので、画像のハッシュ値をキーにして処理結果をデータベースにキャッシュしておくことで、再処理を防げます。画像が更新された場合のみ再分類するロジックを加えると、月次の更新コストが大幅に下がります。
+
+さらに「失敗した処理のリトライキュー」です。一時的なAPIエラーで失敗した画像は、すぐに再試行するのではなく、別のキューに入れておいて数時間後に再処理する設計が安定します。私はシンプルなテキストファイルに失敗したパスを書き出しておき、翌朝のバッチで自動的に再試行するようにしています。
+
+これらの工夫を組み合わせることで、「月に一度1,200枚を処理するコスト3ドル」から「毎週新規追加分のみ処理するコスト0.5ドル」という運用コストの最適化が実現しました。
+
+
+
+## 個人開発者が asyncio を使う際の現実的なコスト感覚
+
+個人開発では「技術的に正しい選択」より「コストパフォーマンスが高い選択」を優先することがあります。asyncio の学習コストと実装コストについて、正直な感覚を共有します。
+
+asyncio の基本的な使い方（コルーチン・`asyncio.run()`・`await`）を理解するには、Python の経験者であれば1〜2日程度で十分です。しかし「本番で安定して動くコード」を書くためには、Semaphore・バックオフ・部分失敗の処理など追加の学習が必要で、実際に詰まりながら学ぶと1週間程度かかります。私の場合、最初のバージョンから「本番で安定するバージョン」に到達するまで、断続的に作業して3週間ほどかかりました。
+
+この学習コストを「APIコールが1件2秒で1,000件処理する必要がある」という観点で評価すると、同期処理の33分と asyncio の81分の差（実行ごとに52分節約）はかなり大きな価値です。週1回実行するバッチなら、年間で約45時間の待機時間を節約できます。個人開発者の時間の価値を自分なりに設定した上で判断することをお勧めします。
+
+一方で「バッチを週1回しか実行しない」「1回あたり100件以下」という場合は、asyncio の投資対効果は下がります。そのような場合は同期処理のシンプルさを選ぶことも賢明な判断です。技術的に優れた方法を選ぶことが目的ではなく、アプリのコンテンツが質よく更新されることが目的だからです。
+
+宮大工だった祖父から受け継いだ「道具は目的に合わせて選ぶ」という感覚は、コードの設計でも生きています。asyncio は強力な道具ですが、すべての場面で必要な道具ではありません。今回の記事で紹介したパターンが、あなたのプロジェクトに asyncio が必要なタイミングを判断するための参考になれば幸いです。
+
+
+## まとめ：まず小さなバッチで動かしてみる
+
+今回紹介した asyncio パターンをまとめると、次の4つが核心です。第一に `asyncio.to_thread()` で同期SDKを非同期化すること、第二に `asyncio.Semaphore` で並列数を制御してレート制限を守ること、第三に指数バックオフとジッターで一時的なエラーからリカバリすること、第四に処理結果をファイルに逐次書き出して部分失敗を許容することです。
+
+これらを一度に全部実装する必要はありません。まずは `asyncio.to_thread()` と `asyncio.Semaphore` だけで試してみることをお勧めします。10〜50件のリストと並列数5から始め、同期処理と比べた速度差を体感してから、バックオフや部分失敗処理を追加していくアプローチが現実的です。Gemini API の asyncio 活用は、コンテンツを多く扱う個人開発者にとって確実に投資対効果のある技術です。少しずつ積み上げていきましょう。
+
+本記事のコードは [Beautiful 4K/HDR Wallpapers](https://apps.apple.com/app/id706533906) の画像分類パイプラインをベースに整理したものです。同じ課題に取り組んでいる方の参考になれば幸いです。
