@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "IO — Google I/O 2026 は 5/19〜20 開催、Gemini 4.0（Omni）・Android 17・Android XR グラス・Aluminium OS に期待（5/17）",
-    "MODEL — Gemini Omni: テキスト・画像・動画生成を単一パイプラインに統合した新モデルが I/O で正式発表予定（5/17）",
-    "FLASH — Gemini 3.2 Flash が先行リリース、GPT-5.5 の 92% 性能を 1/15 コストで実現、Google AI Studio で利用中（5/5）",
-    "ANDROID — Gemini Intelligence for Android 発表、アプリをまたいだ複雑タスクを自動化（5/12 The Android Show）",
-    "RACE — Google が Apple の iOS 27 AI 刷新に対抗、Android での Gemini 中核化を加速（CNBC 5/12）",
-    "CREATIVE — I/O 2026 で Veo（動画生成）・Lyria（音楽生成）の大幅アップデートが発表される見通し（Google 公式予告）",
+    "IO — Google I/O 2026 は 5/19〜20 開催、Gemini 3.5 / Gemini Spark など新モデル発表が濃厚、GPT-5.5 対抗アップデートに期待（5/18）",
+    "ANDROID — Gemini Intelligence for Android: アプリを横断して複雑タスクを自動化、Gmail・カレンダー・ショッピングに対応（5/13）",
+    "GBOARD — Gboard に Rambler 統合、口語・フィラーワード・多言語混在発話を自然な文章に自動変換（Android Show 2026）",
+    "PRICE — Google が「AI Ultra Lite」プランを検討中、Gemini をより低価格帯で提供へ（9to5Google 5/5）",
+    "ANDROID17 — Android 17 + Android XR グラスも I/O で発表予定、Gemini を中心とした新 UI パラダイムへ（AndroidCentral）",
+    "RACE — Google が Apple の iOS 27 AI 刷新に対抗し Android への Gemini 統合を加速（CNBC 5/12）",
   ],
   en: [
-    "IO — Google I/O 2026 runs May 19–20; expect Gemini 4.0 (Omni), Android 17, Android XR glasses & Aluminium OS (May 17)",
-    "MODEL — Gemini Omni: unified text, image & video generation pipeline to debut at Google I/O 2026 (May 2026)",
-    "FLASH — Gemini 3.2 Flash now available in Google AI Studio; 92% of GPT-5.5 performance at 1/15 the cost (May 5)",
-    "ANDROID — Gemini Intelligence for Android announced: cross-app task automation across Gmail, Shopping & more (May 12)",
+    "IO — Google I/O 2026 runs May 19–20; Gemini 3.5 / Gemini Spark new models expected as GPT-5.5 rivals (May 18)",
+    "ANDROID — Gemini Intelligence for Android: cross-app task automation across Gmail, Calendar & Shopping (May 13)",
+    "GBOARD — Gboard gets Rambler integration: converts casual multilingual speech into polished text automatically (Android Show 2026)",
+    "PRICE — Google reportedly preparing 'AI Ultra Lite' plan to offer Gemini at lower price tiers (9to5Google, May 5)",
+    "ANDROID17 — Android 17 + Android XR glasses also expected at I/O, marking a new Gemini-centric UI paradigm (AndroidCentral)",
     "RACE — Google accelerates Gemini integration into Android core ahead of Apple's iOS 27 AI overhaul (CNBC, May 12)",
-    "CREATIVE — I/O 2026 expected to unveil major updates to Veo (video) and Lyria (music) generation (Google preview)",
   ],
 };
 
