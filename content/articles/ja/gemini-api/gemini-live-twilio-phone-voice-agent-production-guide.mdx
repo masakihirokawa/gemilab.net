@@ -1,0 +1,394 @@
+---
+title: "電話を受けるAIを本番投入する：Gemini Live API × Twilio Media Streams で構築する電話応答エージェント"
+slug: "gemini-live-twilio-phone-voice-agent-production-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-30T19:45"
+author: "Gemini Lab"
+description: "Twilio Voice と Gemini Live API を WebSocket で橋渡しし、電話に出る AI 音声エージェントを本番運用するための実装手順・割り込み処理・Function Calling・コスト試算までを完全コード付きで解説します。"
+tags: ["gemini-live-api", "twilio", "voice-agent", "websocket", "fastapi", "production", "media-streams"]
+highlights:
+  - "ブラウザの音声デモで動いていたコードを電話回線に持ち込もうとして詰まっていた人が、μ-law 8kHz と PCM 16kHz の橋渡しまで含めた動く実装を今日手に入れられる"
+  - "Twilio Media Streams と Gemini Live API の双方向ストリーミングを FastAPI WebSocket で中継する完全コードと、割り込み・ハングアップ処理のパターンを習得できる"
+  - "電話受付の予約・問い合わせ・一次対応を AI で自動化したい個人開発者が、Cloud Run へのデプロイとコスト試算まで含めて本番投入の見取り図を持てる"
+---
+
+「電話を受ける AI」と聞くと、多くの方は IVR（自動音声応答）の延長を思い浮かべるのではないでしょうか。決まったメニューを読み上げ、プッシュ番号で分岐する、あの少しよそよそしい仕組みです。ところが Gemini Live API が登場してから、その先のレベル — 自然な会話で予約を受け、必要に応じて社内データベースに書き込み、難しい問い合わせは人間にエスカレーションする音声エージェント — が、個人開発者の射程にも入ってきました。
+
+
+（個人開発者として2014年から累計5,000万DLのアプリ事業を運営してきた経験を踏まえた整理です。廣川政樹）
+私自身、ある小規模店舗向けに「営業時間外の電話を AI で受ける」プロトタイプを試した際、ブラウザ上の WebSocket デモと電話回線とでは、ほとんど別物と言っていいほど実装が違うことを思い知りました。8kHz μ-law と 16kHz PCM の壁、Twilio Media Streams が要求する base64 で包まれたフレーム、無音検知よりも難しい「割り込み」の扱い — 公式ドキュメントのサンプルだけでは、実際の通話に耐える応答エージェントは組み上がりません。
+
+ここで扱うのはその経験をもとに **Twilio Voice の着信を Gemini Live API に橋渡しし、本番運用に耐える電話応答エージェントを構築する手順** をまとめました。コードはすべて動く完全な形で、エラーハンドリング・割り込み制御・落とし穴・コスト試算まで含めて掘り下げています。Gemini Live API の基本を理解された中〜上級の開発者を主な対象としています。
+
+> 前提: WebSocket と ephemeral token の基本については [Gemini Live API WebSocket × Ephemeral Token 本番設計](/articles/gemini-api/gemini-live-api-websocket-ephemeral-token-production) を、Live API そのものの導入は [Gemini Live API 完全ガイド](/articles/gemini-api/gemini-live-api-guide) を併読することをおすすめします。
+
+## ブラウザの音声デモがそのまま電話に乗らない理由
+
+最初に、なぜ電話回線が特別なのかを整理しておきます。ここを理解しないまま実装に入ると、「マイクからは動くのに、電話からだとノイズしか返ってこない」という典型的な詰まり方をします。
+
+電話回線（PSTN）は **8kHz サンプリング・8bit μ-law（u-law）圧縮・モノラル** が事実上の標準です。これは 1970 年代に決まった規格で、人の声が伝わる帯域に最適化されており、帯域は驚くほど狭いものです。一方、Gemini Live API が要求する音声フォーマットは **16kHz サンプリング・16bit リニア PCM・モノラル** です。サンプリングレートが 2 倍、ビット深度も 2 倍、さらに圧縮方式も違います。
+
+加えて Twilio の Media Streams は、生のバイナリではなく **base64 で包まれた JSON フレーム** を WebSocket で送ってきます。フレームには `event` フィールドがあり、`start`・`media`・`mark`・`stop` の状態遷移を扱う必要があります。逆方向（AI からユーザーへ）も同じフォーマットで返さなければなりません。
+
+つまり中継サーバーがやることは、おおまかに次の 4 つです。
+
+- Twilio から届いた base64+μ-law を decode し、16kHz PCM にアップサンプリング
+- それを Gemini Live API の WebSocket にバイナリで送信
+- Gemini が返す 24kHz PCM 応答を 8kHz μ-law にダウンサンプリングして base64 で包む
+- それを Twilio に WebSocket で送り返す
+
+「ただの WebSocket リレー」では済まないことがお分かりいただけると思います。ここを最短距離で実装するのが本記事のゴールです。
+
+## アーキテクチャ全体像 — 3 つのコンポーネント
+
+実装に入る前に、登場人物を整理します。本記事のシステムは次の 3 つから成り立ちます。
+
+- **Twilio Voice**: 電話番号の貸与と、着信を WebSocket（Media Streams）に流す責務を持ちます。TwiML という小さな XML で着信時の振る舞いを制御します。
+- **中継サーバー（FastAPI + WebSocket）**: Twilio と Gemini の橋渡しをします。音声フォーマット変換、割り込み制御、Function Calling の橋渡しが主な仕事です。Cloud Run にデプロイする想定で書きます。
+- **Gemini Live API**: 音声を受け取って音声で返す本体です。Function Calling・System Instructions・割り込み（interrupt）通知も担当します。
+
+データの流れは次のようになります。
+
+1. ユーザーが電話をかける → Twilio が `Voice URL` の Webhook を呼ぶ
+2. 中継サーバーは TwiML で `<Connect><Stream url="wss://.../media">` を返す
+3. Twilio が中継サーバーの WebSocket に接続し、ユーザーの音声を流し始める
+4. 中継サーバーは Gemini Live API にも WebSocket で接続し、双方向ブリッジを開始
+5. Gemini の応答音声が中継サーバー経由で Twilio に戻り、ユーザーに聞こえる
+6. 通話終了で Twilio が `stop` を送り、中継サーバーが Gemini セッションを閉じる
+
+ここまでが概観です。順番に実装していきましょう。
+
+## Step 1: Twilio 番号と TwiML を準備する
+
+Twilio Console で **Buy a Number** から日本または米国の番号を取得します。日本の 050 番号は法人向け本人確認が必要ですが、テスト段階では米国番号で十分動作確認できます。
+
+取得後、その番号の **A Call Comes In** Webhook を、後ほど立てる中継サーバーの `https://example.com/voice` に設定します。HTTP メソッドは POST のままで問題ありません。
+
+中継サーバー側で TwiML を返すエンドポイントを書きます。Twilio から POST が来たら、`<Connect><Stream>` を含む XML を返すだけです。
+
+```python
+# server/twilio_webhook.py
+# 役割: Twilio からの着信通知を受け取り、Media Streams への接続を指示する TwiML を返す
+from fastapi import FastAPI, Request, Response
+
+app = FastAPI()
+
+@app.post("/voice")
+async def voice_webhook(request: Request) -> Response:
+    """Twilio からの着信 Webhook。Media Streams を WebSocket で接続させる TwiML を返す。"""
+    host = request.headers.get("host", "example.com")
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="ja-JP" voice="Polly.Mizuki">お電話ありがとうございます。AI 担当が承ります。</Say>
+    <Connect>
+        <Stream url="wss://{host}/media" />
+    </Connect>
+</Response>"""
+    return Response(content=twiml, media_type="application/xml")
+```
+
+`<Say>` で先に短い挨拶を流しているのは、Gemini Live API の WebSocket が確立するまでの数百ミリ秒〜1 秒の空白を埋めるためです。これがないと、ユーザーは「電話に出たのに無音が続く」と感じて切ってしまいます。電話 UX は、ブラウザの UX 以上に「最初の 1 秒」が決定的です。
+
+## Step 2: 中継サーバーの WebSocket 受信部を書く
+
+ここからが本題です。Twilio から流れてくる Media Streams を受け取り、フォーマット変換しつつ Gemini に渡す部分を書きます。
+
+```python
+# server/media_bridge.py
+# 役割: Twilio Media Streams ⇄ Gemini Live API の双方向ブリッジ本体
+import asyncio
+import audioop
+import base64
+import json
+import logging
+import os
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from google import genai
+from google.genai import types
+
+logger = logging.getLogger("media-bridge")
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
+
+GEMINI_MODEL = "gemini-2.5-flash-live-preview"
+SYSTEM_INSTRUCTION = (
+    "あなたは『花カフェ』の電話受付担当です。"
+    "予約・営業時間・アクセスの問い合わせに、丁寧でテンポの良い日本語で答えてください。"
+    "わからないことは無理に答えず、人間に折り返すと案内してください。"
+)
+
+
+def mulaw8k_to_pcm16k(mulaw_bytes: bytes, state: Optional[bytes]) -> tuple[bytes, bytes]:
+    """Twilio から届いた μ-law 8kHz を Gemini が要求する PCM 16kHz にアップサンプリングする。"""
+    pcm8k = audioop.ulaw2lin(mulaw_bytes, 2)  # 8bit μ-law → 16bit linear PCM (8kHz)
+    pcm16k, new_state = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, state)
+    return pcm16k, new_state
+
+
+def pcm24k_to_mulaw8k(pcm_bytes: bytes, state: Optional[bytes]) -> tuple[bytes, bytes]:
+    """Gemini からの応答 PCM 24kHz を Twilio 用の μ-law 8kHz に変換する。"""
+    pcm8k, new_state = audioop.ratecv(pcm_bytes, 2, 1, 24000, 8000, state)
+    return audioop.lin2ulaw(pcm8k, 2), new_state
+```
+
+ポイントは `audioop` で **state（変換状態）を引き回すこと** です。サンプリングレート変換は内部にバッファを持つため、state を毎回リセットしてしまうとフレーム境界で「プチプチ」というノイズが乗ります。本番で何度この罠に踏まれたかわかりません。
+
+続いて、ブリッジ本体を書きます。
+
+```python
+# server/media_bridge.py（つづき）
+@app.websocket("/media")
+async def media_bridge(twilio_ws: WebSocket) -> None:
+    """Twilio から接続される WebSocket。Gemini Live と双方向ブリッジする。"""
+    await twilio_ws.accept()
+    logger.info("Twilio WebSocket accepted")
+
+    stream_sid: Optional[str] = None
+    upsample_state: Optional[bytes] = None
+    downsample_state: Optional[bytes] = None
+
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)]),
+    )
+
+    try:
+        async with client.aio.live.connect(model=GEMINI_MODEL, config=config) as gemini:
+            async def from_twilio() -> None:
+                """Twilio からの音声を Gemini に送り続ける。"""
+                nonlocal stream_sid, upsample_state
+                while True:
+                    raw = await twilio_ws.receive_text()
+                    msg = json.loads(raw)
+                    event = msg.get("event")
+                    if event == "start":
+                        stream_sid = msg["start"]["streamSid"]
+                        logger.info("stream started: %s", stream_sid)
+                    elif event == "media":
+                        mulaw = base64.b64decode(msg["media"]["payload"])
+                        pcm16k, upsample_state = mulaw8k_to_pcm16k(mulaw, upsample_state)
+                        await gemini.send_realtime_input(
+                            audio=types.Blob(data=pcm16k, mime_type="audio/pcm;rate=16000")
+                        )
+                    elif event == "stop":
+                        logger.info("stream stopped")
+                        break
+
+            async def from_gemini() -> None:
+                """Gemini からの応答音声を Twilio に流し続ける。"""
+                nonlocal downsample_state
+                async for response in gemini.receive():
+                    # 割り込みが起きたら Twilio 側のバッファを clear する
+                    if response.server_content and response.server_content.interrupted:
+                        if stream_sid:
+                            await twilio_ws.send_text(json.dumps({
+                                "event": "clear",
+                                "streamSid": stream_sid,
+                            }))
+                        downsample_state = None  # 状態もリセット
+                        continue
+                    if response.data and stream_sid:
+                        mulaw, downsample_state = pcm24k_to_mulaw8k(response.data, downsample_state)
+                        await twilio_ws.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": base64.b64encode(mulaw).decode()},
+                        }))
+
+            await asyncio.gather(from_twilio(), from_gemini())
+
+    except WebSocketDisconnect:
+        logger.info("Twilio side disconnected (normal hangup)")
+    except Exception:
+        logger.exception("media bridge error")
+    finally:
+        try:
+            await twilio_ws.close()
+        except Exception:
+            pass
+        logger.info("session closed")
+```
+
+期待する動作: 電話をかけると、Twilio の挨拶のあとすぐに Gemini が会話を引き取ります。「予約をお願いしたいのですが」と話すと、AI 担当が日付・時間・人数を聞き取って復唱します。途中でこちらが話し始めると、AI の発話は即座に止まります。
+
+## Step 3: 「割り込み」と「ハングアップ」を正しく扱う
+
+電話 UX で最も難しいのが割り込みです。ユーザーが話し始めたら、AI は **発話中の音声をすべて捨てなければなりません**。ブラウザではユーザーがミュートボタンで AI を黙らせることもできますが、電話ではそれができません。
+
+Gemini Live API は VAD（Voice Activity Detection）が発話開始を検出すると `server_content.interrupted = true` を立ててくれます。これを受け取った瞬間に Twilio に対して **`clear` イベントを送る** のが正解です。Twilio は受信した clear で、まだ再生していない音声バッファを破棄します。先ほどのコードの `if response.server_content and response.server_content.interrupted:` の分岐がそれです。
+
+ハングアップ（通話終了）の検出も忘れがちです。Twilio は `event: "stop"` を送ってくれますが、回線品質によっては届かないこともあります。そこで、`finally` ブロックで必ず `twilio_ws.close()` を呼び、`async with client.aio.live.connect(...)` の context manager で Gemini セッションも自動的に閉じるよう設計しています。`finally` を省くと、Cloud Run のインスタンスにゾンビセッションが溜まり、最終的に同時接続数の上限に当たります。
+
+## Step 4: Function Calling で社内システムと連携する
+
+電話受付の真の価値は、AI が **実際に予約を入れる** ことです。Function Calling を使えば、Gemini に「予約を保存する関数」を渡し、必要なときに呼んでもらえます。
+
+```python
+# server/functions.py
+# 役割: 電話受付エージェントが呼び出せる業務関数の定義
+from datetime import datetime
+from google.genai import types
+
+book_reservation = types.FunctionDeclaration(
+    name="book_reservation",
+    description="花カフェの予約を 1 件登録します。",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "name": types.Schema(type=types.Type.STRING, description="予約者氏名"),
+            "phone": types.Schema(type=types.Type.STRING, description="連絡先電話番号"),
+            "datetime_jst": types.Schema(type=types.Type.STRING, description="ISO8601 形式の日時 (JST)"),
+            "party_size": types.Schema(type=types.Type.INTEGER, description="人数"),
+        },
+        required=["name", "datetime_jst", "party_size"],
+    ),
+)
+
+TOOLS = [types.Tool(function_declarations=[book_reservation])]
+
+
+async def handle_function_call(call) -> dict:
+    """Gemini からの関数呼び出しを実行する。実装はデモ用にログ出力のみ。"""
+    if call.name == "book_reservation":
+        args = call.args or {}
+        # 実運用ではここで予約 DB にトランザクション書き込み、SMS 確認送信など
+        booking_id = f"BK-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        return {
+            "ok": True,
+            "booking_id": booking_id,
+            "message": f"{args.get('datetime_jst')} に {args.get('party_size')} 名で承りました。",
+        }
+    return {"ok": False, "error": "unknown function"}
+```
+
+`LiveConnectConfig` に `tools=TOOLS` を渡すと、Gemini は会話の流れで自動的に関数を呼びます。`from_gemini()` 内で `response.tool_call` が立ったら `handle_function_call` を呼び、結果を `gemini.send_tool_response(...)` で返してください。Live API の Function Calling は、テキスト系 API と違い **会話を中断せずに** 実行されるのが大きな利点です。
+
+期待する動作: ユーザーが「明日の 19 時に 2 名で予約お願いします」と話すと、Gemini が `book_reservation` を呼び、結果を受け取って「明日 19 時、2 名様で承りました。確認のため、お名前をお伺いできますか」と続けます。
+
+## Step 5: Cloud Run にデプロイする際の落とし穴
+
+ローカルでは ngrok を介して動作確認できますが、本番では Cloud Run か類似の WebSocket 対応 PaaS が現実解です。`gunicorn` ではなく **`uvicorn` で `--workers 1 --loop uvloop`** を指定し、`--timeout-keep-alive 0` を付けてください。Cloud Run のデフォルトタイムアウトは 5 分ですが、長電話を許容するなら **`--timeout=3600`** に伸ばし、CPU 課金は **`--cpu-boost`** を有効にして起動レイテンシを下げます。
+
+無視されがちなのが **Min Instances=1** の設定です。コールドスタートが起きると、最初の発話の数秒が落ちて応答が遅れます。電話 UX では致命的です。1 インスタンス常駐させる月額コストは、回線料金から見れば誤差です。
+
+地理的レイテンシも見落とせません。日本のユーザー向けなら **asia-northeast1（東京）**、Gemini Live API は世界中どこからでも同じエンドポイントですが、Twilio Voice の中継リージョンは `Twilio Edge Location` で東京を選んでおくと往復遅延が下がります。
+
+## よくある間違いと正しい修正
+
+- ❌ **μ-law を直接 Gemini に送る**: 動きません。`audioop.ulaw2lin` で 16bit PCM に変換し、さらに `audioop.ratecv` で 16kHz にリサンプルしてから送ります。
+- ❌ **Gemini の応答を全部受け取ってから Twilio に流す**: 1 秒以上の遅延が発生します。`async for response in gemini.receive():` の中で、来た端から Twilio に送ります。
+- ❌ **ハングアップ時に Gemini セッションを閉じ忘れる**: ゾンビセッションが溜まり、Live API のクォータに達して新規通話を受けられなくなります。`async with` か `try/finally` で必ず閉じます。
+- ❌ **API キーをコードに埋め込む**: GitHub Push 時に Secret Scanning が検出します。`os.environ["GEMINI_API_KEY"]` で読み、Cloud Run の Secret Manager に登録してください。詳しくは [個人開発者のための Gemini API キー安全運用チェックリスト](/articles/gemini-api/gemini-api-key-safe-operations-indie-developer-checklist) も合わせて参考にしてください。
+- ❌ **割り込み時に downsample_state をリセットしない**: 旧応答の変換状態が残り、新応答の冒頭にノイズが乗ります。割り込み検知で `downsample_state = None` を必ず実行します。
+
+## コスト試算 — 1 通話あたり何円か
+
+執筆時点（2026 年 4 月）の概算で、1 分の通話あたりのコストは次のようなオーダーです。
+
+- **Twilio Voice 着信（米国番号）**: 約 0.0085 USD/分
+- **Twilio Media Streams**: 約 0.004 USD/分
+- **Gemini 2.5 Flash Live（音声入出力）**: 入出力合計でおおよそ 0.05〜0.10 USD/分（モデルとリージョンで変動）
+- **Cloud Run（同時接続 1 のとき）**: 1 時間あたり 0.03 USD 前後
+
+つまり 1 分の通話で **約 8〜13 円** に収まります。電話受付スタッフを 1 時間雇うコストと比較すれば、ROI は明らかです。月 100 件・平均 3 分の通話を捌くとしても、AI 側のコストは月 4,000 円弱に収まります。
+
+予算を引き締めたい場合は、**System Instructions を短く保つ**（毎セッションで送信される）、**応答の最大長を制限する**、**長時間の沈黙を検知して自動で通話を切る** の 3 点が効果的です。沈黙検知は VAD のイベントを使えばあと数十行で書けます。
+
+## 監視と「失敗の見える化」
+
+電話応答エージェントは、ユーザーが切ってしまうと「何が悪かったか」が永遠にわかりません。`logger.info` だけでなく、各通話を **session_id・通話時間・割り込み回数・Function Call 成功率** の単位で可視化することを強くおすすめします。Langfuse や Datadog で十分に追えます。詳しい構成は [Gemini API 本番監視と Langfuse による可観測性ガイド](/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide) と [Gemini API 本番運用の監視・可観測性パターン](/articles/gemini-api/gemini-api-observability-production-monitoring) が参考になります。
+
+特に追っておきたいのは **「最初の 3 秒」のレイテンシ** です。電話 UX では、ユーザーが話し終えてから AI が話し始めるまでの時間が 1.5 秒を超えると、明らかに不自然に感じられます。ここが伸びる原因の 9 割は Cloud Run のコールドスタートか、Gemini への接続待ちです。
+
+## リサンプラーの「state」をもう少し深く
+
+`pcm16k, new_state = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, state)` の一行は見た目以上に多くの仕事をしています。`audioop.ratecv` は内部にポリフェーズフィルタの記憶（直近のサンプル数個分）を `state` として持ち、フレームをまたいで連続的な変換を可能にしています。最初のフレームは `None` を渡し、以降は前回の戻り値を渡し続ける、というのが正しい使い方です。途中でうっかり `None` に戻すと、フィルタは履歴ゼロから始まり、フレーム境界で「プチッ」というクリックノイズが乗ります。逆方向のダウンサンプリングも同じです。
+
+実装上の含意は 2 つです。第一に、**state は方向ごとに 1 つ持つ** こと。第二に、**state をリセットするのは論理的な境界（通話開始・通話終了・割り込み直後）だけにする** こと。割り込みのケースが特に微妙です。Twilio に `clear` を送って残音を破棄したあと、Gemini が次に送ってくるのはまったく新しい発話で、前の応答の続きではありません。古い state を引きずったまま変換するとクリックが乗ります。先ほどのコードで `downsample_state = None` をリセットしている理由はここにあります。
+
+`scipy.signal.resample_poly` や `librosa`、ネイティブの `samplerate` ライブラリに乗り換える場合も、API の形は違えど state を per-stream で管理し、論理境界でだけリセットする原則は変わりません。
+
+## Twilio TwiML の現場で必ずぶつかる微調整
+
+Step 1 の TwiML は最小構成です。本番運用に入って 1 週間以内に出くわす微調整を 2 つ書き留めておきます。
+
+ひとつは **発信者番号の非通知**。番号通知をオフにされた発信では `From` が `+anonymous` や `restricted` で届きます。Webhook そのものは動きますが、ログの整形を `request.form().get("From", "anonymous")` で逃がしておかないと例外で落ちます。
+
+もうひとつは **通話中の DTMF（プッシュ音）**。自動音声に反射的にボタンを押す方は意外と多く、デフォルト設定だと音声として AI に届いてしまいます。`<Stream dtmfHandling="off">` を付けると無視できますし、`dtmf` イベントを WebSocket で拾って数字をアクションにマップすることも可能です。予約フローでは無視で問題ありません。
+
+そして最も大事なのが **Twilio 署名検証** です。`/voice` を素のままで公開すると、URL を当てた誰かがあなたの AI 受付を任意の番号に発信させて、課金だけがあなたの口座に積み上がります。Twilio は `X-Twilio-Signature` ヘッダを送ってきますので、`twilio.request_validator.RequestValidator(auth_token).validate(url, params, signature)` で必ず検証してください。これは省略してはいけない一行です。
+
+## 同時通話を増やしていく際のボトルネック
+
+ここまでのブリッジは Cloud Run の 1 インスタンスで数十〜数百の同時通話を捌けますが、スケールの壁は段階的に変わります。3 つの上限を意識してください。
+
+ひとつ目は **Gemini Live API の同時セッション数**。プロジェクト単位のクォータがあり、Google AI Studio で確認できます。リリース日が決まっているなら、上限引き上げの申請は早めに動かすのが安全です。回答までは数日かかります。
+
+ふたつ目は **Twilio の同時通話数**。トライアルアカウントは 1〜2 並列に制限されており、有償アカウントでも初期上限はそれほど大きくありません。本番トラフィックで気付くと事故になります。
+
+3 つ目は **インスタンスあたりの WebSocket 数**。Cloud Run の `--concurrency` はデフォルト 80 で 1000 まで上げられますが、各 WebSocket は長時間動き続け、リサンプラーで CPU も使います。`e2-standard-2` のインスタンスで現実的なのは 30〜80 並列くらいでしょう。Min Instances=1、Max Instances を「ピーク予測 ÷ 50」あたりに設定すれば、自動スケールで実用的に運用できます。
+
+これより上のスケールが要るなら、電話番号で水平シャーディングするか、リサンプリング部分を専用の音声サービスに切り出すのが定石です。とはいえ、個人開発の規模であれば本記事の構成のまま 1 日数千通話までは十分まかなえます。
+
+## 1 つだけ FAQ — AWS Lambda や Vercel で動きますか？
+
+**動きません。** 両者とも長時間の WebSocket ブリッジに向きません。Lambda は実行時間 15 分の壁とリクエスト課金が合いませんし、Vercel のサーバーレス関数は HTTP のみで、WebSocket をネイティブにはサポートしません。Cloud Run・Fly.io・Railway・Render のいずれかが現実解です。AWS 縛りなら Fargate か App Runner が同等の選択肢になります。
+
+## 1 通話あたりのデータの旅 — 内部を理解する
+
+20 ミリ秒分の音声がシステムをどう通り抜けるかをたどると、全体が腑に落ちます。Twilio Media Streams は 20 ms ごとに 1 フレーム送ってきます。中身は 8bit μ-law 160 サンプル、つまり 160 バイトのペイロードを base64 で 216 文字の JSON に包んだものです。1 秒あたり 50 フレーム。データレートそのものは難しくありません。
+
+中継サーバーの仕事は順番にこうです。base64 デコードで 160 バイトの μ-law バッファに戻す。`audioop.ulaw2lin` で 16bit 線形 PCM に展開し 320 バイトに。`audioop.ratecv` で 8kHz から 16kHz にアップサンプルし 640 バイトに。これを Gemini Live に送ります。
+
+逆方向は高めの解像度で旅します。Gemini からは 24kHz 16bit PCM が様々なサイズのチャンクで届きます。`audioop.ratecv` で 8kHz に落とし、`audioop.lin2ulaw` で μ-law にして、base64 で包んで Twilio に渡します。60 ms 分の応答（24kHz で 2,880 バイト）が、最終的には 480 バイトの μ-law、648 文字の base64 JSON になって電話線に乗ります。
+
+この計算が大事なのは、**遅延予算の見積もり** に直結するからです。各変換は `audioop` でサブミリ秒ですが、毎分数百フレーム × 同時通話数だけ積み上がります。50 並列のインスタンスなら、両方向あわせて毎秒 5,000 回の変換を回しています。さらに上を狙うなら、`samplerate` や `soxr` のようなネイティブ実装に切り替えると CPU が約 1/3 に落ちます。依存関係は重くなりますが、価値は十分にあります。
+
+## 本番グレードのエラーリカバリ
+
+明示的に扱うべきエラーは 3 種類あります。Gemini 切断・Twilio 切断・業務関数の失敗。それぞれ取るべき対応が違います。
+
+**Gemini WebSocket の切断** は珍しいですが起こり得ます。`async with` の context が次の `send_realtime_input` か `receive` で例外を上げます。正しい振る舞いは、エラーをログし、Twilio 側に短いお詫び音声を流し（`<Say>` を含む TwiML を return する経路、もしくは事前準備した音声ファイルの `mark` イベント）、丁寧に通話を終わらせること、です。会話の途中で再接続を試みると AI のキャラが断絶し、ほぼ確実に違和感を与えます。
+
+**Twilio の予期せぬ切断** は、たいていは携帯電波の不調が原因です。`WebSocketDisconnect` が立ち、`finally` 節で Gemini セッションが閉じます。通話時間と切断理由をログして終わりです。リカバリの余地はありません。
+
+**業務関数の失敗** が一番面白いケースです。たとえば `book_reservation` が DB 接続エラーで例外を投げたとしましょう。`{"ok": False, "error": "..."}` を返せば、Gemini はそれを受け取って「予約システムに繋がりにくいようです、お電話番号をいただければ折り返しご連絡します」と機転を利かせて応えます。これは音声エージェントとして十分良い結果です。例外を握りつぶして無音になるのが最悪です。すべての関数は `try/except` で囲み、必ず JSON シリアライズ可能な dict を返してください。
+
+```python
+async def safe_handle_function_call(call):
+    try:
+        return await handle_function_call(call)
+    except Exception as exc:
+        logger.exception("function call failed: %s", call.name)
+        return {"ok": False, "error": "internal error", "detail": str(exc)[:200]}
+```
+
+この 3 行のラッパーが、最も恥ずかしい失敗（「お調べしますね…」のあと 30 秒の無音で例外が伝播するパターン）を防いでくれます。Gemini に明確な失敗シグナルを返せば、丁寧なリカバリ発話を Gemini 側で生成してくれます。
+
+## システム指示の作り方 — 電話特有のチューニング
+
+電話エージェントのシステム指示は、チャットエージェントとは別物として組み立てるのが得策です。電話のユーザーは「読む」のではなく「聞く」ので、3 つの原則が効きます。
+
+ひとつ目、**回答の長さを縛る**。「明示的に求められない限り、2 文以内で答えてください」と書いておくと、電話 UX が一気に締まります。長文は画面でよりずっと冗長に感じられますし、聞き手は読み飛ばしができません。
+
+ふたつ目、**話のリズムと人格を平易な言葉で指定する**。「親しみやすく、テンポの良い日本語で。各ターンの最後は短い確認質問で締める」と書くと、Gemini はその型に乗せてくれます。長々と説明したり、同じ確認を繰り返す AI は、電話だと役所のカウンターのように響きます。
+
+3 つ目、**逃げ道を最初に書く**。「わからないことがあれば『人間が折り返します』と伝え、お名前と番号を伺ってください。推測で答えないでください」と添えておくと、営業時間や住所の幻覚を防げます。電話で適当な情報を答えるのは、画面で答えるよりずっと致命的です。
+
+私のおすすめは **エスカレーションのトリガー** をシステム指示に書き込むことです。「お客様が責任者を求めた場合や、不満が強そうな場合は `escalate_to_human` 関数を呼んで理由を渡してください」と書き、`escalate_to_human` の Function Declaration で店長の電話を鳴らす実装を用意しておく。これだけで信頼の下支えが一段固まります。
+
+
+## 次に何をすべきか
+
+まずは Twilio の試用クレジット（執筆時点で新規アカウントに 15 USD 付与）と、Google AI Studio の無料枠で動かしてみてください。本記事のコードを `/voice` と `/media` の 2 エンドポイントだけ立てれば、ご自宅から自分の AI 受付に電話する体験ができます。動くもの一つを手元に置けば、Function Calling・割り込み制御・コストの感覚が一気に身に付きます。商用化を見据える方は、`book_reservation` を実 DB に書き換え、SMS 通知（Twilio Programmable Messaging）を足し、`/voice` に Twilio の署名検証を加える、の 3 ステップで本番投入の輪郭が見えてくるはずです。
+
+電話という、長いあいだ「人間の仕事」だった領域に AI が入り込んでいく感触を、ぜひご自身の手で確かめていただければと思います。
+
+実装の幅を広げるための学習素材として、書籍も少しだけ。Google Cloud のサーバーレス全般を体系的に押さえるなら [Google Cloud関連サーバーレス開発の教科書（中井悦司）](https://www.amazon.co.jp/dp/4296119427/?tag=pinocchio-22)、Python の非同期プログラミングを腰を据えて理解したいなら [エキスパートPythonプログラミング 改訂4版](https://www.amazon.co.jp/dp/4048931024/?tag=pinocchio-22) が、本記事の WebSocket ブリッジ実装をさらに深めるための入口として相性が良いと思います。
