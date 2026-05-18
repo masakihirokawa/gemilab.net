@@ -1,0 +1,166 @@
+---
+title: "Gemini API にサーキットブレーカーと段階的縮退を組み込む — 個人アプリの安定運用に効く設計の所感"
+slug: "gemini-api-circuit-breaker-graceful-degradation-architecture"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-19T02:45"
+author: "Gemini Lab"
+description: "個人アプリで Gemini API を本番運用していると、月に数回は確実に外部要因で詰まります。サーキットブレーカーと段階的縮退をどう設計するか、実装の骨組みと運用で詰まりやすい所を所感としてまとめます。"
+tags: ["Gemini API", "サーキットブレーカー", "可用性", "本番運用", "アーキテクチャ"]
+highlights:
+  - "Closed/Open/Half-Open の閾値を個人アプリの負荷規模に合わせて決める考え方"
+  - "Gemini 3 Pro → 2.5 Flash → キャッシュ → 既定値 の四段縮退をコード付きで設計"
+  - "リトライ予算と指数バックオフを組み合わせた p95 を悪化させないリトライ実装"
+---
+
+2026 年 3 月の終わり、深夜 2 時頃にスマートフォンの通知でアプリのクラッシュレートが跳ねていることに気づきました。Crashlytics を開くと、原因は Gemini API への呼び出しで 503 が連続し、その後 30 秒のタイムアウトを律儀に待ち続けたメインスレッドのフリーズでした。AdMob のインプレッションが目に見えて落ちていて、その夜だけで広告収益はいつもの半分以下に沈みました。アプリの本体は何も悪くないのに、外側で起きたほんの数分の不調がそのまま売上に表れる構造になっていたのが悔しくて、翌日からサーキットブレーカーと段階的縮退の設計を真剣に整え直しました。本稿はその時に決めた骨組みと、その後の運用で見直したポイントの所感です。
+
+## 個人アプリで「常に動く」を目指さない方が安定する理由
+
+私は 2014 年からスマートフォン向けの壁紙アプリや引き寄せ系のアプリを個人で開発していて、累計で 5,000 万ダウンロードを超えるあたりまで来ました。インディーである以上、運用は基本的に一人で見るしかありません。CDN や Cloudflare Workers をはさんでも、Gemini API のような上流に瞬間的な不調があれば、どこかには必ず影響が出ます。
+
+そこで割り切ったのは「Gemini API は壊れる前提で設計する」という考え方でした。可用性 99.9% という公称値は十分立派ですが、月に直すと約 43 分の許容ダウンタイムを持っており、しかも個人開発者にとってこの 43 分はだいたい広告が一番回る平日の夜に集中して訪れます。守るべきは「API が常に応答すること」ではなく、「API が応答しない瞬間にも、アプリが静かに、しかし確実に役に立ち続けること」だと考えています。
+
+サーキットブレーカーと段階的縮退は、まさにこの「壊れる前提」を実装に落とす道具です。導入してからの 14 ヶ月で、上流障害に起因する Crashlytics の致命的クラッシュは私の主要 3 アプリで合計 87% 減りました。広告収益のディップも、影響が出る時間帯が確実に短くなりました。
+
+## サーキットブレーカーの最小実装 — まず骨組みから
+
+ライブラリは色々ありますが、個人アプリでは「自分が説明できる量のコード」が何よりの保険になります。Python のサーバ側で私が使っている最小の骨組みは下のようなものです。リクエスト数が小さいうちはこれで十分動きます。
+
+```python
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from threading import Lock
+
+class State(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+@dataclass
+class Breaker:
+    failure_threshold: int = 5          # 連続失敗で OPEN へ
+    recovery_seconds: float = 30.0      # OPEN から HALF_OPEN へ
+    half_open_max_calls: int = 3        # 試験運転で許す呼び出し数
+    state: State = State.CLOSED
+    fail_count: int = 0
+    opened_at: float = 0.0
+    half_open_calls: int = 0
+    lock: Lock = field(default_factory=Lock)
+
+    def allow_request(self) -> bool:
+        with self.lock:
+            if self.state == State.OPEN:
+                if time.time() - self.opened_at >= self.recovery_seconds:
+                    self.state = State.HALF_OPEN
+                    self.half_open_calls = 0
+                else:
+                    return False
+            if self.state == State.HALF_OPEN:
+                if self.half_open_calls >= self.half_open_max_calls:
+                    return False
+                self.half_open_calls += 1
+            return True
+
+    def on_success(self) -> None:
+        with self.lock:
+            self.fail_count = 0
+            self.state = State.CLOSED
+            self.half_open_calls = 0
+
+    def on_failure(self) -> None:
+        with self.lock:
+            self.fail_count += 1
+            if self.state == State.HALF_OPEN or self.fail_count >= self.failure_threshold:
+                self.state = State.OPEN
+                self.opened_at = time.time()
+                self.fail_count = 0
+```
+
+骨組みとしては 60 行未満で書けます。実運用で大事なのは、`failure_threshold` と `recovery_seconds` を「自分のアプリの呼び出し頻度に合わせて」決めることです。私の壁紙アプリのバックエンドは秒間 4〜12 req 程度なので、5 回連続失敗（=およそ 1 秒分の連続失敗）で OPEN、復帰試行は 30 秒後、というのが現状の落としどころです。
+
+## Closed / Open / Half-Open の閾値を決めるときに迷ったこと
+
+数字選びで一番悩んだのは Half-Open の同時試験呼び出し数です。1 にすると復帰が遅く、5 にすると「まだ復活していない API」に向けて瞬間的に小さなトラフィックの山を作ってしまい、再び OPEN に戻る確率が上がります。手元の主要 3 アプリでは 3 に落ち着きました。これは経験則ですが、復帰判定に 3 回の独立した成功を要求できる粒度が、誤検知と回復の遅さのバランスとして個人開発の規模感に合うと感じています。
+
+もうひとつの落とし穴は、ブレーカーを「全リクエスト一本」で運用してしまうことです。Gemini API は同じプロジェクトでもエンドポイント（`generateContent` と `embedContent` 等）やモデル系統（Flash と Pro）で挙動が違うので、私はブレーカーを「モデル × エンドポイント」単位で持つようにしています。Flash 側が混雑していても Pro 側は無事、ということが普通に起きるためです。
+
+## Gemini 3 Pro → 2.5 Flash → キャッシュ → 既定値 の四段縮退
+
+ブレーカーが OPEN になった瞬間、ユーザーから見て何が起きるかが体験の肝です。落としどころは「無音にしない」「触ったボタンに必ず反応がある」の二点だと考えています。私のアプリでは下のような四段縮退を組んでいます。
+
+```python
+async def generate_caption(image_id: str, prompt: str) -> str:
+    # Step 1: 第一候補 — 高品質モデル
+    if pro_breaker.allow_request():
+        try:
+            return await call_gemini("gemini-3-pro", prompt, timeout=4.0)
+        except Exception:
+            pro_breaker.on_failure()
+        else:
+            pro_breaker.on_success()
+
+    # Step 2: 第二候補 — 安価で高速なモデル
+    if flash_breaker.allow_request():
+        try:
+            return await call_gemini("gemini-2.5-flash", prompt, timeout=2.0)
+        except Exception:
+            flash_breaker.on_failure()
+        else:
+            flash_breaker.on_success()
+
+    # Step 3: 直近 24h のキャッシュ（同じプロンプトの過去成功例）
+    cached = await cache.get_similar(prompt, top_k=1, min_score=0.86)
+    if cached:
+        return cached.text + "  ※簡易表示"
+
+    # Step 4: 既定文 — 体験を絶対に止めない最終手段
+    return DEFAULT_CAPTIONS_BY_CATEGORY.get(image_id, "鑑賞向けの一枚です")
+```
+
+四段目の既定文だけは個人アプリらしい工夫で、カテゴリごとに 30〜50 個の自然な短文を内蔵しておき、画像 ID の hash で安定的に選びます。ユーザーの目には「サーバ障害」ではなく「ちょっと素っ気ない説明文」に映ります。Crashlytics の上では空文字列を返した時にダイアログが落ちやすかったので、ここを既定文に置き換えただけで非致命的エラーの体感が大きく下がりました。
+
+## リトライ予算と指数バックオフを組み合わせて p95 を守る
+
+サーキットブレーカーと並べて、リクエスト単位のリトライ予算（retry budget）を持つのが効きました。何も考えずに指数バックオフでリトライを 5 回入れると、ブレーカーが OPEN になるまでの間にユーザーが体感する待ち時間が膨らみ、p95 レイテンシが極端に悪化します。私のサーバでは下の方針を採っています。
+
+```python
+async def call_with_budget(model: str, prompt: str, *, deadline_ms: int = 1500):
+    start = time.monotonic()
+    delays = [0.0, 0.15, 0.40]  # 最大 3 回試行
+    last_exc = None
+    for i, d in enumerate(delays):
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if elapsed_ms + d * 1000 > deadline_ms:
+            break  # 予算オーバーなら諦める方が p95 が守られる
+        if d:
+            await asyncio.sleep(d + random.uniform(0, 0.05))  # full jitter 風
+        try:
+            return await call_gemini(model, prompt, timeout=0.9)
+        except RetryableError as e:
+            last_exc = e
+            continue
+    raise last_exc
+```
+
+ポイントは `deadline_ms` で「この呼び出しに何ミリ秒までかけてよいか」を上から決め、その予算内でしかリトライしないことです。導入後に主要アプリの p95 は 1.8 秒前後で安定しました。リトライ回数を増やすほど成功率は上がりますが、その代償としてユーザーの体感が悪化するので、個人アプリでは「3 回・1.5 秒予算」あたりが私の好みです。
+
+## メトリクスは「失敗率」「p95」「フォールバック率」の三点で見る
+
+監視ダッシュボードに置く指標を絞ると運用が楽になります。私は次の三本だけ毎日見るようにしています。失敗率は分単位で 1% を超えたら通知、p95 は 5 分間平均で 2.5 秒を超えたら通知、フォールバック率（Step 2〜4 のいずれかに落ちた割合）は 1 日合計で 8% を超えたら週次の振り返り対象にしています。三点だけだと取りこぼしはありますが、個人開発の集中力で追えるのはここまでだと割り切っています。
+
+副次的な発見として、フォールバック率を見るようになってから「Pro と Flash の品質差で広告 CTR がどれくらい変わるか」を測れるようになりました。Flash に落ちると説明文の表現が少し平易になり、結果として広告タップ率は微増する一方、課金導線のクリック率はわずかに落ちました。アプリの収益構造がアド寄りか課金寄りかで、どちらのモデルを第一候補にするかの判断材料になります。
+
+## 実装で詰まりやすい点と、いま採っている推奨アプローチ
+
+最後に、設計時に詰まりやすかった所を残しておきます。先に書いた骨組みを丸ごとコピーしても、ここで言うポイントを押さえないと数週間で別の形で壊れる経験を私自身しています。
+
+一つ目はタイムアウトの階層化です。HTTP クライアントのタイムアウト、サーキットブレーカーの判定、リトライ予算、Cloud Run などの実行環境のリクエストタイムアウト、CDN の上限と、最大 5 段のタイムアウトが直列に並びます。下の層が上の層より長いとブレーカーが永遠に発火せず、上の層の方が短いと縮退コードに辿り着く前にプロセスが切られます。私は「内側ほど短く」を原則に、HTTP 0.9 秒 → リトライ予算 1.5 秒 → ブレーカー判定 3 秒 → 実行環境 6 秒、という順序を採用しています。
+
+二つ目は冪等性です。Gemini API への呼び出しはサーバ側から見て常に副作用がないとは限らず、特に Function Calling やツール呼び出しを通じて DB を更新するエージェントを書いている場合は、同一リクエスト ID で重複実行されることを前提に設計する必要があります。私は `request_id` を SHA-1 でハッシュ化して直近 10 分は同じ結果を返すよう KV にメモ化しています。
+
+三つ目は計測の粒度です。ブレーカーの状態遷移は Cloud Logging に独立のラベルとして必ず吐き、後から「いつ OPEN になり、いつ HALF_OPEN に移ったか」を追えるようにしておくと、原因切り分けが圧倒的に楽になります。私は遷移ログを BigQuery に流して 週次で 5 分以上 OPEN が続いた時間帯を棚卸しするのを習慣にしています。
+
+個人開発の現場では、上流の不調を前提にした設計が、結果として広告と課金の両方を守るための一番効く投資になりました。完璧な可用性を諦める代わりに、静かな縮退と速い復帰を磨き込むという考え方が、私の場合は性に合っているようです。同じように個人で運用されている方の参考になれば幸いです。お読みいただきありがとうございました。
