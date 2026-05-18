@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "IO — Google I/O 2026 は 5/19〜20 開催、Gemini 3.5 / Gemini Spark など新モデル発表が濃厚、GPT-5.5 対抗アップデートに期待（5/18）",
-    "ANDROID — Gemini Intelligence for Android: アプリを横断して複雑タスクを自動化、Gmail・カレンダー・ショッピングに対応（5/13）",
-    "GBOARD — Gboard に Rambler 統合、口語・フィラーワード・多言語混在発話を自然な文章に自動変換（Android Show 2026）",
-    "PRICE — Google が「AI Ultra Lite」プランを検討中、Gemini をより低価格帯で提供へ（9to5Google 5/5）",
-    "ANDROID17 — Android 17 + Android XR グラスも I/O で発表予定、Gemini を中心とした新 UI パラダイムへ（AndroidCentral）",
-    "RACE — Google が Apple の iOS 27 AI 刷新に対抗し Android への Gemini 統合を加速（CNBC 5/12）",
+    "IO2026 — Google I/O 2026 開幕（5/19）、Gemini 新モデルと Android Intelligence を発表予定",
+    "INTELLIGENCE — Gemini Intelligence が Android に到来、画面理解とアプリ横断タスク自動化（5月）",
+    "ANDROID17 — Android 17 は Gemini Intelligence をコアに、フォーム入力や要約をネイティブ統合（5月）",
+    "GPT55RIVAL — 新 Gemini モデルが GPT-5.5 級の推論性能を狙うと報道（5月）",
+    "WAVES — Galaxy / Pixel から段階展開、夏以降に時計・車・グラス・ラップトップに拡張（5月）",
+    "ALUMINIUM — Aluminium OS を新しいラップトップ プラットフォームとして I/O で発表予定（5月）",
   ],
   en: [
-    "IO — Google I/O 2026 runs May 19–20; Gemini 3.5 / Gemini Spark new models expected as GPT-5.5 rivals (May 18)",
-    "ANDROID — Gemini Intelligence for Android: cross-app task automation across Gmail, Calendar & Shopping (May 13)",
-    "GBOARD — Gboard gets Rambler integration: converts casual multilingual speech into polished text automatically (Android Show 2026)",
-    "PRICE — Google reportedly preparing 'AI Ultra Lite' plan to offer Gemini at lower price tiers (9to5Google, May 5)",
-    "ANDROID17 — Android 17 + Android XR glasses also expected at I/O, marking a new Gemini-centric UI paradigm (AndroidCentral)",
-    "RACE — Google accelerates Gemini integration into Android core ahead of Apple's iOS 27 AI overhaul (CNBC, May 12)",
+    "IO2026 — Google I/O 2026 kicks off (5/19) with a new Gemini model and Android Intelligence announcements",
+    "INTELLIGENCE — Gemini Intelligence arrives on Android with screen understanding and cross-app task automation (May)",
+    "ANDROID17 — Android 17 builds on Gemini Intelligence with native form-fill, summarization, and proactive AI (May)",
+    "GPT55RIVAL — Reports point to a new Gemini model targeting GPT-5.5-class reasoning performance (May)",
+    "WAVES — Rollout begins on Galaxy / Pixel, expanding to watches, cars, glasses, and laptops later this year",
+    "ALUMINIUM — Google to unveil Aluminium OS as a new laptop platform at I/O 2026 (May)",
   ],
 };
 
