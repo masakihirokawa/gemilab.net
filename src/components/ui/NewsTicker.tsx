@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "IO2026 — Google I/O 2026 開幕（5/19）、Gemini 新モデルと Android Intelligence を発表予定",
-    "INTELLIGENCE — Gemini Intelligence が Android に到来、画面理解とアプリ横断タスク自動化（5月）",
-    "ANDROID17 — Android 17 は Gemini Intelligence をコアに、フォーム入力や要約をネイティブ統合（5月）",
-    "GPT55RIVAL — 新 Gemini モデルが GPT-5.5 級の推論性能を狙うと報道（5月）",
-    "WAVES — Galaxy / Pixel から段階展開、夏以降に時計・車・グラス・ラップトップに拡張（5月）",
-    "ALUMINIUM — Aluminium OS を新しいラップトップ プラットフォームとして I/O で発表予定（5月）",
+    "GEMINI35F — Gemini 3.5 Flash 正式リリース、3.1 Pro 超えの性能と4倍速、Antigravity 2.0 と Gemini API へ即時展開（5/19）",
+    "GEMINI35P — Gemini 3.5 Pro は現在テスト中、来月（6月）リリース予定とアナウンス（5/19）",
+    "OMNI — Gemini Omni が登場、画像/音声/動画/テキストの任意入力から動画生成、AI Plus/Pro/Ultra に世界展開（5月）",
+    "SPARK — Gemini Spark が個人エージェントとして 24/7 稼働、Workspace + Canva/OpenTable/Instacart 連携、Daily Brief 配信（5月）",
+    "NEURALEX — Gemini app が Neural Expressive リデザイン、3.5 Flash 搭載で表現力豊かな音声対話に（5月）",
+    "VOICEWORK — Gmail Live / Docs Live / Keep voice notes が登場、音声ベースの Workspace 作業が本格化（5/19）",
   ],
   en: [
-    "IO2026 — Google I/O 2026 kicks off (5/19) with a new Gemini model and Android Intelligence announcements",
-    "INTELLIGENCE — Gemini Intelligence arrives on Android with screen understanding and cross-app task automation (May)",
-    "ANDROID17 — Android 17 builds on Gemini Intelligence with native form-fill, summarization, and proactive AI (May)",
-    "GPT55RIVAL — Reports point to a new Gemini model targeting GPT-5.5-class reasoning performance (May)",
-    "WAVES — Rollout begins on Galaxy / Pixel, expanding to watches, cars, glasses, and laptops later this year",
-    "ALUMINIUM — Google to unveil Aluminium OS as a new laptop platform at I/O 2026 (May)",
+    "GEMINI35F — Gemini 3.5 Flash launches with above-3.1-Pro benchmarks, 4x faster output, available in Antigravity 2.0 and Gemini API (5/19)",
+    "GEMINI35P — Gemini 3.5 Pro is currently in testing and rolls out next month (June), per Google's I/O announcement (5/19)",
+    "OMNI — Gemini Omni debuts, generating video from any combination of images, audio, video, and text for AI Plus/Pro/Ultra worldwide (May)",
+    "SPARK — Gemini Spark becomes a 24/7 personal agent across Workspace plus Canva, OpenTable, and Instacart, with a new Daily Brief (May)",
+    "NEURALEX — The Gemini app rolls out a Neural Expressive redesign with 3.5 Flash for more natural voice conversations (May)",
+    "VOICEWORK — Gmail Live, Docs Live, and Keep voice notes arrive, making voice-first Workspace workflows mainstream (5/19)",
   ],
 };
 
