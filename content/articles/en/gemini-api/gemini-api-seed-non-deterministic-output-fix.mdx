@@ -1,0 +1,132 @@
+---
+title: "Why a Fixed seed in the Gemini API Still Drifts, and How I Handle It"
+slug: "gemini-api-seed-non-deterministic-output-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-19T11:30"
+author: "Gemini Lab"
+description: "Even when you pin generationConfig.seed in the Gemini API, the same prompt can return slightly different outputs. Here is what causes the drift and the layered approach I rely on as an indie developer running a wallpaper-classification pipeline."
+tags: ["Gemini API", "generationConfig", "seed", "determinism", "troubleshooting"]
+---
+
+The wallpaper app I run as an indie developer relies on Gemini 2.5 Flash to auto-categorize new images, and I kept hitting a frustrating wall: even with `generationConfig.seed` pinned and `temperature=0`, the same image plus the same prompt would occasionally return a different label. I wanted a stable regression test, and seed alone was not enough. A few peers on Discord were running into the same thing, so I want to share where the drift actually comes from and the layered setup I ended up using in production.
+
+## Reproducing the drift with a minimal script
+
+Here is the shortest example I use to confirm the issue. It assumes the Python `google-genai` SDK 1.x.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+config = types.GenerateContentConfig(
+    temperature=0,
+    seed=42,
+    max_output_tokens=64,
+)
+
+for i in range(5):
+    res = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents="Describe Japan's four seasons in one sentence.",
+        config=config,
+    )
+    print(i, res.text.strip())
+```
+
+You would expect five identical strings. In practice, the wording shifts slightly on some runs. Removing `seed` produces wider variation, but adding it back does not flatten the variation to zero.
+
+## Why `seed` alone cannot give you determinism
+
+The mental model people bring to `seed` is "the random number that uniquely determines the output." In the Gemini API, `seed` is closer to "the initial state for the sampler." If anything outside the sampler introduces variation, the output will not be bit-identical.
+
+In day-to-day usage, three sources of drift dominate.
+
+First, the model alias you call against changes underneath you. `gemini-2.5-flash` is routed to the latest stable build internally, and Google can publish behavior updates without a loud release note. Unless you pin a dated tag such as `gemini-2.5-flash-001` (on Vertex AI), your `seed` is only valid for "the current weights on the current backend."
+
+Second, server-side batching and multi-GPU parallelism cause non-associative floating-point reductions. When tensors are summed in a slightly different order across requests, the final logits are not bit-equal, and even an argmax-style decode (`temperature=0`) can occasionally flip a token. This is not Gemini-specific; it is a property of every modern large-scale inference backend.
+
+Third, `temperature=0` does not implicitly tighten the other sampling knobs. `top_p` and `top_k` keep their default values unless you set them, and on thinking-capable models, the internal reasoning length can branch the final answer in ways `seed` does not control.
+
+## The three settings I always pin first
+
+When seed "isn't working," these are the three knobs I check before doing anything more elaborate.
+
+```python
+config = types.GenerateContentConfig(
+    # 1. Pin a dated model tag (e.g., "gemini-2.5-flash-001" on Vertex AI).
+    temperature=0,
+    top_p=1,
+    top_k=1,
+    seed=42,
+    max_output_tokens=64,
+    # 2. Disable thinking if the task does not need it.
+    thinking_config=types.ThinkingConfig(thinking_budget=0),
+)
+```
+
+The important pair is `temperature=0` plus `top_k=1`. The former says "always pick the max-probability token," but the latter narrows the candidate set to a single token at each step, removing one degree of freedom the server side could otherwise wiggle. Adding `thinking_budget=0` on reasoning-capable models also helps, because the answer no longer depends on how long the model decides to think.
+
+In my wallpaper pipeline, this combination dropped the observable drift from "a few percent of runs" to "rare enough that I notice it in logs once a week." It is not zero, because the floating-point order from server-side parallelism is outside my control.
+
+## A practical recipe for "near-deterministic" production
+
+Since perfect determinism is not available at the API level, I redesigned my pipeline so that occasional drift does not break anything. There are three layers.
+
+### 1. Hash the input and cache the response
+
+I only call Gemini once per `(model, prompt-hash, config-hash)`, store the result in KV / SQLite, and serve subsequent reads from there. The "same input returns a different result" failure mode literally cannot happen after the first call.
+
+```python
+import hashlib
+import json
+
+def cache_key(model: str, prompt: str, config: dict) -> str:
+    payload = json.dumps({"m": model, "p": prompt, "c": config}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+```
+
+Some engineers feel a cache "isn't really determinism." For pinning the behavior of a production pipeline, it is the most reliable tool I have found.
+
+### 2. Constrain the output space with structured outputs
+
+Pairing `response_mime_type="application/json"` with a `response_schema` shrinks the surface where wording can vary. Strings full of stylistic variation collapse into enum or boolean fields.
+
+```python
+config = types.GenerateContentConfig(
+    temperature=0,
+    top_k=1,
+    seed=42,
+    response_mime_type="application/json",
+    response_schema={
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "enum": ["nature", "abstract", "geometric", "cute", "minimal"],
+            },
+            "is_dark_theme": {"type": "boolean"},
+        },
+        "required": ["category", "is_dark_theme"],
+    },
+)
+```
+
+Switching my classifier from free-form text to an enum-backed schema produced the largest single improvement in regression test stability that I have measured for this pipeline.
+
+### 3. Vote across a few calls
+
+For the small subset of inputs that still wobble, I call the model three times and take the majority vote, or only accept the result when the calls agree. Cost goes up modestly, but `gemini-2.5-flash` is cheap enough per call that the extra spend is dwarfed by the cost of the occasional bad label propagating through the system.
+
+## When you truly need bit-perfect reproducibility
+
+For audit logs or strict A/B test control arms, do not depend on the API replaying the same output later. Persist the API response itself as an artifact at the time of the call, and replay from that artifact when reproduction is required. The Gemini API's `seed` is best read as a "best effort within identical hardware, batch, and build" hint, not a long-term reproducibility guarantee.
+
+If you build a test suite that assumes "seed is set, so the assertion strings will always match," you will spend a painful afternoon six months from now when the model is updated and every assertion turns red. I have been there. Rewriting my regression tests from "exact string match" to "JSON schema match plus category equality" was less work than I expected and has been quiet ever since.
+
+## Where to go from here
+
+If you are wrestling with this right now, the practical order I would suggest is: pin a dated model tag, add `top_k=1` and `thinking_budget=0`, then absorb the residual drift through a response cache and structured outputs. Thanks for reading — I hope this saves you the afternoon I lost to it.
