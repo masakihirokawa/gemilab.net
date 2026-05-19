@@ -1,0 +1,270 @@
+---
+title: "Gemini Files API と Cloudflare R2 を組み合わせた画像処理パイプライン設計 — 壁紙アプリ運営の実装メモ"
+slug: "gemini-files-api-cloudflare-r2-image-pipeline-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-19T15:45"
+author: "Gemini Lab"
+description: "Gemini Files API と Cloudflare R2 を組み合わせ、壁紙アプリの画像処理パイプラインを再設計した30日の記録です。48時間制限・冪等性・コスト監視の落とし穴と対処を、実装コードと数値で整理しました。"
+tags: ["Gemini API", "Files API", "Cloudflare R2", "個人開発", "画像処理", "壁紙アプリ"]
+highlights:
+  - "Files API の48時間ファイル寿命を前提にした R2 二段構成の役割分担"
+  - "アップロード冪等性とリトライをハッシュキーで担保する実装パターン"
+  - "失敗時の再アップロードコストを月¥3,000台に抑えるレート制御とコスト監視の組み立て方"
+---
+
+アーティスト・クリエイターの廣川政樹です。2013年から個人開発で続けている壁紙アプリは、累計5,000万ダウンロードを超えたあたりから、新規画像の受け入れ本数が想像以上に増えていきました。1日に数百枚単位で画像が追加され、その都度メタデータの抽出やキャッチコピーの生成を回す必要が出てきます。
+
+最初は素朴に Gemini API に画像を都度アップロードして処理していたのですが、48時間でファイルが消える仕様と、リトライ時に同じファイルを何度も上げ直してしまうコストが、月末に小さくない金額になって戻ってきました。そこから1ヶ月かけて、Cloudflare R2 と Gemini Files API を組み合わせた画像処理パイプラインに作り直しました。本稿はその設計の記録です。
+
+## 始まりは「同じ画像を3回アップロードしていた」と気づいた日
+
+2026年3月、壁紙アプリの管理画面に小さな違和感がありました。新規画像が1日あたり400枚前後追加されているのに、Gemini Files API の課金明細を見ると、その3倍近いアップロードが計上されていたのです。
+
+原因はすぐに分かりました。Gemini Files API はアップロードしたファイルが48時間で自動削除されます。私の旧パイプラインは「処理中にエラーが起きたら全部リトライ」というナイーブな実装だったため、わずかなネットワークエラーや一時的な5xx で、同じ画像が何度も再アップロードされていました。
+
+このとき気づいたのは、Files API は「永続ストレージ」ではなく「処理セッション用の一時領域」として扱うべきだという当たり前の事実でした。永続化は別レイヤに寄せるべきで、その役割に Cloudflare R2 がよく合います。
+
+## Files API と R2 をどう役割分担したか
+
+最終的に落ち着いた構成は、次のような二段ストレージです。
+
+| 層 | 役割 | 寿命 | 単価の感覚 |
+|---|---|---|---|
+| Cloudflare R2 | 画像本体の永続化・配信 | 永続 | egress 無料、保存¥2台/GB月 |
+| Gemini Files API | Gemini 処理セッション用の一時アップロード | 48時間 | 処理コール時のみ課金 |
+
+設計上の原則は3つに絞りました。
+
+1. 画像本体は必ず先に R2 へ保存し、R2 上の object key を「真実の在処」とする
+2. Gemini の処理が必要になったタイミングで初めて Files API に上げ、結果が返ったら使い捨てる
+3. リトライは Files API の `file_uri` をキャッシュしてから行い、48時間以内なら再アップロードしない
+
+この方針で書き直したアップロードラッパーは次のような形になりました。
+
+```typescript
+// src/lib/image-pipeline/upload.ts
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { createHash } from "node:crypto";
+
+interface UploadResult {
+  fileUri: string;       // Gemini Files API の参照
+  fileHash: string;      // SHA-256(本体)
+  expiresAt: number;     // UnixMS
+  r2Key: string;         // 永続側の object key
+}
+
+export async function ensureGeminiFile(
+  bytes: Uint8Array,
+  mimeType: string,
+  kv: KVNamespace,        // Cloudflare KV（メタデータ）
+  bucket: R2Bucket,       // Cloudflare R2（本体）
+  apiKey: string,
+): Promise<UploadResult> {
+  const fileHash = sha256(bytes);
+  const cacheKey = `gemini-file:${fileHash}`;
+  const r2Key = `originals/${fileHash}.bin`;
+
+  // 1) R2 永続層に未保存なら保存（put は idempotent）
+  if (!(await bucket.head(r2Key))) {
+    await bucket.put(r2Key, bytes, { httpMetadata: { contentType: mimeType } });
+  }
+
+  // 2) Files API キャッシュを KV から復元
+  const cached = await kv.get<UploadResult>(cacheKey, "json");
+  if (cached && cached.expiresAt > Date.now() + 5 * 60_000) {
+    return cached; // 48h 残り5分以上あれば再利用
+  }
+
+  // 3) Files API へアップロード（必要なときだけ）
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const file = await genAI.files.upload({
+    file: new Blob([bytes], { type: mimeType }),
+    config: { displayName: fileHash },
+  });
+
+  const result: UploadResult = {
+    fileUri: file.uri,
+    fileHash,
+    expiresAt: Date.now() + 47 * 60 * 60_000, // 47h で期限切れ扱い
+    r2Key,
+  };
+  await kv.put(cacheKey, JSON.stringify(result), { expirationTtl: 47 * 3600 });
+  return result;
+}
+
+function sha256(b: Uint8Array): string {
+  return createHash("sha256").update(b).digest("hex");
+}
+```
+
+R2 への保存はハッシュ名で完全に冪等になっており、Files API の方は KV に 47時間 TTL で参照を残しています。アップロード時間のばらつきを考慮して 48 ではなく 47 に丸めているのが地味なポイントです。残り時間が薄いキャッシュを掴むと、Gemini を呼んだ瞬間に「ファイルが見つからない」というエラーになります。
+
+## ハッシュキーで担保するリトライ冪等性
+
+旧パイプラインで一番費用がかさんでいたのは、リトライ時に同じバイト列を何度も Files API に流していた件でした。リライト後の冪等性は次のように整理しました。
+
+リトライ判定は2層に分けています。
+
+- 上位（ワークフロー層）: 失敗したジョブの再実行は `fileHash` ベースで重複を弾く
+- 下位（アップロードラッパー）: Files API への実 PUT は KV キャッシュをまず参照
+
+```typescript
+// src/lib/image-pipeline/worker.ts
+type Job = { id: string; bytes: Uint8Array; mime: string };
+
+export async function processJob(
+  job: Job,
+  env: Env,
+): Promise<{ caption: string; tags: string[] }> {
+  const file = await ensureGeminiFile(
+    job.bytes,
+    job.mime,
+    env.IMG_KV,
+    env.IMG_BUCKET,
+    env.GEMINI_API_KEY,
+  );
+
+  // 同一ハッシュで既に処理済みなら結果を返すだけ
+  const resultKey = `caption:${file.fileHash}`;
+  const cached = await env.IMG_KV.get(resultKey, "json");
+  if (cached) return cached as { caption: string; tags: string[] };
+
+  const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  const resp = await model.generateContent([
+    { fileData: { fileUri: file.fileUri, mimeType: job.mime } },
+    { text: "壁紙として配信する画像です。15字以内の日本語タイトルと、配信タグを5つ JSON で返してください。" },
+  ]);
+
+  const json = parseJsonLoosely(resp.response.text());
+  await env.IMG_KV.put(resultKey, JSON.stringify(json), { expirationTtl: 90 * 86400 });
+  return json;
+}
+```
+
+`caption:{hash}` の結果キャッシュも 90日 TTL で保持しています。同じ画像が別経路から再投入されてもコストが二重に発生しません。実運用では同一画像の重複投入が想像以上に多く、この一段のキャッシュだけで1日あたりの Gemini API コール数が約 22% 減りました。
+
+## 失敗を前提にしたレート制御の組み立て方
+
+Gemini API には RPM・TPM・1日あたり最大コール数のクォータがあり、Flash 系でも油断すると 429 が一気に増えます。1日 1,200 画像を超える日は、ピーク時間帯にきれいに固まる傾向があり、ナイーブにキューを流すと午後のたった2時間で 70% を消費してしまいました。
+
+対処として導入したのは「2段階のバックプレッシャ」です。
+
+1. Cloudflare Queues のディスパッチで秒間あたりの最大ジョブ数を絞る
+2. ワーカー内部で同時実行数を制御し、429 が出たら指数バックオフで一度だけ待つ
+
+```typescript
+// src/lib/rate/dispatcher.ts
+const MAX_INFLIGHT = 6;        // 同時 Gemini 呼び出し数
+const RPM_BUDGET = 480;        // 安全側の RPM 上限
+
+let inflight = 0;
+let calledInWindow = 0;
+let windowStart = Date.now();
+
+export async function withRateLimit<T>(fn: () => Promise<T>): Promise<T> {
+  while (inflight >= MAX_INFLIGHT) {
+    await sleep(50);
+  }
+  const now = Date.now();
+  if (now - windowStart >= 60_000) {
+    windowStart = now;
+    calledInWindow = 0;
+  }
+  if (calledInWindow >= RPM_BUDGET) {
+    const wait = 60_000 - (now - windowStart);
+    await sleep(Math.max(wait, 100));
+  }
+  inflight++;
+  calledInWindow++;
+  try {
+    return await fn();
+  } catch (e: any) {
+    if (e?.status === 429) {
+      await sleep(2_000 + Math.random() * 3_000);
+      return await fn(); // 1回だけ追加リトライ
+    }
+    throw e;
+  } finally {
+    inflight--;
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+```
+
+シンプルな実装ですが、これで 429 起因の Files API 多重アップロードが消えました。再アップロードコストは、書き直し前は月 ¥7,800 ほどでしたが、4月の運用1ヶ月で ¥3,200 にまで下がっています。Gemini 自体の処理コストは増えていない（むしろキャッシュ効果で減っている）ため、純粋に「無駄なリトライ」が抑えられた効果と判断しました。
+
+## 監視ダッシュボードは3つの指標だけにした
+
+監視は欲張ると続かないので、見るのは3つだけと決めています。
+
+| 指標 | しきい値 | 何が読めるか |
+|---|---|---|
+| Files API アップロード/件 比率 | 1.05 未満 | 再アップロードがどの程度起きているか |
+| Gemini 失敗率（24時間移動） | 1.5% 未満 | バックプレッシャ調整の必要性 |
+| 1画像あたりの Gemini コスト | ¥0.4 前後 | キャッシュヒット率の代理指標 |
+
+Cloudflare Analytics Engine に書き込むだけのシンプルな構成ですが、これだけで「金曜の夕方にエラーが偏る」「月末月初にコストが跳ねる」というパターンが見えるようになりました。
+
+```typescript
+// src/lib/metrics/report.ts
+export async function reportEvent(
+  env: Env,
+  event: "upload" | "skip" | "gemini_call" | "gemini_429" | "gemini_5xx",
+  costYen?: number,
+) {
+  env.METRICS.writeDataPoint({
+    indexes: [event],
+    blobs: [new Date().toISOString().slice(0, 13)], // YYYY-MM-DDTHH
+    doubles: [costYen ?? 0],
+  });
+}
+```
+
+書き込む粒度を「時間単位」にしているのは、後でクエリするときに行数が爆発しないためです。日単位だと粗すぎ、分単位だとコストが上がるので、私の場合は1時間に落ち着きました。
+
+## 30日運用で見えてきた3つの落とし穴
+
+実装して終わりではなく、運用して初めて見えてきたものが3つあります。
+
+1つ目は「R2 の `head()` を信用しすぎてはいけない」ということ。R2 の eventual consistency は短時間ですが、ジョブが極端に集中したときには `put` 直後の `head` が空振りすることがありました。同一ハッシュへの put は冪等なので、頻度の高い経路では `head` をスキップして常に `put` する方が安定しました。
+
+2つ目は「Files API の `displayName` を hash のみにしてはいけない」ということ。最初は SHA-256 をそのまま displayName にしていたのですが、ファイル一覧をダッシュボードで眺める時に何の画像か分からず、調査の手戻りが大きかったので、現在は `<category>-<hash[:8]>` という形式に変更しました。
+
+3つ目は、もっとも痛かった落とし穴で「`expiresAt - 5分` のマージンでも足りない瞬間がある」ということです。日本時間で深夜の集中処理時に、Gemini API のレスポンスが稀に 90秒ほどキューイングされ、5分マージンを食い切ったことがありました。47時間という丸め処理に変えて以降は発生していませんが、運用しながら少しずつ余裕を増やす判断は必要だと感じています。
+
+## コスト感を3ヶ月の数字で振り返る
+
+書き直し前後の費用を、私の手元で比較できる範囲で並べておきます。月の総ダウンロード本数は変わっていないので、純粋にパイプラインの違いとして読めるはずです。
+
+| 月 | 構成 | Files API アップロード回数 | 再アップロード比率 | Gemini 月額（処理） | 1画像あたり |
+|---|---|---|---|---|---|
+| 2026-02 | 旧構成（都度アップロード） | 約 51,000 件 | 約 35% | ¥18,400 | ¥1.40 |
+| 2026-03 | 移行中（R2 のみ追加） | 約 33,000 件 | 約 15% | ¥12,900 | ¥0.95 |
+| 2026-04 | 新構成（KV キャッシュ込み） | 約 13,500 件 | 約 5% | ¥7,800 | ¥0.58 |
+
+2月から4月にかけて、1画像あたりの処理コストが約 2.4倍 効率化しています。とりわけ大きく効いたのは「同じ画像が再投入されたときに Gemini を呼ばない」キャッシュ層で、3月→4月の変化はほとんどこの一段で説明できます。
+
+AdMob の収益と紐づけて読むと、壁紙アプリの1画像あたり eCPM 換算では、画像追加にかかる処理コストは収益の 1.2% 程度に収まりました。個人開発の身としては、ここまで小さくできれば「次の画像をどんどん足せる」という安心感が生まれます。
+
+なお、この数値は私のアプリの利用パターン（深夜に少し集中、休日にやや増える）でのものです。アプリの規模や画像追加の頻度によって変わるので、参考程度に読んでいただければと思います。
+
+## 設計判断の背景にあった「過去の自分の失敗」
+
+最後にひとつだけ、設計の背景にある個人的な動機を書かせてください。
+
+私は2014年から個人で AdMob を使ったアプリ運営をしていますが、その途中で何度か「リトライの設計を後回しにしたことで月末に数万円を溶かす」経験をしてきました。クラッシュリポートを見て「もっと早く対処できたはず」と思うことも多く、近年は「冪等性をどう担保するか」を最初に設計するよう意識しています。
+
+冪等性は派手な機能ではないので、後回しになりがちです。けれど、1日数百枚を処理するパイプラインでは、それが直接コストに反映されます。アーティストとして17の国際芸術賞を頂いてきた中で繰り返し感じてきたのは、地味な仕込みほど効くということでした。技術側でも同じ感覚は当てはまるのではないかと、書きながら改めて思いました。
+
+
+## このパイプラインを試してみたい方への小さな提案
+
+このパイプラインは、1日あたり数百枚〜数千枚規模の画像を扱う個人開発・小規模チームの方には十分に効くと思っています。導入を検討されているなら、まず R2 を経由する形に書き換えて、Files API のキャッシュ参照を入れるだけでも、月のアップロード比率はかなり改善するはずです。
+
+私自身、宮大工だった両祖父の影響もあって「同じ作業を二度しない」「作ったものは丁寧に積み直す」という姿勢を技術側にも持ち込みたいと考えています。再アップロードの削減も、結局はその延長線にある仕事だと感じました。
+
+実装の参考になれば幸いです。お読みいただきありがとうございました。
