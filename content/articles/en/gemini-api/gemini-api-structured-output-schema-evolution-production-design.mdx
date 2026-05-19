@@ -1,0 +1,235 @@
+---
+title: "Evolving Gemini API Structured Output Schemas in Production — Design Notes from a 50M-Download Indie App"
+slug: "gemini-api-structured-output-schema-evolution-production-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-20T02:45"
+author: "Gemini Lab"
+description: "How I rebuilt the JSON contract layer for a Gemini-powered recommendation feature serving 50M cumulative downloads — Dual-Emit, Sunset protocol, and a Python compatibility checker."
+tags: ["gemini-api", "structured-output", "schema-evolution", "production", "indie-development"]
+highlights:
+  - "Two-layer Zod schema design (Gemini-facing input, internal IR, public contract) with full Cloudflare Workers source"
+  - "Day-by-day log of a 2-week Dual-Emit migration, including the rollout cutoff threshold and how I picked it"
+  - "Python compatibility checker that joins sampled response logs with Swift/Kotlin client code to flag breaking changes before they ship"
+---
+
+About a month ago, one of the wallpaper apps I run as a solo developer started throwing errors at 5am from a Gemini-powered recommendation endpoint. The Crashlytics alert woke me up. The error trail read `Type 'undefined' is not assignable to type 'string'` — a Zod validation failure on the client side, and the crash rate was already climbing.
+
+The cause was almost embarrassing. The day before, I had added an optional field to the `response_schema` in Google AI Studio. Gemini happily generated the new field, but somewhere in the process, a *different* optional field changed its "unset" behavior from `undefined` to an empty string. An undocumented behavior shift. Around 20% of the users who hit the endpoint that day across my 50-million-download app catalog were affected. AdMob eCPM had been steady, but recommendation-driven session retention dropped 12% overnight, equivalent to about ¥180,000 in monthly impression revenue evaporating.
+
+What I really learned was this: the JSON that Gemini returns is not just data. It is a *contract* you make with every installed client — and it is a fragile contract, because a third-party model update can rewrite it without warning. This article is a record of the design I rebuilt after that incident: how I now treat schemas as contracts, the Dual-Emit pattern I've been running since April 2026, the Sunset protocol that follows it, and the Python compatibility checker that keeps the whole thing honest.
+
+## What broke, in numbers
+
+I'm an indie developer based in Japan. I've been shipping iPhone and Android apps as Dolice since 2014, with 18 wallpaper / healing / manifestation apps in the catalog, totaling roughly 50 million cumulative downloads. Gemini API has been doing recommendation tagging and short intro-text generation across most of them since early 2026.
+
+The damage that morning, in raw figures:
+
+- Apps affected: 6 of 18 (the ones using Gemini-driven recommendations)
+- Session retention drop: 12.4% average, worst single app 18.7%
+- AdMob impression loss: ~36,500 impressions in 24 hours
+- Equivalent monthly revenue loss: ¥180,000 (at a 5.20 USD eCPM baseline)
+- Full recovery time: 1 hour to fix code, ~23 hours total including App Store review and staged rollout
+
+The painful part wasn't the incident itself — it was the root-cause investigation. All I had were client-side Zod failure logs. The actual raw Gemini responses were essentially gone. Cloudflare Workers retained logs for 7 days, but the structured output bodies were being stripped to save space. Half of the post-incident work was about fixing this observability gap, not the schema bug.
+
+## Treat the schema as a contract — separate the internal IR from the public surface
+
+The first thing I changed was the assumption that "Gemini's response equals our API response." I split the model into three layers: a permissive **input schema** that accepts whatever Gemini sends, an **internal IR (Internal Representation)** that the rest of my code is allowed to depend on, and an **external schema** that defines the actual public contract with the client.
+
+```typescript
+// schemas/recommendation.ts
+import { z } from "zod";
+
+// Layer 1: Input schema — absorb Gemini-side variance here.
+export const GeminiRawRecommendation = z.object({
+  theme_tag: z.string().min(1).max(64),
+  // accept null / undefined / empty string and normalize at the boundary
+  subtitle: z.string().optional().nullable().transform((v) => v?.trim() || null),
+  confidence: z.number().min(0).max(1).default(0.5),
+}).passthrough(); // never reject if the model adds extra fields
+
+// Layer 2: Internal IR — the invariants the rest of the app may rely on.
+export const Recommendation = z.object({
+  theme: z.string().min(1).max(64),
+  subtitle: z.string().nullable(), // explicit null, never undefined
+  confidence: z.number().min(0).max(1),
+  source: z.enum(["gemini-3.2", "gemini-3.1-fallback", "cached"]),
+});
+
+// Layer 3: Public contract — versioned, stable, what the client sees.
+export const RecommendationV2 = z.object({
+  schemaVersion: z.literal("v2"),
+  theme: z.string(),
+  subtitle: z.string().default(""), // clients are guaranteed never to see undefined
+  confidence: z.number(),
+});
+```
+
+Three things matter here. First, the input schema uses `passthrough()` deliberately — if Gemini sneaks in a new field, you don't want a 500 error. Second, the internal IR decides once and for all that "absent" means `null`, not `undefined` and not `""`. Letting both leak past the boundary is what hurt me. Third, the public contract gets an explicit `schemaVersion` literal so the client can pick a parser instead of guessing.
+
+My grandfather was a temple carpenter (miyadaiku) in Japan, and one phrase from that craft has stuck with me: *before you put your hands on the wood, settle it.* I think about boundary normalization the same way now — the work you do at the edge makes everything inside easier to live with.
+
+## Dual-Emit — return v1 and v2 from the same response
+
+You cannot wait for 100% of installed clients to update before flipping the schema, especially as an indie developer. My catalog has roughly 22% Day-30 retention, which means a meaningful fraction of users may not open the app for weeks. So during migration, the server returns both v1 and v2 in the same response body.
+
+```typescript
+// workers/recommend.ts
+import { RecommendationV2 } from "../schemas/recommendation";
+
+export async function handleRecommend(req: Request, env: Env) {
+  const raw = await callGeminiAPI(env, prompt);
+  const ir = await normalizeToIR(raw); // input -> internal IR
+
+  const v1Payload = toV1Shape(ir);
+  const v2Payload = RecommendationV2.parse({
+    schemaVersion: "v2",
+    theme: ir.theme,
+    subtitle: ir.subtitle ?? "",
+    confidence: ir.confidence,
+  });
+
+  return Response.json({
+    // old clients keep reading the top-level fields
+    ...v1Payload,
+    // new clients read the v2 key
+    v2: v2Payload,
+    _meta: {
+      generated_at: new Date().toISOString(),
+      ir_source: ir.source,
+    },
+  });
+}
+```
+
+New clients prefer the `v2` key when it exists; old clients don't know about it and ignore the extra payload. They run side by side for a defined window.
+
+I chose two weeks. Retention curves for my older app versions show monthly active users dropping from ~67% to ~8% by Day 14 after a forced update prompt. As a rule of thumb I use "Day 7 is observation, Day 14 is the safe cutoff."
+
+## Workers implementation and the observability fix
+
+The trap in implementing Dual-Emit is forgetting to log all three layers — raw, IR, and public output. That was the original incident's root cause for me. The fix was sampled logging to Cloudflare R2: 1% of requests get their raw response, IR, v1 output, and v2 output written as JSON Lines.
+
+```typescript
+async function logSample(env: Env, payload: SamplePayload) {
+  // 1% sampling — enough to debug, cheap enough to keep
+  if (Math.random() > 0.01) return;
+
+  const date = new Date().toISOString().slice(0, 10);
+  const key = `gemini-samples/${date}/${crypto.randomUUID()}.jsonl`;
+
+  const line = JSON.stringify({
+    ts: Date.now(),
+    schema_version: "v2",
+    gemini_raw: payload.raw,
+    ir: payload.ir,
+    v1_output: payload.v1,
+    v2_output: payload.v2,
+    // critical: always include app version and locale
+    app_version: payload.appVersion,
+    locale: payload.locale,
+  });
+
+  await env.SAMPLES.put(key, line, {
+    httpMetadata: { contentType: "application/x-ndjson" },
+  });
+}
+```
+
+R2 with a 30-day retention policy costs me a few cents per month. Compared to the AdMob revenue at stake, the observability spend is trivial.
+
+### Sampling rate, in practice
+
+Day 1 at 1%, then drop to 0.1% once stable. For my apps (tens of thousands of requests per day per app), 0.1% still produces dozens of samples a day — plenty for production debugging.
+
+### Always log app_version and locale
+
+I strongly recommend this. Without it, you cannot distinguish "the Japanese-locale build of app X" from "everything globally." I lost half a day during the original incident because my samples didn't carry these fields, and I couldn't tell where the breakage was concentrated.
+
+## Compatibility checker — find breaking changes before you ship
+
+Before shipping a new schema, I want to know what fields my client code actually depends on, and what values are currently flowing through. This Python script joins the two:
+
+```python
+# scripts/schema_compat.py
+import json
+import re
+from pathlib import Path
+from collections import Counter
+
+# 1. Extract field references from client code (Swift + Kotlin)
+FIELD_RE = re.compile(r"\.recommendation\.(\w+)|response\[['\"](\w+)['\"]\]")
+
+def extract_field_usage(app_dirs: list[Path]) -> Counter:
+    usage = Counter()
+    for d in app_dirs:
+        for ext in ("*.swift", "*.kt"):
+            for f in d.rglob(ext):
+                text = f.read_text(encoding="utf-8", errors="ignore")
+                for m in FIELD_RE.finditer(text):
+                    field = m.group(1) or m.group(2)
+                    if field:
+                        usage[field] += 1
+    return usage
+
+# 2. Compute the actual distribution of values from sampled R2 logs.
+def sample_field_distribution(log_dir: Path) -> dict[str, dict]:
+    dist = {}
+    for f in log_dir.rglob("*.jsonl"):
+        for line in f.read_text().splitlines():
+            row = json.loads(line)
+            for k, v in (row.get("v1_output") or {}).items():
+                d = dist.setdefault(k, {"null": 0, "empty": 0, "value": 0})
+                if v is None:
+                    d["null"] += 1
+                elif v == "":
+                    d["empty"] += 1
+                else:
+                    d["value"] += 1
+    return dist
+
+# 3. Classify each proposed change.
+def classify_change(field, removed, became_required, usage, dist):
+    used = usage.get(field, 0)
+    nulls = dist.get(field, {}).get("null", 0)
+    total = sum(dist.get(field, {}).values()) or 1
+    null_ratio = nulls / total
+
+    if removed and used > 0:
+        return f"BREAKING: field '{field}' removed but referenced {used} times"
+    if became_required and null_ratio > 0.05:
+        return f"BREAKING: '{field}' required but {null_ratio:.1%} of past responses were null"
+    return "SAFE"
+```
+
+It's rough, but for my scale it's been enough. The first time I ran it, the `subtitle` field had a 14% null rate in production — far above the 5% threshold I had picked. Knowing "I cannot make this required without breaking 14% of responses" before I write the migration is much cheaper than learning it the way I did the first time.
+
+## Sunset protocol — how to retire v1 without scaring anyone
+
+Once Dual-Emit has been live for two weeks, you have to make a call. My rule:
+
+1. Day 0 — Ship Dual-Emit. Submit the client update that reads v2 to the stores.
+2. Day 7 — Add `_meta.deprecated = true` and `_meta.sunset_at = "YYYY-MM-DD"` to v1 responses.
+3. Day 10 — Check the version distribution of clients still reading v1. Project whether 90% will be on the new version by Day 14.
+4. Day 14 — If the projection holds, stop emitting v1. The response now contains only v2 and the meta block.
+5. If Day 14 falls short of 90%, extend the sunset to Day 21 and trigger an in-app update banner.
+
+I chose 90% because my historical store update completion rates land between 91% and 94% over 30 days when App Store review goes smoothly. Calibrate this number to your own update curves before you trust it.
+
+I also recommend reading `_meta.sunset_at` on the client and rendering a soft "please update" dialog when the sunset date is within seven days. Five lines of code. It is not a forced upgrade, so it does not hurt the UX, but it noticeably accelerates migration in my own measurements.
+
+## Why an indie developer ever starts thinking about contracts
+
+Honestly, I used to think schema versioning was a problem for enterprise-scale services, not solo developers. When I first touched the internet in 1997 at age 16, teaching myself programming, JSON was something you parsed loosely and shipped. For code I wrote and used myself, "contract" was an unnecessary word.
+
+It was crossing 50 million cumulative downloads that changed my mind. After the incident, I realized that there is no longer a polite "sorry, I'll fix it" that scales to that audience. Someday I hope my children, who do not live with me, will be able to look back on how I worked as an indie developer — and I want what they find to be technically and ethically honest.
+
+Both of my grandfathers were temple carpenters. They used to say, in their own quiet way, that working with your hands was a kind of devotion. Treating a schema as a contract is, I think, the same kind of work — not about getting one response right, but about keeping a promise to users you will never meet.
+
+## What to try next
+
+If you are running an app on top of Gemini API and want to avoid an incident like mine, I would start with exactly one thing: sample 1% of your Gemini responses into object storage with a 30-day retention. Just that. It will let you diagnose half of the inexplicable client crashes you have not yet had. Dual-Emit and Sunset protocols become natural to introduce once the observability layer is in place.
+
+I am still learning my way through this. If you are running anything at similar scale as a solo developer, I hope this is useful. Thank you for reading.
