@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMINI35F — Gemini 3.5 Flash 正式リリース、3.1 Pro 超えの性能と4倍速、Antigravity 2.0 と Gemini API へ即時展開（5/19）",
-    "GEMINI35P — Gemini 3.5 Pro は現在テスト中、来月（6月）リリース予定とアナウンス（5/19）",
+    "BENCHES — Gemini 3.5 Flash の主要ベンチマーク詳細公開: Terminal-Bench 2.1 で 76.2%、GDPval-AA 1656 Elo、MCP Atlas 83.6%、CharXiv 84.2%（5/20）",
+    "STUDIODEV — Gemini 3.5 Flash が Google AI Studio・Antigravity・Android Studio・Gemini API で開発者向けに即時提供開始（5/19）",
+    "GEMINI35P — Gemini 3.5 Pro は社内で稼働中、6月に一般公開予定とアナウンス、Deep Think 強化版搭載見込み（5/19）",
+    "SCIDEEP — Gemini for Science を発表、Deep Think + Deep Research で研究者の論文読解・実験設計・データ解析を加速",
     "OMNI — Gemini Omni が登場、画像/音声/動画/テキストの任意入力から動画生成、AI Plus/Pro/Ultra に世界展開（5月）",
-    "SPARK — Gemini Spark が個人エージェントとして 24/7 稼働、Workspace + Canva/OpenTable/Instacart 連携、Daily Brief 配信（5月）",
-    "NEURALEX — Gemini app が Neural Expressive リデザイン、3.5 Flash 搭載で表現力豊かな音声対話に（5月）",
-    "VOICEWORK — Gmail Live / Docs Live / Keep voice notes が登場、音声ベースの Workspace 作業が本格化（5/19）",
+    "ENTERPRISE — Gemini Enterprise Agent Platform 経由で 3.5 Flash が企業向けに提供開始、長期タスク・サブエージェント編成対応",
   ],
   en: [
-    "GEMINI35F — Gemini 3.5 Flash launches with above-3.1-Pro benchmarks, 4x faster output, available in Antigravity 2.0 and Gemini API (5/19)",
-    "GEMINI35P — Gemini 3.5 Pro is currently in testing and rolls out next month (June), per Google's I/O announcement (5/19)",
+    "BENCHES — Gemini 3.5 Flash benchmark numbers land: 76.2% on Terminal-Bench 2.1, 1656 Elo on GDPval-AA, 83.6% on MCP Atlas, 84.2% on CharXiv (5/20)",
+    "STUDIODEV — Gemini 3.5 Flash is live for developers in Google AI Studio, Antigravity, Android Studio, and the Gemini API (5/19)",
+    "GEMINI35P — Gemini 3.5 Pro is already in internal use and rolls out to everyone next month, with enhanced Deep Think on board (5/19)",
+    "SCIDEEP — Gemini for Science launches, pairing Deep Think and Deep Research to accelerate paper reading, experiment design, and data analysis",
     "OMNI — Gemini Omni debuts, generating video from any combination of images, audio, video, and text for AI Plus/Pro/Ultra worldwide (May)",
-    "SPARK — Gemini Spark becomes a 24/7 personal agent across Workspace plus Canva, OpenTable, and Instacart, with a new Daily Brief (May)",
-    "NEURALEX — The Gemini app rolls out a Neural Expressive redesign with 3.5 Flash for more natural voice conversations (May)",
-    "VOICEWORK — Gmail Live, Docs Live, and Keep voice notes arrive, making voice-first Workspace workflows mainstream (5/19)",
+    "ENTERPRISE — 3.5 Flash is also live on the Gemini Enterprise Agent Platform with long-horizon task and subagent orchestration support",
   ],
 };
 
