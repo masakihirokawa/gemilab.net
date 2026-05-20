@@ -1,0 +1,233 @@
+---
+title: "Designing a Continuous Quality Monitoring Pipeline for the Gemini API"
+slug: "gemini-api-quality-monitoring-golden-dataset-llm-judge"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-21T02:45"
+author: "Gemini Lab"
+description: "A practical, indie-developer-friendly design for a Gemini API evaluation pipeline that catches silent quality regressions using a Golden Dataset and a multi-aspect LLM-as-Judge, with full code and real cost numbers."
+tags: ["Gemini API", "Quality Monitoring", "LLM-as-Judge", "Golden Dataset", "Production", "Prompt Engineering"]
+highlights:
+  - "How to build a 30+ prompt Golden Dataset that stays useful for years, with the constraint-based labeling pattern that survives natural LLM variance"
+  - "A three-aspect LLM-as-Judge rubric with majority voting in Python that cut my judge variance from about 47% to 18%"
+  - "A sampling and model-tiering strategy that keeps evaluation cost under 3% of production API spend"
+---
+
+I have been shipping personal apps since 2014, and the lineup has now passed 50 million cumulative downloads. As the Gemini API became the backbone for AdMob copy, push notifications, and several backend prompts, I kept noticing the same uncomfortable pattern: one day, the output quality has quietly dropped. No errors. Responses still come back. But the texture of incoming user reports starts to shift in a way that is hard to articulate.
+
+For a while I responded by digging through logs and tweaking prompts after the fact, but I never enjoyed how reactive it felt. The instinct that pushed me to fix this came from somewhere unexpected. While building the body of work that received 17 international art awards over the years, I had to learn that maintaining quality in any practice requires an external lens you can return to. The same lens, in the form of a continuous evaluation pipeline, turned out to be exactly what my Gemini-powered apps needed.
+
+This article walks through the design of that pipeline as it runs today, with the practical constraints of an indie developer in mind.
+
+## You need a monitoring lane that is independent of production
+
+Running things alone means model swaps, prompt revisions, SDK updates, and library bumps all stack up quietly. The trouble is not that any one change is dangerous, it is that the same inputs start returning slightly different outputs across versions and you cannot tell.
+
+Across my current apps, I have 14 distinct Gemini API call patterns. They cover push notification copy, review summarization, content moderation, tone estimation, and a few app-specific roles. Eyeballing all of them on a schedule is not realistic for one person. So I built a separate evaluation lane that runs the same inputs through production prompts on a fixed cadence, completely outside the request path.
+
+The evaluation lane has only three jobs. Catch regressions when I update a model or a prompt. Notice silent drift even when I have not changed anything. Score new prompts before they go live so I have a baseline.
+
+## Building a Golden Dataset that ages well
+
+The backbone is a Golden Dataset, a curated collection of representative inputs paired with a description of the desirable output. I run with 32 entries today. More is not always better. The number settled where evaluation cost and coverage felt balanced for one operator.
+
+My first attempt locked down exact expected outputs. That broke immediately. LLM outputs have natural variance, and any strict string match flagged almost every run. The pattern that actually held up was constraint-based labeling on three levels.
+
+```yaml
+# golden_dataset/push_notification_001.yaml
+id: push_notification_001
+category: push_generation
+input:
+  user_segment: "lapsed_30d"
+  app_context: "wallpaper_app"
+  recent_actions: ["downloaded_5_wallpapers", "browsed_landscape_category"]
+expected:
+  # No exact-match. The output passes if the following hold.
+  must_include_intent: "lapsed_user_reactivation"
+  must_mention_category: ["landscape", "scenery", "nature"]
+  forbidden_phrases: ["best ever", "godlike app", "limited offer"]
+  tone: "warm_neutral"
+  max_chars: 60
+  language: en
+last_verified: 2026-05-10
+verified_by: hirokawa
+```
+
+`must_include_intent` captures intent at the meaning level, `must_mention_category` lists synonyms that satisfy the topic, `forbidden_phrases` protects brand voice, `tone` is a coarse vibe label, and `max_chars` caps length. Defining "correct" as a set of constraints instead of a single string is what lets the dataset survive the years.
+
+The hidden cost is the `verified_by` field. Even as a solo developer, I reserve one to two hours every quarter to walk through every ID and ask whether the constraints still represent good judgment. Without that, the Golden Dataset itself ages and starts to mislead.
+
+## Splitting LLM-as-Judge into three aspects
+
+Constraints alone cannot capture the diffuse sense of something feeling off. That is where LLM-as-Judge comes in as the second evaluation lane. In my setup I deliberately split the judge into three separate calls instead of asking one model to "rate this overall."
+
+The first aspect is constraint compliance. It checks the must/forbidden rules from the Golden Dataset. The rules are concrete, so a low-temperature small model works fine. The second is intent alignment, which checks whether the output direction matches the implied user goal from the input. The third is naturalness, which evaluates readability and the absence of mechanical phrasing.
+
+The reason I split is empirical. An "overall" judge produced visibly unstable scores in my own tests. Splitting reduced the cognitive load for each judge call and brought the rerun score variance down from around 47 percent to about 18 percent, which is the range I can actually trust as a signal.
+
+```python
+# judge.py — split-aspect judges with majority voting
+from dataclasses import dataclass
+from typing import Literal
+import google.generativeai as genai
+
+JUDGE_MODEL_HEAVY = "gemini-2.5-pro"
+JUDGE_MODEL_LIGHT = "gemini-2.5-flash"
+
+@dataclass
+class JudgeVerdict:
+    aspect: Literal["constraint", "intent", "naturalness"]
+    score: int            # 1-5
+    rationale: str
+
+CONSTRAINT_PROMPT = """You are a strict constraint checker.
+Score the candidate from 1 to 5 and explain in under 80 chars.
+Candidate output: <<<{output}>>>
+Constraints: must_include_intent={intent}, forbidden={forbidden}, max_chars={max_chars}
+Return JSON only: {{"score": int, "rationale": str}}"""
+
+INTENT_PROMPT = """Rate how well the output reflects the user goal implied by the input, 1-5.
+Input:  <<<{input}>>>
+Output: <<<{output}>>>
+Return JSON only: {{"score": int, "rationale": str}}"""
+
+NATURALNESS_PROMPT = """Rate naturalness of this output 1-5.
+Penalize mechanical phrasing, pushy tone, and bad length balance.
+Output: <<<{output}>>>
+Return JSON only: {{"score": int, "rationale": str}}"""
+
+
+def call_judge(prompt: str, model_name: str) -> JudgeVerdict:
+    model = genai.GenerativeModel(
+        model_name,
+        generation_config={"temperature": 0.1, "response_mime_type": "application/json"},
+    )
+    resp = model.generate_content(prompt)
+    data = resp.parsed if hasattr(resp, "parsed") else parse_json_fallback(resp.text)
+    return JudgeVerdict(
+        aspect=prompt_aspect(prompt),
+        score=int(data["score"]),
+        rationale=data["rationale"],
+    )
+
+
+def majority_vote(verdicts: list[JudgeVerdict]) -> dict[str, int]:
+    """Median across 3 calls per aspect absorbs the judge's mood swings."""
+    by_aspect: dict[str, list[int]] = {}
+    for v in verdicts:
+        by_aspect.setdefault(v.aspect, []).append(v.score)
+    return {a: sorted(s)[len(s) // 2] for a, s in by_aspect.items()}
+```
+
+The majority vote is there to absorb the judge's mood. I run three calls per aspect and take the median. It costs more, but the sampling strategy below brings the total budget back into reasonable territory.
+
+## Regression detection: read the trend, not the single point
+
+Running the same Golden Dataset every week gives you a time series of scores per sample and per aspect. After running this for about 8 months, my strong preference is to look at the trend, not the single week. A single low score is noise. A four-week median that dropped meaningfully is signal.
+
+Concretely I keep the median of the last four weeks as the baseline per sample and aspect. If the current week comes in 1.0 below baseline, that is a warning. If 1.5 below, it is an alert. This filters out the day-to-day noise and surfaces only the directional drift.
+
+```python
+# regression.py — drift detection against a 4-week median baseline
+import statistics
+
+WARN_DROP = 1.0
+ALERT_DROP = 1.5
+
+def detect_regression(history: list[float], current: float) -> str:
+    """`history` is the prior 4 weeks in chronological order, excluding this week."""
+    if len(history) < 4:
+        return "insufficient_history"
+    baseline = statistics.median(history)
+    delta = baseline - current
+    if delta >= ALERT_DROP:
+        return f"alert (baseline={baseline:.2f}, current={current:.2f})"
+    if delta >= WARN_DROP:
+        return f"warn (baseline={baseline:.2f}, current={current:.2f})"
+    return "ok"
+```
+
+Alerts trigger a personal notification (I use Pushover) that I always read during my weekly review block. The code is small. The discipline it enables is large. Since I introduced it, the pipeline caught three release-driven quality drops before any of them reached enough users to generate complaints.
+
+## Three tricks that keep evaluation cost under 3% of production
+
+An evaluation pipeline only works if it keeps running. If it ever costs more than the production it monitors, you will quietly turn it off. My target is to keep evaluation cost under 3 percent of production API spend.
+
+The first trick is tiered sampling. I do not evaluate all 32 samples every week. Samples whose scores have been stable for the past four weeks drop to every other week. Samples with visible variance are evaluated weekly. This compressed total runs to about 60 percent of the naive schedule.
+
+The second trick is model tiering by aspect. Constraint compliance runs on Gemini 2.5 Flash because rules are concrete. Intent and naturalness run on Gemini 2.5 Pro. The single-call cost gap between Flash and Pro is large enough that this routing alone cut judge cost by about 42 percent in my setup.
+
+The third trick is context caching. The input portion of each Golden Dataset entry never changes, so I push it through Gemini's context cache and only send the aspect-specific prompt fresh each time. That added another 8 percent or so of monthly savings on the evaluation side.
+
+In real money, my current evaluation lane costs about ¥4,200 per month, which is 2.4 percent of the production API spend it monitors. A 30x volume ratio between production and evaluation is sustainable.
+
+## The pipeline I am actually running
+
+Stitching the pieces together, here is the entry point I run as a weekly GitHub Actions job during late-night hours.
+
+```python
+# pipeline.py — weekly evaluation entry point
+import yaml
+from pathlib import Path
+from typing import Any
+
+from judge import call_judge, majority_vote, CONSTRAINT_PROMPT, INTENT_PROMPT, NATURALNESS_PROMPT
+from regression import detect_regression
+from store import load_history, append_score, send_alert
+
+DATASET_DIR = Path("golden_dataset")
+
+
+def select_samples_for_week(week: int) -> list[Path]:
+    """Tiered sampling. Volatile samples every week, stable ones every other week."""
+    all_paths = list(DATASET_DIR.glob("*.yaml"))
+    selected = []
+    for p in all_paths:
+        history = load_history(p.stem)
+        if not history or stdev_recent(history) > 0.4:
+            selected.append(p)
+            continue
+        if week % 2 == 0:
+            selected.append(p)
+    return selected
+
+
+def evaluate_one(sample_path: Path) -> dict[str, Any]:
+    sample = yaml.safe_load(sample_path.read_text())
+    output = run_production_call(sample["input"])
+    verdicts = []
+    for prompt_tpl, aspect, model in [
+        (CONSTRAINT_PROMPT,  "constraint",  "gemini-2.5-flash"),
+        (INTENT_PROMPT,      "intent",      "gemini-2.5-pro"),
+        (NATURALNESS_PROMPT, "naturalness", "gemini-2.5-pro"),
+    ]:
+        for _ in range(3):  # 3 calls per aspect, take the median
+            verdicts.append(call_judge(prompt_tpl.format(**sample, output=output), model))
+    scores = majority_vote(verdicts)
+    return {"id": sample["id"], "scores": scores, "output": output}
+
+
+def main(week: int) -> None:
+    targets = select_samples_for_week(week)
+    for path in targets:
+        result = evaluate_one(path)
+        for aspect, score in result["scores"].items():
+            history = load_history(result["id"], aspect)
+            status = detect_regression(history, score)
+            append_score(result["id"], aspect, score)
+            if status.startswith(("warn", "alert")):
+                send_alert(result["id"], aspect, status, result["output"])
+```
+
+What I value most about this layout is that every piece is independently replaceable. Swap the judge model and only `judge.py` changes. Move the dataset from YAML to CSV and only `select_samples_for_week` changes. That sort of seam-design is what lets a single person keep a pipeline alive over years.
+
+## What changed for me after putting this in place
+
+The most surprising shift was psychological. Before, updating a prompt always came with a quiet dread that I might be breaking something I could not see. Once the pipeline started returning scores, that dread mostly dissolved, and the cycle time for prompt improvements dropped to about a third of what it used to be.
+
+A secondary benefit was incident response. When a user writes in about a strange response, I can now check the evaluation log for that prompt family and immediately tell whether the issue is a systemic drop or an isolated edge case. The quality of my replies has quietly improved in turn.
+
+Indie development is the discipline of trusting systems with as many judgments as possible, because there is only one of you. If you are running on top of an external model like Gemini for any length of time, an evaluation pipeline is one of the highest-leverage systems you can build. Looking back, my main regret is not having built mine earlier.
+
+Thanks for reading. I hope this is useful for anyone running Gemini in production as an indie developer or a small team.
