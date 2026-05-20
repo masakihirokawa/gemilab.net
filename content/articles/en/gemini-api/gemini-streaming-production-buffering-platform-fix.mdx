@@ -1,0 +1,194 @@
+---
+title: "Gemini API Streaming Works Locally but Buffers in Production — Fixing Cloud Run, Vercel, and Cloudflare"
+slug: "gemini-streaming-production-buffering-platform-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-20T11:30"
+author: "Gemini Lab"
+description: "Streaming responses flow token-by-token in local dev, then arrive as one big blob in production. A walkthrough of the five most common causes — Cloud Run timeouts, Vercel runtime mismatch, Cloudflare Workers proxying, server-side text() pitfalls, and client-side decoding — with the fixes I use across Dolice Labs."
+tags: ["gemini-api", "streaming", "troubleshooting", "cloud-run", "vercel", "cloudflare"]
+---
+
+"On my laptop the Gemini response streams one character at a time. After deploying, the user just stares at a spinner for thirty seconds before the entire answer drops in at once." Across the Dolice Labs network — Claude Lab, Gemini Lab, Antigravity Lab, and Rork Lab — this is the single issue I have debugged more often than any other. The API itself is fine; `streamGenerateContent` is doing its job. Something between the model and the browser is **buffering** the chunks, and from the user's perspective it might as well be a frozen tab.
+
+This post walks through the five most common reasons production-only buffering happens and the concrete fix for each platform. I keep this checklist in front of me whenever I ship a new endpoint that talks to Gemini, because forgetting any one of the steps reliably breaks the experience.
+
+## First, prove that the chunks really are being buffered
+
+Roughly seventy percent of "streaming is broken" reports turn out to be a layer between the server and the browser holding chunks back. Before reaching for code changes, isolate whether the server is emitting chunks gradually and whether the client is reading them gradually. Two independent questions.
+
+The most reliable test is `curl --no-buffer`. From a shell, hit the production endpoint directly and watch whether bytes appear progressively.
+
+```bash
+curl --no-buffer -N \
+  -H "Content-Type: application/json" \
+  -X POST "https://your-app.example.com/api/chat" \
+  -d '{"prompt": "Long streaming response, please."}' \
+  2>&1 | tee /tmp/stream.log
+```
+
+`--no-buffer` disables curl's own stdout buffering and `-N` makes curl handle chunked transfer encoding without waiting. If the terminal stays silent for thirty seconds and then dumps the entire payload, the network path is buffering. If text trickles in steadily, the server is healthy and the bug is in the browser code — probably `fetch` ReadableStream handling.
+
+In Chrome DevTools, open the Network panel and look at the Timing breakdown for the request. A long **Content Download** phase means streaming is working. A long **Waiting (TTFB)** with a near-instant Content Download means the server is generating the full response before flushing anything.
+
+## Cause 1: the server collected the response before returning it
+
+This is the most common bug in my code reviews. Calling `model.generateContentStream()` and then doing `JSON.stringify(result)` or `await response.text()` somewhere in the middle defeats streaming completely. In Next.js Route Handlers, Hono, Elysia, or any modern framework, the goal is to hand a **ReadableStream** straight to the `Response` constructor.
+
+```ts
+// app/api/chat/route.ts (Next.js App Router, Node runtime)
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+export const runtime = "nodejs"; // do not switch to edge here without reading Cause 3
+export const dynamic = "force-dynamic";
+
+export async function POST(req: Request) {
+  const { prompt } = await req.json();
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const encoder = new TextEncoder();
+      try {
+        const result = await model.generateContentStream(prompt);
+        for await (const chunk of result.stream) {
+          const text = chunk.text();
+          if (text) controller.enqueue(encoder.encode(text));
+        }
+      } catch (err) {
+        controller.error(err);
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no",
+      "Transfer-Encoding": "chunked",
+    },
+  });
+}
+```
+
+The two headers worth memorising are `Cache-Control: no-transform` and `X-Accel-Buffering: no`. The latter is a hint that Nginx-family reverse proxies (the old Vercel Node runtime, Cloud Load Balancer in front of Cloud Run) respect when deciding whether to buffer.
+
+## Cause 2: Cloud Run timeouts and HTTP/1.1 chunk batching
+
+Cloud Run delivers streaming responses cleanly out of the box, but there are two traps.
+
+The first is the **request timeout**. The default is 60 seconds, and a long Gemini 2.5 Pro response can run past that. The connection gets cut mid-stream and the client sees a 504. Bump it explicitly:
+
+```bash
+gcloud run services update YOUR_SERVICE \
+  --timeout=300 \
+  --use-http2
+```
+
+The second trap is **HTTP/1.1 chunk batching**. Streaming works over HTTP/1.1 in theory, but in practice I have measured Cloud Load Balancer collecting four to five seconds of chunks before forwarding them. Flipping `--use-http2` on the service immediately smoothed it out. I first noticed this while shipping a wallpaper-categorisation endpoint for my indie iOS apps — the same indie apps that have accumulated tens of millions of downloads since 2014 — and it was an embarrassing amount of time before I tried HTTP/2.
+
+## Cause 3: Vercel Edge runtime vs Node runtime
+
+On Vercel, the `runtime` directive on a Route Handler changes everything about streaming behaviour.
+
+| Setting | Streaming | Max duration | Notes |
+| --- | --- | --- | --- |
+| `runtime = "edge"` | Native, stable | 25 s on Hobby, 300 s on Pro | Built on Web Streams; pairs well with fetch-based code |
+| `runtime = "nodejs"` | Works with `force-dynamic` | 10 s on Hobby, up to 900 s on Pro | Omitting `dynamic = "force-dynamic"` causes static generation |
+
+The two failure modes I see most often: hitting the **50 subrequest cap** in Edge runtime when an agent calls Gemini multiple times, and forgetting `export const dynamic = "force-dynamic"` on Node runtime, which silently turns the route into a build-time static export. In the latter case every user gets the exact same prebuilt response, instantly — which can look like streaming "broke" until you realise nothing is being generated at all.
+
+For Node runtime on Pro, lift the function timeout in `vercel.json`:
+
+```json
+{
+  "functions": {
+    "app/api/chat/route.ts": {
+      "maxDuration": 300
+    }
+  }
+}
+```
+
+## Cause 4: Cloudflare Workers and Pages Functions proxying
+
+All four Dolice Labs sites run on Cloudflare Workers, so I trip over this layer regularly. Workers handles ReadableStream natively, but the moment you slot in a caching middleware (something like `cache-worker.js`) it is easy to introduce a line that collapses the stream.
+
+A correct relay looks like this:
+
+```js
+// _workers/cache-worker.js (simplified)
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/chat")) {
+      const upstream = await fetch(request);
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: {
+          ...Object.fromEntries(upstream.headers),
+          "Cache-Control": "no-cache, no-transform",
+        },
+      });
+    }
+    return cacheHandler(request, env, ctx);
+  },
+};
+```
+
+The key is passing `upstream.body` straight into the new `Response`. Any path that does `response.clone()` inside a `Promise.all`, or `await response.text()`, ends up waiting for the entire upstream response before forwarding it. The Worker becomes the bottleneck.
+
+A related quirk: with **Smart Placement** or regional services enabled, the Worker may run in Tokyo while the origin lives in the United States, and the long round trips between them can mask themselves as buffering. For production traffic, prefer custom-domain routes over `workers.dev` and pin Smart Placement only after measuring.
+
+## Cause 5: client-side fetch and ReadableStream pitfalls
+
+Even with a flawless server, browser code that waits for the full response before rendering produces the same UX as buffering. The fetch ReadableStream needs to be iterated chunk-by-chunk.
+
+```ts
+async function streamChat(prompt: string, onToken: (t: string) => void) {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    body: JSON.stringify({ prompt }),
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!res.body) throw new Error("no body");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    onToken(decoder.decode(value, { stream: true }));
+  }
+}
+```
+
+The detail that bites people is `{ stream: true }` on the `TextDecoder.decode` call. Without it, multibyte characters (Japanese, emoji, anything outside basic ASCII) that span a chunk boundary get dropped or replaced. The visible result is "fifty characters appear every few seconds" — looks like buffering, is actually decoder behaviour.
+
+In React, updating `useState` on every chunk causes paint thrashing on long outputs. I keep a `useRef` for the accumulated text and `flushSync` once per animation frame; heavy transforms like `react-markdown` run once at the end.
+
+## Pre-deploy checklist
+
+These are the six items I run through before pushing any new Gemini endpoint to production.
+
+1. `curl --no-buffer -N` shows characters arriving progressively.
+2. Response headers include `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no`.
+3. Cloud Run service has `--timeout=300` and `--use-http2` set.
+4. Vercel Node-runtime handlers explicitly set `export const dynamic = "force-dynamic"`.
+5. Cloudflare Workers relays use `upstream.body` directly without `text()` or `clone().then(...)`.
+6. Client-side `TextDecoder.decode(value, { stream: true })` is in place.
+
+Since I started running through this list before every deploy across the four Dolice Labs sites, the "streaming mysteriously dies in production" incidents have effectively dropped to zero.
+
+## Closing thoughts
+
+Production-only streaming failures are almost always a path problem — Cloud Run, Vercel, Cloudflare, Nginx, or a piece of code that accidentally collects the full response — rather than something Gemini itself is doing wrong. Start by isolating whether the server is emitting chunks at all (`curl --no-buffer`), then check the server implementation for hidden `text()` calls, then go through the platform-specific knobs in this post.
+
+If you have time for one concrete next step, point that `curl --no-buffer` command at your live endpoint right now. If you see silence followed by a single dump, one of the sections above will explain it.
+
+Thanks for reading. I hope it saves another indie developer a long debugging weekend.

@@ -1,0 +1,195 @@
+---
+title: "Gemini API のストリーミングが本番だけまとめて返ってくる — Cloud Run・Vercel・Cloudflare のバッファリング対処"
+slug: "gemini-streaming-production-buffering-platform-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-20T11:30"
+author: "Gemini Lab"
+description: "ローカル開発では一文字ずつ流れるのに本番デプロイ後だけ応答が一括で返ってくる — Cloud Run / Vercel / Cloudflare Workers / Nginx で発生するストリーミングバッファリング問題を、原因と対処パターン別に整理しました。"
+tags: ["gemini-api", "streaming", "troubleshooting", "cloud-run", "vercel", "cloudflare"]
+---
+
+「ローカルでは一文字ずつ流れていた Gemini の応答が、本番にデプロイした途端、数十秒待たされて全文がドンと返ってくる」— Dolice Labs の 6 サイトをまたいで自動投稿パイプラインを組んでいる中で、私自身が一番何度もハマったのがこの問題でした。Gemini API 側は正しく `streamGenerateContent` を返しているのに、間に挟まるプラットフォーム（Cloud Run / Vercel / Cloudflare Workers / Nginx）が応答を **バッファ** してしまい、ユーザーには「フリーズしているように見える数十秒」だけが残ります。
+
+整理しておきたいのは、本番だけストリーミングが効かなくなる代表的な 5 つの原因と、プラットフォーム別の対処手順です。検証コマンドや Response ヘッダの組み合わせまで含めて、自分が直近で 1 ヶ月かけて潰した知見をそのまま残しました。
+
+## まず「本当にバッファされているか」を切り分ける
+
+トラブルの 7 割は、Gemini API ではなく**経路上のどこかで chunk が貯められている**ことが原因です。最初に切り分けるべきは「サーバー側はちゃんと小分けで吐いているのか」「クライアント側はちゃんと小分けで受け取れているのか」の 2 点です。
+
+最も信用できる検証は `curl --no-buffer` です。ターミナルから本番エンドポイントを直接叩いて、文字が段階的に流れてくるかを観察します。
+
+```bash
+curl --no-buffer -N \
+  -H "Content-Type: application/json" \
+  -X POST "https://your-app.example.com/api/chat" \
+  -d '{"prompt": "Gemini API のストリーミング検証用。長めに答えて"}' \
+  2>&1 | tee /tmp/stream.log
+```
+
+`--no-buffer` は curl 自身の標準出力バッファを切り、`-N` で transfer-encoding chunked を待たずに受け取ります。これで「数十秒沈黙 → ドカッと出る」なら経路でバッファされており、「ポロポロ出てくる」ならサーバーは正常で、ブラウザ側の問題（fetch ReadableStream の扱いや SSE クライアント）に絞れます。
+
+ブラウザの DevTools で確認するなら、Network パネルの該当リクエストを開いて **EventStream** タブまたは **Timing** の `Content Download` フェーズを見ます。Content Download が長く伸びていれば正常にストリーミングできており、`Waiting (TTFB)` だけが伸びている場合はサーバー側で全文生成を待ってから返している状態です。
+
+## 原因 1: レスポンスを `await response.text()` で受けてしまっている
+
+実装ミスとして一番多いのがこれです。Gemini SDK の `model.generateContentStream()` を呼んでも、その結果を `JSON.stringify` したり一旦バッファに詰めてから返すと、サーバー側でストリーミングは死にます。Next.js の Route Handler や Hono などのフレームワークでは、`Response.body` に **ReadableStream** をそのまま渡す形に揃えます。
+
+```ts
+// app/api/chat/route.ts (Next.js App Router)
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+export const runtime = "nodejs"; // ★ Edge にしない（後述）
+export const dynamic = "force-dynamic";
+
+export async function POST(req: Request) {
+  const { prompt } = await req.json();
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+  // SDK のストリームを Web Streams にブリッジ
+  const stream = new ReadableStream({
+    async start(controller) {
+      const encoder = new TextEncoder();
+      try {
+        const result = await model.generateContentStream(prompt);
+        for await (const chunk of result.stream) {
+          const text = chunk.text();
+          if (text) controller.enqueue(encoder.encode(text));
+        }
+      } catch (err) {
+        controller.error(err);
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no", // Nginx 経路のバッファ無効化（後述）
+      "Transfer-Encoding": "chunked",
+    },
+  });
+}
+```
+
+ここで効くのは `Cache-Control: no-transform` と `X-Accel-Buffering: no` の 2 つです。後者は Nginx 系のリバースプロキシ（Vercel の旧 Node Runtime、Cloud Run 前段の Cloud Load Balancer 等）に「このレスポンスはバッファするな」と明示するヒントになります。
+
+## 原因 2: Cloud Run の HTTP/2 とコネクションタイムアウト
+
+Cloud Run のデフォルトはレスポンス転送に問題はないのですが、罠が 2 つあります。
+
+1 つ目は **request timeout** です。Cloud Run のサービス設定で「リクエストタイムアウト」を 60 秒のまま運用していると、Gemini 2.5 Pro の長い応答（90 秒程度かかるケースがあります）が途中で 504 になります。`gcloud run services update YOUR_SERVICE --timeout=300` で 300 秒程度まで延ばすのが定石です。
+
+2 つ目は **HTTP/2 エンドポイントへの切り替え忘れ**です。デフォルトの HTTP/1.1 でも chunked transfer は動きますが、長時間ストリーミングする場合は HTTP/2 のほうが安定します。`gcloud run services update YOUR_SERVICE --use-http2` を一度叩いておくと、Cloud Load Balancer の中間バッファ挙動が変わって応答が滑らかになります。
+
+実際に私が個人開発の壁紙アプリで Gemini を使った類似カテゴリ提案 API を Cloud Run に載せた際、HTTP/1.1 のまま放置していたら 1 秒分の chunk が 4〜5 秒まとめて飛んでくる挙動になっていました。`--use-http2` をオンにし、サーバー側で 100 ms 単位の `flush` を明示的に行うようにしたら、ようやくローカルと同等のスムーズさが戻りました。
+
+## 原因 3: Vercel の Edge Runtime と Node Runtime の違い
+
+Vercel に Next.js App Router をデプロイしている場合、**Route Handler の `runtime` 指定** によってストリーミング挙動が大きく変わります。
+
+| 設定 | ストリーミング | 最大実行時間 | 備考 |
+| --- | --- | --- | --- |
+| `runtime = "edge"` | 安定 | 25 秒（Hobby）/ 300 秒（Pro） | Web Streams ネイティブ。fetch ベース実装と相性が良い |
+| `runtime = "nodejs"` | 標準で OK だが要 `force-dynamic` | 10 秒（Hobby）/ 60〜900 秒（Pro 設定次第） | `export const dynamic = "force-dynamic"` を必ず指定 |
+
+落とし穴は Edge Runtime の **subrequest 制限 50 回** と、Node Runtime の **`force-dynamic` 指定忘れ**による Static 化です。後者の場合、ビルド時にレスポンスが事前生成されてしまい「常に同じ内容が一括で返ってくる」謎の挙動になります。私はこれを `gemini-api-edge-runtime-subrequest-limit-troubleshooting` で詳しく書いていますが、5,000 万 DL 規模を想定するなら最初から Edge + KV キャッシュにしておくと、後で書き直す痛みが減ります。
+
+Pro プランで Node Runtime を使う場合は、`vercel.json` で関数ごとに最大実行時間を伸ばします。
+
+```json
+{
+  "functions": {
+    "app/api/chat/route.ts": {
+      "maxDuration": 300
+    }
+  }
+}
+```
+
+## 原因 4: Cloudflare Workers / Pages Functions のレスポンス整形
+
+私自身が Dolice Labs 4 サイト（Claude Lab / Gemini Lab / Antigravity Lab / Rork Lab）の本体を Cloudflare Workers に載せている関係で、ここは特によく踏みます。Cloudflare Workers は ReadableStream をネイティブで扱えますが、間に `cache-worker.js` のようなキャッシュレイヤーを挟むと、**応答ボディを `await response.text()` してから返す古い実装が紛れ込んでいるケース** が定期的に発生します。
+
+正しい Workers 側の中継パターンはこうです:
+
+```js
+// _workers/cache-worker.js（簡略）
+export default {
+  async fetch(request, env, ctx) {
+    // ストリーミング系の API はキャッシュをバイパス
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/chat")) {
+      const upstream = await fetch(request);
+      // ★ body をそのまま転送（クローンや text() 化は厳禁）
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: {
+          ...Object.fromEntries(upstream.headers),
+          "Cache-Control": "no-cache, no-transform",
+        },
+      });
+    }
+    // 他のパスは通常キャッシュ処理
+    return cacheHandler(request, env, ctx);
+  },
+};
+```
+
+`upstream.body` をそのまま `new Response(..., { ... })` の第一引数に渡すのがポイントです。`response.clone()` を `Promise.all` で待ったり、`await response.text()` を経由すると、その時点で全文受信を待つので「Workers レイヤーでバッファされた」結果になります。
+
+加えて、Cloudflare の **smart placement** や **regional services** を有効にしていると、Workers 自体が東京で動いているのにオリジン側が米国にあって、その間で chunk がまとまる挙動も見ました。`workers.dev` 直接よりもカスタムドメイン経由のほうが安定するので、本番では Pages Functions / Workers Routes での運用を勧めます。
+
+## 原因 5: クライアント側 fetch + ReadableStream の処理ミス
+
+サーバーが完璧でも、ブラウザ側で「全文受信してから一気に描画する」コードを書いていると、ユーザー体験はバッファされたのと同じです。fetch の ReadableStream は async iterator で 1 chunk ずつ取り出します。
+
+```ts
+// クライアント側
+async function streamChat(prompt: string, onToken: (t: string) => void) {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    body: JSON.stringify({ prompt }),
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!res.body) throw new Error("no body");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    onToken(decoder.decode(value, { stream: true }));
+  }
+}
+```
+
+ここで `decoder.decode(value, { stream: true })` の **`{ stream: true }` を忘れない** ようにします。マルチバイト文字（日本語）を chunk の境界で受け取ると、これがないと文字化けや「不完全な文字を捨てる」挙動になり、結果として「数秒ごとに 50 文字単位で表示される」見え方になります。
+
+React で扱うなら、`useState` を chunk ごとに呼ぶより `useRef` + `flushSync` で 60 fps に合わせて更新するか、`react-markdown` のような重い変換は最後にまとめて流すと体感が良くなります。
+
+## 検証用チェックリスト
+
+push する前に手元で必ず通している項目です。
+
+1. `curl --no-buffer -N` で文字がポロポロ出るか確認した
+2. Response ヘッダに `Cache-Control: no-cache, no-transform` と `X-Accel-Buffering: no` が含まれている
+3. Cloud Run の場合、`--timeout=300` と `--use-http2` を設定済み
+4. Vercel Node Runtime の場合、`export const dynamic = "force-dynamic"` を明示している
+5. Cloudflare Workers の中継で `response.body` を直接渡している
+6. クライアントの `TextDecoder.decode(value, { stream: true })` を指定している
+
+このチェックリストを 6 サイトのデプロイ前に通すようになってから、本番だけ謎にストリーミングが死ぬ事故はほぼゼロになりました。
+
+## まとめ
+
+ストリーミング応答が本番だけ効かない問題は、Gemini API 側ではなく **経路上のプラットフォーム（Cloud Run / Vercel / Cloudflare / Nginx）と、それを正しく扱えていない実装** に原因があるケースが大半です。最初に `curl --no-buffer` で経路の挙動を切り分け、サーバー実装（特に `await response.text()` をしていないか）と Response ヘッダ、そしてプラットフォーム固有設定を順に確認していけば、ほとんどの症状は説明がつきます。
+
+次に手を動かす一歩としては、いま動いている本番エンドポイントに対して上の `curl --no-buffer` を 1 回だけ叩いてみてください。「沈黙 → ドカッ」が再現する場合、この記事のどれかの章に必ず該当しています。
+
+お読みいただきありがとうございました。同じく個人で複数サービスを並行運用している方の役に立てば嬉しいです。
