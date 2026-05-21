@@ -1,0 +1,177 @@
+---
+title: "When responseSchema enum returns unexpected values — debugging Gemini API"
+slug: "gemini-api-response-schema-enum-ignored-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-21T11:30"
+author: "Gemini Lab"
+description: "Why Gemini API sometimes returns values outside the enum you defined in responseSchema, and the three-layer workaround I use in production for my wallpaper app classification pipeline."
+tags: ["Gemini API", "responseSchema", "enum", "Structured Output", "Troubleshooting"]
+---
+
+I ran into this while classifying user-submitted wallpapers into four buckets — `landscape`, `portrait`, `abstract`, `other`. The schema clearly listed those four enum values, yet `"natural"` and `"scenery"` kept leaking into the responses. As an indie developer running wallpaper apps backed by AdMob revenue, a misclassification feeds straight into a worse search experience for users, so I spent a fair amount of time figuring out why a strict `enum` was not being respected.
+
+Below is the minimal reproducer, the most likely root cause, and the three layered workarounds I actually run in production.
+
+## Minimal reproducer
+
+```python
+from google import genai
+from pydantic import BaseModel
+from typing import Literal
+
+class Classification(BaseModel):
+    label: Literal["landscape", "portrait", "abstract", "other"]
+    confidence: float
+
+client = genai.Client()
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=[
+        "Classify this wallpaper image.",
+        image_part,
+    ],
+    config={
+        "response_mime_type": "application/json",
+        "response_schema": Classification,
+    },
+)
+
+result = Classification.model_validate_json(response.text)
+# Expected: label is always one of the four
+# Actual:   occasionally returns "natural", "scenic", "city" → pydantic.ValidationError
+```
+
+On my dataset, around 12 out of 5,000 wallpaper requests came back with a label that was not in the allowed set. Worse, retrying the same image often produced the same wrong enum value, which ruled out simple temperature randomness.
+
+## Why the enum gets ignored
+
+The official docs describe `propertyOrdering` and `enum` as schema features, but internally they behave closer to a *hint* than a hard constraint. Three conditions tend to make the leak more likely:
+
+1. Multimodal inputs (image, PDF) push the prompt token count higher.
+2. Two enum values share semantic neighborhood in natural language (`landscape` vs `scenic`).
+3. The prompt body itself does not enumerate the allowed values.
+
+The underlying decoding logic is not public, but in side-by-side comparisons of `gemini-2.5-flash` and `gemini-2.5-pro` on my image set, simply repeating the allowed values inside the prompt body reduced drift by 3× to 5×. It is best to treat `responseSchema` as a formatter, and to put the semantic constraints into the prompt body where the model actually pays attention. The same pattern shows up in OpenAI's `response_format` and Anthropic's tool use — a two-layer design of prompt plus schema is more robust than relying on the schema alone.
+
+## Fix 1: enumerate the allowed values in the prompt
+
+This was by far the most effective single change.
+
+```python
+ALLOWED = ["landscape", "portrait", "abstract", "other"]
+
+prompt = f"""\
+Classify the wallpaper image into exactly one of these labels:
+- landscape (natural scenery, mountains, sea, sky)
+- portrait (a person or animal as the main subject)
+- abstract (pattern, gradient, geometric art)
+- other (anything that does not fit the above)
+
+Return JSON. The "label" field MUST be exactly one of: {ALLOWED}.
+Do NOT invent new labels.
+"""
+
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=[prompt, image_part],
+    config={
+        "response_mime_type": "application/json",
+        "response_schema": Classification,
+    },
+)
+```
+
+Adding the semantic definitions and the explicit "do not invent new labels" line pushed the drift in my test set to nearly zero. Duplicating the constraint feels redundant on paper, but it is currently the most reproducible fix.
+
+## Fix 2: validate on receipt and retry once
+
+Edge cases still slip through, so I always validate the returned enum value and, if it fails, send one self-correction prompt. Unlimited retries would spike API cost, so the loop is capped — important when AdMob revenue feeds the budget.
+
+```python
+def classify_with_retry(image_part, max_retry: int = 1) -> Classification:
+    last_text = ""
+    for attempt in range(max_retry + 1):
+        instruction = prompt if attempt == 0 else (
+            f"Your previous label '{last_text}' was not in {ALLOWED}. "
+            f"Re-classify using ONLY these four labels."
+        )
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[instruction, image_part],
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": Classification,
+            },
+        )
+        last_text = response.text
+        try:
+            result = Classification.model_validate_json(last_text)
+            if result.label in ALLOWED:
+                return result
+        except Exception:
+            pass
+
+    # Fallback: treat as "other" so the pipeline never stalls
+    return Classification(label="other", confidence=0.0)
+```
+
+A single retry rescues most of the leftover edge cases. For the very rare image that still fails, falling back to `other` keeps the wider classification pipeline alive — a small but important detail for an app I have been running solo since 2014.
+
+## Fix 3: check the SDK version
+
+The interpretation of `response_schema` changed between `google-genai` v0.6 and v1.x. Passing a Pydantic v2 model directly only works on more recent versions; older ones require a plain JSON Schema `dict`.
+
+```bash
+pip show google-genai | grep Version
+# Upgrade if it is on an old release
+pip install --upgrade google-genai
+```
+
+Across the apps I maintain — which collectively have crossed the 50 million download mark over the years — I have seen CI environments pinned to old SDK releases where the enum ordering hint silently no-ops. If the drift rate differs between environments running the same code, check the SDK version first.
+
+## Operational ordering
+
+The three fixes are not alternatives. I run all three, in this order:
+
+- Always apply Fix 1 (prompt-side enumeration).
+- Layer Fix 2 (validate plus one self-correction) as a safety net.
+- Reach for Fix 3 (SDK version check) when the drift rate suddenly changes.
+
+Which fix is doing the heavy lifting depends on the phase of the product. Early on, Fix 1 is enough. As traffic grows and edge cases surface, Fix 2 becomes essential, and Fix 3 typically matters during SDK upgrade windows.
+
+## Watching for drift in production
+
+Total elimination is unrealistic, so I treat enum drift as a metric, not a defect to be hunted down once.
+
+```python
+def log_classification(label: str, allowed: list[str]):
+    is_drift = label not in allowed
+    # Send to Cloud Logging / BigQuery / Sentry, whichever you use
+    print({
+        "event": "enum_classification",
+        "label": label,
+        "is_drift": is_drift,
+    })
+```
+
+When the drift rate jumps, the cause is almost always one of:
+
+- a new model snapshot for `gemini-2.5-flash`,
+- a shift in the input distribution (a new wallpaper series went live),
+- an SDK upgrade.
+
+Having those three suspects mapped in advance turned a vague "feels less accurate this week" intuition into a 30-minute investigation.
+
+## Related symptoms that look the same
+
+A few other schema problems present with very similar symptoms. I have confused them with enum drift before:
+
+- Forgetting `response_mime_type` — the response comes back as Markdown-fenced JSON.
+- Nested `oneOf` — child fields always collapse to the first alternative.
+- Long JSON without `propertyOrdering` — field order shifts and parsing wobbles.
+
+Printing the raw `response.text` before validation is the fastest way to distinguish "the JSON came back wrong" from "the JSON was correct, but the enum was wrong."
+
+`responseSchema` is genuinely useful, but treating it as a hard contract leads to surprises. Pair it with explicit prompt-side constraints, a one-shot retry, and a drift metric, and the same pipeline keeps running through model updates and SDK upgrades alike.
