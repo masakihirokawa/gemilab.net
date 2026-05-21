@@ -1,0 +1,253 @@
+---
+title: "A Gemini API Control Plane for Indie Developers Running an App Portfolio"
+slug: "gemini-api-multi-app-portfolio-control-plane-architecture"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-22T02:45"
+author: "Gemini Lab"
+description: "When you run several apps (wallpaper, healing, manifestation) on Gemini API, keys scatter and per-app cost attribution disappears. This is the three-layer control-plane architecture I have used for twelve months, with the traps that only show up over time."
+tags: ["Gemini API", "Architecture", "Indie Developer", "AdMob", "Cost Management"]
+highlights:
+  - "A Firebase Remote Config–based three-layer control plane (Config / Routing / Telemetry) with implementation templates"
+  - "Per-app cost attribution via usage_metadata wrapping plus a daily BigQuery roll-up SQL"
+  - "A 5%→25%→100% model rollout pattern that lives entirely inside Remote Config — no separate A/B tooling required"
+---
+
+Some time in 2026, seven of the apps I run as an indie developer — mostly wallpaper, healing, and manifestation apps — quietly tipped over into calling the Gemini API directly. The first few were built the obvious way: each app held its own API key and called Gemini inline. By the fourth one I had a small but unmistakable incident: I could no longer tell which app was responsible for last month's Gemini bill. That was the moment I stopped, sat down, and redesigned how the portfolio talked to the API.
+
+If you operate several apps at once, the picture is probably familiar. Each app has its own key. Each app hard-codes a model name. The bill lands as one undifferentiated line on the Google Cloud invoice. From the outside everything looks fine; from the operator's seat the resolution of what you can see slowly fades to grey.
+
+In the following sections I want to walk through the idea of a "Gemini API control plane" — a thin central layer between your apps and the Gemini API — based on twelve months of running it myself. The implementation I describe is deliberately small: Firebase Remote Config plus a lightweight relay (Cloud Functions or Cloudflare Workers), sized for an indie developer rather than an enterprise team.
+
+## Why a central layer at all
+
+When you call the Gemini API directly from several apps, the problems converge on roughly three:
+
+1. **You cannot roll out a new model in one move.** Upgrading `gemini-2.5-flash` to `gemini-3.1-flash` requires shipping a new build of every app and waiting through every store review
+2. **You cannot attribute cost per app.** The GCP invoice is project-scoped, so you cannot tell what fraction of the bill came from the wallpaper app's onboarding text versus the manifestation app's daily message
+3. **You cannot anomaly-detect per app.** When call volume spikes, you have no way to know whether a single app is misbehaving or the whole portfolio is trending up
+
+All three dissolve if you place a thin central layer between the apps and Gemini. The apps say "generate text" or "describe this image." The central layer chooses the model, tracks the cost, and enforces rate limits.
+
+This is the same pattern that the commercial world calls an "LLM Gateway" or "Model Router." But for an indie developer running about 50 million cumulative downloads alone, full-fat middleware like Portkey or LiteLLM is overkill. Firebase Remote Config and Cloudflare Workers, in my experience, are enough.
+
+## Three layers: Config, Routing, Telemetry
+
+The control plane's responsibilities split cleanly into three layers.
+
+| Layer | Responsibility | Implementation |
+| --- | --- | --- |
+| Config | What settings each app sees | Firebase Remote Config with conditional values |
+| Routing | Actual destination and fallback decisions | Cloudflare Workers as a lightweight relay |
+| Telemetry | usage_metadata collection and daily aggregation | BigQuery plus a Google Sheet for the per-app roll-up |
+
+Keeping these separate matters. If the boundary is fuzzy, rolling back a model change ends up meaning "edit the Worker source and redeploy" — which is too slow. In my setup, every layer can be changed without a deploy.
+
+### Config layer: Remote Config as a server-side setting store
+
+Firebase Remote Config is usually discussed in the context of client-side A/B testing. Here I use it as a versioned server-side config store. It comes with built-in change history and instant rollback, which matches the cadence of indie development.
+
+Concretely, each app gets one slot inside a single Remote Config parameter called `gemini_app_config`:
+
+```json
+{
+  "wallpaper_app": {
+    "model": "gemini-3.1-flash",
+    "fallback": "gemini-2.5-flash",
+    "max_tokens": 1024,
+    "rate_limit_per_minute": 30,
+    "rollout_percent": 100,
+    "budget_jpy_per_day": 800
+  },
+  "healing_app": {
+    "model": "gemini-3.1-flash",
+    "fallback": "gemini-2.5-flash",
+    "max_tokens": 512,
+    "rate_limit_per_minute": 20,
+    "rollout_percent": 25,
+    "budget_jpy_per_day": 300
+  },
+  "attraction_app": {
+    "model": "gemini-2.5-flash",
+    "fallback": "gemini-2.5-flash-lite",
+    "max_tokens": 768,
+    "rate_limit_per_minute": 15,
+    "rollout_percent": 100,
+    "budget_jpy_per_day": 200
+  }
+}
+```
+
+`rollout_percent` is the dial for the staged rollout described below, and `budget_jpy_per_day` feeds the circuit-breaker logic in the Telemetry section.
+
+The Remote Config REST API requires an OAuth 2.0 admin token and has tight rate limits, so the Worker reads it with a five-minute cache:
+
+```typescript
+// worker/config.ts
+type AppConfig = {
+  model: string;
+  fallback: string;
+  max_tokens: number;
+  rate_limit_per_minute: number;
+  rollout_percent: number;
+  budget_jpy_per_day: number;
+};
+
+let configCache: { value: Record<string, AppConfig>; expiresAt: number } | null = null;
+
+export async function getAppConfig(env: Env, appId: string): Promise<AppConfig> {
+  if (configCache && configCache.expiresAt > Date.now()) {
+    return configCache.value[appId];
+  }
+
+  const token = await getRemoteConfigAccessToken(env);
+  const res = await fetch(
+    `https://firebaseremoteconfig.googleapis.com/v1/projects/${env.GCP_PROJECT}/remoteConfig`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  const body = await res.json<RemoteConfigResponse>();
+  const raw = body.parameters.gemini_app_config.defaultValue.value;
+  const parsed = JSON.parse(raw) as Record<string, AppConfig>;
+
+  configCache = { value: parsed, expiresAt: Date.now() + 5 * 60 * 1000 };
+  return parsed[appId];
+}
+```
+
+A subtle but important point: the Worker holds no "default" model name or budget. It only holds the decision logic. The values themselves always come from Remote Config. That separation is what makes future value-only changes painless.
+
+### Routing layer: dispatch and staged rollout
+
+Apps call the Worker at `/v1/generate` and pass an `appId`. The Worker pulls the config, looks at `rollout_percent`, picks between the new model and the fallback, and forwards the call to Gemini.
+
+```typescript
+// worker/router.ts
+export async function generate(req: GenerateRequest, env: Env): Promise<GenerateResponse> {
+  const cfg = await getAppConfig(env, req.appId);
+
+  await assertWithinBudget(env, req.appId, cfg.budget_jpy_per_day);
+  await assertRateLimit(env, req.appId, cfg.rate_limit_per_minute);
+
+  const useNewModel = hashUser(req.userId) % 100 < cfg.rollout_percent;
+  const model = useNewModel ? cfg.model : cfg.fallback;
+
+  const t0 = Date.now();
+  const result = await callGemini(env, model, req.prompt, cfg.max_tokens);
+  const elapsed = Date.now() - t0;
+
+  await emitTelemetry(env, {
+    app_id: req.appId,
+    model_used: model,
+    rollout_branch: useNewModel ? "new" : "fallback",
+    prompt_tokens: result.usageMetadata.promptTokenCount,
+    output_tokens: result.usageMetadata.candidatesTokenCount,
+    elapsed_ms: elapsed,
+    timestamp: new Date().toISOString(),
+  });
+
+  return { text: result.text, model };
+}
+```
+
+The critical line is `hashUser(req.userId) % 100 < cfg.rollout_percent`. A given user always lands on the same branch. Without that property, users feel a sudden change in response style mid-session, which reads as a bug to them.
+
+In my setup, staged rollouts always go `5 → 25 → 100` and each step holds for at least 48 hours. Forty-eight hours covers at least one full cycle of late-night and daytime traffic, and is long enough to outlast AdMob's reporting delay (up to 24 hours).
+
+### Telemetry layer: aggregating usage_metadata for attribution
+
+The `usageMetadata` returned by `callGemini` is the lifeline of per-app cost attribution. I land one row per call in BigQuery:
+
+```sql
+CREATE TABLE gemini_usage (
+  timestamp TIMESTAMP NOT NULL,
+  app_id STRING NOT NULL,
+  model_used STRING NOT NULL,
+  rollout_branch STRING NOT NULL,
+  prompt_tokens INT64 NOT NULL,
+  output_tokens INT64 NOT NULL,
+  elapsed_ms INT64 NOT NULL
+)
+PARTITION BY DATE(timestamp);
+```
+
+The daily attribution query joins against a small `gemini_pricing` view that holds the per-million-token rates:
+
+```sql
+SELECT
+  DATE(timestamp, "Asia/Tokyo") AS jst_date,
+  app_id,
+  model_used,
+  SUM(prompt_tokens) AS in_tokens,
+  SUM(output_tokens) AS out_tokens,
+  ROUND(
+    SUM(prompt_tokens) / 1000000.0 * p.input_usd_per_1m +
+    SUM(output_tokens) / 1000000.0 * p.output_usd_per_1m,
+    4
+  ) AS usd_estimated
+FROM gemini_usage u
+JOIN gemini_pricing p USING (model_used)
+WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+GROUP BY jst_date, app_id, model_used, p.input_usd_per_1m, p.output_usd_per_1m
+ORDER BY jst_date DESC, usd_estimated DESC;
+```
+
+A Google Apps Script triggers this query at 7 a.m. JST every morning and writes the results into a single sheet. Where the GCP invoice arrives once a month, this sheet arrives once a day — collapsing operational tempo from monthly to daily.
+
+## Running the entire staged rollout out of Remote Config
+
+A lot of staged-rollout documentation hands off the percentage logic to an A/B testing service. For an indie operator, adding another service usually costs more than it saves. The recipe below stays inside Remote Config and the Worker.
+
+1. In the `gemini_app_config` JSON, set the target app's `model` to the new model, `fallback` to the old one, and `rollout_percent` to `5`
+2. In the Worker, `hashUser(userId) % 100 < 5` routes 5 percent of users to the new model
+3. Observe `rollout_branch = "new"` latency, error rate, and output length in BigQuery for 48 hours
+4. If it looks healthy, raise `rollout_percent` to `25`, then `100`. If something is off, drop it back to `0` — rollback is instant
+
+Two caveats. First, background jobs (the wallpaper app's daily image batch, for example) do not have a `userId`. Hash on `appId + date` instead. Otherwise the dice rolls every time and your observation window becomes noise.
+
+Second, never set the Worker's Remote Config cache TTL to zero. The Remote Config REST API needs at least ~100 ms per request, and Workers compute is billed in CPU time. Five minutes is the sweet spot, with an admin endpoint `/admin/flush-config` that invalidates the cache instantly for emergency rollbacks.
+
+## Pairing it with a circuit breaker
+
+`budget_jpy_per_day` lives in Remote Config for a reason. The Worker's `assertWithinBudget` accumulates estimated USD into Workers KV as the day progresses. When the running total crosses 80 percent of the daily budget it emits a warning; when it crosses 100 percent it forces the `fallback` model:
+
+```typescript
+export async function assertWithinBudget(
+  env: Env, appId: string, budgetJpyPerDay: number
+): Promise<"normal" | "warn" | "degrade"> {
+  const jstDate = new Date().toISOString().slice(0, 10);
+  const key = `budget:${appId}:${jstDate}`;
+  const spentUsd = parseFloat((await env.BUDGET_KV.get(key)) ?? "0");
+  const spentJpy = spentUsd * 155; // a rough conversion is fine here
+
+  if (spentJpy >= budgetJpyPerDay) return "degrade";
+  if (spentJpy >= budgetJpyPerDay * 0.8) return "warn";
+  return "normal";
+}
+```
+
+The first time this actually fired in production was during a push-notification loop bug in one of my healing apps that exhausted a full day's budget by lunchtime. If the app had been calling Gemini directly, I most likely would not have noticed until the end-of-month invoice. With the control plane in place, the `degrade` flag tripped that same afternoon.
+
+## Traps that only become visible after twelve months
+
+After a year of running this, several traps surfaced that were not visible at design time.
+
+**Remote Config does not update instantly.** Saving a value in the console takes 1–2 minutes to propagate, and the Worker cache adds up to five more. The realistic worst case is seven minutes of old config still in flight. When you make a rollback decision, you must mentally model that delay — otherwise you will double-change a value out of impatience and confuse the next operator (often yourself).
+
+**You must split out `cachedContentTokenCount` in the telemetry.** When Context Caching is in use, only part of `promptTokenCount` is billable. If your BigQuery cost model does not subtract `cachedContentTokenCount`, apps that rely on caching look much more expensive than they actually are, and you end up tightening their budget in the wrong direction.
+
+**Cloudflare Workers' CPU budget is real.** Just `JSON.stringify`-ing a large prompt inside `callGemini` can burn tens of milliseconds of CPU. The free plan's 10 ms cap will refuse long-prompt apps. I moved to the paid plan ($5/month). Lambda is the other reasonable destination.
+
+**Store-review timing changes.** With a control plane in place, the app only knows the Worker endpoint and authentication. Model swaps happen entirely server-side, which is a real advantage. But it also means you can introduce new behavior without an app update — and App Store / Google Play guidelines require careful thinking about what server-side changes are acceptable. My personal rule: quality improvements to existing features can change server-side; new user-facing features ship via an app update.
+
+## Where to start
+
+The argument so far probably reads as "design is fine, but building this from scratch tomorrow is too much." I felt the same. The migration is easier as a staged path.
+
+Start with the BigQuery table `gemini_usage` and have each app log `usageMetadata` right after every API call. That alone gives you per-app cost attribution. No Worker required, no architecture rewrite — just one helper function inside each app.
+
+Next, pick the app whose feature surface changes most often, and put a Worker in front of just that one. Drive the model choice through Remote Config so you can feel how rollout branching behaves in production. This step is where most of the learning happens.
+
+Finally, migrate the rest of the portfolio behind the Worker. In my case, moving all seven apps took six weeks of careful, one-at-a-time rollout. Take it slow.
+
+If you walk away with one concrete next step, make it this: create the `gemini_usage` table, pick the highest-volume app in your portfolio, and instrument that app's Gemini calls to write `usageMetadata` to BigQuery tonight. The rest of the control plane can grow from there. Thanks for reading.
