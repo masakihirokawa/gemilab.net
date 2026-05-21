@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "BENCHES — Gemini 3.5 Flash の主要ベンチマーク詳細公開: Terminal-Bench 2.1 で 76.2%、GDPval-AA 1656 Elo、MCP Atlas 83.6%、CharXiv 84.2%（5/20）",
-    "STUDIODEV — Gemini 3.5 Flash が Google AI Studio・Antigravity・Android Studio・Gemini API で開発者向けに即時提供開始（5/19）",
+    "MANAGEDAG — Gemini API に Managed Agents 追加、API 1コールで Linux 隔離環境のエージェントを起動可能に（Antigravity ハーネス採用）",
+    "INTERACTAPI — Interactions API のスキーマ刷新、レガシースキーマは 2026-06-08 で廃止予定",
     "GEMINI35P — Gemini 3.5 Pro は社内で稼働中、6月に一般公開予定とアナウンス、Deep Think 強化版搭載見込み（5/19）",
-    "SCIDEEP — Gemini for Science を発表、Deep Think + Deep Research で研究者の論文読解・実験設計・データ解析を加速",
-    "OMNI — Gemini Omni が登場、画像/音声/動画/テキストの任意入力から動画生成、AI Plus/Pro/Ultra に世界展開（5月）",
-    "ENTERPRISE — Gemini Enterprise Agent Platform 経由で 3.5 Flash が企業向けに提供開始、長期タスク・サブエージェント編成対応",
+    "NANO4 — Gemini Nano 4 プレビュー版を Android 17 向けに公開、要約や情報抽出をオンデバイス処理",
+    "AISTUDIOAPP — Google AI Studio がテキストプロンプトから Jetpack Compose ネイティブ Android アプリを自動生成（5/19）",
+    "ULTRAPRICE — Google AI Ultra が $249→$99/月に値下げ、20x Pro 限度のプロプランは $200/月で継続",
   ],
   en: [
-    "BENCHES — Gemini 3.5 Flash benchmark numbers land: 76.2% on Terminal-Bench 2.1, 1656 Elo on GDPval-AA, 83.6% on MCP Atlas, 84.2% on CharXiv (5/20)",
-    "STUDIODEV — Gemini 3.5 Flash is live for developers in Google AI Studio, Antigravity, Android Studio, and the Gemini API (5/19)",
+    "MANAGEDAG — Gemini API adds Managed Agents — spin up agents in an isolated Linux sandbox with a single API call (powered by the Antigravity harness)",
+    "INTERACTAPI — Interactions API ships breaking schema changes; legacy schema is sunset on 2026-06-08",
     "GEMINI35P — Gemini 3.5 Pro is already in internal use and rolls out to everyone next month, with enhanced Deep Think on board (5/19)",
-    "SCIDEEP — Gemini for Science launches, pairing Deep Think and Deep Research to accelerate paper reading, experiment design, and data analysis",
-    "OMNI — Gemini Omni debuts, generating video from any combination of images, audio, video, and text for AI Plus/Pro/Ultra worldwide (May)",
-    "ENTERPRISE — 3.5 Flash is also live on the Gemini Enterprise Agent Platform with long-horizon task and subagent orchestration support",
+    "NANO4 — Gemini Nano 4 preview is available for Android 17 on-device summarization and information extraction",
+    "AISTUDIOAPP — Google AI Studio now generates native Jetpack Compose Android apps from a text prompt (5/19)",
+    "ULTRAPRICE — Google AI Ultra drops from $249 to $99/month; a $200/month plan retains 20x Pro usage limits for power users",
   ],
 };
 
