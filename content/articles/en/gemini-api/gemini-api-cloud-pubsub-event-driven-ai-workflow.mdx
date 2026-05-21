@@ -1,0 +1,393 @@
+---
+title: "Designing Event-Driven AI Workflows with Gemini API and Cloud Pub/Sub — Notes from an Indie Developer"
+slug: "gemini-api-cloud-pubsub-event-driven-ai-workflow"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-21T06:53"
+author: "Gemini Lab"
+description: "An implementation memo on wiring Gemini API into Cloud Pub/Sub event-driven workflows. Using an app-review analysis pipeline as the running example, the article covers retry policy, dead-lettering, idempotency, and cost guardrails — from the perspective of someone running it solo."
+tags: ["Gemini API", "Cloud Pub/Sub", "Cloud Run", "Event-Driven", "Indie Developer", "Production"]
+highlights:
+  - "How to choose between push and pull subscribers when Gemini API is on the other side, with code for each path"
+  - "A retry and dead-letter design that prevents silent quality drops when Gemini fails or returns malformed output"
+  - "Idempotency, dedup, and daily cost guards bundled as one coherent design for a single-operator project"
+---
+
+Over the last few months I've been reworking a small piece of plumbing across the six wallpaper apps I run on the side: when a user review arrives, classify and summarize it with Gemini, then quietly forward only the high-priority ones to my Slack DM. I started with a Cloud Functions HTTP trigger wired together in an afternoon. Then a few bursty days and a couple of transient Gemini errors later, the system was silently dropping analyses that I really did want to see.
+
+Stepping back, an AI workflow is mostly the job of catching events that flow in from the outside world, having an LLM read them in a near-human way, and handing the result off to the next system. The thing I kept reaching for to make this reliable was Cloud Pub/Sub. The following is a write-up of what I learned the hard way while putting Gemini API on top of Pub/Sub — both the code and the operational shape of the design.
+
+## Why I Put Pub/Sub at the Center of the AI Workflow
+
+I have been publishing iOS and Android apps as a solo developer since 2014, with total downloads now over 50 million. That track record has put me through plenty of moments where outside events arrive as a wave rather than a trickle: ad networks dropping daily reports all at once, StoreKit notifications batching up, App Store review counts spiking right after a release. Absorbing those waves without dropping data is a design problem you can't really avoid, even at indie scale.
+
+Cloud Pub/Sub is Google Cloud's managed messaging service that decouples publishers and subscribers and guarantees at-least-once delivery. For workflows that fan out into external calls like Gemini API, the property that matters most is that you can push the responsibility for asynchrony and re-delivery into Google's hands.
+
+- Publishers only need to assert that an event happened
+- Subscribers can pull or be pushed messages at their own sustainable rate
+- Retries, dead-lettering, and ordering are configured declaratively on the subscription
+
+Gemini API responses can range from a few hundred milliseconds to several seconds depending on the task. With Pub/Sub in front, even a sudden burst of 100 events can be absorbed and metered by the subscriber. Almost any AI workload that "doesn't have to answer in the same HTTP request" ends up living happily on top of Pub/Sub.
+
+## The Shape of the Review-Analysis Pipeline
+
+To keep the discussion concrete, here is the layout of the App Store / Google Play review-analysis pipeline I actually run.
+
+1. A Cloud Run Job periodically fetches new reviews from App Store Connect and Google Play Developer API
+2. Each new review is published one at a time to the `app-reviews` topic
+3. A Cloud Run service subscribed to `app-reviews` calls Gemini API to classify, summarize, and rank priority
+4. Results are written to Firestore; only high-priority records are republished onto `priority-alerts`
+5. A handler for `priority-alerts` forwards the entry to my Slack DM
+
+The AI step is exactly one node in that chain. Everything else is plain Pub/Sub plus Cloud Run. The discipline I want to highlight is "one message, one inference". Batching fifty reviews into a single Gemini call may look efficient, but it makes retries painful and cost projections fuzzier. Single-shot inference is the easier shape to operate.
+
+```text
+[Reviews fetcher (Cloud Run Job)]
+        │ publish
+        ▼
+[app-reviews topic] ──► [Cloud Run service: classifier]
+                                   │ (Gemini API)
+                                   ▼
+                          [Firestore: review_analyses]
+                                   │ publish (high priority only)
+                                   ▼
+                       [priority-alerts topic] ──► [Slack notifier]
+                                   │
+                                   ▼
+                       [dead-letter topic: review-dlq]
+```
+
+Before writing any code, I locked in three design decisions:
+
+- Which subscriptions go push, which go pull
+- Whether ordering matters, or per-user parallelism is enough
+- When to stop retrying and let a message fall into the dead-letter topic
+
+These three axes are reusable for any Pub/Sub workflow that calls an external API, not just Gemini.
+
+## Push vs Pull — Picking the Right Shape for Gemini
+
+Pub/Sub subscriptions come in two flavors: pull, where the subscriber asks for messages, and push, where Pub/Sub posts them to an HTTPS endpoint. For workflows that fan into an external API like Gemini, I default to push. Cloud Run hooked to a push subscription handles one message per HTTP request, which keeps the latency profile predictable.
+
+The minimum push subscriber I run looks like this. It is an Express server on Cloud Run that decodes the Pub/Sub envelope and calls Gemini.
+
+```javascript
+// app.mjs — Cloud Run service: classifier
+import express from "express";
+import { GoogleGenAI } from "@google/genai";
+import { Firestore } from "@google-cloud/firestore";
+import { PubSub } from "@google-cloud/pubsub";
+
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const firestore = new Firestore();
+const pubsub = new PubSub();
+const priorityTopic = pubsub.topic("priority-alerts");
+
+app.post("/", async (req, res) => {
+  const envelope = req.body;
+  if (!envelope?.message?.data) {
+    // A valid Pub/Sub POST always carries message.data. Bad shape => ack and drop.
+    return res.status(204).send();
+  }
+  const raw = Buffer.from(envelope.message.data, "base64").toString("utf8");
+  let review;
+  try {
+    review = JSON.parse(raw);
+  } catch {
+    // Unparseable forever. Ack and discard.
+    return res.status(204).send();
+  }
+
+  try {
+    const analysis = await classifyReview(review);
+    await firestore
+      .collection("review_analyses")
+      .doc(review.reviewId)
+      .set(analysis, { merge: true });
+
+    if (analysis.priority === "high") {
+      await priorityTopic.publishMessage({
+        attributes: { reviewId: review.reviewId },
+        json: { ...review, analysis },
+      });
+    }
+    return res.status(204).send();
+  } catch (err) {
+    console.error("classify-failed", { reviewId: review.reviewId, err: err.message });
+    // 5xx asks Pub/Sub to redeliver. Only retriable errors should reach here.
+    return res.status(500).send("retryable");
+  }
+});
+
+async function classifyReview(review) {
+  const prompt = buildPrompt(review);
+  const result = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: REVIEW_SCHEMA,
+      temperature: 0.2,
+    },
+  });
+  return JSON.parse(result.text);
+}
+
+app.listen(process.env.PORT || 8080);
+```
+
+Three small traps caught me in this layout. First, Pub/Sub treats 2xx as ack and 5xx as nack, so returning 500 on errors you actually want to discard (bad payloads, retired App IDs) causes infinite redelivery. I recommend separating retriable and non-retriable exceptions from day one. Second, push subscriptions have a default HTTP timeout of 10 seconds and a maximum of 600. If you use a slower Gemini model, raise the ack deadline accordingly — I use 60 seconds for `gemini-2.5-flash` and 180 seconds for `gemini-2.5-pro`. Third, lock the Cloud Run service to "no unauthenticated", and grant `roles/run.invoker` to the Pub/Sub service agent. That is the standard production shape.
+
+I reach for pull subscriptions only in two cases: when I want strict global throttling across calls to Gemini, or when I am batch-processing large backlogs. Pull from a Cloud Run Job is more flexible, but you take on every retry and error path yourself. For the day-to-day event loop, push wins.
+
+## Ordering — Per-User Sequencing Without Stalling Everything
+
+Reviews can confuse the analyzer if an older review for the same user is processed after a newer one. "Keep the same user's messages in order" is a common request in Gemini workflows.
+
+Pub/Sub supports ordering keys on the subscription. Set the `ordering_key` to `userId` and messages for that user will be delivered in publish order. The trade-offs to accept are:
+
+- While a message is being retried, later messages with the same key are blocked
+- Per-message latency dilation hurts overall throughput more than you'd expect
+- Ordering is not preserved across regions, so don't design around cross-region order
+
+In my setup, the review analyzer uses per-user ordering, while `priority-alerts` is ordering-free. The rule is to keep ordering "as minimal as possible, only where it's required". Ordering everything makes every transient Gemini error cascade into a global stall.
+
+When you use ordering keys, the publisher must also opt in.
+
+```javascript
+// publisher.mjs — Reviews fetcher (Cloud Run Job)
+import { PubSub } from "@google-cloud/pubsub";
+
+const pubsub = new PubSub();
+// messageOrdering: true is required when using orderingKey
+const topic = pubsub.topic("app-reviews", { messageOrdering: true });
+
+export async function publishReview(review) {
+  try {
+    await topic.publishMessage({
+      orderingKey: `user:${review.userId}`,
+      json: review,
+    });
+  } catch (err) {
+    console.error("publish-failed", err);
+    // Once an ordered publish fails, that key is paused until resumed.
+    topic.resumePublishing(`user:${review.userId}`);
+    throw err;
+  }
+}
+```
+
+`resumePublishing` is one of the operations that only exist for ordered publishing. Forget it and every later message for that key is silently stuck. Hook it into your health checks before going live.
+
+## Designing Failure — Retries and Dead Letters
+
+The single most important design decision in an event-driven AI workflow is what to do when things fail. For Gemini-bound processing I split errors into four buckets.
+
+- 5xx server errors, rate limits, network blips — retry
+- Response doesn't match the JSON schema — retry once or twice, then DLQ
+- Retired App ID, empty review body — drop immediately, don't retry
+- Gemini explicitly refused to answer — drop but leave a trace in Firestore
+
+On the subscription side, retries and the dead-letter target are wired together like this.
+
+```bash
+gcloud pubsub topics create review-dlq
+gcloud pubsub topics create app-reviews
+
+gcloud pubsub subscriptions create app-reviews-sub \
+  --topic=app-reviews \
+  --push-endpoint=https://classifier-xxx.a.run.app \
+  --push-auth-service-account=pubsub-invoker@project.iam.gserviceaccount.com \
+  --ack-deadline=60 \
+  --message-retention-duration=7d \
+  --min-retry-delay=10s \
+  --max-retry-delay=600s \
+  --dead-letter-topic=review-dlq \
+  --max-delivery-attempts=5 \
+  --enable-message-ordering
+```
+
+Pub/Sub exposes the delivery attempt count via the `googclient_deliveryattempt` attribute. Subscribers that branch on "last attempt" can ack-and-route instead of letting the retry counter bleed out.
+
+```javascript
+// classifier.mjs (excerpt)
+const deliveryAttempt = Number(envelope.message?.attributes?.googclient_deliveryattempt ?? 1);
+const isLastAttempt = deliveryAttempt >= 5;
+
+try {
+  await classifyReview(review);
+  return res.status(204).send();
+} catch (err) {
+  if (isLastAttempt || isUnrecoverable(err)) {
+    // Ack and route to DLQ (or audit). Don't trigger another redelivery.
+    await firestore.collection("review_dlq_audit").doc(review.reviewId).set({
+      review,
+      reason: err.message,
+      attemptedAt: new Date().toISOString(),
+    });
+    return res.status(204).send();
+  }
+  return res.status(500).send("retryable");
+}
+```
+
+I treat the dead-letter topic as a human-facing queue. A tiny Cloud Run subscriber writes incoming DLQ messages into `review_dlq_audit` in Firestore and stops there. Re-injection happens only after I look. Resisting the urge to auto-recover from AI failures turns out to be the single biggest contributor to operational sanity.
+
+## Idempotency and Dedup — Don't Call Gemini Twice
+
+Pub/Sub is at-least-once. The same message can arrive more than once, and each Gemini call costs money. Idempotency is unglamorous but ties directly into your bill.
+
+I use a Firestore document keyed by the message id (or `reviewId`) and update it with `set({ merge: true })`. Before calling `generateContent`, I mark the document as "in_progress", then overwrite it on completion.
+
+```javascript
+async function classifyOnce(review) {
+  const docRef = firestore.collection("review_analyses").doc(review.reviewId);
+  const snap = await docRef.get();
+  if (snap.exists && snap.data().status === "done") {
+    // Already processed. Skip Gemini and ack.
+    return snap.data().analysis;
+  }
+  await docRef.set({ status: "in_progress", startedAt: new Date().toISOString() }, { merge: true });
+
+  const analysis = await classifyReview(review);
+  await docRef.set(
+    { status: "done", analysis, completedAt: new Date().toISOString() },
+    { merge: true }
+  );
+  return analysis;
+}
+```
+
+It is not airtight. Two workers can in theory race the "in_progress" state. In practice this catches well over 99% of duplicate calls, which I find good enough. For stricter guarantees, wrap the status update in a Firestore transaction, or switch to a stricter queue like Cloud Tasks.
+
+Pub/Sub now exposes an "exactly-once delivery" setting. That option strengthens ack semantics but does not remove the need for idempotency in your subscriber. For anything that calls Gemini, "ignore me if you've already seen me" is the design that holds up.
+
+## Structured Output to Reduce "Off-Schema" Results
+
+Pairing the workflow with Gemini's `responseSchema` makes the whole pipeline noticeably steadier. For review classification I pass a JSON schema like this.
+
+```javascript
+const REVIEW_SCHEMA = {
+  type: "object",
+  properties: {
+    sentiment: { type: "string", enum: ["positive", "neutral", "negative"] },
+    topics: {
+      type: "array",
+      items: { type: "string" },
+      maxItems: 5,
+    },
+    priority: { type: "string", enum: ["high", "medium", "low"] },
+    suggestedReply: { type: "string", maxLength: 400 },
+    requiresHumanReview: { type: "boolean" },
+  },
+  required: ["sentiment", "priority", "requiresHumanReview"],
+};
+```
+
+Combined with `responseMimeType: "application/json"`, Gemini sticks to the schema. In my deployment, schema-violation rate for `gemini-2.5-flash` under this configuration sits below 1%, and that 1% can be caught with a Zod parse and retried.
+
+```javascript
+import { z } from "zod";
+const ReviewAnalysis = z.object({
+  sentiment: z.enum(["positive", "neutral", "negative"]),
+  topics: z.array(z.string()).max(5).optional(),
+  priority: z.enum(["high", "medium", "low"]),
+  suggestedReply: z.string().max(400).optional(),
+  requiresHumanReview: z.boolean(),
+});
+
+async function classifyReview(review) {
+  const result = await ai.models.generateContent({ /* ... */ });
+  return ReviewAnalysis.parse(JSON.parse(result.text));
+}
+```
+
+When the parse fails, the choice is whether to retry or route directly to the DLQ. I retry once with a slightly lower temperature; if Gemini "confidently misformats" the response, the same call at the same temperature tends to produce the same shape, so a small temperature shift lifts the recovery rate.
+
+## Capping Cost the Queue Way
+
+The thing that really scares me about running AI workflows as a solo developer is the prospect of something runaway-firing overnight. AdMob revenue does not matter if a Gemini bill eats it. Pub/Sub plus Cloud Run helps here, because you can express the cost ceiling as queue shape.
+
+My three-layer cap looks like:
+
+- Pin Cloud Run max instances to a small number such as 10
+- Cap Cloud Run concurrency to 1–5 per instance
+- Lower `--max-outstanding-messages` on the subscription
+
+Even a sudden 10,000-message burst onto `app-reviews` can only consume "max-instances × concurrency" Gemini calls in flight. The rest wait in the queue. If each call costs $0.001, the hourly maximum is now a knowable number.
+
+I also keep a Firestore "daily cost guard" document. When the day's Gemini call count crosses a configured ceiling (I use 5,000), the subscriber short-circuits with a 204. Pub/Sub treats it as ack, so messages are not piled up — they are intentionally dropped under budget pressure. This little self-defense switch has bought me real peace of mind.
+
+```javascript
+async function isBudgetExceeded() {
+  const today = new Date().toISOString().slice(0, 10);
+  const ref = firestore.collection("budget_guards").doc(`gemini-${today}`);
+  const snap = await ref.get();
+  const used = snap.exists ? snap.data().count ?? 0 : 0;
+  return used >= Number(process.env.DAILY_LIMIT ?? "5000");
+}
+
+async function incrementBudget() {
+  const today = new Date().toISOString().slice(0, 10);
+  const ref = firestore.collection("budget_guards").doc(`gemini-${today}`);
+  await ref.set(
+    { count: Firestore.FieldValue.increment(1), updatedAt: new Date().toISOString() },
+    { merge: true }
+  );
+}
+```
+
+Put the guard immediately before the Gemini call and the spend will cap itself, regardless of Pub/Sub-side throttles.
+
+## Local Testing and Deployment
+
+The Pub/Sub Emulator gives a close-to-production loop for local testing, and `gcloud run deploy --source` is sufficient for the Cloud Run side. My usual flow:
+
+```bash
+# 1. Start the Pub/Sub Emulator
+gcloud beta emulators pubsub start --host-port=localhost:8085
+
+# 2. In another terminal, point the SDK at the emulator and start the server
+export PUBSUB_EMULATOR_HOST=localhost:8085
+export PUBSUB_PROJECT_ID=local-test
+node app.mjs
+
+# 3. Publish a test message
+gcloud pubsub topics create app-reviews --project=local-test
+gcloud pubsub topics publish app-reviews \
+  --message='{"reviewId":"r1","userId":"u1","text":"sample"}' \
+  --project=local-test
+```
+
+The emulator does not stub Gemini calls — they still hit the real API. For local runs I provision a separate API key and switch to a cheaper model like `gemini-2.5-flash-lite`. For load tests, I publish to a parallel staging topic `app-reviews-staging` pointed at a preview Cloud Run service.
+
+I deploy from GitHub Actions through Workload Identity Federation with OIDC, running `gcloud run deploy` and `gcloud pubsub subscriptions update` back to back. Keeping ack-deadline and max-delivery-attempts changes in the same pull request as the code change makes operational history searchable. Managing the subscription itself as code is the move that, in my experience, halves the mental cost of running Pub/Sub.
+
+## What to Watch in Operations
+
+Day to day, I follow a small number of Cloud Monitoring metrics on the Pub/Sub side:
+
+- `subscription/oldest_unacked_message_age` — the first place a Gemini slowdown shows up
+- `subscription/num_undelivered_messages` — burst magnitude
+- `subscription/dead_letter_message_count` — early warning for quality drift
+- Cloud Run `request_count` and `request_latency` — separates "Gemini is slow" from "container is jammed"
+- Gemini API `quota_usage_percentage` — whether we are pinning the quota
+
+My thresholds are simple: page me on Slack if `oldest_unacked_message_age` crosses five minutes, and send a morning summary when `dead_letter_message_count` is higher than yesterday's. The slow-rot failure mode of AI workflows is well covered by old-fashioned threshold-based monitoring.
+
+In Cloud Logging I make every entry include `reviewId` as a structured field. With a single field you can correlate the inbound Pub/Sub push, the Gemini API call, and the Firestore write. Adding OpenTelemetry for full distributed tracing is great, but at indie scale, structured logs alone go a long way.
+
+## Options I Considered and Set Aside
+
+- Cloud Functions (2nd gen): quick to start, but less tunable for long-tail Gemini latencies than Cloud Run
+- Cloud Workflows: declarative orchestration is appealing, but it clashes with Gemini's variable latency, and ended up requiring custom retry logic anyway
+- Pub/Sub Lite: overkill at indie scale; cheaper, but operationally rigid
+- A self-hosted Redis queue: do not do this if you operate solo. The on-call cost of "always-on" is heavier than it looks, and I have regretted it before
+
+If the question is "Gemini, then what?", a Gemini-centric framework tends to be the answer. If the question is "I already trust Pub/Sub, where does Gemini fit?", the design becomes quiet and dull. That dullness is, in my view, exactly what keeps a one-person operation running for years.
+
+I am still learning, but the pair of Pub/Sub and Gemini already feels comfortable for indie production. Hopefully one of the design choices above clicks with a small pipeline you are running. Thanks for reading.

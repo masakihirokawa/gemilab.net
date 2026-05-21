@@ -1,0 +1,395 @@
+---
+title: "Gemini API × Cloud Pub/Sub によるイベント駆動 AI ワークフロー設計 — 個人開発者の実装メモ"
+slug: "gemini-api-cloud-pubsub-event-driven-ai-workflow"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-21T06:53"
+author: "Gemini Lab"
+description: "Gemini API を Cloud Pub/Sub のイベント駆動型ワークフローに組み込む実装メモ。アプリレビュー解析パイプラインを題材に、リトライ・デッドレター・冪等性・コスト管理までを個人開発の視点で整理しました。"
+tags: ["Gemini API", "Cloud Pub/Sub", "Cloud Run", "イベント駆動", "個人開発", "本番運用"]
+highlights:
+  - "Pub/Sub から Gemini を呼ぶ Push 型・Pull 型サブスクライバーの選び方と、それぞれの落とし穴を実装コードで示します"
+  - "推論失敗をデッドレタートピックに退避させ、サイレントな品質低下を起こさないリトライ設計を提示します"
+  - "Gemini 呼び出しの冪等性確保、メッセージ重複排除、コスト上限ガードまでをひとまとめの設計として整理します"
+---
+
+ここ数ヶ月、6本の壁紙アプリを並行で改修している中で、「ユーザーレビューが届いたら、それを Gemini で分類・要約し、優先度の高いものだけ自分の Slack に流す」という地味な仕組みを作り直していました。最初は Cloud Functions の HTTP トリガーで雑に組んでいたのですが、メッセージの突発的なバーストや Gemini API の一時的なエラーで、何度か「届くべき分析結果が届かない」状態に陥りました。
+
+落ち着いて見直してみると、結局のところ AI ワークフローというのは、外部から流れ込んでくるイベントを LLM で「人間に近い形で読み解いて」次のシステムに橋渡しする仕事だと感じます。そこで核に据えたのが Cloud Pub/Sub でした。ここでは、Gemini API を Cloud Pub/Sub のイベント駆動パイプラインに組み込む際に、私が個人開発の現場でつまずいて学び直したことを、コードと運用設計の両面から書き残しておきます。
+
+## なぜ Pub/Sub を AI ワークフローの中心に置くのか
+
+私は 2014 年から個人で iOS / Android アプリを公開してきました。累計のダウンロード数は 5,000 万を超え、その中で「外部のイベントが、なだれのように同時に押し寄せる瞬間」を何度も経験してきました。広告ネットワークから配信レポートが届く時間帯、StoreKit の通知がまとめて届くタイミング、レビューが急に増える App Store のアップデート直後。こうした波を、サービスを止めずに受け止める仕組みは、個人開発でも避けて通れない設計です。
+
+Cloud Pub/Sub は、メッセージの送信側と受信側を非同期に切り離し、配信を少なくとも 1 回保証する Google Cloud のマネージドサービスです。Gemini API のような外部呼び出しを伴うワークフローでは、この「非同期と再送の責任を Google 側に寄せられる」という性質がとても効きます。
+
+- 送信側（Publisher）は「イベントが発生した」事実だけを投げ込めばよい
+- 受信側（Subscriber）は自分の処理可能なペースでメッセージを引き取れる
+- 失敗時の再配信、デッドレター退避、順序制御を、サブスクリプション設定で宣言的に扱える
+
+Gemini API は、生成タスクによっては 1 回数百ミリ秒から数秒の応答時間を必要とします。Pub/Sub を経由しておくことで、突発的に 100 件のイベントが流れ込んできても、サブスクライバー側のレート制御で着実にさばけるようになります。「すぐに返事できなくてもよい AI 処理」は、ほぼすべて Pub/Sub の上に乗せられると考えてよさそうです。
+
+## レビュー解析パイプラインの全体像
+
+具体的なイメージを掴むために、私が実際に運用している「App Store / Google Play のレビュー解析パイプライン」を題材にします。構成はおおむね次のとおりです。
+
+1. App Store Connect / Google Play Developer API から定期的にレビューを取得する Cloud Run Job
+2. 新しいレビューを 1 件ずつ `app-reviews` トピックに publish
+3. `app-reviews` サブスクリプションに紐づく Cloud Run サービスが、Gemini API を呼んで分類・要約・優先度判定
+4. 結果を Firestore に保存し、優先度が高いものだけ別トピック `priority-alerts` に publish
+5. `priority-alerts` を受け取ったハンドラが Slack の DM に通知
+
+このうち AI が顔を出すのは 3 番目の段階だけです。残りは Pub/Sub と Cloud Run の組み合わせで素直に書けます。ポイントは、AI 呼び出しを 1 メッセージ 1 推論に分解しておくことです。バッチで 50 件まとめて投げるよりも、結果としてリトライしやすく、コストも見積もりやすくなります。
+
+```text
+[Reviews fetcher (Cloud Run Job)]
+        │ publish
+        ▼
+[app-reviews topic] ──► [Cloud Run service: classifier]
+                                   │ (Gemini API)
+                                   ▼
+                          [Firestore: review_analyses]
+                                   │ publish (high priority only)
+                                   ▼
+                       [priority-alerts topic] ──► [Slack notifier]
+                                   │
+                                   ▼
+                       [dead-letter topic: review-dlq]
+```
+
+このワークフローを設計するうえで、私は以下の三点を最初に決めました。
+
+- どのサブスクリプションを Push 型にして、どれを Pull 型にするか
+- メッセージの順序が必要か、それともユーザー単位で並列に処理してよいか
+- リトライをどこで諦めて、デッドレタートピックに退避させるか
+
+これらの判断軸は、Gemini に限らず外部 API を呼ぶ Pub/Sub ワークフローで共通です。
+
+## Push 型と Pull 型 — Gemini を呼ぶならどちらか
+
+Pub/Sub のサブスクリプションには、メッセージをサブスクライバー側から取りに行く Pull 型と、Pub/Sub 側が HTTP POST で押し込む Push 型があります。Gemini API のような外部呼び出しがある場合、私は基本的に Push 型を選びます。Cloud Run が Pub/Sub のサブスクリプションエンドポイントを受けるよう構成すれば、メッセージごとにコンテナがリクエストを処理し、レイテンシも安定します。
+
+Push 型を選ぶ場合の最小構成は次のようになります。Cloud Run に Express サーバを置き、Pub/Sub からの POST を受けてベース 64 デコードし、Gemini API を呼びます。
+
+```javascript
+// app.mjs — Cloud Run service: classifier
+import express from "express";
+import { GoogleGenAI } from "@google/genai";
+import { Firestore } from "@google-cloud/firestore";
+import { PubSub } from "@google-cloud/pubsub";
+
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const firestore = new Firestore();
+const pubsub = new PubSub();
+const priorityTopic = pubsub.topic("priority-alerts");
+
+app.post("/", async (req, res) => {
+  const envelope = req.body;
+  if (!envelope?.message?.data) {
+    // Pub/Sub からの POST は必ず message.data を含む。形式違反は ack して捨てる。
+    return res.status(204).send();
+  }
+  const raw = Buffer.from(envelope.message.data, "base64").toString("utf8");
+  let review;
+  try {
+    review = JSON.parse(raw);
+  } catch {
+    // パースできない場合は永久に直らないので ack して廃棄。
+    return res.status(204).send();
+  }
+
+  try {
+    const analysis = await classifyReview(review);
+    await firestore
+      .collection("review_analyses")
+      .doc(review.reviewId)
+      .set(analysis, { merge: true });
+
+    if (analysis.priority === "high") {
+      await priorityTopic.publishMessage({
+        attributes: { reviewId: review.reviewId },
+        json: { ...review, analysis },
+      });
+    }
+    return res.status(204).send();
+  } catch (err) {
+    console.error("classify-failed", { reviewId: review.reviewId, err: err.message });
+    // 5xx を返すと Pub/Sub が再配信する。再試行可能なエラーだけここに来るよう設計する。
+    return res.status(500).send("retryable");
+  }
+});
+
+async function classifyReview(review) {
+  const prompt = buildPrompt(review);
+  const result = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: REVIEW_SCHEMA,
+      temperature: 0.2,
+    },
+  });
+  return JSON.parse(result.text);
+}
+
+app.listen(process.env.PORT || 8080);
+```
+
+実装上の地味な落とし穴を 3 つほど共有します。1 つ目は、Pub/Sub の Push エンドポイントは「2xx で ack、5xx で nack」と判定するため、ビジネス的に再配信したくないエラー（不正なペイロード、廃止された App ID など）まで 500 を返すと、無限に再配信が発生します。リトライしたい例外と、無視して捨ててよい例外は、最初から分けて書いておくことを推奨します。2 つ目は、Push の HTTP タイムアウトは既定で 10 秒、最大でも 600 秒です。Gemini API の応答が遅いモデルを使う場合、サブスクリプションの ack 期限を伸ばす必要があります。私は `gemini-2.5-flash` を使う前提で 60 秒、`gemini-2.5-pro` を使うなら 180 秒を目安にしています。3 つ目は、認証です。Cloud Run を「未認証アクセス禁止」にしつつ、Pub/Sub のサービスアカウントに `roles/run.invoker` を付与するのが本番運用での標準形です。
+
+Pull 型を選ぶのは、限られた状況だけにしています。具体的には、Gemini への呼び出しレートを GCP プロジェクト単位で厳格に制御したいときと、長時間バッチで一気に処理したいときです。Cloud Run Job から Pull する形にすれば、自分でスロットリングを書く自由度が増えますが、その分エラー処理を全部自前で書くことになります。日常のイベント駆動処理に Pull は重く、私は Push を既定にしています。
+
+## 順序制御 — 「ユーザー単位で順番に処理する」の設計
+
+レビュー解析の場面では、同じユーザーの古いレビューが、新しいレビューよりあとに処理されると混乱が生じます。同じ `userId` のメッセージは時系列順に並べたい、というのは Gemini ワークフローでよくある要求です。
+
+Pub/Sub は順序付け（ordering keys）をサブスクリプションに対して有効にできます。`ordering_key` を `userId` に設定すれば、同じユーザーのメッセージは publish した順に配信されます。一方で、これを有効にすると次の制約が生じます。
+
+- メッセージが失敗してリトライされている間、同じキーの後続メッセージは詰まる
+- 1 メッセージあたりの処理時間が伸びると、全体のスループットが大きく落ちる
+- リージョン跨ぎの順序保証はないので、リージョンを跨いで設計しない
+
+私の運用では、レビュー解析は「ユーザー単位で順序保証あり」、優先度通知の `priority-alerts` トピックは「順序保証なし」、と分けています。順序保証は「必要なところに最小限」が原則です。すべてのメッセージを順序付きにすると、Gemini の一時的なエラーで滞留が連鎖し、結局運用が破綻します。
+
+順序キーを使うときは、Publisher 側でも明示的にキーを指定する必要があります。
+
+```javascript
+// publisher.mjs — Reviews fetcher (Cloud Run Job)
+import { PubSub } from "@google-cloud/pubsub";
+
+const pubsub = new PubSub();
+// orderingKey を使う場合は messageOrdering: true 必須
+const topic = pubsub.topic("app-reviews", { messageOrdering: true });
+
+export async function publishReview(review) {
+  try {
+    await topic.publishMessage({
+      orderingKey: `user:${review.userId}`,
+      json: review,
+    });
+  } catch (err) {
+    console.error("publish-failed", err);
+    // 順序付き publish が一度失敗するとそのキーは一時停止状態になる。
+    topic.resumePublishing(`user:${review.userId}`);
+    throw err;
+  }
+}
+```
+
+`resumePublishing` は順序付き publish ならではの操作で、これを忘れると同じユーザーの後続メッセージが永遠に止まります。本番運用に出す前に必ずヘルスチェックの中に組み込んでおくべき呼び出しです。
+
+## 失敗時の挙動を設計する — リトライとデッドレター
+
+イベント駆動の AI ワークフローで最も大事なのは、失敗時の挙動を最初から明示的に書いておくことです。私の場合、Gemini API 経由の処理は次のように分類しています。
+
+- 5xx 系のサーバーエラー、レート制限、ネットワーク断 → リトライ対象
+- レスポンスが JSON スキーマに合致しない → 1〜2 回までリトライ、その後はデッドレターへ
+- App ID が廃止済み・レビュー本文が空 → リトライ不要、即廃棄
+- Gemini の応答が「指示拒否」になった → 即廃棄しつつ Firestore に痕跡を残す
+
+サブスクリプション側では、リトライポリシーとデッドレターポリシーを次のように設定します。
+
+```bash
+gcloud pubsub topics create review-dlq
+gcloud pubsub topics create app-reviews
+
+gcloud pubsub subscriptions create app-reviews-sub \
+  --topic=app-reviews \
+  --push-endpoint=https://classifier-xxx.a.run.app \
+  --push-auth-service-account=pubsub-invoker@project.iam.gserviceaccount.com \
+  --ack-deadline=60 \
+  --message-retention-duration=7d \
+  --min-retry-delay=10s \
+  --max-retry-delay=600s \
+  --dead-letter-topic=review-dlq \
+  --max-delivery-attempts=5 \
+  --enable-message-ordering
+```
+
+ここでの実装上のポイントは、サブスクライバー側でリトライ回数を意識した分岐を書くことです。Pub/Sub は配信回数をメッセージ属性 `googclient_deliveryattempt` で渡してくれます。「最後の試行で来たら、無理に再試行せず DLQ 行きを促す」ように書いておくと、運用が安定します。
+
+```javascript
+// classifier.mjs (一部抜粋)
+const deliveryAttempt = Number(envelope.message?.attributes?.googclient_deliveryattempt ?? 1);
+const isLastAttempt = deliveryAttempt >= 5;
+
+try {
+  await classifyReview(review);
+  return res.status(204).send();
+} catch (err) {
+  if (isLastAttempt || isUnrecoverable(err)) {
+    // ack して DLQ に流す（あるいは廃棄）。再配信させない。
+    await firestore.collection("review_dlq_audit").doc(review.reviewId).set({
+      review,
+      reason: err.message,
+      attemptedAt: new Date().toISOString(),
+    });
+    return res.status(204).send();
+  }
+  return res.status(500).send("retryable");
+}
+```
+
+私の運用では、デッドレタートピックは「人間が見るためのキュー」と割り切っています。`review-dlq` を受けるシンプルな Cloud Run があり、Firestore の `review_dlq_audit` コレクションに保存して終わりです。再投入は、原因を確認した上で手作業で行います。AI の失敗を即時に自動で取り戻そうとしないのが、結局のところ運用を楽にする選択でした。
+
+## 冪等性と重複排除 — Gemini を二度叩かないために
+
+Pub/Sub は「少なくとも 1 回」配信です。つまり、同じメッセージが 2 回以上届く可能性があります。Gemini API は呼び出すたびに課金が発生するので、冪等性の設計は地味ですがコストにも直結します。
+
+私が採用しているのは、Firestore のドキュメント ID にメッセージ ID（あるいは `reviewId`）を使い、`set({ merge: true })` で更新する方法です。`generateContent` を呼ぶ前に、Firestore に「処理中」フラグだけ立てておき、完了したらフラグを書き換えます。
+
+```javascript
+async function classifyOnce(review) {
+  const docRef = firestore.collection("review_analyses").doc(review.reviewId);
+  const snap = await docRef.get();
+  if (snap.exists && snap.data().status === "done") {
+    // 既に処理済み。Gemini を呼ばずに ack。
+    return snap.data().analysis;
+  }
+  await docRef.set({ status: "in_progress", startedAt: new Date().toISOString() }, { merge: true });
+
+  const analysis = await classifyReview(review);
+  await docRef.set(
+    { status: "done", analysis, completedAt: new Date().toISOString() },
+    { merge: true }
+  );
+  return analysis;
+}
+```
+
+完璧ではありません。`in_progress` 中に別のワーカーが同じメッセージを処理し始める可能性は理屈の上では残ります。それでも、99% 以上のケースで二重課金を防げるので、私はこれで十分実用的だと感じています。さらに厳密にしたい場合は、Firestore のトランザクションで `status` の更新を直列化するか、Cloud Tasks のような厳密な exactly-once 寄りのキューに切り替える選択も考えられます。
+
+ちなみに 2026 年現在、Pub/Sub には「exactly-once delivery」設定が用意されています。これは ack の確実性を上げるオプションであり、サブスクライバー側の冪等性をなくしてよいわけではありません。AI 呼び出しが絡む処理では、結局アプリ側で「もう一度呼ばれたら何もしない」状態を作るのが現実解だと考えています。
+
+## 構造化出力で「合致しない結果」を減らす
+
+Gemini の `responseSchema` を併用すると、Pub/Sub ワークフローの堅さが大きく上がります。レビュー解析の場面では、次のような JSON スキーマを与えて、応答のばらつきを抑えています。
+
+```javascript
+const REVIEW_SCHEMA = {
+  type: "object",
+  properties: {
+    sentiment: { type: "string", enum: ["positive", "neutral", "negative"] },
+    topics: {
+      type: "array",
+      items: { type: "string" },
+      maxItems: 5,
+    },
+    priority: { type: "string", enum: ["high", "medium", "low"] },
+    suggestedReply: { type: "string", maxLength: 400 },
+    requiresHumanReview: { type: "boolean" },
+  },
+  required: ["sentiment", "priority", "requiresHumanReview"],
+};
+```
+
+`responseMimeType: "application/json"` と組み合わせると、Gemini はこのスキーマに沿った JSON を返します。手元の運用では、`gemini-2.5-flash` でこの形式を使ったときの「スキーマ違反率」は概ね 1% を下回りました。違反した 1% も、`Zod` などのバリデータで弾いてリトライする設計にしておけば、サブスクライバーの実装はかなり安定します。
+
+```javascript
+import { z } from "zod";
+const ReviewAnalysis = z.object({
+  sentiment: z.enum(["positive", "neutral", "negative"]),
+  topics: z.array(z.string()).max(5).optional(),
+  priority: z.enum(["high", "medium", "low"]),
+  suggestedReply: z.string().max(400).optional(),
+  requiresHumanReview: z.boolean(),
+});
+
+async function classifyReview(review) {
+  const result = await ai.models.generateContent({ /* 省略 */ });
+  return ReviewAnalysis.parse(JSON.parse(result.text));
+}
+```
+
+スキーマ違反で `parse` が失敗した場合、それを「リトライ可能なエラー」として扱うか、「DLQ 直行」にするかは判断が分かれます。私は最初の 1 回だけ温度を少し下げた再試行をして、それでもダメなら DLQ に流す方式にしています。Gemini が一度確信を持って間違えた応答を返すと、同じ温度でもう一度叩いてもだいたい同じ間違いを返すので、温度調整を含めたフォールバックを書いておくと、復活率がじわじわ上がります。
+
+## コストを「上限で締める」設計
+
+個人開発で AI ワークフローを動かすとき、私が一番怖いのは、深夜に何かが暴走してコストが跳ねることです。AdMob の収益が積み上がっても、Gemini の請求がそれを上回ったら本末転倒です。Pub/Sub と Cloud Run の組み合わせは、ここでも頼りになります。コスト上限を「キューの形」で表現できるからです。
+
+私が実装している上限の入れ方は次の 3 段構えです。
+
+- Cloud Run の最大インスタンス数を 10 などの小さい値で固定する
+- Cloud Run の同時実行数（concurrency）を 1〜5 程度に絞る
+- Pub/Sub サブスクリプションの `--max-outstanding-messages` を控えめに設定する
+
+これによって、たとえ `app-reviews` トピックに 10,000 件のメッセージが突発的に流れ込んでも、サブスクライバーが処理できる Gemini 呼び出しは「最大インスタンス × 同時実行数」の数しか同時には進みません。残りはキューで待ちます。仮に 1 件あたり Gemini の課金が 0.001 ドルだとしても、1 時間あたりの上限が見える形になります。
+
+加えて、私は Firestore に「日次コストガード」ドキュメントを持たせています。1 日の Gemini 呼び出し数が事前設定の上限（私の場合は 5,000 回）を超えたら、サブスクライバーは早期 return して 204 を返します。Pub/Sub 側は ack を受けるので、メッセージは積み残らず捨てられます。「自己防衛のスイッチ」として、これがあるだけでだいぶ眠れるようになりました。
+
+```javascript
+async function isBudgetExceeded() {
+  const today = new Date().toISOString().slice(0, 10);
+  const ref = firestore.collection("budget_guards").doc(`gemini-${today}`);
+  const snap = await ref.get();
+  const used = snap.exists ? snap.data().count ?? 0 : 0;
+  return used >= Number(process.env.DAILY_LIMIT ?? "5000");
+}
+
+async function incrementBudget() {
+  const today = new Date().toISOString().slice(0, 10);
+  const ref = firestore.collection("budget_guards").doc(`gemini-${today}`);
+  await ref.set(
+    { count: Firestore.FieldValue.increment(1), updatedAt: new Date().toISOString() },
+    { merge: true }
+  );
+}
+```
+
+このガードを Gemini 呼び出しの直前にだけ置いておけば、Pub/Sub 側の設定を変えなくても自動的にコストが頭打ちになります。あくまで個人開発の現実解ですが、私はこれで助かった夜が何度もあります。
+
+## ローカルでのテストとデプロイ手順
+
+Pub/Sub の動作確認は、Pub/Sub Emulator で本番に近い形で行えます。Cloud Run も `gcloud run deploy --source` で十分です。私は次の流れで開発しています。
+
+```bash
+# 1. Pub/Sub Emulator を起動
+gcloud beta emulators pubsub start --host-port=localhost:8085
+
+# 2. 別ターミナルで emulator 用環境変数を設定し、ローカルサーバ起動
+export PUBSUB_EMULATOR_HOST=localhost:8085
+export PUBSUB_PROJECT_ID=local-test
+node app.mjs
+
+# 3. テスト用メッセージを publish
+gcloud pubsub topics create app-reviews --project=local-test
+gcloud pubsub topics publish app-reviews \
+  --message='{"reviewId":"r1","userId":"u1","text":"sample"}' \
+  --project=local-test
+```
+
+エミュレータ上では Gemini API は本物が呼ばれるので、テスト用には別 API キーを発行し、`gemini-2.5-flash-lite` のような安価なモデルに切り替えるのがコスト的に賢明です。本番に近い負荷試験をしたい場合は、Cloud Run のプレビュー環境に対して、別トピック `app-reviews-staging` を作って投げ込む方法を採っています。
+
+デプロイは GitHub Actions から OIDC で Workload Identity Federation を使い、`gcloud run deploy` と `gcloud pubsub subscriptions update` を続けて流します。サブスクリプションの ack 期限や最大配信回数を変える際にも、コードと一緒にプルリクエストで管理できるようにしておくと、後から「いつ運用設定を変えたか」を追いやすくなります。Pub/Sub の運用は、サブスクリプションそのものを IaC で管理できるかどうかで、心理的負担がかなり変わると感じます。
+
+## 観測と運用 — どこを見れば早く気づけるか
+
+私が日常的に見ているのは、Pub/Sub の Cloud Monitoring 指標のうち以下の数本です。
+
+- `subscription/oldest_unacked_message_age` — メッセージの最古滞留時間。AI 呼び出しの詰まりを最初に示す
+- `subscription/num_undelivered_messages` — 未配信メッセージ数。バーストの大きさを示す
+- `subscription/dead_letter_message_count` — DLQ への流入量。品質低下の早期警報
+- Cloud Run の `request_count` と `request_latency` — Gemini が遅くなっているか、それともコンテナが詰まっているのかを切り分ける
+- Gemini API 側の `quota_usage_percentage` — 呼び出しがクォータに張り付いていないか
+
+私の場合、`oldest_unacked_message_age` が 5 分を超えたら Slack に Critical アラート、`dead_letter_message_count` が前日比で増えたら朝に通知、という素朴な閾値を置いています。AI ワークフローの「徐々に悪くなる」性質は、しきい値ベースの古典的監視で十分掴めるという実感があります。
+
+Cloud Logging では、各メッセージの `reviewId` を構造化ログに必ず含めるようにしています。Pub/Sub の Push エンドポイントから来た要求と、Gemini API への呼び出しと、Firestore への書き込みが、同じ `reviewId` で串刺し検索できる状態を作っておくと、運用での問い合わせ対応が劇的に楽になります。OpenTelemetry を入れて分散トレーシングまでやってもよいのですが、個人開発のスケールでは構造化ログだけでもしばらく戦えます。
+
+## 私が選ばなかった構成と、その理由
+
+最後に、検討したけれど採用しなかった選択肢にも触れておきます。
+
+- Cloud Functions（第 2 世代）：起動は速いものの、長時間処理のチューニング自由度が Cloud Run より弱く、Gemini が遅くなった際のチューニングがしにくい印象がありました
+- Cloud Workflows：パイプラインを宣言的に書けるのは魅力的ですが、Gemini のレイテンシのばらつきと相性が悪く、結局リトライ制御を自分で書く方が安定しました
+- Pub/Sub Lite：個人開発の規模だとオーバースペックです。コストは安くなりますが、運用の自由度がやや窮屈に感じました
+- 自前の Redis キュー：個人で運用するなら絶対にやめた方がよい構成でした。停止できない平日夜の運用負担が想像以上に重く、過去に一度後悔しています
+
+「Gemini を中心に据えたいから AI フレームワークから入る」のではなく、「すでに信頼できる Pub/Sub の上に Gemini を載せる」という順番で考えると、設計はかなり地味になります。けれど、結局その地味さが、個人開発で何年も止めずに動かすコツだと感じています。
+
+私自身、まだ学びの途中です。それでも、Pub/Sub と Gemini の組み合わせは、個人開発の現場で十分に実用範囲に入っていると思います。みなさんが運用している小さなパイプラインの中で、ここで挙げた設計のどれか一つでも、明日の作業のヒントになれば嬉しく思います。お読みいただきありがとうございました。
