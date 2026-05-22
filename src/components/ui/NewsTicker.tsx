@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MANAGEDAG — Gemini API に Managed Agents 追加、API 1コールで Linux 隔離環境のエージェントを起動可能に（Antigravity ハーネス採用）",
-    "INTERACTAPI — Interactions API のスキーマ刷新、レガシースキーマは 2026-06-08 で廃止予定",
-    "GEMINI35P — Gemini 3.5 Pro は社内で稼働中、6月に一般公開予定とアナウンス、Deep Think 強化版搭載見込み（5/19）",
-    "NANO4 — Gemini Nano 4 プレビュー版を Android 17 向けに公開、要約や情報抽出をオンデバイス処理",
-    "AISTUDIOAPP — Google AI Studio がテキストプロンプトから Jetpack Compose ネイティブ Android アプリを自動生成（5/19）",
-    "ULTRAPRICE — Google AI Ultra が $249→$99/月に値下げ、20x Pro 限度のプロプランは $200/月で継続",
+    "FLASH35 — Gemini 3.5 Flash が最強の agentic / coding モデルとして公開、Gemini 3.1 Pro を主要ベンチで上回る性能（5/19）",
+    "OMNI — Gemini Omni 発表、ビデオを起点に any input → any output のマルチモーダル新モデルへ進化（I/O 2026）",
+    "SPARK — Gemini Spark が登場、24時間稼働の常駐パーソナル AI エージェントが指示通りに自律実行",
+    "DAILYBRIEF — Gemini アプリが Daily Brief を搭載、UI 刷新と Gemini Omni / Spark の統合で全面刷新（5/19）",
+    "MANAGEDAG — Managed Agents in the Gemini API が public preview、Google ホスト Linux サンドボックスで自律実行可能に",
+    "CODEMENDER — AI セキュリティエージェント CodeMender が Agent Platform で提供開始、脆弱性の発見と修正を自動化",
   ],
   en: [
-    "MANAGEDAG — Gemini API adds Managed Agents — spin up agents in an isolated Linux sandbox with a single API call (powered by the Antigravity harness)",
-    "INTERACTAPI — Interactions API ships breaking schema changes; legacy schema is sunset on 2026-06-08",
-    "GEMINI35P — Gemini 3.5 Pro is already in internal use and rolls out to everyone next month, with enhanced Deep Think on board (5/19)",
-    "NANO4 — Gemini Nano 4 preview is available for Android 17 on-device summarization and information extraction",
-    "AISTUDIOAPP — Google AI Studio now generates native Jetpack Compose Android apps from a text prompt (5/19)",
-    "ULTRAPRICE — Google AI Ultra drops from $249 to $99/month; a $200/month plan retains 20x Pro usage limits for power users",
+    "FLASH35 — Gemini 3.5 Flash launches as the strongest agentic and coding model yet, outperforming Gemini 3.1 Pro on key benchmarks (May 19)",
+    "OMNI — Gemini Omni debuts, generating any output from any input starting with video at Google I/O 2026",
+    "SPARK — Gemini Spark arrives as a 24/7 personal AI agent that takes autonomous action on your behalf",
+    "DAILYBRIEF — The Gemini app rolls out Daily Brief, a refreshed UI, and built-in access to Gemini Omni and Spark (May 19)",
+    "MANAGEDAG — Managed Agents in the Gemini API hit public preview, running autonomously in secure Google-hosted Linux sandboxes",
+    "CODEMENDER — CodeMender, an AI security agent on Agent Platform, automatically finds and fixes vulnerabilities in source code",
   ],
 };
 
