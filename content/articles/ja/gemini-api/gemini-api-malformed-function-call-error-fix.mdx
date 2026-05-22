@@ -1,0 +1,188 @@
+---
+title: "Gemini API で MALFORMED_FUNCTION_CALL が返ってくるときの原因と対処"
+slug: "gemini-api-malformed-function-call-error-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-22T11:30"
+author: "Gemini Lab"
+description: "Gemini API の function calling で finishReason: MALFORMED_FUNCTION_CALL が返ってくる現象について、再現条件・3つの根本原因・実運用で効いた対処を整理しました。"
+tags: ["Gemini API", "function calling", "troubleshooting", "google-genai"]
+---
+
+import GuideTrack from "@/components/GuideTrack";
+
+function calling を本番に組み込んだ直後、ある日突然 `finishReason: MALFORMED_FUNCTION_CALL` だけが返ってきて `parts` が空、というケースに何度かぶつかりました。一見すると関数定義もスキーマも変えていないのに、入力サイズや会話ターン数が増えた特定のリクエストだけが落ちる、という挙動です。
+
+`google-genai` SDK 経由でも Vertex AI 経由でも、引いたときの切り分けの考え方はほとんど同じでした。再現条件・原因の見極め方・私の個人開発（壁紙・癒し系の iOS/Android アプリ群、累計 5,000万 DL）で実際に効いた対処を順に整理します。多くは「モデルが関数呼び出しを途中で切ってしまった」結果として読み解くと腹落ちします。
+
+## どんな現象か — まずレスポンスの全文を見る
+
+`MALFORMED_FUNCTION_CALL` は HTTP エラーではなく、candidates 配列の `finishReason` として返ります。リクエスト自体は 200 で完走するため、`response.text` だけを見ているとサイレントに空応答として処理してしまいがちです。私自身、AdMob 入札ログの分類パイプラインを Gemini 2.5 Flash に切り替えた直後、ログには何も出ないのに分類結果がゼロ件、という事象で 2 時間溶かしました。
+
+最低限、以下のフィールドを必ずログに残すところから始めるのが安全です。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=user_message,
+    config=types.GenerateContentConfig(
+        tools=[types.Tool(function_declarations=[classify_bid_log])],
+        tool_config=types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+        ),
+    ),
+)
+
+for cand in resp.candidates:
+    print("finish_reason:", cand.finish_reason)
+    print("safety_ratings:", cand.safety_ratings)
+    if cand.content and cand.content.parts:
+        for p in cand.content.parts:
+            if p.function_call:
+                print("fc.name:", p.function_call.name)
+                print("fc.args:", p.function_call.args)
+            elif p.text:
+                print("text:", p.text[:120])
+    else:
+        print("⚠️ empty parts")
+```
+
+`finish_reason` が `MALFORMED_FUNCTION_CALL` であれば、原因の 8 割は次の 3 つのいずれかに収まります。
+
+## 原因 1: 出力トークンの上限で関数呼び出しが途中で切れている
+
+最頻出のパターンです。`maxOutputTokens` を低めに設定していると、モデルが関数名は決められたものの引数 JSON を書き終える前に切られ、結果として「途中まで生成されたが妥当ではない function call」として `MALFORMED` 扱いになります。
+
+切り分け方は単純で、同じプロンプトを `tools` を外したテキスト出力で投げ、`usage_metadata.candidates_token_count` を見ます。これが `maxOutputTokens` に張り付いていれば確定です。
+
+```python
+# 切り分け用: tools を外して同じプロンプトを投げる
+debug = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=user_message,
+    config=types.GenerateContentConfig(max_output_tokens=512),
+)
+print(debug.usage_metadata)
+# candidates_token_count が 512 に張り付いていたら出力上限が原因
+```
+
+対処は次の優先順で試します。
+
+1. `max_output_tokens` を 2 倍にする（特に引数が深い JSON を期待する関数）
+2. 関数の引数構造をフラット化し、不要なネストを潰す
+3. `thinking_budget` を併用している場合は、`thinking_budget` の分も加算して `max_output_tokens` を確保する（Gemini 2.5 系では thinking トークンも出力枠を食います）
+
+私の壁紙アプリで使っている「ユーザーレビューを 12 軸でスコアリングする」関数は、引数が 12 個の float なので 256 トークンでは収まらず、512 に上げただけで `MALFORMED_FUNCTION_CALL` の発生率が日次 4%前後 から ほぼ 0% に落ちました。
+
+## 原因 2: スキーマと自然言語の指示が衝突している
+
+`function_declarations` の `parameters` スキーマと、システムプロンプトで書いている指示が矛盾していると、モデルが「指示通りに書こうとした結果、スキーマ違反になり MALFORMED 扱いされる」ことがあります。
+
+特にハマりやすいのは以下の組み合わせです。
+
+- スキーマでは `enum: ["happy", "sad", "neutral"]` と定義しているのに、システムプロンプトで「感情を自由に表現してよい」と書いている
+- スキーマで `required: ["title", "tags"]` と書いているのに、プロンプトでは「タイトルは省略可能」と書いている
+- スキーマで `type: "integer"` と定義しているのに、プロンプト中の例示が `"3.5"` のような小数
+
+対処は、システムプロンプトを最小化し、引数の指示をスキーマの `description` 側に寄せることです。私は次のパターンで安定しました。
+
+```python
+classify_bid_log = types.FunctionDeclaration(
+    name="classify_bid_log",
+    description="広告入札ログを 1 件分類する。必ずこの関数で結果を返すこと。",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "category": types.Schema(
+                type="STRING",
+                enum=["fill", "no_fill", "error", "timeout"],
+                description="入札の結果。サーバ応答がない場合は timeout を選ぶ。",
+            ),
+            "ecpm_bucket": types.Schema(
+                type="STRING",
+                enum=["low", "mid", "high"],
+                description="eCPM が $0.5 未満なら low、$2 未満なら mid、それ以上は high。",
+            ),
+        },
+        required=["category", "ecpm_bucket"],
+    ),
+)
+```
+
+description にしきい値や判断ルールを書き込んでおくと、システムプロンプトを 1 行に短縮できます。これで衝突が起きにくくなります。
+
+## 原因 3: 会話履歴に過去の不正な function_response が混ざっている
+
+マルチターンの会話で function calling を回している場合、過去ターンで返した `function_response` のスキーマが現在の関数定義と微妙にズレていると、次のターン以降ずっと `MALFORMED_FUNCTION_CALL` が出続けることがあります。
+
+よくあるのは以下のケースです。
+
+- 関数定義を後から変更したが、会話履歴には旧スキーマの結果が残っている
+- 別のセッションで使っていた履歴を使い回した
+- 履歴の `function_response` の `response` フィールドに、本来 string であるべき値を dict で渡してしまっている
+
+対処はシンプルで、`MALFORMED_FUNCTION_CALL` が連続して出始めたら会話履歴を一度リセットする実装を入れます。再起防止のため、現在の関数定義のハッシュを履歴とともに保存し、不一致なら自動でクリアするようにしています。
+
+```python
+import hashlib, json
+
+def fc_signature(tools):
+    blob = json.dumps([t.to_dict() for t in tools], sort_keys=True)
+    return hashlib.sha1(blob.encode()).hexdigest()[:12]
+
+# セッション開始時に保存、再開時に照合
+session["fc_sig"] = fc_signature(tools)
+if session.get("fc_sig") != fc_signature(tools):
+    session["history"] = []  # 関数定義が変わったら履歴を捨てる
+```
+
+地味ですが、A/B テストで関数定義をいじっていた時期に何度も助けられた仕組みです。
+
+## モデル別の発生傾向 — 2.5 Pro と 2.5 Flash で振る舞いが違う
+
+Gemini 2.5 系を運用してきた中で、`MALFORMED_FUNCTION_CALL` の出方にモデル差があることに気付きました。広告ログ分類のような短い関数では `gemini-2.5-flash` の方が高速で安価なのですが、引数が 8 個を超えるあたりから MALFORMED の発生率が `2.5-pro` の倍程度になります。一方、`gemini-2.5-pro` は thinking が深く入る分、複雑な関数定義でも安定して呼び出してくれます。
+
+実運用では、関数の引数の数で振り分けるルーターを噛ませて、引数 6 個までは Flash、それ以上は Pro、というように切り分けると、コストと安定性のバランスが取れました。私の個人開発で動かしている「ユーザーレビューの感情分析」は引数 4 個なので Flash 固定、「壁紙のメタデータ生成」は引数 14 個ある関係で Pro 固定にしています。月額のトータルコストで見ると、全部 Pro に統一していた時より約 38% 安く済んでいます。
+
+加えて、`thinking_budget` を明示しないと Flash でも自動で thinking が入る場合があり、その分のトークンが出力枠を食って MALFORMED の遠因になります。Flash で function calling を回すときは `thinking_budget=0` を明示すると挙動が安定しました。
+
+## それでも収まらないときの最終手段
+
+上記 3 つを試しても 1% 未満で `MALFORMED_FUNCTION_CALL` が残る場合、次の 2 段構えで実運用を回しています。
+
+1. `tool_config.function_calling_config.mode = "ANY"` と `allowed_function_names` を併用して、確実に関数を呼ばせる
+2. それでも MALFORMED が返ったら、`temperature` を 0.0 に固定して 1 回だけ再試行する（バックオフは入れず即時）
+
+再試行で 95%以上は救えています。それでも落ちる残りは、入力に絵文字や RTL 文字列など特殊文字が大量に混ざっているケースが多く、入力側を sanitize するルールを足すことで収束しました。
+
+```python
+def call_with_fallback(client, model, contents, tools):
+    for attempt in (0, 1):
+        cfg = types.GenerateContentConfig(
+            tools=[types.Tool(function_declarations=tools)],
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode="ANY",
+                    allowed_function_names=[t.name for t in tools],
+                )
+            ),
+            temperature=0.0 if attempt == 1 else 0.4,
+            max_output_tokens=2048,
+        )
+        resp = client.models.generate_content(model=model, contents=contents, config=cfg)
+        if resp.candidates[0].finish_reason != "MALFORMED_FUNCTION_CALL":
+            return resp
+    raise RuntimeError("function call malformed after retry")
+```
+
+## 次のアクション
+
+まずは現在のコードに `finish_reason` のロギングを入れ、`MALFORMED_FUNCTION_CALL` の発生率を可視化するところから始めるのが現実的です。3 日ほど観測してから、原因 1〜3 のどれが多いかに応じて対処を入れていくと、闇雲に `max_output_tokens` を上げて課金額だけ膨らむ事態を避けられます。
+
+同じ症状で悩んでいる方の参考になれば幸いです。

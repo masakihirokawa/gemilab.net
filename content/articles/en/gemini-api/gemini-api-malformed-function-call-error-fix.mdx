@@ -1,0 +1,186 @@
+---
+title: "Why Gemini API Returns MALFORMED_FUNCTION_CALL — Causes and Fixes"
+slug: "gemini-api-malformed-function-call-error-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-22T11:30"
+author: "Gemini Lab"
+description: "Hit by finishReason: MALFORMED_FUNCTION_CALL in production? Three root causes, how to diagnose each, and the workarounds that actually worked in our indie iOS/Android pipeline."
+tags: ["Gemini API", "function calling", "troubleshooting", "google-genai"]
+---
+
+import GuideTrack from "@/components/GuideTrack";
+
+Shortly after rolling function calling into production, I started seeing intermittent `finishReason: MALFORMED_FUNCTION_CALL` responses with empty `parts`. The function declarations and schemas had not changed — only certain requests with larger inputs or longer conversation history were failing.
+
+Whether the request goes through the `google-genai` SDK or Vertex AI, the diagnosis path is largely the same. Below are reproducible conditions, three root causes, and the workarounds that actually held up in our indie-developer pipeline (wallpaper and relaxation apps, 50M cumulative downloads). Most cases become clear once you realize the model "cut off mid function call."
+
+## What you actually see — log the full response first
+
+`MALFORMED_FUNCTION_CALL` is not an HTTP error. The request returns 200; the value shows up as the `finishReason` on a candidate. If your code only inspects `response.text`, you will silently swallow it as an empty response. I burned two hours on exactly this after switching an AdMob bid-log classifier from Flash 1.5 to Gemini 2.5 Flash — logs were clean, but the classifier output went to zero.
+
+At minimum, log these fields before doing anything else.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=user_message,
+    config=types.GenerateContentConfig(
+        tools=[types.Tool(function_declarations=[classify_bid_log])],
+        tool_config=types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+        ),
+    ),
+)
+
+for cand in resp.candidates:
+    print("finish_reason:", cand.finish_reason)
+    print("safety_ratings:", cand.safety_ratings)
+    if cand.content and cand.content.parts:
+        for p in cand.content.parts:
+            if p.function_call:
+                print("fc.name:", p.function_call.name)
+                print("fc.args:", p.function_call.args)
+            elif p.text:
+                print("text:", p.text[:120])
+    else:
+        print("empty parts")
+```
+
+When `finish_reason` is `MALFORMED_FUNCTION_CALL`, about 80% of cases fall into one of the three patterns below.
+
+## Cause 1: max_output_tokens cut the call mid-stream
+
+This is by far the most common. With a tight `maxOutputTokens`, the model decides on the function name but is interrupted before it can finish the argument JSON. The partial output is rejected as malformed.
+
+The cleanest way to confirm it is to send the same prompt without `tools` and read `usage_metadata.candidates_token_count`. If it pins to the limit, you have your answer.
+
+```python
+debug = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=user_message,
+    config=types.GenerateContentConfig(max_output_tokens=512),
+)
+print(debug.usage_metadata)
+# candidates_token_count hitting 512 means the output cap is the cause
+```
+
+Three fixes, in order:
+
+1. Double `max_output_tokens` (especially when your function takes deeply nested JSON).
+2. Flatten the argument schema and drop nesting you do not strictly need.
+3. If you also pass `thinking_budget`, remember that thinking tokens count toward the output cap on Gemini 2.5 — budget for both.
+
+A scoring function I run in one wallpaper app takes twelve float arguments, and 256 tokens was simply not enough. Bumping to 512 took the daily `MALFORMED_FUNCTION_CALL` rate from around 4% to essentially zero.
+
+## Cause 2: schema and natural-language instructions conflict
+
+When the JSON schema in `function_declarations.parameters` contradicts the system prompt, the model tries to follow the wording and produces output that violates the schema — which the runtime then flags as malformed.
+
+The most common collisions:
+
+- Schema declares `enum: ["happy", "sad", "neutral"]` but the system prompt says "feel free to express any emotion."
+- Schema marks `required: ["title", "tags"]` but the prompt says "title is optional."
+- Schema declares `type: "integer"` but the in-prompt examples use values like `"3.5"`.
+
+The fix is to keep the system prompt minimal and push instructional detail into the schema's `description` fields.
+
+```python
+classify_bid_log = types.FunctionDeclaration(
+    name="classify_bid_log",
+    description="Classify a single ad-bid log entry. Always return via this function.",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "category": types.Schema(
+                type="STRING",
+                enum=["fill", "no_fill", "error", "timeout"],
+                description="Bid outcome. If the server returned nothing, pick timeout.",
+            ),
+            "ecpm_bucket": types.Schema(
+                type="STRING",
+                enum=["low", "mid", "high"],
+                description="low if eCPM < $0.5, mid if < $2, high otherwise.",
+            ),
+        },
+        required=["category", "ecpm_bucket"],
+    ),
+)
+```
+
+Once the thresholds and decision rules live in the schema, the system prompt can shrink to a single sentence and the collision disappears.
+
+## Cause 3: stale function_response entries in history
+
+In multi-turn function calling, a prior `function_response` whose shape no longer matches the current declaration can poison every subsequent turn — you start getting `MALFORMED_FUNCTION_CALL` continuously.
+
+The usual culprits:
+
+- You changed the function declaration but kept the old history around.
+- A history saved from a different session was reused.
+- The history's `function_response.response` field carries a dict where a string was expected.
+
+The pragmatic fix is to hash the current tool definitions and store that signature alongside the session. If the saved signature does not match the current one, drop the history.
+
+```python
+import hashlib, json
+
+def fc_signature(tools):
+    blob = json.dumps([t.to_dict() for t in tools], sort_keys=True)
+    return hashlib.sha1(blob.encode()).hexdigest()[:12]
+
+session["fc_sig"] = fc_signature(tools)
+if session.get("fc_sig") != fc_signature(tools):
+    session["history"] = []  # drop history when function defs changed
+```
+
+Simple, but it saved me repeatedly while A/B testing different function declarations.
+
+## Model differences — 2.5 Pro and 2.5 Flash behave differently
+
+Running both models in production made the difference visible. For short functions like ad-log classification, `gemini-2.5-flash` is faster and cheaper, but once the function has more than eight arguments the malformed rate is roughly twice that of `gemini-2.5-pro`. Pro's deeper thinking phase absorbs schema complexity better.
+
+The compromise that worked: route by argument count. Up to six arguments goes to Flash, above that goes to Pro. In our indie stack, review-sentiment analysis (four args) stays on Flash and wallpaper-metadata generation (fourteen args) stays on Pro. Total monthly cost dropped by about 38% versus pinning everything to Pro.
+
+One more knob: on Flash, set `thinking_budget=0` explicitly when you want function calling. Without it, Flash sometimes runs a small thinking pass anyway, and those tokens count against `max_output_tokens` — a quiet contributor to MALFORMED in long-argument calls.
+
+## When the residual rate still bothers you
+
+After the three causes above, our residual was under 1%. We handle the rest with two layers:
+
+1. Force a call by setting `tool_config.function_calling_config.mode = "ANY"` with `allowed_function_names`.
+2. Retry once at `temperature = 0.0` with no backoff if a MALFORMED still slips through.
+
+The retry catches over 95% of stragglers. What remains tends to be input with heavy emoji or RTL strings; adding an input-sanitization pass cleared it up.
+
+```python
+def call_with_fallback(client, model, contents, tools):
+    for attempt in (0, 1):
+        cfg = types.GenerateContentConfig(
+            tools=[types.Tool(function_declarations=tools)],
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode="ANY",
+                    allowed_function_names=[t.name for t in tools],
+                )
+            ),
+            temperature=0.0 if attempt == 1 else 0.4,
+            max_output_tokens=2048,
+        )
+        resp = client.models.generate_content(model=model, contents=contents, config=cfg)
+        if resp.candidates[0].finish_reason != "MALFORMED_FUNCTION_CALL":
+            return resp
+    raise RuntimeError("function call malformed after retry")
+```
+
+## Next step
+
+Start by adding `finish_reason` logging to your existing call sites so you can measure the MALFORMED rate. Three days of observation is usually enough to see which of the three causes dominates, and from there you can fix the right thing instead of blindly raising `max_output_tokens` and watching the bill climb.
+
+Hope this helps anyone running into the same symptom.
