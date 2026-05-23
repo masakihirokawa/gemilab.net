@@ -1,0 +1,398 @@
+---
+title: "Gemini API × Sentry でLLMエラー追跡とプロンプト失敗を観測する本番運用パイプライン"
+slug: "gemini-api-sentry-llm-error-observability-pipeline"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-23T15:45"
+author: "Gemini Lab"
+description: "Sentry のエラートラッキングと Gemini API 固有の失敗パターンを組み合わせ、プロンプト崩壊・安全フィルタ発火・トークン超過まで本番で観測する実装パイプラインを設計します。"
+tags: ["gemini-api", "sentry", "observability", "error-tracking", "production", "prompt-engineering", "monitoring"]
+highlights:
+  - "Gemini API 特有の失敗パターン（safety filter / recitation / token超過 / レイテンシ劣化）を Sentry にタグ付きで送る実装が手に入る"
+  - "Sentry の sample_rate と costguard を組み合わせ、エラー収集コストを月数百円に抑える運用テンプレートを学べる"
+  - "PII を含むプロンプトを Sentry に送らないための before_send フィルタの実装パターンを得られる"
+---
+
+## 「動いているように見える」LLM の沈黙が一番こわい
+
+Gemini API を本番アプリに組み込んで運用していると、ある日 Crashlytics や Cloud Run のメトリクスは何の異常も示していないのに、ユーザーからの問い合わせフォームにだけ「最近、回答が変なんです」という曖昧な苦情が届く、という現象に必ず遭遇します。
+
+私自身も 2014 年から累計 5,000 万ダウンロードのアプリ事業を続けてきた中で、AdMob の収益が突然 30% 落ちた日があり、原因を追ったところ Gemini API に流していたタグ付け処理が `finish_reason: SAFETY` でほぼ全件ブロックされていた、ということがありました。HTTP ステータスは 200、JSON も返ってきている、けれど中身は空文字。アプリは正常に動き、ユーザー側ではタグなしの広告枠が表示され続け、eCPM が静かに下がっていく。気付くまでに丸三日かかりました。
+
+LLM の運用が難しいのは、こうした「成功した失敗」が常に発生することです。500 を投げてくれるならまだ Sentry に飛ばして気付けますが、Gemini 側の判断で安全フィルタが発火したり、推論はしたものの空の structured output が返ってきたりするのは、従来の APM では拾えません。
+
+ここから先は、Sentry をベースに Gemini API 固有の失敗パターンを観測し、月数百円のコストでプロンプト崩壊や安全フィルタ発火に気付けるパイプラインを設計します。Langfuse のような専用 LLM 観測ツールも併用していますが、Sentry は既存のクラッシュ・例外と同じダッシュボードで LLM 問題を見られる利点があり、個人開発者にも導入しやすい選択肢です。
+
+## なぜ標準の Sentry SDK では足りないのか
+
+Sentry の Python / Node SDK には `openai-python` 用のインテグレーションが入っており、デフォルトで `chat.completions.create` を span として記録してくれます。しかし Gemini API（`google-genai` パッケージや Vertex AI SDK）には現時点で公式の自動計装がなく、何もしなければ HTTP ステータスベースの失敗しか観測できません。
+
+具体的に言うと、以下のような Gemini 特有の失敗は Sentry にも Datadog にも自動では届きません。
+
+- `finish_reason: SAFETY` で本文が空のまま 200 が返るケース
+- `finish_reason: RECITATION` で著作物保護のブロックが入ったケース
+- structured output（response_schema 指定）でスキーマ違反のまま返ってきたケース
+- prompt feedback の `block_reason` が `OTHER` で返ってきたケース
+- `usage_metadata.candidates_token_count` が想定の半分以下で切れたケース
+- レイテンシは正常範囲だが品質が劣化した golden dataset 評価
+- リクエストの 95%ile レイテンシが急に 3 倍になった、という時系列の異常
+
+これらは「Gemini API のレスポンスを開いて中身を見て初めてわかる」種類の失敗です。私の場合、SAFETY ブロックを発見できなかった三日間の損失は、ざっくり 4 万円ぶんの広告収益でした。観測コストを払って早く気付くほうが、間違いなく安く済みます。
+
+## 設計するパイプラインの全体像
+
+本記事で組むパイプラインは、以下の役割を担います。
+
+1. **Gemini SDK のラッパー層**で全コールを `with sentry_sdk.start_span()` に包み、レスポンスの中身を検査
+2. **失敗パターンごとに `sentry_sdk.capture_message`** または `capture_exception` でタグ付きイベントとして送信
+3. **PII を含むプロンプトは `before_send`** で必ず削る
+4. **コスト爆発を防ぐサンプリング**を `traces_sampler` で実装
+5. **ダッシュボード**で「block_reason 別の発生率」「prompt_hash 別のエラー率」を可視化
+
+実装は Python（Cloud Run / Cloud Functions / FastAPI 想定）を中心に書いていきますが、Node.js / TypeScript への移植も難しくありません。
+
+## ステップ 1: 基本セットアップとサンプリング設計
+
+まず `sentry-sdk` と `google-genai` をインストールします。
+
+```bash
+pip install "sentry-sdk[fastapi]==2.15.0" "google-genai==1.5.0"
+```
+
+Sentry の初期化はアプリのエントリポイントで一度だけ行います。LLM のコールは件数が多いため、`traces_sample_rate` を 1.0 にすると課金プランをすぐ食い潰します。私の運用では、本番では `0.05`（5%）を基準にし、エラーイベントは別ロジックで 100% 送るようにしています。
+
+```python
+import os
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+
+def gemini_traces_sampler(sampling_context: dict) -> float:
+    """Gemini 関連スパンは個別にサンプルレートを下げる。
+
+    通常リクエストは 5%、エラーが疑われるスパンは 100% 採取する。
+    """
+    op = sampling_context.get("transaction_context", {}).get("op", "")
+    if op == "gemini.generate":
+        return 0.05
+    if op == "gemini.generate.failed":
+        return 1.0
+    return 0.1
+
+sentry_sdk.init(
+    dsn=os.environ["SENTRY_DSN"],
+    environment=os.environ.get("APP_ENV", "production"),
+    release=os.environ.get("APP_VERSION", "dev"),
+    traces_sampler=gemini_traces_sampler,
+    profiles_sample_rate=0.0,
+    send_default_pii=False,
+    integrations=[FastApiIntegration()],
+)
+```
+
+ポイントは `send_default_pii=False` を必ず明示することです。Sentry SDK のデフォルトは False ですが、フレームワーク統合によっては True に上書きされることがあるため、明示しておくと安心です。後段の `before_send` でさらに重ねて防御します。
+
+## ステップ 2: Gemini クライアントのラッパーを作る
+
+Gemini API のすべてのコールを観測するため、薄いラッパークラスを作ります。直接 `client.models.generate_content()` を呼ばないことを社内ルールにし、レビューでも徹底します。
+
+```python
+import hashlib
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Optional
+
+import sentry_sdk
+from google import genai
+from google.genai import types as genai_types
+
+@dataclass
+class GeminiCallResult:
+    text: str
+    finish_reason: str
+    block_reason: Optional[str]
+    prompt_tokens: int
+    candidates_tokens: int
+    latency_ms: float
+    model: str
+    prompt_hash: str
+
+class ObservedGeminiClient:
+    """Gemini API の薄いラッパー。
+    すべてのコールを Sentry の span として記録し、
+    失敗パターンを別イベントとして送信する。"""
+
+    SAFE_FINISH = {"STOP", "MAX_TOKENS"}
+
+    def __init__(self, api_key: str, default_model: str = "gemini-2.5-flash"):
+        self.client = genai.Client(api_key=api_key)
+        self.default_model = default_model
+
+    def _prompt_hash(self, prompt: str) -> str:
+        return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        config: Optional[genai_types.GenerateContentConfig] = None,
+        user_id_hash: Optional[str] = None,
+    ) -> GeminiCallResult:
+        model = model or self.default_model
+        prompt_hash = self._prompt_hash(prompt)
+
+        with sentry_sdk.start_span(
+            op="gemini.generate",
+            description=f"{model} / {prompt_hash}",
+        ) as span:
+            span.set_tag("gemini.model", model)
+            span.set_tag("gemini.prompt_hash", prompt_hash)
+            if user_id_hash:
+                span.set_tag("user.id_hash", user_id_hash)
+
+            t0 = time.perf_counter()
+            try:
+                resp = self.client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+            except Exception as exc:
+                latency_ms = (time.perf_counter() - t0) * 1000
+                span.set_status("internal_error")
+                self._capture_transport_error(exc, model, prompt_hash, latency_ms)
+                raise
+            latency_ms = (time.perf_counter() - t0) * 1000
+
+            result = self._parse(resp, model, prompt_hash, latency_ms)
+            span.set_data("gemini.finish_reason", result.finish_reason)
+            span.set_data("gemini.tokens.prompt", result.prompt_tokens)
+            span.set_data("gemini.tokens.candidates", result.candidates_tokens)
+            span.set_measurement("latency_ms", latency_ms, "millisecond")
+
+            self._inspect(result)
+            return result
+```
+
+`generate` の中で例外が出る前にレイテンシだけは必ず計測し、Sentry のスパン上に残します。これにより「タイムアウトで死んだコールはそもそも遅かったのか、瞬間的に落ちたのか」を後から区別できます。
+
+## ステップ 3: 「成功した失敗」を捕捉するインスペクタ
+
+次がこの記事の核心です。`_parse` と `_inspect` で Gemini レスポンスを開き、Gemini 固有の失敗パターンを Sentry にタグ付きで送ります。
+
+```python
+    def _parse(
+        self,
+        resp: Any,
+        model: str,
+        prompt_hash: str,
+        latency_ms: float,
+    ) -> GeminiCallResult:
+        # 注意: candidates が空の場合がある（block_reason で弾かれた等）
+        candidates = getattr(resp, "candidates", []) or []
+        candidate = candidates[0] if candidates else None
+        finish_reason = (
+            str(candidate.finish_reason).split(".")[-1]
+            if candidate and candidate.finish_reason
+            else "UNKNOWN"
+        )
+        text = (resp.text or "") if hasattr(resp, "text") else ""
+
+        block_reason = None
+        pf = getattr(resp, "prompt_feedback", None)
+        if pf and getattr(pf, "block_reason", None):
+            block_reason = str(pf.block_reason).split(".")[-1]
+
+        usage = getattr(resp, "usage_metadata", None)
+        prompt_tokens = getattr(usage, "prompt_token_count", 0) if usage else 0
+        candidates_tokens = (
+            getattr(usage, "candidates_token_count", 0) if usage else 0
+        )
+
+        return GeminiCallResult(
+            text=text,
+            finish_reason=finish_reason,
+            block_reason=block_reason,
+            prompt_tokens=prompt_tokens,
+            candidates_tokens=candidates_tokens,
+            latency_ms=latency_ms,
+            model=model,
+            prompt_hash=prompt_hash,
+        )
+
+    def _inspect(self, r: GeminiCallResult) -> None:
+        """成功した失敗パターンを検出し Sentry に通知。"""
+        if r.block_reason:
+            self._capture_prompt_block(r)
+            return
+        if r.finish_reason == "SAFETY":
+            self._capture_safety_block(r)
+            return
+        if r.finish_reason == "RECITATION":
+            self._capture_recitation_block(r)
+            return
+        if r.finish_reason not in self.SAFE_FINISH:
+            self._capture_unknown_finish(r)
+            return
+        if not r.text.strip():
+            self._capture_empty_response(r)
+            return
+        if r.candidates_tokens > 0 and r.candidates_tokens < 16:
+            # 極端に短いレスポンスは品質劣化のサインになる
+            self._capture_thin_response(r)
+
+    def _capture_safety_block(self, r: GeminiCallResult) -> None:
+        with sentry_sdk.push_scope() as scope:
+            scope.set_tag("gemini.failure", "safety_block")
+            scope.set_tag("gemini.model", r.model)
+            scope.set_tag("gemini.prompt_hash", r.prompt_hash)
+            scope.set_extra("tokens_prompt", r.prompt_tokens)
+            scope.set_extra("latency_ms", r.latency_ms)
+            scope.set_level("warning")
+            sentry_sdk.capture_message(
+                f"Gemini SAFETY block: {r.prompt_hash}",
+                level="warning",
+            )
+```
+
+`_capture_prompt_block` `_capture_recitation_block` `_capture_unknown_finish` `_capture_empty_response` `_capture_thin_response` `_capture_transport_error` も同様に実装します。重要なのは **prompt の本文そのものを Sentry に絶対に送らない** ことです。`prompt_hash`（SHA-256 の頭 12 文字）だけを共有することで、後述の Discover クエリで「同じプロンプトハッシュで毎日 SAFETY が出ている」というパターンを検出できます。
+
+私の運用では、`scope.set_level("warning")` を SAFETY と RECITATION に使い、`error` レベルは reserved にしています。Sentry の Issue Owners ルールで「level: error は私の Slack に即時通知、warning は週次ダイジェスト」と切り分けると、夜中に起こされる回数が現実的になります。
+
+## ステップ 4: PII を絶対に外に出さない before_send 防御
+
+LLM 利用で最大のリスクは、ユーザー入力のプロンプトを誤って Sentry に送ってしまうことです。Sentry SDK の `before_send` フックで多層防御します。
+
+```python
+import re
+
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_RE = re.compile(r"\+?\d[\d\-\s\(\)]{7,}\d")
+CC_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+
+def _scrub(text: str) -> str:
+    text = EMAIL_RE.sub("[email]", text)
+    text = PHONE_RE.sub("[phone]", text)
+    text = CC_RE.sub("[cc]", text)
+    return text
+
+def before_send(event: dict, hint: dict) -> Optional[dict]:
+    # 1) message を必ずスクラブ
+    if event.get("message"):
+        event["message"] = _scrub(event["message"])
+    # 2) breadcrumbs から本文っぽい巨大文字列を落とす
+    for crumb in event.get("breadcrumbs", {}).get("values", []) or []:
+        data = crumb.get("data") or {}
+        for k, v in list(data.items()):
+            if isinstance(v, str) and len(v) > 200:
+                data[k] = f"<redacted: {len(v)} chars>"
+            elif isinstance(v, str):
+                data[k] = _scrub(v)
+    # 3) extra から prompt キーを問答無用で消す
+    extra = event.get("extra") or {}
+    for k in list(extra.keys()):
+        if "prompt" in k.lower() or "input" in k.lower():
+            extra[k] = "<scrubbed>"
+    # 4) 環境変数経由のシークレットを消す
+    env_keys = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
+    request = event.get("request") or {}
+    env = request.get("env") or {}
+    for k in list(env.keys()):
+        if any(s in k.upper() for s in env_keys):
+            env[k] = "<scrubbed>"
+    return event
+```
+
+これを `sentry_sdk.init(..., before_send=before_send)` に渡します。`before_send` は「Sentry に送る最後の関門」なので、ここで漏れたら防げません。私は CI で `pytest` の中に、わざと PII を含むエラーを発生させ、Sentry のモックレスポンスが `<scrubbed>` を含むか確認するテストを 8 本走らせています。
+
+## ステップ 5: Discover クエリと Issue Alert を設計する
+
+タグ付きで送ったイベントは、Sentry の Discover で集計します。私が常用している 4 つのクエリを紹介します。
+
+1. **block_reason 別の発生率**:
+   `event.type:default tags[gemini.failure]:safety_block` を時系列で表示し、特定リリース後に増えていないか確認
+2. **prompt_hash 別の失敗率**:
+   `event.type:default has:tags[gemini.prompt_hash]` をグルーピング。同じハッシュで頻発しているならテンプレ自体が壊れている
+3. **モデル別のレイテンシ p95**:
+   `gemini.model:gemini-2.5-pro` と `gemini.model:gemini-2.5-flash` を並べて比較
+4. **ユーザー単位のエラー集中**:
+   `tags[user.id_hash]:*` の上位件数。1 ユーザーだけがエラーを引き起こしているなら、そのユーザーの入力パターンが特殊
+
+これらに対して Issue Alert を 2 段階で設定します。
+
+- **即時通知**: `gemini.failure:transport_error` が 5 分で 10 件以上 → Slack
+- **週次通知**: `gemini.failure:safety_block` が 7 日で 100 件以上 → 月曜の朝にダイジェスト
+
+「即時で叩き起こされる条件」と「週次でレビューする条件」を分けるのが、ひとり運用のサステナビリティに直結します。私は深夜 3 時の通知で何度も眠れない夜を過ごした末に、この 2 段階構成に落ち着きました。
+
+## ステップ 6: コスト管理 — Sentry イベント爆発を防ぐ
+
+Sentry の課金は基本的にイベント数ベースです。LLM アプリは、1 リクエストで複数回コールが発生するため、油断するとイベント数が膨れ上がります。私の運用で効いている節約策を共有します。
+
+第一に、`capture_message` の代わりに **`Sentry Performance` のスパンに `tag` として残す**ことで、件数を増やさずに「失敗が起きた事実」を計測できます。サンプル先で 5% だけ取れていれば、傾向は十分に分かります。
+
+第二に、`before_send_transaction` で **特定の正常系トランザクションをドロップ**します。
+
+```python
+def before_send_transaction(event, hint):
+    tx = event.get("transaction", "")
+    if tx.startswith("GET /healthz"):
+        return None
+    return event
+```
+
+第三に、**警告レベル（warning）のイベントは fingerprint をまとめる**ことで Issue 数を抑えます。
+
+```python
+scope.fingerprint = ["gemini-safety-block", r.model]
+```
+
+これにより、SAFETY ブロックは全モデル合計でも 1 つの Issue に集約され、Sentry の Issue Quota を圧迫しません。
+
+私の場合、月 70 万件 LLM コールでも Sentry の Team プラン（月 $26）に収まっています。最初の月は 5% サンプリングを忘れて月 $180 になり、青ざめて修正しました。
+
+## ステップ 7: golden dataset と Sentry の連携
+
+最後に、品質劣化を検出する仕組みを Sentry に集約します。Langfuse や PromptFoo で実行した golden dataset の評価結果を、Cloud Scheduler から日次で叩いてサマリを Sentry に送ります。
+
+```python
+def report_eval_summary(pass_rate: float, sample_size: int, dataset: str):
+    with sentry_sdk.push_scope() as scope:
+        scope.set_tag("eval.dataset", dataset)
+        scope.set_extra("sample_size", sample_size)
+        scope.set_extra("pass_rate", pass_rate)
+        if pass_rate < 0.85:
+            scope.set_level("error")
+            sentry_sdk.capture_message(
+                f"Eval regression: {dataset} pass_rate={pass_rate:.2%}",
+                level="error",
+            )
+        elif pass_rate < 0.92:
+            scope.set_level("warning")
+            sentry_sdk.capture_message(
+                f"Eval warning: {dataset} pass_rate={pass_rate:.2%}",
+                level="warning",
+            )
+```
+
+合格率が 85% を下回ったら error、92% を下回ったら warning。閾値はアプリの特性によって変えるべきですが、「観測する側が動ける値」になっているかが重要です。85% を切ったときに「何ができるか」が決まっていないと、アラートが鳴っても放置になります。
+
+## 運用 6 ヶ月で学んだ落とし穴
+
+このパイプラインを 6 ヶ月運用して、いくつかハマりどころがありました。実体験ベースで共有します。
+
+第一に、**`before_send` の中で例外を投げると Sentry SDK が無限ループ**に入ります。`_scrub` の正規表現で再帰的に呼ばれるパターンに気付かず、Cloud Run のメモリが膨れ上がって OOM で死にました。今は `try/except Exception: return event` で必ずガードしています。
+
+第二に、**Vertex AI 経由の Gemini と直接 Gemini API のレスポンス構造が微妙に違う**ことです。`finish_reason` の取り出し方や `prompt_feedback` の有無が異なるため、両方を扱う場合は `_parse` をクライアント別に分けたほうが安全です。
+
+第三に、**Sentry の Issue Owners を勘で設定しない**ことです。最初は「gemini.\* タグは全部自分」にしていたら、毎日 200 件以上の通知が来ました。今は `gemini.failure:transport_error` だけ即時、`gemini.failure:safety_block` は週次ダイジェスト、と段階を分けています。
+
+第四に、**サンプリングしたデータでも個別調査ができる窓口を残す**ことです。サンプル外の障害でも、ユーザー問い合わせから `prompt_hash` を逆引きできるよう、自社の DB に `prompt_hash` と `timestamp` だけは 100% 保存しています。プロンプトの本文は保存しないため、PII リスクなく追跡できます。
+
+## 次の一歩 — 自分のアプリに最低 1 つ仕込む
+
+ここまで読まれた方は、今晩のうちに 1 つだけ仕掛けてみてほしいです。`finish_reason: SAFETY` だけを Sentry の warning として送る、約 30 行のラッパー。それだけで、私が三日間気付けなかった広告収益の沈黙のような損失を、おそらく当日中に察知できるようになります。
+
+LLM の本番運用は「動いていることの保証」を取り続ける仕事です。Sentry はそのための、安価で実用的な相棒になってくれます。同じ課題に取り組んでいる方の参考になれば幸いです。

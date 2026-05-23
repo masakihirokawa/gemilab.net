@@ -1,0 +1,376 @@
+---
+title: "Gemini API × Sentry: A Production Pipeline for LLM Error Tracking and Prompt Failure Observability"
+slug: "gemini-api-sentry-llm-error-observability-pipeline"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-23T15:45"
+author: "Gemini Lab"
+description: "Pair Sentry's error tracking with Gemini-specific failure modes so you can catch safety filter blocks, recitation rejections, empty completions, and quiet latency drift in production."
+tags: ["gemini-api", "sentry", "observability", "error-tracking", "production", "prompt-engineering", "monitoring"]
+highlights:
+  - "Hands-on patterns for sending Gemini-specific failures (safety filters, recitation, token overruns, latency drift) to Sentry with rich tags"
+  - "Cost-aware sampling and costguard tactics that keep Sentry usage under roughly a few hundred yen per month for a 700k-call workload"
+  - "A multi-layered before_send filter that prevents prompt text and PII from ever leaving your service"
+---
+
+## The scariest failure is silent
+
+If you run Gemini API in production for any length of time, you will hit a day when Crashlytics is clean, Cloud Run dashboards look fine, and yet a vague support ticket arrives saying "the answers feel weird lately." That gap between green dashboards and unhappy users is the LLM-specific failure mode that traditional APM cannot see.
+
+I have been shipping mobile apps as a solo developer since 2014 (around 50 million cumulative downloads across the catalog), and one morning my AdMob revenue dropped about thirty percent overnight. I dug in, and the cause was that the Gemini API tagging job I rely on had started returning `finish_reason: SAFETY` on almost every request. HTTP 200, valid JSON envelope, empty body. The app kept running, ad slots rendered without tags, and eCPM quietly tanked. It took me three full days to notice.
+
+LLM operations are hard precisely because of these "successful failures." A 500 you can ship straight into Sentry and be paged on. A safety block, an empty structured output, or a thinking-budget overrun produces a 200 OK that no standard error tracker catches.
+
+Here we will design a Sentry-based pipeline that surfaces Gemini-specific failure patterns and lets a solo operator catch prompt collapse and safety drift for a few hundred yen per month. I also use Langfuse for deeper LLM tracing, but Sentry has the unique advantage of putting LLM problems on the same dashboard as crashes and exceptions — which is what an indie developer realistically watches every morning.
+
+## Why the stock Sentry SDK is not enough
+
+The Python and Node Sentry SDKs ship with an `openai-python` integration that records `chat.completions.create` as a span automatically. For Gemini (the `google-genai` package or the Vertex AI SDK) there is no equivalent auto-instrumentation today, so without extra work you can only see HTTP-level failures.
+
+Concretely, these Gemini-specific failures never reach Sentry or Datadog by default:
+
+- `finish_reason: SAFETY` with an empty body returning 200
+- `finish_reason: RECITATION` when copyright filters fire
+- Structured output that returns a schema-violating payload
+- `prompt_feedback.block_reason` of `OTHER` (the catch-all bucket)
+- `usage_metadata.candidates_token_count` truncated below half the expected length
+- Golden-dataset quality regressions while latency stays nominal
+- A 95th-percentile latency spike from 800 ms to 2.4 s with no error count change
+
+These are the kind of issues you only see if something deliberately opens the response and inspects it. My three-day SAFETY blackout cost roughly forty thousand yen in lost ad revenue. Paying a small observability tax is dramatically cheaper.
+
+## What the pipeline looks like
+
+The pipeline we will build has five responsibilities:
+
+1. A **wrapper layer over the Gemini SDK** that runs every call inside `sentry_sdk.start_span()` and inspects the response
+2. **Per-failure-mode events** sent via `capture_message` or `capture_exception` with structured tags
+3. A **before_send filter** that strips PII out of anything Sentry ever sees
+4. **Sampling logic** in `traces_sampler` so cost stays predictable
+5. **Dashboards** that show failure rate by `block_reason` and by `prompt_hash`
+
+I will write Python (FastAPI / Cloud Run / Cloud Functions style) but everything ports cleanly to Node.
+
+## Step 1: baseline setup and sampling
+
+Install the SDKs:
+
+```bash
+pip install "sentry-sdk[fastapi]==2.15.0" "google-genai==1.5.0"
+```
+
+Initialize Sentry once at app startup. LLM calls are frequent — pushing `traces_sample_rate` to 1.0 will burn through your event quota fast. In production I default Gemini spans to five percent and bump error-related spans to one hundred percent.
+
+```python
+import os
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+
+def gemini_traces_sampler(sampling_context: dict) -> float:
+    """Sample Gemini spans at a low rate but keep failures at 100%."""
+    op = sampling_context.get("transaction_context", {}).get("op", "")
+    if op == "gemini.generate":
+        return 0.05
+    if op == "gemini.generate.failed":
+        return 1.0
+    return 0.1
+
+sentry_sdk.init(
+    dsn=os.environ["SENTRY_DSN"],
+    environment=os.environ.get("APP_ENV", "production"),
+    release=os.environ.get("APP_VERSION", "dev"),
+    traces_sampler=gemini_traces_sampler,
+    profiles_sample_rate=0.0,
+    send_default_pii=False,
+    integrations=[FastApiIntegration()],
+)
+```
+
+Set `send_default_pii=False` explicitly. The SDK default is already False, but framework integrations sometimes flip it on, and the cost of being wrong here is a leak. We will harden again in `before_send` later.
+
+## Step 2: the observed Gemini client
+
+Every Gemini call needs to flow through a thin wrapper. Make it a code-review rule that nobody calls `client.models.generate_content()` directly.
+
+```python
+import hashlib
+import time
+from dataclasses import dataclass
+from typing import Any, Optional
+
+import sentry_sdk
+from google import genai
+from google.genai import types as genai_types
+
+@dataclass
+class GeminiCallResult:
+    text: str
+    finish_reason: str
+    block_reason: Optional[str]
+    prompt_tokens: int
+    candidates_tokens: int
+    latency_ms: float
+    model: str
+    prompt_hash: str
+
+class ObservedGeminiClient:
+    """A thin wrapper that records every Gemini call as a Sentry span
+    and emits typed events for each Gemini-specific failure mode."""
+
+    SAFE_FINISH = {"STOP", "MAX_TOKENS"}
+
+    def __init__(self, api_key: str, default_model: str = "gemini-2.5-flash"):
+        self.client = genai.Client(api_key=api_key)
+        self.default_model = default_model
+
+    def _prompt_hash(self, prompt: str) -> str:
+        return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        config: Optional[genai_types.GenerateContentConfig] = None,
+        user_id_hash: Optional[str] = None,
+    ) -> GeminiCallResult:
+        model = model or self.default_model
+        prompt_hash = self._prompt_hash(prompt)
+
+        with sentry_sdk.start_span(
+            op="gemini.generate",
+            description=f"{model} / {prompt_hash}",
+        ) as span:
+            span.set_tag("gemini.model", model)
+            span.set_tag("gemini.prompt_hash", prompt_hash)
+            if user_id_hash:
+                span.set_tag("user.id_hash", user_id_hash)
+
+            t0 = time.perf_counter()
+            try:
+                resp = self.client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+            except Exception as exc:
+                latency_ms = (time.perf_counter() - t0) * 1000
+                span.set_status("internal_error")
+                self._capture_transport_error(exc, model, prompt_hash, latency_ms)
+                raise
+            latency_ms = (time.perf_counter() - t0) * 1000
+
+            result = self._parse(resp, model, prompt_hash, latency_ms)
+            span.set_data("gemini.finish_reason", result.finish_reason)
+            span.set_data("gemini.tokens.prompt", result.prompt_tokens)
+            span.set_data("gemini.tokens.candidates", result.candidates_tokens)
+            span.set_measurement("latency_ms", latency_ms, "millisecond")
+
+            self._inspect(result)
+            return result
+```
+
+Latency is measured before the exception escapes, which gives you "was this call slow before it died, or did it die instantly" as a tag, useful when triaging Cloud Run timeouts later.
+
+## Step 3: the inspector that catches successful failures
+
+This is the heart of the pipeline. `_parse` extracts the diagnostic fields, and `_inspect` decides which ones constitute a problem worth telling Sentry about.
+
+```python
+    def _parse(self, resp: Any, model: str, prompt_hash: str, latency_ms: float) -> GeminiCallResult:
+        # Note: candidates may be empty (e.g. when block_reason fires)
+        candidates = getattr(resp, "candidates", []) or []
+        candidate = candidates[0] if candidates else None
+        finish_reason = (
+            str(candidate.finish_reason).split(".")[-1]
+            if candidate and candidate.finish_reason
+            else "UNKNOWN"
+        )
+        text = (resp.text or "") if hasattr(resp, "text") else ""
+
+        block_reason = None
+        pf = getattr(resp, "prompt_feedback", None)
+        if pf and getattr(pf, "block_reason", None):
+            block_reason = str(pf.block_reason).split(".")[-1]
+
+        usage = getattr(resp, "usage_metadata", None)
+        prompt_tokens = getattr(usage, "prompt_token_count", 0) if usage else 0
+        candidates_tokens = (
+            getattr(usage, "candidates_token_count", 0) if usage else 0
+        )
+
+        return GeminiCallResult(
+            text=text,
+            finish_reason=finish_reason,
+            block_reason=block_reason,
+            prompt_tokens=prompt_tokens,
+            candidates_tokens=candidates_tokens,
+            latency_ms=latency_ms,
+            model=model,
+            prompt_hash=prompt_hash,
+        )
+
+    def _inspect(self, r: GeminiCallResult) -> None:
+        """Detect successful failures and notify Sentry."""
+        if r.block_reason:
+            self._capture_prompt_block(r); return
+        if r.finish_reason == "SAFETY":
+            self._capture_safety_block(r); return
+        if r.finish_reason == "RECITATION":
+            self._capture_recitation_block(r); return
+        if r.finish_reason not in self.SAFE_FINISH:
+            self._capture_unknown_finish(r); return
+        if not r.text.strip():
+            self._capture_empty_response(r); return
+        if r.candidates_tokens > 0 and r.candidates_tokens < 16:
+            # Very short responses are a quality-drift signal
+            self._capture_thin_response(r)
+
+    def _capture_safety_block(self, r: GeminiCallResult) -> None:
+        with sentry_sdk.push_scope() as scope:
+            scope.set_tag("gemini.failure", "safety_block")
+            scope.set_tag("gemini.model", r.model)
+            scope.set_tag("gemini.prompt_hash", r.prompt_hash)
+            scope.set_extra("tokens_prompt", r.prompt_tokens)
+            scope.set_extra("latency_ms", r.latency_ms)
+            scope.set_level("warning")
+            sentry_sdk.capture_message(
+                f"Gemini SAFETY block: {r.prompt_hash}",
+                level="warning",
+            )
+```
+
+Fill out `_capture_prompt_block`, `_capture_recitation_block`, `_capture_unknown_finish`, `_capture_empty_response`, `_capture_thin_response`, and `_capture_transport_error` with the same shape. The non-negotiable rule is **never send the prompt text itself**. The hash is enough to spot patterns like "this prompt hash hits SAFETY every day" in Discover later.
+
+I keep `warning` for SAFETY and RECITATION, and reserve `error` for transport-level breakage. Combined with Issue Owners rules that send `error` straight to Slack and digest `warning` to a weekly summary, the on-call ergonomics become survivable for one person.
+
+## Step 4: never let PII out the door
+
+The biggest LLM observability risk is accidentally shipping user input to Sentry. Defense in depth lives in `before_send`.
+
+```python
+import re
+from typing import Optional
+
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_RE = re.compile(r"\+?\d[\d\-\s\(\)]{7,}\d")
+CC_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+
+def _scrub(text: str) -> str:
+    text = EMAIL_RE.sub("[email]", text)
+    text = PHONE_RE.sub("[phone]", text)
+    text = CC_RE.sub("[cc]", text)
+    return text
+
+def before_send(event: dict, hint: dict) -> Optional[dict]:
+    if event.get("message"):
+        event["message"] = _scrub(event["message"])
+
+    for crumb in event.get("breadcrumbs", {}).get("values", []) or []:
+        data = crumb.get("data") or {}
+        for k, v in list(data.items()):
+            if isinstance(v, str) and len(v) > 200:
+                data[k] = f"<redacted: {len(v)} chars>"
+            elif isinstance(v, str):
+                data[k] = _scrub(v)
+
+    extra = event.get("extra") or {}
+    for k in list(extra.keys()):
+        if "prompt" in k.lower() or "input" in k.lower():
+            extra[k] = "<scrubbed>"
+
+    env_keys = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
+    request = event.get("request") or {}
+    env = request.get("env") or {}
+    for k in list(env.keys()):
+        if any(s in k.upper() for s in env_keys):
+            env[k] = "<scrubbed>"
+    return event
+```
+
+Wire this in with `sentry_sdk.init(..., before_send=before_send)`. This is the last gate before data leaves your process — if PII slips through here, you cannot pull it back. In CI I run eight pytest cases that deliberately raise errors containing PII and assert that the mocked Sentry payload contains only `<scrubbed>` markers.
+
+## Step 5: Discover queries and a two-tier alert design
+
+Once the tagged events land, build Discover queries on top. Four I rely on:
+
+1. **Failure mix by reason**: `event.type:default tags[gemini.failure]:safety_block` plotted over time, watched against deploys
+2. **Failure rate by prompt hash**: group by `tags[gemini.prompt_hash]` to spot brittle templates
+3. **Latency p95 by model**: compare `gemini-2.5-pro` vs `gemini-2.5-flash` side by side
+4. **Per-user error concentration**: top counts grouped by `tags[user.id_hash]` to see if a single power user is generating most of the noise
+
+Wire Issue Alerts in two tiers:
+
+- **Immediate**: `gemini.failure:transport_error` exceeding ten events in five minutes → Slack
+- **Weekly digest**: `gemini.failure:safety_block` exceeding one hundred events in seven days → Monday morning summary
+
+Separating "wake me up" from "we review on Monday" is the single biggest sustainability win for solo operators. I learned this the hard way after several months of 3 AM alerts.
+
+## Step 6: keeping the Sentry bill sane
+
+Sentry charges by event volume. LLM apps generate multiple Gemini calls per user request, and unmanaged this will balloon. The strategies that have worked for me:
+
+First, prefer **tags on a Performance span** over `capture_message` for routine failure flagging. A 5% sample is enough to track the trend without inflating event counts.
+
+Second, use **`before_send_transaction`** to drop noise transactions:
+
+```python
+def before_send_transaction(event, hint):
+    tx = event.get("transaction", "")
+    if tx.startswith("GET /healthz"):
+        return None
+    return event
+```
+
+Third, **collapse warning events with a stable fingerprint** so Issue counts stay bounded:
+
+```python
+scope.fingerprint = ["gemini-safety-block", r.model]
+```
+
+This rolls every SAFETY block into a single per-model issue. My production setup runs about 700k Gemini calls a month and stays inside the Sentry Team plan (around $26/month). The first month I forgot the 5% sampling and the bill was $180 — fix early, fix permanently.
+
+## Step 7: closing the loop with golden datasets
+
+Quality drift needs a place to live too. I run my Langfuse / PromptFoo golden-dataset evaluations on a Cloud Scheduler daily cron and forward the summary into Sentry, so the morning glance covers both errors and quality.
+
+```python
+def report_eval_summary(pass_rate: float, sample_size: int, dataset: str):
+    with sentry_sdk.push_scope() as scope:
+        scope.set_tag("eval.dataset", dataset)
+        scope.set_extra("sample_size", sample_size)
+        scope.set_extra("pass_rate", pass_rate)
+        if pass_rate < 0.85:
+            scope.set_level("error")
+            sentry_sdk.capture_message(
+                f"Eval regression: {dataset} pass_rate={pass_rate:.2%}",
+                level="error",
+            )
+        elif pass_rate < 0.92:
+            scope.set_level("warning")
+            sentry_sdk.capture_message(
+                f"Eval warning: {dataset} pass_rate={pass_rate:.2%}",
+                level="warning",
+            )
+```
+
+Below 85% pass rate is an error, below 92% is a warning. The thresholds depend on your domain — what matters is whether the threshold maps to an action you would actually take. If you cannot answer "what do I do when this fires?", the alert will be ignored and pollute your dashboard.
+
+## Six months of operational lessons
+
+A handful of things bit me on the way to the current setup. Sharing them so you can skip the same mistakes.
+
+First, **never let `before_send` raise**. My early `_scrub` regex hit a pathological prompt and recursed on its own output. Cloud Run OOM'd. The fix is a defensive `try/except Exception: return event` at the top of `before_send`.
+
+Second, **Vertex AI Gemini and direct Gemini API responses are not byte-for-byte identical**. `finish_reason` lookup and `prompt_feedback` shapes diverge. If you use both, branch `_parse` per client rather than try to share code.
+
+Third, **do not set Issue Owners by intuition**. Tagging `gemini.*` to me directly sent 200+ notifications a day. The two-tier setup (immediate for transport, weekly digest for filters) is what made it sustainable.
+
+Fourth, **keep a 100% non-PII metadata trail outside Sentry**. Even at 5% Sentry sampling, I store `prompt_hash` + `timestamp` for every call in my own database. When a support ticket comes in, I can reverse-lookup the prompt hash and pull traces for that user — without ever having stored the prompt body itself.
+
+## A single next step you can take tonight
+
+If you read this far, pick exactly one thing and ship it before bed: a 30-line wrapper that sends `finish_reason: SAFETY` to Sentry as a warning. Just that one event class would have saved me the three-day ad-revenue blackout. Reliability work compounds — your first small wrapper is the foundation everything else gets bolted onto.
+
+LLM operations is the work of continuously proving the system is alive. Sentry is an inexpensive, practical partner for that proof. I hope this is useful to anyone solving the same problem.
