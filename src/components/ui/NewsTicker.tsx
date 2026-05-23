@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH35 — Gemini 3.5 Flash が最強の agentic / coding モデルとして公開、Gemini 3.1 Pro を主要ベンチで上回る性能（5/19）",
-    "OMNI — Gemini Omni 発表、ビデオを起点に any input → any output のマルチモーダル新モデルへ進化（I/O 2026）",
-    "SPARK — Gemini Spark が登場、24時間稼働の常駐パーソナル AI エージェントが指示通りに自律実行",
-    "DAILYBRIEF — Gemini アプリが Daily Brief を搭載、UI 刷新と Gemini Omni / Spark の統合で全面刷新（5/19）",
-    "MANAGEDAG — Managed Agents in the Gemini API が public preview、Google ホスト Linux サンドボックスで自律実行可能に",
-    "CODEMENDER — AI セキュリティエージェント CodeMender が Agent Platform で提供開始、脆弱性の発見と修正を自動化",
+    "GEMINI35FLASH — Gemini 3.5 Flash リリース、3.1 Pro 超え＆他 frontier 比 4倍速度（5/19 I/O）",
+    "DAILYBRIEF — Gemini App に Daily Brief 追加、メール/カレンダー/タスクを朝の1画面に集約（5月）",
+    "SPARK — Gemini Spark 24/7 稼働パーソナルAIエージェント、AI Ultra 米国版から段階展開（5月）",
+    "OMNI — Gemini Omni 公開、画像/音声/動画/テキスト入力から動画生成までシームレス対応（5月）",
+    "AISTUDIO — Google AI Studio が native Android アプリ生成に対応、Compose+Kotlin で数分（5/19）",
+    "ULTRA100 — AI Ultra 新プラン $100 登場、既存 Ultra は $250→$200 に値下げ（5月）",
   ],
   en: [
-    "FLASH35 — Gemini 3.5 Flash launches as the strongest agentic and coding model yet, outperforming Gemini 3.1 Pro on key benchmarks (May 19)",
-    "OMNI — Gemini Omni debuts, generating any output from any input starting with video at Google I/O 2026",
-    "SPARK — Gemini Spark arrives as a 24/7 personal AI agent that takes autonomous action on your behalf",
-    "DAILYBRIEF — The Gemini app rolls out Daily Brief, a refreshed UI, and built-in access to Gemini Omni and Spark (May 19)",
-    "MANAGEDAG — Managed Agents in the Gemini API hit public preview, running autonomously in secure Google-hosted Linux sandboxes",
-    "CODEMENDER — CodeMender, an AI security agent on Agent Platform, automatically finds and fixes vulnerabilities in source code",
+    "GEMINI35FLASH — Gemini 3.5 Flash launched, beats 3.1 Pro at 4x faster than other frontier models (5/19 I/O)",
+    "DAILYBRIEF — Gemini App adds Daily Brief unifying email, calendar, and tasks each morning (May)",
+    "SPARK — Gemini Spark 24/7 personal AI agent rolls out to AI Ultra users in US (May)",
+    "OMNI — Gemini Omni released, accepting image/audio/video/text input with video output (May)",
+    "AISTUDIO — Google AI Studio now generates native Android apps with Compose & Kotlin (5/19)",
+    "ULTRA100 — New AI Ultra plan at $100, existing Ultra dropped from $250 to $200 (May)",
   ],
 };
 
