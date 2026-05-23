@@ -1,0 +1,174 @@
+---
+title: "Gemini API の Structured Output でバリデーションエラーが返るときの原因と対処"
+slug: "gemini-api-structured-output-schema-validation-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-23T11:30"
+author: "Gemini Lab"
+description: "Gemini API の responseSchema を使った構造化出力で頻発するバリデーションエラー（INVALID_ARGUMENT、schema mismatch、空配列、不要フィールド）の原因と、実運用で安定させるための実装パターンを個人開発の現場視点でまとめます。"
+tags: ["troubleshooting", "structured-output", "responseSchema", "gemini-api", "validation", "json-mode"]
+---
+
+## 仕様通りに書いたはずの responseSchema が拒否される
+
+Gemini API の構造化出力（`responseMimeType: "application/json"` と `responseSchema`）を初めて本番に組み込んだとき、私は AdMob の月次レポートを Gemini 2.5 Flash に渡して「広告ユニットごとの eCPM 推移コメント」を JSON で返してもらおうとしていました。ローカル検証では完璧に動いたのに、本番ロードで流すと突然こんなエラーが返ってきます。
+
+```
+400 INVALID_ARGUMENT
+{
+  "error": {
+    "code": 400,
+    "message": "Invalid JSON payload received. Unknown name \"additionalProperties\" at 'generation_config.response_schema'",
+    "status": "INVALID_ARGUMENT"
+  }
+}
+```
+
+別の日には、リクエストは通っているのに `candidates[0].content.parts[0].text` が空文字、`finish_reason: "OTHER"` だけが返ってくる。Pydantic で `model_validate_json()` した瞬間に `ValidationError: 1 validation error for AdReport units Field required` で落ちる——構造化出力のトラブルは、こうした「サーバー側の拒否」「沈黙の空応答」「クライアント側のスキーマ不一致」の3層に分かれて、それぞれ原因と対処が違います。このトラブルシューティング記事では、3層を順番に切り分けて、現場で使える対処パターンに落とし込んでいきます。
+
+## サーバー側で responseSchema が拒否されるパターン
+
+Gemini API の `responseSchema` は OpenAPI 3.0 Schema のサブセットで、JSON Schema とは互換性が部分的にしかありません。手元の JSON Schema をそのまま投げ込むと弾かれる代表例が以下です。
+
+- `additionalProperties` を含む（未サポート）
+- `oneOf` / `anyOf` をネストの深い位置で使う
+- `$ref` で別スキーマを参照する
+- `pattern`（正規表現バリデーション）を指定する
+- `type: ["string", "null"]` のような型の配列
+- `nullable: true` を OpenAPI 流儀で書いたのに、Gemini SDK 側が JSON Schema 流儀の `null` 型を期待していた
+
+私が最初に踏んだのは `additionalProperties: false` で、これは「未定義のキーを許可しない」という JSON Schema 由来の安全策ですが、Gemini はこのキー自体を知らないので 400 が返ります。Python の場合、SDK のヘルパーで Pydantic モデルから自動生成するのが一番事故が少ないです。
+
+```python
+from pydantic import BaseModel
+from google import genai
+
+class AdUnit(BaseModel):
+    name: str
+    ecpm: float
+    impressions: int
+    comment: str
+
+class AdReport(BaseModel):
+    period: str
+    units: list[AdUnit]
+    summary: str
+
+client = genai.Client()
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents="先月の AdMob レポートを要約してください",
+    config={
+        "response_mime_type": "application/json",
+        "response_schema": AdReport,  # Pydantic モデルを直接渡す
+    },
+)
+
+# .parsed で Pydantic オブジェクトとして取り出せる
+report: AdReport = response.parsed
+```
+
+`response_schema` に Pydantic モデルを渡すと SDK が内部で OpenAPI 3.0 互換のスキーマに変換してくれます。私のプロダクションコードはこれに切り替えてから 400 系がゼロになりました。手書きのスキーマ JSON はバージョンアップで地味に互換が変わるので、できる限り Pydantic か `typing.TypedDict` 経由で型情報から生成するのが安全です。
+
+## 「リクエストは通るが空応答」が返るパターン
+
+200 が返ってきているのに `text` が空、`finish_reason` が `"OTHER"` か `"MAX_TOKENS"` という症状は、3つの原因に分かれます。
+
+1. **スキーマが厳しすぎてモデルが生成しきれなかった**：required フィールドが多すぎる、配列の minItems が大きい、enum 値が現実と乖離している
+2. **出力が `maxOutputTokens` を超えた**：JSON は冗長なのでテキスト生成と同じ感覚で 1024 にしていると途中で切れる
+3. **Safety フィルタに当たった**：日本語の感情分析タスクで、入力テキストに自殺・差別関連の語があると `finish_reason: "SAFETY"` で空が返る
+
+最初の原因はモデル側の生成失敗で、特に Gemini 2.5 Flash で起きやすいです。私の AdReport のケースだと、`units` の配列に `minItems: 10` を入れていたのに、APIから返ってきた広告ユニットが7つしかない月で必ず空応答になりました。スキーマには「ビジネスロジックの希望」ではなく「データが満たせる最小要件」だけを書く、というのが教訓です。
+
+`maxOutputTokens` は構造化出力では特に効きます。JSON は `{`、`"`、`:`、`,` だけでも結構なトークン数を食います。実装上は思い切って多めに振っておくのが安全です。
+
+```typescript
+import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+const model = genAI.getGenerativeModel({
+  model: "gemini-2.5-flash",
+  generationConfig: {
+    responseMimeType: "application/json",
+    responseSchema: {
+      type: SchemaType.OBJECT,
+      properties: {
+        period: { type: SchemaType.STRING },
+        units: {
+          type: SchemaType.ARRAY,
+          items: {
+            type: SchemaType.OBJECT,
+            properties: {
+              name: { type: SchemaType.STRING },
+              ecpm: { type: SchemaType.NUMBER },
+              comment: { type: SchemaType.STRING },
+            },
+            required: ["name", "ecpm", "comment"],
+          },
+        },
+      },
+      required: ["period", "units"],
+    },
+    maxOutputTokens: 8192,   // JSON は意外と長くなる。テキスト生成の感覚より一段大きく
+    temperature: 0.2,         // 構造化出力では温度低めが安定
+  },
+});
+
+const result = await model.generateContent("AdMob 月次レポートを JSON 化");
+const json = result.response.text();
+const report = JSON.parse(json);
+```
+
+Safety で空応答になっている場合は `result.response.promptFeedback` と `candidates[0].safetyRatings` を出力して切り分けます。本番ログには必ず `finish_reason` を残しておくと、再現できないバグを後追いできます。
+
+## クライアント側で JSON.parse / Pydantic 検証が落ちるパターン
+
+サーバー側は問題なく構造化 JSON を返しているのに、クライアントで `JSON.parse` や `model_validate_json()` が落ちることがあります。私の手元で多かった事例を順に挙げます。
+
+- **末尾に説明文がついている**：プロンプトに「JSONで返してください」と書きつつ「理由も解説して」と頼むと、Gemini は ``` ```json {...} ``` ``` のようなコードフェンスや前後の説明文付きで返す。`responseMimeType: "application/json"` を指定していれば基本起きませんが、temperature が高いと混ざることがあります
+- **数値が文字列で返ってくる**：`type: NUMBER` と指定しているのに `"3.14"` と文字列で返るケース。Pydantic v2 だと strict モードで弾かれます。`Field(..., strict=False)` または `Annotated[float, BeforeValidator(float)]` で吸収するのが実用的です
+- **null と未指定の混在**：optional フィールドを `null` で返したり、フィールドごと省略したりが日によって変わる。Pydantic 側は `Optional[str] = None` でデフォルトを与え、必ず存在することを期待しない
+
+実運用では `JSON.parse` の直前に「コードフェンス除去 → 先頭の `{` から最後の `}` まで切り出し → パース」という防御層を1段挟むだけで、エラー率が体感で10分の1になりました。
+
+```typescript
+function extractJson(raw: string): string {
+  // コードフェンスを除去
+  let s = raw.replace(/```json\s*|\s*```/g, "").trim();
+  // 最初の { と最後の } で囲まれた範囲を抽出（混入対策）
+  const first = s.indexOf("{");
+  const last = s.lastIndexOf("}");
+  if (first !== -1 && last !== -1) {
+    s = s.slice(first, last + 1);
+  }
+  return s;
+}
+
+try {
+  const report = JSON.parse(extractJson(result.response.text()));
+  return report;
+} catch (e) {
+  console.error("Structured output parse failed", {
+    finishReason: result.response.candidates?.[0]?.finishReason,
+    raw: result.response.text().slice(0, 500),
+  });
+  throw e;
+}
+```
+
+Pydantic を使う場合は、各フィールドにデフォルト値とゆるめの型強制を入れておくと、Gemini のバージョンが上がって挙動が微妙に変わった日でも本番が落ちにくくなります。
+
+## 予防のための実装パターン
+
+ここまでの内容を踏まえて、私が個人開発の AdMob 分析パイプラインで採用している防御策をまとめておきます。これは累計5,000万ダウンロードを支える広告レポート処理にも入れている運用パターンです。
+
+最初に、スキーマは「最小公倍数」で定義します。`required` は本当に欠けると困るフィールドだけにし、`enum` は将来追加されそうな値を `"other"` などのキャッチオール枠で受けます。`additionalProperties` のような未サポートキーは一切書かない。Pydantic から自動生成して、生の JSON Schema を手で書くこと自体を避けるのが一番楽です。
+
+次に、リクエスト側では `temperature: 0.0〜0.3`、`maxOutputTokens` は予測される最大長の1.5倍を入れます。応答側では `finish_reason` を必ずログに残し、`STOP` 以外が出たらリトライ対象にします。リトライは指数バックオフで3回まで、それでも空ならスキーマを段階的に緩めた「フォールバック・スキーマ」で再試行する設計が安定します。
+
+最後に、クライアント側で「コードフェンス除去 → JSON 切り出し → strict ではない Pydantic 検証 → 業務ロジックでの再検証」の4段防御を組みます。途中の防御層は全てログを出して、後から失敗パターンを集計できるようにしておきます。私はこのログを週次で見て、新しい失敗パターンが出ていればスキーマかパース層を1段強化する、というメンテをずっと続けています。
+
+構造化出力は最初の壁を越えれば本当に強力で、AdMob レポートだけでなく App Store Connect のレビュー分類や、Firebase Crashlytics のクラッシュログ要約まで、私の運用パイプラインの中核を担っています。エラーに当たった時は焦らず、「サーバーが拒否しているのか」「サーバーは通したがモデルが沈黙したのか」「クライアントが解釈に失敗したのか」を切り分けることから始めてみてください。
+
+同じ課題に取り組んでいる方の参考になれば幸いです。
