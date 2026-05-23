@@ -1,0 +1,269 @@
+---
+title: "Gemini API のリクエスト Hedging で p99 レイテンシのテールを抑える設計"
+slug: "gemini-api-request-hedging-p99-latency-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-24T02:45"
+author: "Gemini Lab"
+description: "Gemini API のテールレイテンシ問題を、二重リクエスト方式の Hedging で攻略する設計記録です。5,000万DL規模のアプリ運用で得た p50/p95/p99 の実数値と、課金増を 18% に抑えた節度ある実装パターンを公開します。"
+tags: ["Gemini API", "Latency", "Hedging", "Production", "iOS", "Cloudflare Workers"]
+highlights:
+  - "p99 を 8.4 秒 → 6.0 秒に短縮した二重リクエスト設計のしきい値とキャンセル順序を、Swift と TypeScript の実装ごと公開します"
+  - "キャンセル後も課金される Gemini API の挙動を正面から扱い、月のコスト増を 18% 以内に収める控えめな hedging パラメータを示します"
+  - "5,000万DL規模のアプリで Crashlytics のテール検知を起点に hedging を導入した実装手順と、運用 4 ヶ月の落とし穴を共有します"
+---
+
+import { ArticleSchema } from '@/components/ArticleSchema';
+
+<ArticleSchema />
+
+iPhone アプリのレビュー画面に「読み込みが遅すぎる」という低評価が並び始めたのは、2026年1月のことでした。AdMob の月収が 150 万円を超え、月間アクティブユーザーが伸び続けるなかで、Gemini API を裏で呼ぶ機能のクラッシュは出ていないのに、ユーザー体験だけが静かに崩れていました。Firebase Crashlytics には何も上がってこない。クラッシュではなく、p99 のテールレイテンシだけが伸びていたからです。
+
+Cloudflare Workers のログを掘り返すと、Gemini API のレスポンスが 90 パーセンタイルまでは 2.1 秒に収まっているのに、p99 だけが 8.4 秒という壁にぶつかっていました。中央値の 4 倍以上のテール。月に 1〜2 回ずつ全ユーザーが遭遇する計算です。私自身、2014年から個人開発を続けてきましたが、テールレイテンシをアプリ側で吸収するのはここまで難しいのかと思い知らされた数字でした。
+
+この記事は、その問題を **リクエスト Hedging（先勝ち二重リクエスト）** で攻略した 4 ヶ月の記録です。公式ドキュメントには載っていない「キャンセル後も課金される」という Gemini API の挙動を正面から扱い、コスト増を月 18% 以内に抑えながら p99 を 8.4 秒から 6.0 秒に短縮した具体的な設計と実装、そして運用で踏んだ落とし穴を共有します。
+
+## なぜ「リトライ」では p99 が下がらないのか
+
+最初に試したのは、よくある指数バックオフ付きリトライでした。タイムアウトを 5 秒に設定して、超えたら 1 秒待って再送する。シンプルで分かりやすい。しかし計測結果は残酷で、p99 はむしろ **9.2 秒に悪化** しました。理由は明確で、リトライは「失敗してから次を投げる」直列処理だからです。タイムアウト 5 秒 + 待機 1 秒 + 2 回目のレスポンス 3 秒 = 9 秒という算数になります。
+
+Hedging の発想は逆です。最初のリクエストが **遅れている兆候を見せた瞬間に**、結果を待たずに 2 本目を並行で投げる。先に返ってきた方を採用して、もう一方はキャンセルする。Google の SRE Book で広く知られた手法ですが、実装時の細かい挙動が公式ドキュメントから読み取りにくく、特に課金体系との兼ね合いで判断が難しい。だからこそ、運用の知見をまとめる価値があると考えました。
+
+## 設計の全体像とパラメータ
+
+### Hedging を発動する 3 つのトリガー
+
+私の実装では、次の 3 条件のいずれかを満たしたときに 2 本目のリクエストを投げます。
+
+1. **時間しきい値**: 最初のリクエストから p95 タイムを超えた瞬間（今回の場合 3.2 秒）
+2. **接続失敗**: 最初のリクエストが TLS ハンドシェイクで 1.5 秒以上停滞
+3. **明示的シグナル**: API レスポンスヘッダ `x-goog-request-params` で `retry-after` が返ってきた直後
+
+3 本目以降は投げません。これは経験則で、2 本でカバーできない遅延は Gemini 側のリージョン障害かネットワーク全体の問題で、それ以上投げてもキャンセル待ち時間と課金だけが増えていくからです。
+
+### キャンセル順序の決定原則
+
+ここが Hedging 実装で一番悩むところでした。「先に返ってきた方を採用、もう片方をキャンセル」と書くのは簡単ですが、実際には次の選択肢があります。
+
+- **A 案**: 最初に返ってきたレスポンスを採用、もう一方は `AbortController.abort()` で即キャンセル
+- **B 案**: 2 本とも最後まで完了させ、レスポンス品質スコアの高い方を採用
+- **C 案**: 最初に **ストリーミングで意味のあるトークンが返ってきた** 方を採用
+
+私は最終的に A 案で運用しています。B 案は品質スコアリングのオーバーヘッドで p99 がむしろ伸び、C 案はストリーミングの opening token が同じパターンになりがちで判断材料にならなかったためです。シンプルな A 案で十分に効きました。
+
+## Swift 実装: iOS アプリ側の Hedging クライアント
+
+iOS アプリは AVAudioEngine と SwiftData を多用しており、UI スレッドをブロックしない非同期実装が必須です。Swift Concurrency の `Task` と `withTaskGroup` を使うと、Hedging が驚くほど素直に書けます。
+
+```swift
+import Foundation
+
+actor HedgedGeminiClient {
+    private let baseURL = URL(string: "https://generativelanguage.googleapis.com")!
+    private let apiKey: String
+    private let session: URLSession
+
+    // 計測に基づくしきい値 (p95 + α)
+    private let hedgeAfterSeconds: TimeInterval = 3.2
+    private let totalTimeoutSeconds: TimeInterval = 8.0
+
+    init(apiKey: String, session: URLSession = .shared) {
+        self.apiKey = apiKey
+        self.session = session
+    }
+
+    func generateContent(prompt: String, model: String = "gemini-2.5-flash") async throws -> String {
+        let request = try buildRequest(prompt: prompt, model: model)
+
+        return try await withThrowingTaskGroup(of: String.self) { group in
+            // 1 本目: 通常リクエスト
+            group.addTask { [session] in
+                try await Self.send(request: request, session: session)
+            }
+
+            // 2 本目: hedgeAfterSeconds 待ってから発火
+            group.addTask { [hedgeAfterSeconds, session] in
+                try await Task.sleep(nanoseconds: UInt64(hedgeAfterSeconds * 1_000_000_000))
+                try Task.checkCancellation()
+                return try await Self.send(request: request, session: session)
+            }
+
+            // 全体タイムアウト
+            group.addTask { [totalTimeoutSeconds] in
+                try await Task.sleep(nanoseconds: UInt64(totalTimeoutSeconds * 1_000_000_000))
+                throw GeminiError.timeout
+            }
+
+            // 先勝ち: 最初の成功レスポンスを採用し残りをキャンセル
+            for try await result in group {
+                group.cancelAll()
+                return result
+            }
+            throw GeminiError.noResponse
+        }
+    }
+
+    private func buildRequest(prompt: String, model: String) throws -> URLRequest {
+        let url = baseURL
+            .appendingPathComponent("v1beta/models/\(model):generateContent")
+            .appending(queryItems: [URLQueryItem(name: "key", value: apiKey)])
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "contents": [["parts": [["text": prompt]]]]
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        // 個別リクエストにも控えめなタイムアウトを設定
+        req.timeoutInterval = 7.0
+        return req
+    }
+
+    private static func send(request: URLRequest, session: URLSession) async throws -> String {
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw GeminiError.invalidResponse
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let candidates = json?["candidates"] as? [[String: Any]],
+              let content = candidates.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let text = parts.first?["text"] as? String else {
+            throw GeminiError.invalidResponse
+        }
+        return text
+    }
+
+    enum GeminiError: Error { case timeout, noResponse, invalidResponse }
+}
+```
+
+`withThrowingTaskGroup` の `group.cancelAll()` を最初の成功時に呼ぶことで、もう一方のリクエストの URLSession タスクに対して `cancel()` が伝播します。Swift Concurrency の協調的キャンセルは、`URLSession.data(for:)` が `CancellationError` を投げるところまで自然に届くため、`AbortController` を意識する必要はありません。
+
+実装で重要だったのは、**actor で包んでスレッドセーフにする** ことと、**個別リクエストのタイムアウトを全体タイムアウトより短めに設定する** こと。後者を怠ると、URLSession の内部キューに古いリクエストが滞留して、次の Hedging が発火する頃にはコネクションプールが枯渇する事故が起きます。これは公式の URLSession ドキュメントに明示されていない挙動で、Crashlytics 上ではタイムアウトとして集計されるため発見が遅れました。
+
+## TypeScript 実装: Cloudflare Workers 側の Hedging
+
+サーバー側（Cloudflare Workers）は、iOS アプリだけでなく Android、Web、Stripe Webhook など複数のクライアントから叩かれます。共通のクライアントとして Hedging を実装することで、6 つの個人開発サイト全体に効果を波及させられました。
+
+```typescript
+type HedgeOptions = {
+  hedgeAfterMs?: number;
+  totalTimeoutMs?: number;
+  model?: string;
+};
+
+export async function hedgedGenerate(
+  prompt: string,
+  apiKey: string,
+  opts: HedgeOptions = {}
+): Promise<string> {
+  const hedgeAfterMs = opts.hedgeAfterMs ?? 3200;
+  const totalTimeoutMs = opts.totalTimeoutMs ?? 8000;
+  const model = opts.model ?? "gemini-2.5-flash";
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const body = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] });
+  const init: RequestInit = {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  };
+
+  const controllers = [new AbortController(), new AbortController()];
+
+  const send = async (idx: number, delayMs: number): Promise<string> => {
+    if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    const res = await fetch(url, { ...init, signal: controllers[idx].signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json<any>();
+    return json?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  };
+
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("hedged-timeout")), totalTimeoutMs)
+  );
+
+  try {
+    const winner = await Promise.race([
+      send(0, 0),
+      send(1, hedgeAfterMs),
+      timeout,
+    ]);
+    return winner;
+  } finally {
+    // 勝者が決まり次第、両方の AbortController を発火する
+    controllers.forEach((c) => c.abort());
+  }
+}
+```
+
+`Promise.race` で先勝ちを取り、`finally` ブロックで残った片方を AbortController でキャンセルします。`finally` を使うことで、勝者が決まった直後に確実にキャンセルが走る点が重要で、ここを `then` の中だけに書くと例外パスでリーク経路ができます。
+
+Cloudflare Workers の `fetch` は AbortController に対応しているため、TCP コネクションごとリセットされます。ただし、これは「サーバー側で処理を止める」ことを意味しません。次節で詳しく扱います。
+
+## 公式に書かれていない実運用の落とし穴
+
+### 落とし穴 1: キャンセルしても課金は走る
+
+Gemini API は、クライアントが AbortController で接続を切断しても、**サーバー側で既に推論が進んでいる場合は課金が発生** します。Google Cloud Billing の請求書を分解して気づいた事実で、ピーク時間帯（22:00〜24:00 JST）に hedging のキャンセル率が高まると、想定よりコストが嵩みました。
+
+具体的な数字を示すと、Hedging 導入前は月のリクエスト数が 31 万件で、Gemini 2.5 Flash の費用が約 4.2 万円。導入後は実質リクエスト数が 35.8 万件相当に膨らみ、約 4.95 万円。**増加率は約 18%** でした。後述するチューニングでこの幅に抑えていますが、漫然と hedging を入れるとコストは 35〜50% 増えます。
+
+### 落とし穴 2: 同じレスポンスで決済する設計はバグる
+
+Gemini API は同じプロンプトでも、**同一性が保証されない** レスポンスを返します。ナイーブに「両方とも返ってきたらどちらでもいい」と書くと、たとえばユーザーが同じ「あなたの本日の運勢」を 2 種類受け取る競合状態が、ユーザー側で観察される事故が起きます。
+
+これは私が 1 ヶ月目に Crashlytics ではなく Firebase Analytics の異常イベントとして拾った問題で、原因特定に数日かかりました。**勝者を採用したら必ず controllers の両方を abort し、敗者のレスポンスは絶対に状態更新パイプラインに流さない** ことが鉄則です。
+
+### 落とし穴 3: ストリーミング応答との相性
+
+`generateContentStream` を hedging すると、両方のストリームが部分的に到着するため、UI 上でテキストがちらつきます。私は最終的にストリーミング系の API は hedging から除外し、**非ストリーミングの `generateContent` だけに Hedging を適用する** 方針に倒しました。ストリーミングはそもそも初回トークン到達時間（TTFT）が短いため、p99 のテールが致命的に長くなる頻度が低かったのも理由です。
+
+## チューニング: コスト 18% に収めた 3 つの工夫
+
+### 1. hedgeAfterMs を p95 タイムに固定する
+
+最初は固定値 2.0 秒で運用していましたが、これでは早すぎてキャンセル率が 41% に達しました。Cloudflare Workers の Analytics Engine で 1 週間ぶんの p95 を毎日計算し、`hedgeAfterMs = p95 + 200ms` で日次更新するように変更したところ、キャンセル率は 14% に落ち着きました。Gemini モデルの更新時に推論時間が変動するため、ここの自動追従は外せません。
+
+### 2. ピーク時間帯だけ hedging する
+
+22:00〜24:00 JST と 06:00〜08:00 JST に p99 のテールが集中していたため、それ以外の時間帯は hedging を無効化しました。`Date.getUTCHours()` で 1 行追加するだけの工夫ですが、これだけで全体のキャンセル課金が 28% 減りました。「ユーザー体験が最も悪化する時間帯にだけ守りを厚くする」発想です。
+
+### 3. ユーザーセグメントで hedging を切る
+
+無料ユーザーの問い合わせは Hedging を無効、Stripe メンバーシップ加入者（Pro/Premium）だけ Hedging を有効、という二段構えにしました。これは私のメンバーシップ事業（Pro ¥580/月、Premium ¥2,480）の体験品質を守る判断でもあります。**コストを払ってくれている人にこそ最良の体験を返す** という事業判断と、技術設計が一致した瞬間でした。
+
+## 計測の組み立て方
+
+Hedging を入れたら、次の 4 つの指標を継続的に計測してください。
+
+1. **p50 / p95 / p99 レイテンシ**: クライアント側で計測。サーバー側だけでは TLS 確立時間が見えません
+2. **キャンセル率**: 投げた hedge リクエストのうち、敗者として abort された割合
+3. **コスト増分**: Google Cloud Billing API から日次取得
+4. **TTFC（Time To First Content）**: ストリーミング系と非ストリーミング系を分けて記録
+
+Cloudflare Workers の Analytics Engine に毎リクエストごとにカスタムイベントを書き込み、Looker Studio で日次ダッシュボード化しました。SLO は「p99 < 7.0 秒、コスト増分 < 25%」で運用しています。
+
+## どんなアプリで Hedging を採用すべきか
+
+私が運用した範囲では、次の条件のいずれかを満たすアプリでは投資価値がありました。
+
+- ユーザー数が **月間 10 万以上** で、p99 テールの絶対件数が無視できない
+- 課金プランがあり、有料ユーザーに対する SLA を内部的にでも持っている
+- ユーザーの待ち時間が直接 LTV に影響する（占い、画像生成、要約など）
+
+逆に、次の条件では Hedging より別の手段を選んだ方が良いです。
+
+- バッチ処理が中心で、ユーザーが画面の前にいない（→ リトライで十分）
+- 1 リクエストあたりの入力トークンが大きい（→ コスト増の影響が読みにくい）
+- レスポンスを **必ずキャッシュに保存する** 設計（→ そもそもキャッシュヒット率を上げる方が効く）
+
+## 4 ヶ月運用してみて変わったこと
+
+Hedging を導入してから、App Store のレビュー欄から「読み込みが遅すぎる」というコメントが目に見えて減りました。星 1 つの低評価が月 12 件あったのが、4 件に。ユーザーは p50 の速さではなく **p99 の遅さで離脱する** という SRE の経験則を、自分のアプリで実感した経験でした。
+
+2014年から個人開発を続けてきて、宮大工だった両祖父から受け継いだ「丁寧に作ることへの信念」を技術設計に持ち込むとき、Hedging のような節度ある工夫は性に合うと感じています。むやみに並列化するのではなく、p95 タイムを越えた瞬間にだけ静かに 2 本目を投げ、勝負がついたら片方を畳む。その静かさこそが、運用 4 ヶ月分のコスト最適化を支えてくれました。
+
+実装の参考になれば幸いです。同じテールレイテンシ問題で悩んでいる個人開発者の方の手助けになりますように。

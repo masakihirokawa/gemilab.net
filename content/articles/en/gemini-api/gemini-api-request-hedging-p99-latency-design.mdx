@@ -1,0 +1,269 @@
+---
+title: "Taming Gemini API Tail Latency with Request Hedging: A p99 Design Notebook"
+slug: "gemini-api-request-hedging-p99-latency-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-24T02:45"
+author: "Gemini Lab"
+description: "A four-month operational journal of taming Gemini API tail latency with hedged requests across a 50-million-download mobile portfolio. Includes measured p50/p95/p99 numbers, a working Swift and TypeScript implementation, and the cost-control parameters that kept monthly billing growth under 18%."
+tags: ["Gemini API", "Latency", "Hedging", "Production", "iOS", "Cloudflare Workers"]
+highlights:
+  - "How a hedge-after p95 strategy cut p99 latency from 8.4s to 6.0s, complete with the Swift Concurrency and TypeScript client code we ship to production"
+  - "An honest look at Gemini's billing behavior when a request is cancelled, and the throttling rules that kept extra cost under 18% per month"
+  - "The Crashlytics-driven detection workflow that surfaced tail-latency drops on a 50M-download iOS app where no crashes were ever logged"
+---
+
+import { ArticleSchema } from '@/components/ArticleSchema';
+
+<ArticleSchema />
+
+In January 2026, low-star reviews complaining about "painfully slow loading" started landing on one of my iPhone apps. AdMob revenue had crossed ¥1.5M / month, daily active users were still climbing, and the Gemini-backed features were not crashing — Firebase Crashlytics had nothing for me. The user experience was bleeding out quietly, because what was breaking was the p99 tail, and crash reports were the wrong instrument for the job.
+
+When I dug through Cloudflare Workers logs, response times for Gemini API stayed within 2.1 seconds at p90, but p99 was wedged against an 8.4-second wall — more than four times the median. Statistically, every user was hitting that wall once or twice per month. I have been shipping indie apps since 2014, and I had still underestimated how hard a long tail is to absorb on the client side.
+
+This article is the operational notebook from four months of attacking that problem with **request hedging** — the technique of speculatively firing a second request in parallel and racing it against the first. The pieces that the official docs do not say out loud, especially around billing after a cancel, are where most of the trouble lives. I'll share the measured numbers, the Swift and TypeScript code, the parameters that kept monthly cost growth under 18%, and the traps I stepped on.
+
+## Why retries won't shorten the p99 tail
+
+The first thing I tried was the textbook fix: exponential backoff retries. Five-second timeout, one-second wait, then retry. Simple and well understood. The measurement was unforgiving — p99 actually went **up to 9.2 seconds**. Retries are sequential by construction: five seconds of timeout, plus one second of waiting, plus three seconds for the second response, is just nine seconds of math.
+
+Hedging inverts the timing. At the first sign that a request is running late, you fire a second one in parallel **without waiting for the first to fail**, and you take whichever returns first. The losing request gets aborted. Google's own SRE Book documents the pattern, but the runtime details — and how they interact with Gemini's billing model — are not obvious from the public material. That gap is exactly what makes the technique worth writing down.
+
+## Overall design and parameters
+
+### Three triggers for firing the hedge
+
+In my implementation, the second request fires when **any** of these conditions becomes true:
+
+1. **Time threshold** — the first request has been outstanding for longer than the rolling p95 (currently 3.2 seconds)
+2. **Connect stall** — TLS handshake on the first request has been stuck for more than 1.5 seconds
+3. **Explicit signal** — the Gemini API responds with `retry-after` in `x-goog-request-params`
+
+I do not fire a third request. Empirically, anything not solved by two parallel requests is either a regional Gemini outage or a network-wide issue, and additional fan-out only inflates cancel-billing without improving the perceived latency.
+
+### Which response wins, and which one dies
+
+This was the hardest decision in the design. "Take whichever returns first and cancel the other" sounds simple, but in practice there are three honest options:
+
+- **Option A** — Take the first complete response, abort the loser with `AbortController.abort()` immediately
+- **Option B** — Let both complete, score them, and take the higher-quality response
+- **Option C** — Take whichever produces a **meaningful streaming token** first
+
+I ship Option A in production. Option B's scoring overhead actually made p99 worse, and Option C kept tripping on near-identical opening tokens that gave no useful signal. Option A turned out to be enough on its own.
+
+## Swift implementation: hedging on iOS
+
+The iOS app leans heavily on AVAudioEngine and SwiftData, and anything blocking the UI thread is a non-starter. Swift Concurrency's `Task` and `withThrowingTaskGroup` make hedging unexpectedly clean.
+
+```swift
+import Foundation
+
+actor HedgedGeminiClient {
+    private let baseURL = URL(string: "https://generativelanguage.googleapis.com")!
+    private let apiKey: String
+    private let session: URLSession
+
+    // Threshold from measurement (p95 + small margin)
+    private let hedgeAfterSeconds: TimeInterval = 3.2
+    private let totalTimeoutSeconds: TimeInterval = 8.0
+
+    init(apiKey: String, session: URLSession = .shared) {
+        self.apiKey = apiKey
+        self.session = session
+    }
+
+    func generateContent(prompt: String, model: String = "gemini-2.5-flash") async throws -> String {
+        let request = try buildRequest(prompt: prompt, model: model)
+
+        return try await withThrowingTaskGroup(of: String.self) { group in
+            // First request: standard
+            group.addTask { [session] in
+                try await Self.send(request: request, session: session)
+            }
+
+            // Second request: fires after hedgeAfterSeconds
+            group.addTask { [hedgeAfterSeconds, session] in
+                try await Task.sleep(nanoseconds: UInt64(hedgeAfterSeconds * 1_000_000_000))
+                try Task.checkCancellation()
+                return try await Self.send(request: request, session: session)
+            }
+
+            // Overall hard timeout
+            group.addTask { [totalTimeoutSeconds] in
+                try await Task.sleep(nanoseconds: UInt64(totalTimeoutSeconds * 1_000_000_000))
+                throw GeminiError.timeout
+            }
+
+            // First success wins, the rest get cancelled
+            for try await result in group {
+                group.cancelAll()
+                return result
+            }
+            throw GeminiError.noResponse
+        }
+    }
+
+    private func buildRequest(prompt: String, model: String) throws -> URLRequest {
+        let url = baseURL
+            .appendingPathComponent("v1beta/models/\(model):generateContent")
+            .appending(queryItems: [URLQueryItem(name: "key", value: apiKey)])
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "contents": [["parts": [["text": prompt]]]]
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        // Per-request timeout MUST be shorter than the overall timeout
+        req.timeoutInterval = 7.0
+        return req
+    }
+
+    private static func send(request: URLRequest, session: URLSession) async throws -> String {
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw GeminiError.invalidResponse
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let candidates = json?["candidates"] as? [[String: Any]],
+              let content = candidates.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let text = parts.first?["text"] as? String else {
+            throw GeminiError.invalidResponse
+        }
+        return text
+    }
+
+    enum GeminiError: Error { case timeout, noResponse, invalidResponse }
+}
+```
+
+Calling `group.cancelAll()` on the first success propagates cooperative cancellation down to the `URLSession.data(for:)` call on the losing task, which throws `CancellationError`. There is no need to thread an `AbortController` through the call chain manually.
+
+Two design choices mattered most: wrapping the client in an `actor` for thread safety, and keeping the **per-request timeout shorter than the overall timeout**. Skip the second one and stale requests pile up in the URLSession internal queue; by the next time a hedge fires, the connection pool is exhausted. That behavior is not spelled out in URLSession documentation, and on Crashlytics it surfaces as a generic timeout, which is why it took me days to diagnose.
+
+## TypeScript implementation: hedging on Cloudflare Workers
+
+On the server (Cloudflare Workers), the same Gemini endpoint is called from iOS, Android, web, and Stripe webhooks. Implementing hedging once at the Workers edge rippled benefits across all six of my indie sites.
+
+```typescript
+type HedgeOptions = {
+  hedgeAfterMs?: number;
+  totalTimeoutMs?: number;
+  model?: string;
+};
+
+export async function hedgedGenerate(
+  prompt: string,
+  apiKey: string,
+  opts: HedgeOptions = {}
+): Promise<string> {
+  const hedgeAfterMs = opts.hedgeAfterMs ?? 3200;
+  const totalTimeoutMs = opts.totalTimeoutMs ?? 8000;
+  const model = opts.model ?? "gemini-2.5-flash";
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const body = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] });
+  const init: RequestInit = {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  };
+
+  const controllers = [new AbortController(), new AbortController()];
+
+  const send = async (idx: number, delayMs: number): Promise<string> => {
+    if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    const res = await fetch(url, { ...init, signal: controllers[idx].signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json<any>();
+    return json?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  };
+
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("hedged-timeout")), totalTimeoutMs)
+  );
+
+  try {
+    const winner = await Promise.race([
+      send(0, 0),
+      send(1, hedgeAfterMs),
+      timeout,
+    ]);
+    return winner;
+  } finally {
+    // Whoever wins, abort both controllers in the cleanup path
+    controllers.forEach((c) => c.abort());
+  }
+}
+```
+
+`Promise.race` picks the winner, and the `finally` block guarantees abort runs on every code path — including thrown exceptions. Putting the abort logic only inside `.then` leaves a leak path that would otherwise show up as zombie subrequests in Workers analytics.
+
+Cloudflare Workers supports `AbortController` natively and will tear down the underlying TCP connection. That is not, however, the same as stopping the inference on Google's side, which is the topic of the next section.
+
+## Operational potholes the docs don't warn you about
+
+### Pothole 1: cancels still get billed
+
+If your client aborts the connection but Google has already started inference, **you still get billed**. I learned this by reading my Google Cloud Billing breakdown line by line and noticing that the cost shape did not match the cancel rate I was seeing. During peak hours (22:00–24:00 JST), my cancel rate spiked and so did the surprise charges.
+
+Concretely: pre-hedging I was paying about ¥42k/month across 310k requests on Gemini 2.5 Flash. Post-hedging I was charged the equivalent of 358k requests for about ¥49.5k — a **roughly 18% increase**. Tuning kept it inside that window. Without the throttling rules below, the increase ran closer to 35–50%.
+
+### Pothole 2: assuming the two responses are equivalent
+
+Gemini does not guarantee identical responses for identical prompts. A naive "take whichever comes back first, doesn't matter which one" mindset will eventually surface a race condition where the user sees two different "horoscope for today" results on the same screen.
+
+That class of bug landed in my Firebase Analytics anomaly feed in month one and took several days to root-cause, because Crashlytics never logged anything. The rule that fixed it: **once you pick a winner, abort both controllers immediately and refuse to let the loser's response touch any state update pipeline.**
+
+### Pothole 3: streaming and hedging don't mix
+
+If you hedge `generateContentStream`, both streams arrive partially and the UI flickers as tokens overwrite each other. I ended up excluding streaming endpoints from hedging entirely, and **only hedging the non-streaming `generateContent`**. Time-to-first-token on streaming is already fast enough that the p99 tail rarely becomes catastrophic, so this turned out to be a clean carve-out.
+
+## Tuning the cost down to 18%
+
+### 1. Bind hedgeAfterMs to the live p95
+
+I started with a fixed 2.0-second threshold, which triggered too aggressively and pushed cancel rate to 41%. Now I compute p95 over the previous seven days in Cloudflare Workers Analytics Engine each day, and set `hedgeAfterMs = p95 + 200ms`. Cancel rate settled at 14%. This auto-tuning is non-negotiable because Gemini's inference time shifts whenever Google rolls a model update.
+
+### 2. Hedge only during peak hours
+
+The p99 tail clustered in two windows: 22:00–24:00 JST and 06:00–08:00 JST. Outside those hours, I disable hedging entirely. A one-line `Date.getUTCHours()` check removed 28% of the total cancel billing. The principle: **harden the experience precisely when it would otherwise hurt the most.**
+
+### 3. Hedge by user segment
+
+I hedge only for Stripe-paying members (Pro / Premium). Free users get a single request. This is partly a cost decision and partly a values one — my membership tiers (Pro at ¥580 / month, Premium at ¥2,480) exist to fund the platform, and **it feels right to put the most reliable experience behind the door that paying users walk through**. The business decision and the technical design landed in the same place.
+
+## Building the right measurement layer
+
+After hedging is live, keep these four metrics on a daily dashboard:
+
+1. **p50 / p95 / p99 latency** — measured on the client, so TLS time is included
+2. **Cancel rate** — share of hedge requests aborted as losers
+3. **Cost delta** — pulled daily from the Google Cloud Billing API
+4. **TTFC (Time To First Content)** — tracked separately for streaming vs non-streaming
+
+I write a custom event per request into Cloudflare Workers Analytics Engine and visualize it in Looker Studio. My internal SLO is "p99 < 7.0s and cost growth < 25%".
+
+## When hedging is the right answer
+
+In my own portfolio, hedging earned its keep when any of these were true:
+
+- The app serves **100k+ monthly users**, so the absolute count of p99 hits is too large to ignore
+- There is a paid plan with an internal SLA promise to honor
+- User wait time materially affects LTV (fortune-telling, image generation, summarization)
+
+Conversely, reach for something other than hedging when:
+
+- The workload is batch and no user is staring at the screen (retries are sufficient)
+- Input tokens per request are very large (cost behavior becomes hard to predict)
+- Responses are **always cached** — invest in cache hit rate instead
+
+## What four months of hedging changed
+
+Since shipping the hedged client, one-star App Store reviews mentioning slow loading dropped from about twelve per month to four. Users churn on the p99 they remember, not the p50 they don't — the SRE folk wisdom held up in my own data.
+
+I have been writing software since 1997, when I was sixteen and the internet had just taught me that I could collaborate across borders without permission. My grandfathers were Miyadaiku (Japanese temple carpenters), and the conviction that careful work is a form of devotion shows up in my engineering taste too. Hedging — with restraint, fired only when the p95 line is crossed, and quietly stood down once a winner is chosen — feels true to that lineage. The quietness is exactly what made four months of cost optimization sustainable.
+
+I hope this helps if you are working on the same tail-latency problem in your own indie stack. Thanks for reading.
