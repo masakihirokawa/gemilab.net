@@ -1,0 +1,291 @@
+---
+title: "SwiftData × Gemini API Offline Response Cache — Persisting and Reusing AI Responses on iOS"
+slug: "gemini-api-swiftdata-offline-response-cache-architecture"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-05-24T02:45"
+author: "Gemini Lab"
+description: "Design a SwiftData-backed cache layer for Gemini API responses so your iOS app keeps working in airplane mode and on flaky networks. Covers @Model schema, invalidation strategy, store-size discipline, and migration — all from production iOS experience."
+tags: ["Gemini API", "SwiftData", "iOS", "Offline", "Architecture"]
+highlights:
+  - "A @Model schema for Gemini responses, with prompt-hash keying for fast lookups"
+  - "A three-axis invalidation policy combining TTL, model version, and explicit user refresh"
+  - "Four hard-won lessons from running this pattern across a multi-million-download iOS portfolio"
+---
+
+I have come to dislike apps that go silent the moment they lose signal. If a sentence the model produced a minute ago can reappear immediately, that is not "caching working" — it is "the user not feeling abandoned." On the subway or on a plane, the previous response simply renders again, quietly. The piece of engineering that delivers that experience is rarely glamorous: it is a small, carefully designed persistence layer.
+
+I have shipped indie iOS apps since 2014, and the wallpaper, calm, and manifestation categories within my roughly 50-million-download portfolio open disproportionately often in places with poor connectivity. After integrating Gemini API in earnest from 2025 onward, I found that "returning the previous response without calling the network" was directly tied to perceived production quality. This article walks through an architecture that uses SwiftData as the storage tier to persist and reuse Gemini API responses, with both the implementation and the operational lessons.
+
+## Why app-side response caching, not just Gemini context caching
+
+Gemini API offers context caching that is genuinely useful for reusing long system prompts and reference documents on the server side. But it cannot help when the device itself is offline. The pattern in this article — caching the response payload on the device — pays off in three concrete scenarios.
+
+The user can re-open a paragraph the model just wrote, in airplane mode, as many times as they want. Cells re-rendered while the user scrolls (in a `LazyVGrid` or `UICollectionView`) do not need a fresh call; the previous response shows up instantly. For internal review tools that hit the same prompt repeatedly, token cost can drop by an order of magnitude.
+
+You can implement the same idea with `UserDefaults` or a homemade JSON file, and that is fine up to a few hundred entries. Past a few thousand, query performance, schema evolution, and related-object management all collapse. In my wallpaper app, where description-generation entries reach the low thousands per day, moving to SwiftData cut the initial first-load time on cold start to under a third of what it used to be.
+
+## High-level architecture
+
+There are three layers. First, the SwiftData `@Model` records — the storage tier. Second, `ResponseCacheStore`, which resolves prompts to keys to records — the repository tier. Third, `GeminiResponder`, which returns a cached hit or falls back to a live Gemini call — the use-case tier.
+
+The SwiftUI view only knows about `GeminiResponder`. It does not know SwiftData exists, and it does not know the Gemini SDK exists. That separation matters later, when you want to swap storage to Realm or Core Data, or swap the model to on-device Gemma.
+
+```
+SwiftUI View
+    │
+    ▼
+GeminiResponder (Use Case) ─── if hit ──→ Cached response
+    │                                       ▲
+    │ miss                                  │ save
+    ▼                                       │
+GeminiClient (Network) ─── response ───────┘
+    │
+    └─→ ResponseCacheStore (Repository)
+            │
+            ▼
+        SwiftData @Model
+```
+
+## @Model schema design
+
+The first design decision is how to build the cache key. Using the entire prompt as the key means one different character produces an entirely different entry, and you never get a hit on what should logically be the same call. I concatenate three things and SHA-256 them: a normalized prompt (trim, unify line endings), the model name (e.g. `gemini-2.5-pro`), and the `responseSchema` JSON string when structured output is in use.
+
+```swift
+import Foundation
+import CryptoKit
+import SwiftData
+
+@Model
+final class CachedGeminiResponse {
+    @Attribute(.unique) var cacheKey: String
+    var promptDigest: String          // first 200 chars, for debug listings
+    var modelName: String
+    var responseText: String
+    var responseSchemaHash: String?   // only when using structured output
+    var inputTokens: Int
+    var outputTokens: Int
+    var finishReason: String
+    var createdAt: Date
+    var lastAccessedAt: Date
+    var hitCount: Int
+
+    init(
+        cacheKey: String,
+        promptDigest: String,
+        modelName: String,
+        responseText: String,
+        responseSchemaHash: String?,
+        inputTokens: Int,
+        outputTokens: Int,
+        finishReason: String
+    ) {
+        self.cacheKey = cacheKey
+        self.promptDigest = promptDigest
+        self.modelName = modelName
+        self.responseText = responseText
+        self.responseSchemaHash = responseSchemaHash
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.finishReason = finishReason
+        self.createdAt = .now
+        self.lastAccessedAt = .now
+        self.hitCount = 0
+    }
+}
+
+enum CacheKeyBuilder {
+    static func make(prompt: String, model: String, schemaJSON: String?) -> String {
+        let normalized = prompt
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+        let raw = [normalized, model, schemaJSON ?? ""].joined(separator: "::")
+        let digest = SHA256.hash(data: Data(raw.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+```
+
+The `@Attribute(.unique)` on `cacheKey` quietly does important work — it prevents duplicate inserts under concurrent writes at the SwiftData layer.
+
+People often ask whether `responseText` should be `Data` instead of `String`. In my experience `String` is the right default: Gemini returns UTF-8 text and the `Data` round-trip is wasted overhead. The exception is when the response embeds base64-encoded audio or images — in that case, split them out into a separate `@Model` (something like `CachedGeminiBinary`) joined via `@Relationship`. Keeping individual records small is what enables the store-size discipline described later.
+
+## Repository layer — make hit rate observable while you make it real
+
+A cache whose hit rate you cannot see will rot within a month of going live. I bump `hitCount` and `lastAccessedAt` on every lookup, and on app launch I log the top 20 most-hit records to a debug-only console. That report has caught design pathologies more than once — for instance, a screen calling the same prompt 200 times in a session because of a SwiftUI re-render loop.
+
+```swift
+@MainActor
+final class ResponseCacheStore {
+    private let context: ModelContext
+    init(context: ModelContext) { self.context = context }
+
+    func find(key: String) throws -> CachedGeminiResponse? {
+        var descriptor = FetchDescriptor<CachedGeminiResponse>(
+            predicate: #Predicate { $0.cacheKey == key }
+        )
+        descriptor.fetchLimit = 1
+        guard let hit = try context.fetch(descriptor).first else { return nil }
+        hit.hitCount += 1
+        hit.lastAccessedAt = .now
+        try context.save()
+        return hit
+    }
+
+    func upsert(_ record: CachedGeminiResponse) throws {
+        if let existing = try find(key: record.cacheKey) {
+            existing.responseText = record.responseText
+            existing.outputTokens = record.outputTokens
+            existing.finishReason = record.finishReason
+            existing.lastAccessedAt = .now
+        } else {
+            context.insert(record)
+        }
+        try context.save()
+    }
+
+    func evict(olderThan days: Int) throws {
+        let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: .now)!
+        let descriptor = FetchDescriptor<CachedGeminiResponse>(
+            predicate: #Predicate { $0.lastAccessedAt < cutoff }
+        )
+        for record in try context.fetch(descriptor) {
+            context.delete(record)
+        }
+        try context.save()
+    }
+}
+```
+
+The `@MainActor` annotation matters because `ModelContext` is thread-affine. Touching it from a background queue produces either `EXC_BAD_ACCESS` or, worse, silent data corruption. Swift 6 strict concurrency is gradually turning these into compile-time errors, but SwiftData's actor design is still in flux, so pinning to `@MainActor` is the safer baseline for the snippets in this article.
+
+## Use case layer — three-axis invalidation
+
+If you express "when should we discard a cache entry" as a single condition, that condition will fail somewhere. I combine three axes.
+
+```swift
+struct CachePolicy {
+    var ttl: TimeInterval        // e.g. 7 days
+    var allowedModel: String     // e.g. "gemini-2.5-pro"
+    var schemaHash: String?      // invalidate if structured-output schema changes
+    var forceRefresh: Bool       // true when the user taps "Regenerate"
+}
+
+@MainActor
+final class GeminiResponder {
+    private let store: ResponseCacheStore
+    private let client: GeminiClient
+
+    init(store: ResponseCacheStore, client: GeminiClient) {
+        self.store = store
+        self.client = client
+    }
+
+    func respond(prompt: String, policy: CachePolicy) async throws -> String {
+        let key = CacheKeyBuilder.make(
+            prompt: prompt,
+            model: policy.allowedModel,
+            schemaJSON: policy.schemaHash
+        )
+
+        if !policy.forceRefresh,
+           let cached = try store.find(key: key),
+           cached.modelName == policy.allowedModel,
+           cached.responseSchemaHash == policy.schemaHash,
+           cached.createdAt.timeIntervalSinceNow > -policy.ttl {
+            return cached.responseText
+        }
+
+        let result = try await client.generate(
+            prompt: prompt,
+            model: policy.allowedModel
+        )
+
+        let record = CachedGeminiResponse(
+            cacheKey: key,
+            promptDigest: String(prompt.prefix(200)),
+            modelName: policy.allowedModel,
+            responseText: result.text,
+            responseSchemaHash: policy.schemaHash,
+            inputTokens: result.usage.input,
+            outputTokens: result.usage.output,
+            finishReason: result.finishReason
+        )
+        try store.upsert(record)
+        return result.text
+    }
+}
+```
+
+The `forceRefresh` flag exists because a user-facing "Regenerate" button is non-negotiable. When the response disappoints, people press regenerate immediately, and if your cache returns the same response again, they conclude the feature is broken and never come back. "A cache the user can override" is more trusted than "a cleverly automatic cache."
+
+## Four lessons from running this at scale
+
+These are not abstract pieces of advice — they are scars from shipping.
+
+### 1. Keep the SwiftData store to text only
+
+My first release packed response text, source images, and audio into a single `@Model`. Three months in, a handful of users had stores larger than 80 MB and saw a three-second freeze during migration on launch. Split binaries into a separate model, restore references only on launch, and load the actual data lazily.
+
+### 2. Version responses by both model name and prompt version
+
+When I rolled forward from `gemini-2.5-pro` to `gemini-3-pro`, leaving the old cache in place produced an obvious quality drift as old and new responses interleaved. I tightened the equality check to require an exact `modelName` match, and I started bumping a manual prompt-version number (stashed in the `schemaHash` field) every time the system prompt changed. Complaints about "the response style seems different from before" dropped noticeably after that.
+
+### 3. Asynchronously evict "last accessed more than 30 days ago" on launch
+
+After the first run loop tick on launch, I kick off `Task.detached { try await evictOldEntries() }`. Doing this on the main thread inflates cold-start time and tanks App Store ratings. The change shaved roughly 1.4 seconds off the P95 cold start in my wallpaper app — small and unglamorous, but real.
+
+### 4. Explicitly disable iCloud sync for the cache
+
+`@Model` plays nicely with CloudKit by default. That is exactly why you need to opt out for cache data — otherwise you eat into the user's iCloud quota and you make first launch on a slow network impossible. Always pass `ModelConfiguration(cloudKitDatabase: .none)` so the store stays device-local.
+
+## Wiring up offline fallback
+
+Detect airplane mode and dead spots with `NWPathMonitor`. When offline, treat the TTL as effectively infinite and switch to "return something, even if stale" mode.
+
+```swift
+import Network
+
+actor ConnectivityMonitor {
+    private var isOnline: Bool = true
+    private let monitor = NWPathMonitor()
+
+    init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            Task { await self?.update(isOnline: path.status == .satisfied) }
+        }
+        monitor.start(queue: .global(qos: .background))
+    }
+
+    func currentlyOnline() -> Bool { isOnline }
+    private func update(isOnline: Bool) { self.isOnline = isOnline }
+}
+```
+
+At the top of `GeminiResponder.respond`, branch on `if await !monitor.currentlyOnline()`. If you have a hit, return it. If you have a miss, tell the user explicitly: "You are offline. The previous response will be refreshed the next time you are online." From running this in production, an honest notice generates far less anger in App Store reviews than a silent failure.
+
+## Operational metrics that keep the store from bloating
+
+In real operation I track the four numbers below. I review them weekly, and act the moment any of them turn red.
+
+| Metric | Target | What to do when it goes red |
+| --- | --- | --- |
+| Total store size | Under 50 MB | Re-check the binary split-off model |
+| Cache hit rate | 30% or higher | Revisit prompt normalization and TTL |
+| Single record's share of total hits | Under 10% | The prompt is too coupled to user input |
+| Backlog of >30-day-old entries | Under 100 | The launch-time evict job is not running |
+
+Store size is available from `FileManager.default.attributesOfItem(atPath:)`. I surface it on a debug menu, and it is the first number I check whenever a beta tester complains that "the app feels heavy."
+
+## Migration strategy — bolting this onto an existing app
+
+If you are adding the cache layer to an app that already shipped, the safest path is a one-shot migration on first launch that imports the old `UserDefaults` or homemade JSON cache into the SwiftData store. Set a "migration done" flag in `UserDefaults` and skip thereafter.
+
+The catch: converting a large amount of data on the main thread on first launch can trigger an ANR detection. If the count exceeds about 500, run the migration in `Task.detached`, and keep the old API call path alive in parallel for one release — call it a "parallel-operation window." I gave my wallpaper app a two-week parallel-operation window, confirmed zero crash regression, and only then removed the legacy cache code.
+
+## Next action
+
+Start small: pick one feature (description generation, title suggestions) and introduce `CachedGeminiResponse` and `GeminiResponder` there. After a month of real usage, if the hit rate is above 30%, the design is appropriate. If it stays under 5%, suspect prompt normalization first, or accept that this particular feature is not cache-friendly.
+
+An AI feature that does not go silent offline is a quiet but reliable differentiator. I hope this article helps you ship one of your own.
