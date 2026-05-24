@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMINI35FLASH — Gemini 3.5 Flash リリース、3.1 Pro 超え＆他 frontier 比 4倍速度（5/19 I/O）",
-    "DAILYBRIEF — Gemini App に Daily Brief 追加、メール/カレンダー/タスクを朝の1画面に集約（5月）",
+    "GEMINI35FLASH — Gemini 3.5 Flash 一般提供、3.1 Pro 超えで他 frontier 比 4倍速度、3.5 Pro は来月テスト展開（5/19 I/O）",
+    "ANDROIDINT — Gemini Intelligence が Android 端末でフォーム自動入力・Web 要約・複雑タスク自動化、Samsung/Pixel に夏先行（5/12）",
+    "DAILYBRIEF — Gemini App の Daily Brief、メール/カレンダー/タスクを朝に統合し次アクションまで提案（5月）",
+    "OMNI — Gemini Omni 公開、画像/音声/動画/テキスト入力から動画生成までマルチモーダル一体対応（5月）",
     "SPARK — Gemini Spark 24/7 稼働パーソナルAIエージェント、AI Ultra 米国版から段階展開（5月）",
-    "OMNI — Gemini Omni 公開、画像/音声/動画/テキスト入力から動画生成までシームレス対応（5月）",
-    "AISTUDIO — Google AI Studio が native Android アプリ生成に対応、Compose+Kotlin で数分（5/19）",
-    "ULTRA100 — AI Ultra 新プラン $100 登場、既存 Ultra は $250→$200 に値下げ（5月）",
+    "NEURAL — Gemini App が Neural Expressive デザインへ刷新、流体アニメ＋触覚フィードバック搭載（5/19）",
   ],
   en: [
-    "GEMINI35FLASH — Gemini 3.5 Flash launched, beats 3.1 Pro at 4x faster than other frontier models (5/19 I/O)",
-    "DAILYBRIEF — Gemini App adds Daily Brief unifying email, calendar, and tasks each morning (May)",
-    "SPARK — Gemini Spark 24/7 personal AI agent rolls out to AI Ultra users in US (May)",
-    "OMNI — Gemini Omni released, accepting image/audio/video/text input with video output (May)",
-    "AISTUDIO — Google AI Studio now generates native Android apps with Compose & Kotlin (5/19)",
-    "ULTRA100 — New AI Ultra plan at $100, existing Ultra dropped from $250 to $200 (May)",
+    "GEMINI35FLASH — Gemini 3.5 Flash now GA, beats 3.1 Pro and runs 4x faster than other frontier models; 3.5 Pro in testing next month (5/19 I/O)",
+    "ANDROIDINT — Gemini Intelligence brings form autofill, web summarization, and complex task automation to Android, Samsung/Pixel get it this summer (5/12)",
+    "DAILYBRIEF — Gemini App's Daily Brief unifies email, calendar, and tasks each morning with prioritized next actions (May)",
+    "OMNI — Gemini Omni released, multimodal across image/audio/video/text input through to video output (May)",
+    "SPARK — Gemini Spark 24/7 personal AI agent rolling out to AI Ultra users in the US (May)",
+    "NEURAL — Gemini App redesigned with Neural Expressive language: fluid motion, vibrant color, haptics (5/19)",
   ],
 };
 
