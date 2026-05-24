@@ -1,0 +1,177 @@
+---
+title: "Why Your Gemini File API Uploads Vanish After 48 Hours — and How to Code Around It"
+slug: "gemini-file-api-48h-ttl-expired-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-24T02:00"
+author: "Gemini Lab"
+description: "Gemini File API resources are auto-deleted 48 hours after upload. Here is how to recognize the failure, why it happens, and concrete patterns for re-uploading, falling back to inline data, and managing expiration safely."
+tags: ["Gemini API", "File API", "Troubleshooting", "Python", "Production"]
+---
+
+One morning a classification script that I had been running over AdMob reports failed with an error I had never seen before. The code had not changed since the day before, yet the call that referenced an already-uploaded PDF came back with `403 PERMISSION_DENIED`.
+
+The reason turned out to be simple: every file sent through `files.upload()` is **automatically deleted 48 hours after upload**. As an indie developer who has been shipping apps since 2014 (Hirokawa, @dolice), I have learned that TTL behavior in external APIs is the kind of trap that bites long after the integration looks "done", and the Gemini File API is no exception.
+
+This post walks through how to identify the failure, which TTL-safe patterns exist for passing files into a model, and how to build a small "assume re-upload" layer once you decide to operate around the limit.
+
+## Pin down which error you are actually seeing
+
+A TTL expiration shows up in several different shapes depending on the SDK version and how you call the API. Identifying which variant you are looking at is the fastest way to a fix.
+
+The three you are most likely to encounter:
+
+- `PERMISSION_DENIED`: returned by `generateContent` when you pass a `file_uri` that refers to a deleted resource. Misleading because it tempts you to suspect API key permissions
+- `NOT_FOUND`: returned by `files.get(name=...)` when you check the resource individually
+- `INVALID_ARGUMENT: File ... is not in an active state`: occasionally surfaces while the file is mid-deletion
+
+The cleanest way to distinguish a real auth failure from a TTL miss is to ask the Files endpoint directly.
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+file_name = "files/abc123xyz"  # the name returned by a previous upload()
+
+try:
+    meta = client.files.get(name=file_name)
+    print(meta.state, meta.expiration_time)
+except Exception as e:
+    print(f"file is gone or inaccessible: {e}")
+```
+
+`expiration_time` comes back as ISO 8601. If it is already in the past, you have a TTL miss, not an authentication problem.
+
+## Treat the 48-hour TTL as a hard contract
+
+The File API is a short-term staging area, not a storage service.
+
+- Uploaded files are **deleted automatically after 48 hours**; there is no extension endpoint
+- Referencing a `file_uri` after deletion returns `PERMISSION_DENIED`
+- The per-file limit is 2 GB, and a single project can hold up to 20 GB
+- Calling `files.upload()` on the same bytes always produces a new `name`
+
+Designing around this means accepting that "upload once, reuse forever" is not a supported pattern. For real persistence, the standard play is to keep the source in Cloud Storage and reach it through Vertex AI instead.
+
+This is documented in the [official Files API reference](https://ai.google.dev/api/files), but if you have been porting code from an older SDK or following half-stale snippets, the TTL is easy to miss.
+
+## Pattern 1: upload immediately before every call
+
+The most straightforward fix is to call `files.upload()` right before each `generateContent`. It is wasteful in pure throughput terms, but for jobs that run a handful of times a day the simplicity is worth it.
+
+```python
+from pathlib import Path
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def classify_pdf(pdf_path: Path, prompt: str) -> str:
+    """Minimal upload → classify → delete cycle."""
+    uploaded = client.files.upload(file=pdf_path)
+    try:
+        result = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[uploaded, prompt],
+        )
+        return result.text
+    finally:
+        # Delete immediately so we never bump into the 20 GB project ceiling
+        client.files.delete(name=uploaded.name)
+```
+
+The `finally` block matters more than it looks. If you forget it, a long-running worker can quietly eat through the project quota in a couple of weeks. I have seen this happen on a shared key shared across multiple wallpaper apps on App Store and Google Play.
+
+## Pattern 2: fall back to inline data for small files
+
+When the payload is small enough that the whole request stays under roughly 20 MB, you can skip the File API entirely and pass the bytes through `inline_data`.
+
+```python
+import base64
+from pathlib import Path
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def classify_small_pdf(pdf_path: Path, prompt: str) -> str:
+    data = pdf_path.read_bytes()
+
+    part = types.Part.from_bytes(
+        data=data,
+        mime_type="application/pdf",
+    )
+
+    result = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[part, prompt],
+    )
+    return result.text
+```
+
+Inline mode is TTL-free and easy to retry, but the request body grows fast. Past about 3 MB you will start to feel the added latency. A small router that picks the right path by file size keeps both worlds usable.
+
+```python
+THRESHOLD_BYTES = 20 * 1024 * 1024  # 20 MB
+
+def smart_classify(pdf_path: Path, prompt: str) -> str:
+    if pdf_path.stat().st_size < THRESHOLD_BYTES:
+        return classify_small_pdf(pdf_path, prompt)
+    return classify_pdf(pdf_path, prompt)
+```
+
+## Pattern 3: build a local expiration cache for reuse
+
+If you genuinely need to reuse the same file across many calls within a day, the realistic approach is to maintain your own `(local_path, remote_name, expires_at)` table in Redis or SQLite and check validity before each use.
+
+```python
+import datetime as dt
+import sqlite3
+from pathlib import Path
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+SAFETY_MARGIN = dt.timedelta(hours=2)  # refresh 2h before expiration
+
+def get_or_refresh(conn: sqlite3.Connection, local_path: Path) -> str:
+    row = conn.execute(
+        "SELECT remote_name, expires_at FROM files WHERE local_path = ?",
+        (str(local_path),),
+    ).fetchone()
+
+    now = dt.datetime.now(dt.timezone.utc)
+
+    if row:
+        remote_name, expires_at = row
+        if dt.datetime.fromisoformat(expires_at) - SAFETY_MARGIN > now:
+            return remote_name
+        try:
+            client.files.delete(name=remote_name)
+        except Exception:
+            pass
+
+    uploaded = client.files.upload(file=local_path)
+    conn.execute(
+        "INSERT OR REPLACE INTO files VALUES (?, ?, ?)",
+        (str(local_path), uploaded.name, uploaded.expiration_time.isoformat()),
+    )
+    conn.commit()
+    return uploaded.name
+```
+
+The two-hour margin exists because referencing a file right at its expiration time occasionally surfaces a transient `INVALID_ARGUMENT`. If your batch runs at 2 a.m., it is worth confirming that no expirations land in that window.
+
+## Things to double-check before going to production
+
+A few items that I always verify before turning a File API integration loose:
+
+1. `expiration_time` is **in UTC**, so never compare it directly to local time
+2. `files.list()` returns at most 100 entries per call, so you need to walk `page_token` for a full inventory
+3. The `state` field varies subtly between SDK versions (`ACTIVE` / `PROCESSING` / `FAILED`); string matching tends to survive upgrades better than enum comparison
+4. In CI, upload a small test PDF each run instead of sharing a long-lived record across jobs
+
+For my own apps, a weekly App Store review classifier eventually settled on "do not trust the TTL — upload every time" as the safest default. Capacity and bandwidth are cheap enough today that the simplicity has been worth it.
+
+Hope this saves a debugging session for anyone hitting the same wall. Thanks for reading.

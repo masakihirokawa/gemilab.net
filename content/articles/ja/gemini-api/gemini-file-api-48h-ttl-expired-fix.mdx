@@ -1,0 +1,178 @@
+---
+title: "Gemini File API でアップロードしたファイルが48時間後に消える問題への対処法"
+slug: "gemini-file-api-48h-ttl-expired-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-24T02:00"
+author: "Gemini Lab"
+description: "Gemini File API のファイルは48時間で削除される仕様です。突然 PERMISSION_DENIED や NOT_FOUND が返るようになった原因と、再アップロードを前提とした実装パターンを整理します。"
+tags: ["Gemini API", "File API", "トラブルシューティング", "Python", "本番運用"]
+---
+
+ある朝、AdMob のレポート取り込みに使っていた Gemini File API 経由の分類スクリプトが、見たことのないエラーで落ちていました。前日まで動いていたコードを一切変えていないのに、アップロード済みのはずの PDF を参照しに行ったところで `403 PERMISSION_DENIED` が返ってきます。
+
+原因は単純で、`files.upload()` で送ったファイルは **アップロードから48時間で自動削除される**仕様だったからです。2014年から個人開発でアプリを運用してきた廣川（@dolice）の経験でも、外部 API の TTL（Time To Live）周りはあとから刺さる落とし穴の代表格で、Gemini File API も例外ではありませんでした。
+
+症状の見分け方、TTL に依存しないファイル受け渡しパターン、そして「再アップロード前提」で組み直すときの実装例を、実運用で詰まったポイントだけに絞って整理します。
+
+## どのエラーが出ているのかを正確に切り分ける
+
+48時間 TTL に起因するエラーは、複数の顔を持っています。SDK のバージョンと呼び出し方によって表面化するメッセージが変わるため、最初にどの分類なのかを確定させると判断が速くなります。
+
+代表的なものは次の3パターンです。
+
+- `PERMISSION_DENIED`：`generateContent` に `file_uri` を渡したときに返ってくる。すでに削除されたリソースを参照しているため権限エラー扱いになる
+- `NOT_FOUND`：`files.get(name=...)` で個別にステータスを確認したときに返ってくる
+- `INVALID_ARGUMENT: File ... is not in an active state`：稀に、削除直前の遷移中に返ってくる
+
+特に混乱しやすいのが `PERMISSION_DENIED` で、認証情報を疑って API キーを差し替えても解決しません。判別のためには、まず `files.get()` で個別の生死を確認するのが確実です。
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+file_name = "files/abc123xyz"  # 以前 upload() が返した name
+
+try:
+    meta = client.files.get(name=file_name)
+    print(meta.state, meta.expiration_time)
+except Exception as e:
+    print(f"file is gone or inaccessible: {e}")
+```
+
+`expiration_time` は ISO8601 で返ってきます。これが現在時刻より過去であれば、確実に TTL 失効です。
+
+## 仕様としての48時間 TTL を一度きちんと押さえる
+
+File API は Gemini API の補助エンドポイントで、Files リソースの保持期間は短期です。
+
+- アップロード後 **48時間で自動削除**される（延長 API は提供されていない）
+- 削除されたあとに `file_uri` を参照すると `PERMISSION_DENIED` が返る
+- 1ファイル上限は 2GB、プロジェクト全体で 20GB まで保持できる
+- 同じバイナリでも `files.upload()` を呼ぶたびに別 `name` のリソースになる
+
+つまり「一度アップロードして使い回す」運用は最大2日間しか保たない、と最初から割り切るのが安全です。長期保存したいなら Google Cloud Storage に置いて Vertex AI 経由で参照するなど、別のサービスを組み合わせる前提で設計するのが現実的です。
+
+詳細は [Files API 公式ドキュメント](https://ai.google.dev/api/files)に明記されていますが、移行ガイドや古い記事を見ながら実装していると、TTL の存在を見落としやすい部分でもあります。
+
+## 対処1：呼び出しの直前に毎回アップロードする
+
+もっとも単純で確実な対処は、`generateContent` の直前で必ず `files.upload()` を呼び直すことです。バッチで何百件も処理する場合は無駄が増えますが、1日数回〜数十回程度の呼び出しなら、TTL のことを完全に忘れられる安心感が勝ちます。
+
+```python
+from pathlib import Path
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def classify_pdf(pdf_path: Path, prompt: str) -> str:
+    """毎回アップロード → 分類 → 削除 の最小サイクル"""
+    uploaded = client.files.upload(file=pdf_path)
+    try:
+        result = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[uploaded, prompt],
+        )
+        return result.text
+    finally:
+        # 待たずに即削除すれば 20GB のプロジェクト枠も浪費しない
+        client.files.delete(name=uploaded.name)
+```
+
+`finally` で `files.delete()` を呼ぶのは、容量枠を意識した小さな配慮ですが、長期間稼働するワーカーでは効いてきます。個人開発で複数アプリを掛け持ちしている場合、ここを抜くと半月ほどで容量上限に当たることがあります。
+
+## 対処2：20MB 未満なら inlineData にフォールバックする
+
+PDF や画像が小さい場合は、そもそも File API を経由せず `inline_data` として直接埋め込んでしまう手があります。HTTP リクエスト本体が 20MB 以内に収まるなら、API 側の制約的にもこちらで通ります。
+
+```python
+import base64
+from pathlib import Path
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def classify_small_pdf(pdf_path: Path, prompt: str) -> str:
+    data = pdf_path.read_bytes()
+
+    part = types.Part.from_bytes(
+        data=data,
+        mime_type="application/pdf",
+    )
+
+    result = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[part, prompt],
+    )
+    return result.text
+```
+
+inline 方式の利点は TTL に縛られないことと、リトライ時もファイル状態を気にしなくていいことです。一方でリクエストサイズが膨らむので、3MB を超えるあたりからレイテンシの増加が目立ちます。サイズに応じてスイッチする小さなルーターを挟むと使い分けやすくなります。
+
+```python
+THRESHOLD_BYTES = 20 * 1024 * 1024  # 20MB
+
+def smart_classify(pdf_path: Path, prompt: str) -> str:
+    if pdf_path.stat().st_size < THRESHOLD_BYTES:
+        return classify_small_pdf(pdf_path, prompt)
+    return classify_pdf(pdf_path, prompt)
+```
+
+## 対処3：再利用したいなら期限を見て再アップロードする
+
+同じファイルを1日に何度も使い回したい場合は、自前で「期限管理 + 再アップロード」を入れるのが現実的です。Redis や SQLite に `(local_path, remote_name, expires_at)` のテーブルを持っておき、呼び出し前に有効性を確認します。
+
+```python
+import datetime as dt
+import sqlite3
+from pathlib import Path
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+SAFETY_MARGIN = dt.timedelta(hours=2)  # 2時間早めに更新
+
+def get_or_refresh(conn: sqlite3.Connection, local_path: Path) -> str:
+    row = conn.execute(
+        "SELECT remote_name, expires_at FROM files WHERE local_path = ?",
+        (str(local_path),),
+    ).fetchone()
+
+    now = dt.datetime.now(dt.timezone.utc)
+
+    if row:
+        remote_name, expires_at = row
+        if dt.datetime.fromisoformat(expires_at) - SAFETY_MARGIN > now:
+            return remote_name
+        # 期限が近いか過ぎているので破棄して再アップロード
+        try:
+            client.files.delete(name=remote_name)
+        except Exception:
+            pass
+
+    uploaded = client.files.upload(file=local_path)
+    conn.execute(
+        "INSERT OR REPLACE INTO files VALUES (?, ?, ?)",
+        (str(local_path), uploaded.name, uploaded.expiration_time.isoformat()),
+    )
+    conn.commit()
+    return uploaded.name
+```
+
+2時間の安全マージンを取っているのは、ちょうど期限ぎりぎりで参照すると遷移中の `INVALID_ARGUMENT` が出ることがあるからです。バッチが午前2時に走る運用なら、その時刻をまたぐタイミングで失効しないかを確認しておくと安心です。
+
+## つまずきやすいポイントを最後にまとめる
+
+実運用に持ち込む前に、次の点を必ず確認しています。
+
+1. `expiration_time` は **UTC** で返ってくるので、ローカルタイムと混ぜて比較しないこと
+2. `files.list()` は最大100件までしか返さないため、`page_token` で全件走査する処理を入れること
+3. SDK のバージョンによって `state` のフィールド名が `ACTIVE` / `PROCESSING` / `FAILED` で微妙に違うので、enum 比較ではなく文字列マッチで書いておくほうが壊れにくい
+4. CI のテストでは [テスト用の小さな PDF](https://ai.google.dev/api/files#supported-mime-types) を都度アップロードして使い、レコードを共有しないこと
+
+廣川（@dolice）が個人運用しているアプリでは、App Store レビュー CSV を週次で分類する処理に File API を組み込んでいますが、最終的には「TTL を信用せず毎回アップロード」がいちばん事故が少ない結論になりました。容量や帯域に余裕がある今のプランでは、シンプルさが運用コストを下げてくれます。
+
+同じところで詰まっている方の助けになれば幸いです。お読みいただきありがとうございました。
