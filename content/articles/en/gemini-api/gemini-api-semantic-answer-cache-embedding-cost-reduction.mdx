@@ -1,0 +1,202 @@
+---
+title: "Designing a Semantic Cache for the Gemini API — Embedding-based Answer Caching That Actually Pays for Itself"
+slug: "gemini-api-semantic-answer-cache-embedding-cost-reduction"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-25T15:45"
+author: "Gemini Lab"
+description: "A practical design for a semantic cache that sits in front of the Gemini API. Combines text-embedding-004, cosine similarity thresholds, versioned cache keys, and TTL design to balance hit rate and answer quality, with Python and Cloudflare Vectorize code that runs in production."
+tags: ["gemini-api", "embedding", "semantic-cache", "cost-optimization", "vectorize", "production"]
+highlights:
+  - "You can implement similarity-based cache lookups with Gemini text-embedding-004, with the threshold-tuning pitfalls and a real measurement table you can copy"
+  - "You get a concrete picture of how a 40–60% hit rate on a 50M-download indie app stack translated into 35% lower monthly API spend, and what trade-offs you accept along the way"
+  - "You take home three concrete patterns: TTL design, versioned cache keys, and a Cloudflare KV + Vectorize edge deployment, each with the pitfalls I hit during rollout"
+---
+
+The Gemini 2.5 Flash pricing is cheap on paper, but when you operate several apps that together pass 50 million downloads, the monthly invoice from the Gemini API starts to bite. In my case, one healing app I run uses Gemini to infer mood tags from a user's daily journal entry. At peak, that endpoint fires dozens of requests per second, and when I broke down the logs I noticed that most of them were variations of the same prompt arriving from different users.
+
+The exact-match cache I had in place wasn't doing much. People write journal entries in their own way: "I think I'm a bit tired today", "Today I'm a little tired", "today I'm sort of tired" — semantically identical, lexically different. An exact-match cache obviously misses all of those. I was paying Gemini every time to return the same three relaxation tags.
+
+After living with that for a while I decided to build a proper semantic cache. This article is the design and lessons I extracted from running it in production. I'll also pull in context from running indie iOS / Android apps since 2014, a cumulative 50M downloads, and the four-site Dolice Labs network, because the "what's worth optimizing for a one-person shop" boundary matters as much as the code.
+
+## Why a hash-keyed cache won't save you on LLM responses
+
+A typical HTTP cache uses the URL plus query string as the key. Same URL, same query, same response — that's the contract. LLM responses break that assumption immediately, because the cache key is now a natural-language prompt. Users vary punctuation, politeness level, typos, every parameter you can imagine. The two journal sentences I quoted above hash to completely different keys.
+
+In my healing app the exact-match cache ran at a 6–9% hit rate. Roughly 90% of every 100 requests still hit Gemini directly. That is the classic "the cache is in but doesn't help" pattern. It was tolerable while AdMob revenue absorbed it, but as the share of free-tier users grew, the bill became a real factor.
+
+What you want is a cache that maps semantically close prompts to the same entry. You vectorize the incoming prompt with an embedding model and ask the cache store whether anything close enough already exists.
+
+## What semantic caching solves, and what it introduces
+
+A semantic cache absorbs lexical variation, which is the point. It also introduces a new failure mode: prompts that look close in vector space but expect different answers.
+
+"What relaxation methods can I try when I can't sleep?" and "What relaxation music can I try when I can't sleep?" are very close in embedding distance. But the first expects breathing exercises and stretching, the second expects a playlist. Reusing a cached answer across that boundary collapses the answer quality.
+
+So a semantic cache is fundamentally a hit-rate versus quality trade-off. Loose threshold, high hit rate, more wrong reuses. Strict threshold, low hit rate, less benefit. In production I ended up with a threshold that adapts to the length of the user's journal entry. More on that below.
+
+## Architecture at the smallest useful scale
+
+The architecture I run is intentionally minimal so that a single operator can keep it healthy.
+
+1. Embed the incoming prompt with Gemini `text-embedding-004`
+2. Query a vector store for the top-K nearest entries by cosine similarity
+3. If the top score crosses the threshold, return the cached answer
+4. Otherwise call Gemini, store the answer alongside the vector, return it
+5. Emit hit rate, threshold, and API call counters to a metrics sink
+
+The vector store is whatever fits your hosting. I use Cloudflare Workers, so I picked Cloudflare Vectorize. At roughly one US dollar per 10 million vectors per month, it is invisible at indie-app scale. I keep the answer body in KV and only ship the vector ID plus minimal metadata into Vectorize.
+
+```python
+import os
+import requests
+
+GEMINI_KEY = os.environ["YOUR_GEMINI_API_KEY"]
+EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent"
+GEN_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+
+
+def embed(text: str) -> list[float]:
+    r = requests.post(
+        EMBED_URL,
+        params={"key": GEMINI_KEY},
+        json={
+            "model": "models/text-embedding-004",
+            "content": {"parts": [{"text": text}]},
+            "taskType": "RETRIEVAL_QUERY",
+        },
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()["embedding"]["values"]
+
+
+def generate(prompt: str) -> str:
+    r = requests.post(
+        GEN_URL,
+        params={"key": GEMINI_KEY},
+        json={"contents": [{"parts": [{"text": prompt}]}]},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+```
+
+One small but load-bearing detail: I pass `taskType: RETRIEVAL_QUERY` on both read and write. Google's documentation recommends `RETRIEVAL_DOCUMENT` on the write side, but for caching purposes I want the query-side and document-side vectors to be drawn from the same distribution so the similarity scores stay comparable. It is off-spec, but my hit rate noticeably improved when I aligned them.
+
+## Vectorize plus KV as a minimal storage layer
+
+Vectorize holds the embedding plus small metadata. The answer body lives in KV. The reason is mundane: Vectorize has a per-vector metadata size limit, and long Gemini answers blow past it quickly.
+
+```typescript
+interface Env {
+  VECTORIZE: VectorizeIndex;
+  KV: KVNamespace;
+}
+
+const SIM_THRESHOLD = 0.92; // tuned below
+
+export async function lookupCache(env: Env, vec: number[]) {
+  const result = await env.VECTORIZE.query(vec, {
+    topK: 3,
+    returnMetadata: "all",
+  });
+  const top = result.matches[0];
+  if (!top || top.score < SIM_THRESHOLD) return null;
+  const body = await env.KV.get(`ans:${top.id}`, "json");
+  if (!body) return null;
+  return { id: top.id, score: top.score, body };
+}
+
+export async function writeCache(
+  env: Env,
+  prompt: string,
+  vec: number[],
+  answer: string,
+  meta: { model: string; promptVersion: string }
+) {
+  const id = await hashId(prompt + meta.promptVersion);
+  await env.VECTORIZE.upsert([
+    {
+      id,
+      values: vec,
+      metadata: {
+        model: meta.model,
+        promptVersion: meta.promptVersion,
+        createdAt: Date.now(),
+      },
+    },
+  ]);
+  await env.KV.put(`ans:${id}`, JSON.stringify({ answer, savedAt: Date.now() }), {
+    expirationTtl: 60 * 60 * 24 * 7, // 7 days
+  });
+}
+
+async function hashId(s: string): Promise<string> {
+  const data = new TextEncoder().encode(s);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+```
+
+Three things to watch. First, the cache ID mixes the prompt body with a `promptVersion`. That lets you invalidate a generation of cached answers when you change the system prompt without touching individual entries. Second, Vectorize has no TTL API today, so old vectors need a periodic broom; KV handles expiration itself. Third, `topK: 3` rather than `topK: 1` lets me log the runner-up scores when I'm debugging a noisy hit, which has saved me twice.
+
+## Tuning the similarity threshold — false positives hurt the most
+
+The threshold is the part that decides answer quality, so I always validate it on labelled samples before touching production. I pulled 500 input pairs from my healing app logs and labelled them by hand into "same answer is fine" versus "needs a different answer".
+
+| Threshold | Hit rate | False-positive rate | Monthly cost cut |
+|---|---|---|---|
+| 0.80 | ~72% | ~11% | ~60% |
+| 0.88 | ~55% | ~4% | ~45% |
+| 0.92 | ~42% | ~1.2% | ~35% |
+| 0.95 | ~28% | ~0.4% | ~22% |
+
+Those numbers are from my own app. The right threshold depends on what you're protecting. If you can tolerate up to 5% quality degradation, 0.88–0.92 is the usable window. I picked 0.92 because the healing app is one of the AdMob-supported flagships and a single batch of "weird answers" can earn me a flurry of one-star reviews that wipe out the savings several times over.
+
+The mental model matters more than the exact figures. If you read a blog post claiming "we cut costs 80% with semantic caching" and copy the loose threshold, you will start getting low-rating reviews from users who notice the off-pitch answers. The damage a one-star wave does to an indie app vastly outweighs the saved compute, so begin conservatively.
+
+## TTL and versioned keys — keep stale knowledge out
+
+A subtle failure mode of semantic caches is that yesterday's answers linger after you change the model or the prompt. When I migrated from Gemini 2.0 Flash to Gemini 2.5 Flash, my app silently served a mix of old and new outputs for days. I only noticed when a user wrote in saying "the replies feel different lately."
+
+I prevent that structurally now by composing the cache key from three pieces.
+
+1. A prompt template version string (I use values like `promptVersion: "v3-2026-05"` so the month is visible)
+2. The exact model name (`gemini-2.5-flash`)
+3. A hash of the input text
+
+When either of the first two changes, the old vectors fall out of any filtered search. Vectorize supports metadata filters, so on query I scope by `where: { model: "gemini-2.5-flash", promptVersion: "v3-2026-05" }`. It is more complex than a single hash key, but it pays back every time you do a model swap or rewrite a system prompt.
+
+I leave KV TTL at 7 days. The reasoning is "anything older than a week may already be out of step with user mood or fresh content; better to refresh it." Chat-style apps may want a shorter TTL, document-retrieval apps a longer one. Anything from 1 to 30 days is reasonable, set by the use case.
+
+## Five metrics to watch the moment you ship
+
+The minute the cache is live, instrument these.
+
+1. **Hit rate** — fraction of requests served from cache. Below 30% likely means the threshold is too strict or your input distribution surprised you.
+2. **Average similarity score on hits** — plot a histogram. A pile of hits sitting right on top of the threshold signals borderline reuse and probably some quality drift.
+3. **Cost reduction percentage** — Gemini call count multiplied by the unit price, compared with the pre-cache baseline. My number is 35%.
+4. **Latency cut on hits** — when Gemini is skipped, response time on my deployment drops from about 600ms to 80ms.
+5. **Quality-degradation feedback loop** — review trends, support tickets, star rating delta. Track weekly so you can correlate with deployments.
+
+Pipe those into Logflare, Cloudflare Analytics Engine, or BigQuery and look at them every week. Skipping the metrics part is what lands teams in the bad pattern of "it should be helping but the bill hasn't moved, let me lower the threshold" — which is exactly how quality collapses.
+
+## When to actually adopt a semantic cache
+
+A short decision checklist I use before recommending semantic caching to anyone:
+
+1. Prompts are mostly free-form text and a meaningful fraction of users phrase the same thing differently
+2. The Gemini API bill is at least 5% of revenue, or peak traffic stresses your rate limit
+3. Answer freshness is acceptable on the order of hours to days; if you need second-level freshness, caching is the wrong layer
+
+If any one of those is missing, an exact-match cache and request deduplication (collapsing concurrent identical prompts into one upstream call) will give you most of the benefit at a fraction of the design cost. A semantic cache costs effort to build and effort to keep healthy; it only pays back where the problem actually shows up.
+
+My healing app cleared all three checks, so the work was worth doing. A simpler wallpaper app of mine fails check 1 and I never added caching there. Picking the boundary correctly is what keeps indie-scale operations sustainable.
+
+The end result on my flagship is a 35% drop in monthly Gemini API spend and a latency improvement from ~600ms to ~80ms on cached responses. If you adopt the same shape, start with a conservative threshold, watch the five metrics for at least a week, and only loosen the threshold once the quality signal is clean.
+
+Thank you for reading — I hope this lands well with other operators running multiple apps from a single pair of hands.
