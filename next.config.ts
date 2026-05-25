@@ -246,6 +246,12 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/gemini-updates/weekly-pickup-2026-0417", to: "/articles/gemini-updates" },
   // 2026-05-25 YMYL (tax) removal
   { from: "/articles/gemini-updates/weekly-pickup-2026-0424", to: "/articles/gemini-updates" },
+  // 2026-05-25 cross-site duplicate slug rename
+  { from: "/articles/gemini-basics/ai-tools-directory-2026-part1", to: "/articles/gemini-basics/gemini-ai-tools-directory-2026-part1" },
+  // 2026-05-25 cross-site duplicate slug rename
+  { from: "/articles/gemini-basics/ai-tools-directory-2026-part2", to: "/articles/gemini-basics/gemini-ai-tools-directory-2026-part2" },
+  // 2026-05-25 cross-site duplicate slug rename
+  { from: "/articles/gemini-basics/ai-narration-video-workflow-2026", to: "/articles/gemini-basics/gemini-ai-narration-video-workflow-2026" },
 ];
 
 const buildAuditRedirects = () => {
