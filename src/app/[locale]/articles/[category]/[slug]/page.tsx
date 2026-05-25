@@ -349,7 +349,7 @@ export default async function ArticlePage({ params }: Props) {
       />
 
       {/* Membership CTA — shown for non-members on free articles */}
-      {!canViewPremium && !article.meta.premium && (
+      {!canViewPremium && (
         <MembershipCTA locale={locale} />
       )}
 
