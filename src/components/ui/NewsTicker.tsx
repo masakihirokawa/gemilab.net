@@ -4,24 +4,25 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMINI35FLASH — Gemini 3.5 Flash 一般提供、3.1 Pro 超えで他 frontier 比 4倍速度、3.5 Pro は来月テスト展開（5/19 I/O）",
-    "ANDROIDINT — Gemini Intelligence が Android 端末でフォーム自動入力・Web 要約・複雑タスク自動化、Samsung/Pixel に夏先行（5/12）",
-    "DAILYBRIEF — Gemini App の Daily Brief、メール/カレンダー/タスクを朝に統合し次アクションまで提案（5月）",
-    "OMNI — Gemini Omni 公開、画像/音声/動画/テキスト入力から動画生成までマルチモーダル一体対応（5月）",
-    "SPARK — Gemini Spark 24/7 稼働パーソナルAIエージェント、AI Ultra 米国版から段階展開（5月）",
-    "NEURAL — Gemini App が Neural Expressive デザインへ刷新、流体アニメ＋触覚フィードバック搭載（5/19）",
+    "GEMINI3 — Gemini 3 ファミリー正式リリース、3 Pro が推論/マルチモーダル/コーディングで前世代を凌駕、AI Studio・Vertex AI から利用可能（5/20）",
+    "GEMINI3FLASH — Gemini 3 Flash がプレビュー提供、AI Mode in Search や Gemini App にも段階展開、開発者向けは無償アクセス開始（5/20）",
+    "AISTUDIO — Google AI Studio に Android ネイティブアプリ生成機能、Jetpack Compose + Kotlin をプロンプトから数分でビルド（5/19）",
+    "DEEPTHINK — Gemini 3 Deep Think は安全性評価を経て Google AI Ultra 加入者向けに数週間以内に提供開始（5/20）",
+    "MANAGED — Managed Agents in Gemini API、isolated Linux 環境でエージェントを 1 API コール起動 / 推論・ツール・コード実行を完結（5月）",
+    "PARTNERS — Cursor / GitHub / JetBrains / Manus / Replit / Antigravity が Gemini 3 統合を同時アナウンス（5/20）",
   ],
   en: [
-    "GEMINI35FLASH — Gemini 3.5 Flash now GA, beats 3.1 Pro and runs 4x faster than other frontier models; 3.5 Pro in testing next month (5/19 I/O)",
-    "ANDROIDINT — Gemini Intelligence brings form autofill, web summarization, and complex task automation to Android, Samsung/Pixel get it this summer (5/12)",
-    "DAILYBRIEF — Gemini App's Daily Brief unifies email, calendar, and tasks each morning with prioritized next actions (May)",
-    "OMNI — Gemini Omni released, multimodal across image/audio/video/text input through to video output (May)",
-    "SPARK — Gemini Spark 24/7 personal AI agent rolling out to AI Ultra users in the US (May)",
-    "NEURAL — Gemini App redesigned with Neural Expressive language: fluid motion, vibrant color, haptics (5/19)",
+    "GEMINI3 — Gemini 3 family officially released; 3 Pro beats the previous generation in reasoning, multimodality, and coding; available via AI Studio and Vertex AI (5/20)",
+    "GEMINI3FLASH — Gemini 3 Flash enters preview, rolling out to AI Mode in Search and the Gemini App; free developer access begins (5/20)",
+    "AISTUDIO — Google AI Studio now builds native Android apps with Jetpack Compose + Kotlin straight from a prompt, in minutes (5/19)",
+    "DEEPTHINK — Gemini 3 Deep Think clears safety evaluations and ships to Google AI Ultra subscribers in the coming weeks (5/20)",
+    "MANAGED — Managed Agents in the Gemini API: spin up an agent in an isolated Linux sandbox with a single API call (May)",
+    "PARTNERS — Cursor, GitHub, JetBrains, Manus, Replit, and Antigravity all announce Gemini 3 integrations simultaneously (5/20)",
   ],
 };
 
 export function NewsTicker() {
+
   const locale = useLocale();
   const items = NEWS_ITEMS[locale] || NEWS_ITEMS.en;
   const doubled = [...items, ...items];
