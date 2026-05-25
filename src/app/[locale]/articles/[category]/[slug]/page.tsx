@@ -118,6 +118,10 @@ export default async function ArticlePage({ params }: Props) {
   const premiumAccess = await getPremiumAccess();
   const canViewPremium = !!premiumAccess;
   const canViewArticle = canViewPremium || await getArticleAccess(slug);
+  // PAYWALL TEMPORARILY DISABLED for GSC recovery (2026-05-25)
+  // Override: always show full content, hide paywall UI
+  const _paywallDisabled = true;
+  const _canViewArticleEffective = _paywallDisabled ? true : canViewArticle;
   // Cut preview at roughly 50% of H2 sections (min 2 sections shown).
   // This prevents full-article exposure while conveying enough value.
   const previewContent = (() => {
@@ -152,16 +156,8 @@ export default async function ArticlePage({ params }: Props) {
     },
     // Google Flexible Sampling: declare paywalled content properly
     // https://developers.google.com/search/docs/appearance/structured-data/paywalled-content
-    ...(article.meta.premium ? {
-      isAccessibleForFree: false,
-      hasPart: {
-        "@type": "WebPageElement",
-        isAccessibleForFree: false,
-        cssSelector: ".paywall",
-      },
-    } : {
-      isAccessibleForFree: true,
-    }),
+    // PAYWALL DISABLED — always declare as free for GSC recovery
+    isAccessibleForFree: true,
   };
 
   // BreadcrumbList for AI crawlers & Google rich results
@@ -313,12 +309,12 @@ export default async function ArticlePage({ params }: Props) {
       )}
 
       {/* Article purchase thank-you banner (shown after redirect from Stripe) */}
-      {article.meta.premium && canViewArticle && !canViewPremium && (
+      {article.meta.premium && _canViewArticleEffective && !canViewPremium && !_paywallDisabled && (
         <ArticlePurchaseThankYou locale={locale} />
       )}
 
       {/* Article Content with paywall */}
-      {article.meta.premium && !canViewArticle ? (
+      {article.meta.premium && !_canViewArticleEffective ? (
         <>
           <div
             className="article-content"
@@ -348,7 +344,7 @@ export default async function ArticlePage({ params }: Props) {
       )}
 
       {/* Tip CTA — shown when full article content is visible */}
-      {(!article.meta.premium || canViewArticle) && <TipCTA locale={locale} />}
+      {(!article.meta.premium || _canViewArticleEffective) && <TipCTA locale={locale} />}
 
       {/* Related Articles */}
       <RelatedArticles

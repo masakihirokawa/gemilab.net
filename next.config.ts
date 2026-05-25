@@ -230,6 +230,22 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/gemini-dev/gemini-api-react-ai-chat-ui-guide", to: "/articles/gemini-dev" },
   { from: "/articles/gemini-dev/gemini-github-actions-ci-cd-guide", to: "/articles/gemini-dev" },
   { from: "/articles/gemini-dev/gemini-md-setup-guide", to: "/articles/gemini-dev" },
+  // 2026-05-25 YMYL (tax) removal
+  { from: "/articles/gemini-advanced/gemini-gems-paid-distribution-business-design-2026", to: "/articles/gemini-advanced" },
+  // 2026-05-25 YMYL (tax) removal
+  { from: "/articles/gemini-advanced/gemini-kindle-publishing-guide", to: "/articles/gemini-advanced" },
+  // 2026-05-25 YMYL (tax) removal
+  { from: "/articles/gemini-api/gemini-rag-query-decomposition-hyde-production-guide", to: "/articles/gemini-api" },
+  // 2026-05-25 YMYL (tax) removal
+  { from: "/articles/gemini-basics/gemini-gems-custom-business-tool-monetization", to: "/articles/gemini-basics" },
+  // 2026-05-25 YMYL (tax) removal
+  { from: "/articles/gemini-basics/gemini-google-tv-ai-integration-guide", to: "/articles/gemini-basics" },
+  // 2026-05-25 YMYL (tax) removal
+  { from: "/articles/gemini-basics/gemini-gems-monetization-guide", to: "/articles/gemini-basics" },
+  // 2026-05-25 YMYL (tax) removal
+  { from: "/articles/gemini-updates/weekly-pickup-2026-0417", to: "/articles/gemini-updates" },
+  // 2026-05-25 YMYL (tax) removal
+  { from: "/articles/gemini-updates/weekly-pickup-2026-0424", to: "/articles/gemini-updates" },
 ];
 
 const buildAuditRedirects = () => {
