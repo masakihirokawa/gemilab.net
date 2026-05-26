@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMINI3 — Gemini 3 ファミリー正式リリース、3 Pro が推論/マルチモーダル/コーディングで前世代を凌駕、AI Studio・Vertex AI から利用可能（5/20）",
-    "GEMINI3FLASH — Gemini 3 Flash がプレビュー提供、AI Mode in Search や Gemini App にも段階展開、開発者向けは無償アクセス開始（5/20）",
-    "AISTUDIO — Google AI Studio に Android ネイティブアプリ生成機能、Jetpack Compose + Kotlin をプロンプトから数分でビルド（5/19）",
-    "DEEPTHINK — Gemini 3 Deep Think は安全性評価を経て Google AI Ultra 加入者向けに数週間以内に提供開始（5/20）",
-    "MANAGED — Managed Agents in Gemini API、isolated Linux 環境でエージェントを 1 API コール起動 / 推論・ツール・コード実行を完結（5月）",
-    "PARTNERS — Cursor / GitHub / JetBrains / Manus / Replit / Antigravity が Gemini 3 統合を同時アナウンス（5/20）",
+    "FLASH35 — Gemini 3.5 Flash 提供開始、Antigravity 2.0 のエージェント実行エンジンとして Gemini API・AI Studio・Vertex AI で利用可能（5/27）",
+    "AGENTBENCH — Gemini 3.5 Flash が Terminal-Bench 2.1 で 76.2%、MCP Atlas で 83.6%、CharXiv Reasoning で 84.2% を記録（5/27）",
+    "OMNI — Gemini Omni シリーズ発表、image / audio / video / text 入力から現実世界に根拠付けされた動画を出力（5月）",
+    "MANAGED — Managed Agents in Gemini API が公開プレビュー、isolated Linux サンドボックスで stateful autonomous agent を実行（5月）",
+    "FILESEARCH — File Search が gemini-embedding-2 でマルチモーダル検索対応、画像をネイティブに埋め込み・検索可能に（5月）",
+    "AIMODE — Search の AI Mode が Gemini 3.5 Flash 駆動に、入力に応じて拡張する新検索ボックスと AI 提案を提供（5月）",
   ],
   en: [
-    "GEMINI3 — Gemini 3 family officially released; 3 Pro beats the previous generation in reasoning, multimodality, and coding; available via AI Studio and Vertex AI (5/20)",
-    "GEMINI3FLASH — Gemini 3 Flash enters preview, rolling out to AI Mode in Search and the Gemini App; free developer access begins (5/20)",
-    "AISTUDIO — Google AI Studio now builds native Android apps with Jetpack Compose + Kotlin straight from a prompt, in minutes (5/19)",
-    "DEEPTHINK — Gemini 3 Deep Think clears safety evaluations and ships to Google AI Ultra subscribers in the coming weeks (5/20)",
-    "MANAGED — Managed Agents in the Gemini API: spin up an agent in an isolated Linux sandbox with a single API call (May)",
-    "PARTNERS — Cursor, GitHub, JetBrains, Manus, Replit, and Antigravity all announce Gemini 3 integrations simultaneously (5/20)",
+    "FLASH35 — Gemini 3.5 Flash launches as the agent execution engine for Antigravity 2.0, available via Gemini API, AI Studio, and Vertex AI (May 27)",
+    "AGENTBENCH — Gemini 3.5 Flash posts 76.2% on Terminal-Bench 2.1, 83.6% on MCP Atlas, and 84.2% on CharXiv Reasoning (May 27)",
+    "OMNI — The new Gemini Omni series accepts image, audio, video, and text input and outputs video grounded in real-world knowledge (May)",
+    "MANAGED — Managed Agents in the Gemini API enter public preview, running stateful autonomous agents in isolated Linux sandboxes (May)",
+    "FILESEARCH — File Search now supports multimodal search with gemini-embedding-2, letting you natively embed and search across images (May)",
+    "AIMODE — AI Mode in Search is now powered by Gemini 3.5 Flash, with an expanding search box and AI-driven query suggestions (May)",
   ],
 };
 
