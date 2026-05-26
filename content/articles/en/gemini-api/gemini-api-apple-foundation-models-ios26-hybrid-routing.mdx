@@ -1,0 +1,347 @@
+---
+title: "Pairing Gemini API with Apple FoundationModels (iOS 26): An On-Device-First Hybrid Routing Notebook"
+slug: "gemini-api-apple-foundation-models-ios26-hybrid-routing"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-26T02:45"
+author: "Gemini Lab"
+description: "Running iOS 26 FoundationModels alongside Gemini API as a hybrid stack for a wallpaper app's poem-from-image feature: routing decisions, full Swift code, and one week of latency and cost numbers."
+tags: ["gemini-api", "apple-foundation-models", "ios-26", "swift", "hybrid-inference", "indie-dev", "wallpaper-app"]
+highlights:
+  - "A decision tree for routing requests between Apple FoundationModels and Gemini API, with a complete Swift implementation (SystemLanguageModel.availability, LanguageModelSession, structured generateContent calls)"
+  - "Real numbers from one week of production traffic: mean latency 920ms → 240ms, monthly Gemini spend ¥18,400 → ¥4,720, and the measured impact on AdMob eCPM"
+  - "Four traps from shipping on-device inference (language coverage, token ceiling, temperature drift, cold-start latency) and the concrete workarounds I landed on"
+---
+
+One morning I opened my own wallpaper app, tapped the "Generate a poem for this image" button, and the lower half of the screen stayed faintly gray for about 0.9 seconds. The poem itself was fine. What I wanted, though, was a response that landed while my finger was still touching the screen. Blaming Gemini 2.5 Flash for the latency felt slightly off — the deeper question was whether a six-line haiku really needed a round trip to the cloud in the first place.
+
+I am Masaki Hirokawa, an artist and indie developer. I have been building and running iOS and Android apps independently since 2014, and I currently maintain a family of wallpaper apps with more than 50 million cumulative downloads. The Apple FoundationModels framework that shipped in iOS 26 has become stable enough on my iPhone 15 Pro that I rewired the app to use it first, falling back to Gemini API only when the local model isn't enough. After one week of production logs I want to write down the design decisions and the Swift code while they're fresh.
+
+## Three constraints that pushed me toward hybrid
+
+My first version used Gemini 2.5 Flash alone. It handles multilingual poetry without breaking, and the per-million-token price is sustainable on paper. Three things still pushed me to rethink the setup.
+
+The first is the time from button-press to first visible line. With my Cloudflare Workers proxy in the middle, TTFB landed in the 600–900ms range; at lunchtime in Japan the mean sat around 920ms. Wallpaper users tend to look at the image and the poem as one continuous gesture, and one whole second feels long inside that gesture.
+
+The second is cost. Monthly active users hover near 8,000 DAU, and each one taps the poem button roughly 1.4 times per session. That's around 330,000 requests per month. At about 400 tokens per request (prompt + response combined) the math is 132M input tokens and 66M output tokens. At Gemini 2.5 Flash rates that came out to ¥18,400 a month — not enough to wipe out ad revenue, but enough to be uncomfortable for a free app.
+
+The third is the offline behavior. Users who open the app on the subway or in airplane mode see a stuck "loading…" state and write reviews along the lines of "felt slower recently." It also throws off the timing of AdMob interstitials. I wanted the poem at least to appear even when the network is gone.
+
+While sorting through these I realized that Apple's FoundationModels framework hits a sweet spot for short structured generation. The on-device model is a roughly 3B distilled model, which is plenty for six-to-twelve-line poems with a defined schema.
+
+## What Apple FoundationModels is good at, and what to keep away from it
+
+To be specific: this is not a cloud replacement. The shape of tasks I've found it carries reliably is narrower than the marketing suggests.
+
+It is genuinely strong on short generation in English and the major European languages, where output stays well-formed up to about 200–400 tokens. JSON-style structured output via `@Generable` rarely produces schema violations, much like Gemini's structured output mode. Tagging, keyword extraction, short caption-style descriptions, and short formal poems sit firmly in its strike zone.
+
+It does not, however, take image input directly (you need to caption images through the Vision framework first). Long-form generation tends to truncate. As of iOS 26.0 Japanese output is still unstable: kanji selection often drifts toward literal-translation choices. RAG-style inference over big embedding sets doesn't fit comfortably because of the on-device context ceiling.
+
+Availability checking has to be the first step in production. `SystemLanguageModel.default.availability` returns values other than `.available` more often than you'd hope — `.unavailable(.deviceNotEligible)` and `.unavailable(.appleIntelligenceNotEnabled)` are both common — so writing the branching code up front is the only sane option.
+
+```swift
+import FoundationModels
+
+enum LocalModelStatus {
+    case ready
+    case notEligible
+    case appleIntelligenceOff
+    case downloading
+    case other(String)
+}
+
+func detectLocalModelStatus() -> LocalModelStatus {
+    let model = SystemLanguageModel.default
+    switch model.availability {
+    case .available:
+        return .ready
+    case .unavailable(.deviceNotEligible):
+        return .notEligible
+    case .unavailable(.appleIntelligenceNotEnabled):
+        return .appleIntelligenceOff
+    case .unavailable(.modelNotReady):
+        return .downloading
+    case .unavailable(let reason):
+        return .other(String(describing: reason))
+    @unknown default:
+        return .other("unknown")
+    }
+}
+```
+
+On my DAU mix (which leans toward older devices because wallpaper apps tend to attract long-term users on aging hardware), the share that returns `.ready` is roughly 38%: iPhone 15 Pro and later, plus M-series iPads.
+
+## The routing decision tree: local first, cloud when it isn't enough
+
+The core idea is to make the per-request decision declarative, so you can adjust it later without rewriting the call sites. I keep it small enough to express as a Swift enum and a switch.
+
+In my case the decision rests on four axes:
+
+1. Whether the local model is available (`SystemLanguageModel.availability`).
+2. Whether the request's language tag is within Apple's reliable coverage.
+3. Whether the combined input plus expected output token count fits the on-device ceiling.
+4. Whether the user explicitly chose "high quality mode" in settings.
+
+Wrapping the decision in a single function makes the upstream code easy to read.
+
+```swift
+enum InferenceTarget {
+    case appleFoundationModels
+    case geminiFlash
+    case geminiPro
+}
+
+struct RoutingInput {
+    let languageCode: String          // "ja" / "en" / "fr" / etc.
+    let estimatedInputTokens: Int
+    let estimatedOutputTokens: Int
+    let userPrefersQuality: Bool
+    let modelStatus: LocalModelStatus
+}
+
+func decideTarget(_ input: RoutingInput) -> InferenceTarget {
+    // High-quality mode always goes to the cloud.
+    if input.userPrefersQuality {
+        return input.estimatedInputTokens > 32_000
+            ? .geminiPro
+            : .geminiFlash
+    }
+
+    // Otherwise: cloud when local is unavailable, language is unsupported, or input/output too long.
+    let totalTokens = input.estimatedInputTokens + input.estimatedOutputTokens
+    let isAppleLangSupported = ["en", "fr", "de", "es", "it", "pt"].contains(input.languageCode)
+    let isWithinLocalLimit = totalTokens <= 1_500
+
+    switch input.modelStatus {
+    case .ready where isAppleLangSupported && isWithinLocalLimit:
+        return .appleFoundationModels
+    default:
+        return input.estimatedInputTokens > 32_000
+            ? .geminiPro
+            : .geminiFlash
+    }
+}
+```
+
+The `isAppleLangSupported` list reflects what I observed on iOS 26.0. I deliberately exclude Japanese: during my own quality pass the model swapped kanji that changed the meaning of the line (one haiku turned "autumn duck" into "autumn crane"), so I keep that path on Gemini. I plan to re-evaluate after iOS 26.x updates, and the list is loaded from a config file so I can flip it without shipping a binary.
+
+## Swift: generating poems with FoundationModels on-device
+
+For structured text like a poem I lean on `@Generable` to define the schema and let the model fill it in.
+
+```swift
+import FoundationModels
+
+@Generable
+struct ShortPoem {
+    @Guide(description: "Title in three to five words.")
+    var title: String
+
+    @Guide(description: "Body lines, six to ten lines total, each fewer than 12 words.")
+    var lines: [String]
+
+    @Guide(description: "Mood tag: calm, melancholic, hopeful, energetic.")
+    var mood: String
+}
+
+actor LocalPoemGenerator {
+    private var session: LanguageModelSession?
+
+    func prepare() async throws {
+        guard SystemLanguageModel.default.availability == .available else {
+            throw PoemError.localUnavailable
+        }
+        if session == nil {
+            session = LanguageModelSession(model: .default,
+                                           instructions: """
+                You are a quiet, observant poet. Use plain English.
+                Avoid metaphors that depend on Japanese cultural cues.
+                """)
+        }
+    }
+
+    func generate(promptDescription: String) async throws -> ShortPoem {
+        try await prepare()
+        guard let session else { throw PoemError.localUnavailable }
+        let response = try await session.respond(
+            to: """
+            Write a short poem inspired by the following scene.
+            Scene: \(promptDescription)
+            Keep the language sober and concrete.
+            """,
+            generating: ShortPoem.self,
+            options: GenerationOptions(temperature: 0.7, maximumResponseTokens: 320)
+        )
+        return response.content
+    }
+}
+
+enum PoemError: Error {
+    case localUnavailable
+    case schemaMismatch
+    case timedOut
+}
+```
+
+The `actor` wrapper is there because `LanguageModelSession` is not thread-safe, and because initializing it takes a non-trivial 150–400ms on device. Reusing one session brings the second call and beyond down to 30–80ms. Running `prepare()` once at app launch removes the cold start the user would otherwise feel on the first tap.
+
+## Swift: the cloud path through Gemini API
+
+For the cloud side I mostly use Gemini 2.5 Flash, escalating to 2.5 Pro only when the input grows long. There is no official Swift SDK, so I call `generateContent` over `URLSession` directly.
+
+```swift
+struct GeminiResponse: Decodable {
+    struct Candidate: Decodable {
+        struct Content: Decodable {
+            struct Part: Decodable { let text: String }
+            let parts: [Part]
+        }
+        let content: Content
+    }
+    let candidates: [Candidate]
+}
+
+actor GeminiPoemGenerator {
+    private let apiKey: String
+    private let session: URLSession
+
+    init(apiKey: String, session: URLSession = .shared) {
+        self.apiKey = apiKey
+        self.session = session
+    }
+
+    func generate(promptDescription: String,
+                  model: String = "gemini-2.5-flash") async throws -> ShortPoem {
+        let endpoint = URL(string:
+            "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)")!
+        let schema: [String: Any] = [
+            "type": "OBJECT",
+            "properties": [
+                "title": ["type": "STRING"],
+                "lines": ["type": "ARRAY", "items": ["type": "STRING"]],
+                "mood": ["type": "STRING", "enum": ["calm", "melancholic", "hopeful", "energetic"]]
+            ],
+            "required": ["title", "lines", "mood"]
+        ]
+        let body: [String: Any] = [
+            "contents": [[
+                "parts": [["text": """
+                    Write a short poem inspired by the scene below.
+                    Output JSON that matches the schema. Six to ten lines.
+                    Scene: \(promptDescription)
+                """]]
+            ]],
+            "generationConfig": [
+                "responseMimeType": "application/json",
+                "responseSchema": schema,
+                "temperature": 0.8,
+                "maxOutputTokens": 512
+            ]
+        ]
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 8.0
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw PoemError.timedOut
+        }
+        let decoded = try JSONDecoder().decode(GeminiResponse.self, from: data)
+        guard let jsonText = decoded.candidates.first?.content.parts.first?.text,
+              let jsonData = jsonText.data(using: .utf8) else {
+            throw PoemError.schemaMismatch
+        }
+        return try JSONDecoder().decode(ShortPoem.self, from: jsonData)
+    }
+}
+```
+
+The shared `ShortPoem` type is doing real work here. From the caller's perspective, both backends look like "a function that returns a ShortPoem," so switching the routing target does not ripple into the UI layer.
+
+## The facade that holds it together
+
+The decision logic and the two backends meet in a facade. The rest of the app only sees this.
+
+```swift
+final class PoemEngine {
+    private let local: LocalPoemGenerator
+    private let cloudFlash: GeminiPoemGenerator
+    private let cloudPro: GeminiPoemGenerator
+
+    init(geminiApiKey: String) {
+        self.local = LocalPoemGenerator()
+        self.cloudFlash = GeminiPoemGenerator(apiKey: geminiApiKey)
+        self.cloudPro = GeminiPoemGenerator(apiKey: geminiApiKey)
+    }
+
+    func generate(scene: String,
+                  languageCode: String,
+                  estimatedInputTokens: Int = 220,
+                  estimatedOutputTokens: Int = 320,
+                  userPrefersQuality: Bool = false) async throws -> (ShortPoem, InferenceTarget) {
+        let status = detectLocalModelStatus()
+        let target = decideTarget(.init(
+            languageCode: languageCode,
+            estimatedInputTokens: estimatedInputTokens,
+            estimatedOutputTokens: estimatedOutputTokens,
+            userPrefersQuality: userPrefersQuality,
+            modelStatus: status
+        ))
+
+        do {
+            switch target {
+            case .appleFoundationModels:
+                return (try await local.generate(promptDescription: scene), target)
+            case .geminiFlash:
+                return (try await cloudFlash.generate(promptDescription: scene,
+                                                      model: "gemini-2.5-flash"), target)
+            case .geminiPro:
+                return (try await cloudPro.generate(promptDescription: scene,
+                                                    model: "gemini-2.5-pro"), target)
+            }
+        } catch PoemError.localUnavailable, PoemError.schemaMismatch {
+            // Quietly fall back to the cloud when the local path can't deliver.
+            return (try await cloudFlash.generate(promptDescription: scene), .geminiFlash)
+        }
+    }
+}
+```
+
+Returning the chosen `InferenceTarget` alongside the poem turns out to matter. I initially omitted it and spent a confused afternoon trying to interpret latency graphs that mixed the two paths into one curve.
+
+## One week of production numbers
+
+I aggregated logs from the iOS 26 beta TestFlight inside my team and the first few days after the public release — about 114,000 requests in total. Broken down by path:
+
+The local path (eligible for about 38% of users, used for roughly 46% of actual requests) had a mean latency of 90ms, p95 of 180ms, and a failure rate of 0.4%. The failures were almost entirely `schemaMismatch`; bumping `maximumResponseTokens` from 320 to 384 dropped that into the 0.1% range. Cost: zero.
+
+The Gemini 2.5 Flash path (about 51% of actual requests) averaged 720ms, with p95 at 1.4s and a 0.7% failure rate. Failures were mostly 5xx responses that timed out at 8s. Moving from the Cloudflare Workers proxy to direct API calls trimmed p95 from 1.8s to 1.4s.
+
+The Gemini 2.5 Pro path (about 3% of requests, only when a user enabled high quality mode) averaged 1.2s with a 0.2% failure rate.
+
+Monthly costs reflected the shift directly: Flash traffic dropped from 330,000 requests to 168,000, so the Gemini bill went from about ¥18,400 to about ¥4,720 — roughly a 74% reduction.
+
+The AdMob eCPM impact was inside the noise floor (-0.6% week over week, within the confidence interval). What did move was a downstream metric: with the local path snapping back faster, the "read the poem, swipe to the next image" gesture chain felt smoother, and the number of images viewed per session rose by a factor of 1.07. Interstitial impressions tracked that 1.05x rise, so ad revenue ticked up rather than down.
+
+## Four traps I walked into
+
+These are notes to my future self.
+
+**Trap one: forgetting the cold start.** Initializing `LanguageModelSession` can take close to 400ms on certain devices. I originally did it inside `generate()`, which made the first call painfully slow and every subsequent call fast — confusing for users and confusing in the metrics. Moving the initialization into a one-shot `actor.prepare()` at app launch removed the symptom.
+
+**Trap two: trusting `Locale` too much for language detection.** A non-trivial share of Japanese users keep the app's interface in English, so `Locale.current.language.languageCode?.identifier` misclassified the request language. I now run the prompt's description text through `NLLanguageRecognizer` (NaturalLanguage framework) and override the locale-derived value when the two disagree.
+
+**Trap three: temperature does not mean the same thing on both backends.** At the same `temperature: 0.7`, Apple FoundationModels produces a narrower vocabulary spread while Gemini 2.5 Flash produces a wider syntactic spread. I land on closer subjective quality by using 0.7 on the local side and 0.8 on the Gemini side; the call sites pass different values intentionally.
+
+**Trap four: schema-violation fallback as a UX problem, not an engineering problem.** Showing "Sorry, generation failed" was the wrong answer. Retrying once on the cloud, and then surfacing a "Try the next image" button if that fails too, brought complaint reviews to zero. Any AI feature in production needs its failure path designed separately, not as an afterthought.
+
+## Where I'd start, if I were you
+
+The first concrete step I recommend is just looking at one day of your existing Gemini logs and counting the requests that turn out to be short, single-language, schema-friendly tasks. In my case 46% of all requests fit inside "six to ten lines, mostly English, under 1,500 combined tokens." Seeing that number on paper was what convinced me the rewrite would actually be worth doing.
+
+After that, ship the observation code first: read `SystemLanguageModel.availability` on real devices for a few days and find out what fraction of your user base is eligible. Wrap the routing behind a Firebase Remote Config flag so you can roll it out gradually. I ran observation-only for three days, then 10% for a few days, and reached 100% over the course of a week.
+
+The code in this article is a cleaned-up version of what I'm running in my own wallpaper app. Apple FoundationModels is still maturing, and I expect to rewrite parts of this routing layer again next quarter. I hope these notes are useful for anyone else running AI features as an indie developer. Thanks for reading.
