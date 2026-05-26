@@ -1,0 +1,126 @@
+---
+title: "Why Gemini API Streaming Drops on iOS After Backgrounding — and How to Fix It"
+slug: "ios-urlsession-gemini-streaming-background-resume-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-26T11:30"
+author: "Gemini Lab"
+description: "When your iOS app receives a streaming response from Gemini API and the user briefly switches to another app, the stream often goes silent forever. Here's how URLSession actually treats long-lived HTTP, and the smallest change that brings reliability back."
+tags: ["Gemini API", "iOS", "Swift", "URLSession", "streaming", "troubleshooting"]
+---
+
+A few iOS developer friends have asked me the same question recently: their Gemini-powered chat works perfectly in the simulator, but on real devices the stream silently dies whenever the user pops out to Safari and comes back. I ran into exactly this myself when I added AI caption generation to one of the wallpaper apps I've been running as an indie developer since 2014. The issue surfaced right after a TestFlight push: users who watched an AdMob rewarded video and returned to the app would see the spinner spin forever.
+
+This isn't really a Gemini bug — it's a classic URLSession lifecycle problem that shows up the moment you try to stream HTTP responses on iOS. The good news is that the fix is small and mechanical once you understand what iOS is doing under the hood.
+
+## What the failure looks like in practice
+
+The reproduction pattern is consistent:
+
+- The streaming response starts, the first few chunks appear in the UI
+- The user backgrounds the app for anywhere between a few seconds and half a minute
+- They return — and no further tokens arrive
+- Some seconds later Xcode prints `NSURLErrorDomain Code=-1005 (The network connection was lost)`
+
+You won't see this in the simulator. It only shows up on physical devices, and it shows up more aggressively when Low Power Mode is on. For a flow like mine — AdMob rewarded video → return → expect a completed AI caption — that silent failure is conversion poison.
+
+## The real culprit: idle connections and task suspension
+
+iOS treats an open streaming HTTP request as a single `URLSessionDataTask`. When your app moves to the background, the system makes two judgements in quick succession:
+
+- A foreground-only session (the default `URLSession.shared`) will close its sockets within seconds when idle
+- Without the right Background Modes entitlement, your data task is a candidate for suspension regardless
+
+Gemini's `streamGenerateContent` endpoint sends chunks irregularly, especially during the model's thinking phase. From iOS's perspective, that silence reads as "idle" and the underlying TCP connection gets dropped. URLSession will not silently retry — it just hands you a completion error after the fact, and your `for try await` loop ends without warning your UI.
+
+## The broken pattern, and the minimum viable fix
+
+Here is the shape most production crashes I've seen take:
+
+```swift
+// ❌ Convenient, but fragile across foreground/background transitions
+let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?key=\(apiKey)")!
+var req = URLRequest(url: url)
+req.httpMethod = "POST"
+req.httpBody = try JSONEncoder().encode(body)
+let (bytes, _) = try await URLSession.shared.bytes(for: req)
+for try await line in bytes.lines {
+    update(line)
+}
+```
+
+`URLSession.shared` is fine for ad-hoc fetches, but it gives you no handle on timeouts or connectivity behaviour. The first thing I do is build a session specifically for streaming workloads:
+
+```swift
+// ✅ Tuned for long-lived Gemini streams
+private let streamingSession: URLSession = {
+    let config = URLSessionConfiguration.default
+    config.timeoutIntervalForRequest = 60       // per-chunk patience
+    config.timeoutIntervalForResource = 300     // hard cap for the whole stream
+    config.waitsForConnectivity = true          // ride out brief network gaps
+    config.allowsCellularAccess = true
+    config.httpMaximumConnectionsPerHost = 4
+    return URLSession(configuration: config)
+}()
+```
+
+`waitsForConnectivity = true` is the single most underrated flag here. When a user walks between Wi-Fi and LTE — or through a tunnel on a train — URLSession will hold the request rather than failing it. Just adding that flag eliminated a meaningful percentage of my support emails.
+
+## Detecting the return and resuming via Gemini's own context
+
+`waitsForConnectivity` does not actually resume an in-flight request, though. Gemini's streaming endpoint does not support resumable streaming the way large file uploads do, so the workable pattern is: snapshot the partial response when the app backgrounds, and ask Gemini to continue from that exact text when it returns.
+
+SwiftUI's `ScenePhase` is the natural hook:
+
+```swift
+struct ChatView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var vm = ChatViewModel()
+
+    var body: some View {
+        ChatBody(vm: vm)
+            .onChange(of: scenePhase) { _, phase in
+                switch phase {
+                case .background:
+                    vm.snapshotPartial()       // remember the partial text
+                case .active:
+                    if vm.wasInterrupted {
+                        Task { await vm.resumeFromSnapshot() }
+                    }
+                default: break
+                }
+            }
+    }
+}
+```
+
+On the resume side, you append the partial text as an `assistant` turn, then ask the model to continue from there. Gemini handles this gracefully if you give it a short tone-preserving nudge:
+
+```swift
+func resumeFromSnapshot() async {
+    var history = currentHistory
+    history.append(.init(role: "model", parts: [.text(partialText)]))
+    history.append(.init(role: "user", parts: [.text("Please continue the previous answer in the same tone, starting from where it left off.")]))
+    await streamGenerate(contents: history)
+}
+```
+
+The "same tone" hint matters more than it sounds — without it, the continuation often shifts register, and the seam becomes visible to the user.
+
+## Four checks for the edge cases that survive
+
+After the changes above, most of the disconnects vanish. A small number of cases remain, and these are what I check in order:
+
+1. **App Transport Security exceptions** — if you've routed traffic through a custom proxy, backgrounding can trigger ATS re-evaluation and break the connection with a `-1200`-family error. Hitting Google's endpoint directly is the cleanest baseline.
+2. **`URLSessionDataDelegate` vs the async API** — `bytes(for:)` is the convenient path, but a delegate-based implementation gives you `didReceive data` and `didCompleteWithError` independently, which makes triage faster in production.
+3. **VPN or per-app network filters** — some VPN clients re-establish their tunnel when the app comes back to foreground, and HTTP requests in flight rarely survive that. When users report random disconnects, my first question is whether they have a VPN active.
+4. **Low Power Mode** — under Low Power Mode iOS is more aggressive about killing background networking. I check `ProcessInfo.processInfo.isLowPowerModeEnabled` and surface a small note in the UI ("Long generations may be interrupted in Low Power Mode"), which has noticeably reduced support tickets.
+
+## Where I landed in my own apps
+
+Across the wallpaper apps I've been running — together they sit north of 50 million downloads — the pragmatic compromise turned out to be a split: short prompts (typically under five seconds) keep the streaming UX, while longer prompts fall back to the non-streaming `generateContent` endpoint. Streaming is a UI trick to make the model feel snappy; for anything where the user expects a complete answer after backgrounding, the completion endpoint is simply more honest.
+
+## Where to start
+
+Begin with the three lines of `URLSessionConfiguration` (timeouts, `waitsForConnectivity`, dedicated session). That single change usually cuts the disconnect rate in half. Then layer in the `ScenePhase` snapshot-and-resume pattern and you'll have a chat that survives the kind of app switching iOS users actually do. Thanks for reading — I hope this saves you the half day it cost me.

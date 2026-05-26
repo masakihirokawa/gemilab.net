@@ -1,0 +1,128 @@
+---
+title: "iOS の URLSession で Gemini API のストリーミングがバックグラウンド復帰時に途切れる原因と対処"
+slug: "ios-urlsession-gemini-streaming-background-resume-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-26T11:30"
+author: "Gemini Lab"
+description: "iOS アプリで Gemini API のストリーミング応答を受け取っている最中にアプリを一旦バックグラウンドに送って戻ると、接続が切れて続きが返ってこない――そんな現象に遭遇したときの原因切り分けと、URLSession 周りの最小修正をまとめます。"
+tags: ["Gemini API", "iOS", "Swift", "URLSession", "ストリーミング", "トラブルシューティング"]
+---
+
+iOS アプリで Gemini API のストリーミング応答を流していると、ユーザーが Safari や設定アプリを少し開いて戻ってきた瞬間にレスポンスが止まる、という相談を何度か受けました。私自身、運営している壁紙系の iOS アプリで Gemini を使った「AI による壁紙キャプション生成」を組み込んだとき、TestFlight 配布直後にこの症状で半日溶かしたことがあります。AdMob のリワード動画を見終わって戻ってきた瞬間に切れる、というユーザー報告で気づきました。
+
+2014年から個人開発で App Store にアプリを出し続けている立場から見ると、これは「Gemini 側のエラー」ではなく「iOS の URLSession 設計を理解せずに HTTP ストリーミングを乗せたとき」に起きる典型的な落とし穴です。本来は再接続できるはずなのに、切断検知のロジックがないまま続きを待ち続けて、UI 上は「考え中…」のスピナーが永遠に回るだけになってしまう、というパターンが多いと感じます。
+
+## 症状 — どんな時に「切れる」のか
+
+ユーザー操作の流れと、観測される挙動を整理しておきます。
+
+- ストリーミング応答の途中（最初のチャンクは UI に届いている）でアプリをバックグラウンドへ送る
+- 数秒〜30 秒ほど経ってフォアグラウンドに戻す
+- 続きのチャンクがいつまで経っても届かない／ローディングが止まらない
+- Xcode のコンソールには `NSURLErrorDomain Code=-1005 (The network connection was lost)` が遅れて流れてくる
+
+シミュレータでは再現せず、実機（特に省電力モードや Low Power Mode）で頻発するのも特徴です。私の AdMob 案件のように「リワード動画 → 復帰 → 続きを期待」のような UX を組んでいる場合、ここで折れるとユーザーは黙って離脱します。
+
+## まず疑うべきは「アイドルタイムアウト」と「シングルタスク扱い」
+
+iOS の URLSession は、HTTP/1.1 や HTTP/2 のロングコネクション（ストリーミング）を 1 つのタスクとして扱います。アプリがバックグラウンドに入ると、システムは以下のいずれかを判断します。
+
+- フォアグラウンド限定のセッション（既定の `URLSession.shared`）は数秒〜十数秒でソケットを閉じる
+- アプリが「Background Modes」未設定なら、`URLSessionDataTask` は基本的に suspend 対象
+
+つまり「Gemini からまだチャンクが来ていない＝アイドル」と OS が判断した瞬間、TCP コネクション自体が落とされます。復帰しても、URLSession が自動でリトライしてくれることはありません。アプリ側で切断検知して再接続のリクエストを投げ直す必要があります。
+
+## 再現コードと、まずやるべき最小修正
+
+ありがちな「壊れた」実装はこんな形です。
+
+```swift
+// ❌ よくある実装：背景に入ると簡単に切れる
+let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?key=\(apiKey)")!
+var req = URLRequest(url: url)
+req.httpMethod = "POST"
+req.httpBody = try JSONEncoder().encode(body)
+let (bytes, _) = try await URLSession.shared.bytes(for: req)
+for try await line in bytes.lines {
+    update(line)
+}
+```
+
+`URLSession.shared` は便利ですが、タイムアウトもコネクションも自分でコントロールできません。最低限、専用の `URLSession` を持ち、ストリーミング用に長めのアイドルタイムアウトと「セルラー使用許可」「待機可」設定を明示します。
+
+```swift
+// ✅ ストリーミング用にチューニングした URLSession
+private let streamingSession: URLSession = {
+    let config = URLSessionConfiguration.default
+    config.timeoutIntervalForRequest = 60      // 1 チャンク待ちの上限
+    config.timeoutIntervalForResource = 300    // ストリーム全体の上限
+    config.waitsForConnectivity = true         // 一時的な切断なら自動待機
+    config.allowsCellularAccess = true
+    config.httpMaximumConnectionsPerHost = 4
+    return URLSession(configuration: config)
+}()
+```
+
+`waitsForConnectivity = true` は、Wi-Fi から 4G へ切り替わるような短時間の切断であれば、URLSession 側で接続を待ち合わせてくれます。これだけで「電車のトンネル」系の切断はかなり減ります。
+
+## バックグラウンド復帰を検知して、続きを取り直す
+
+ただし、`waitsForConnectivity` は「ネットワークが復旧したら同じリクエストを送り直す」わけではありません。Gemini の `streamGenerateContent` は途中再開（resumable streaming）に対応していないので、アプリ側で「どこまで読めたか」を覚えておき、復帰時に新しいリクエストとして投げ直すのが現実解です。
+
+SwiftUI なら `ScenePhase` を使います。
+
+```swift
+struct ChatView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var vm = ChatViewModel()
+
+    var body: some View {
+        ChatBody(vm: vm)
+            .onChange(of: scenePhase) { _, phase in
+                switch phase {
+                case .background:
+                    vm.snapshotPartial()       // 受信済みテキストを保持
+                case .active:
+                    if vm.wasInterrupted {
+                        Task { await vm.resumeFromSnapshot() }
+                    }
+                default: break
+                }
+            }
+    }
+}
+```
+
+`ChatViewModel` 側は「ここまで受け取った文字列」を保持しておき、復帰時にはそれをプロンプトに含めて続きを依頼します。Gemini への再リクエストは、ユーザーへの応答を `assistant` ロール側のメッセージとして履歴に追加し、「直前の応答の続きから書いてください」と指示するだけで、自然な続きが返ってきます。
+
+```swift
+func resumeFromSnapshot() async {
+    var history = currentHistory
+    history.append(.init(role: "model", parts: [.text(partialText)]))
+    history.append(.init(role: "user", parts: [.text("直前の回答の続きから、同じトーンで書き続けてください。")]))
+    await streamGenerate(contents: history)
+}
+```
+
+ここでのコツは「同じトーンで」と一言入れることです。これがないと、続きが急に文体だけ変わって不自然になります。
+
+## それでも切れる時に確認する 4 つのポイント
+
+上の修正でほとんどのケースは解消しますが、稀に残る症状もあります。確認順に並べておきます。
+
+1. **App Transport Security（ATS）の例外を入れていないか**: 独自プロキシ経由にしているとバックグラウンド復帰時に検証が走り、`-1200` 系のエラーで切れることがあります。素直に Google のエンドポイントを直叩きするのが安定します。
+2. **`URLSessionDataDelegate` を使っているか**: SwiftConcurrency の `bytes(for:)` は手軽ですが、デリゲートを実装した方が `didReceive data`・`didCompleteWithError` を取りやすく、デバッグもしやすいです。本番運用ではデリゲート版に倒した方が問題切り分けが早くなります。
+3. **VPN や仮想ネットワークが間に入っていないか**: 一部の VPN クライアントはアプリのバックグラウンド復帰時にトンネルを張り直すため、その間の HTTP がほぼ確実に切れます。ユーザーから報告が来た時は「VPN を切って試してください」を最初に聞きます。
+4. **iOS の Low Power Mode が ON か**: 低電力モードでは、バックグラウンド時のネットワーク維持がより積極的に切られます。`ProcessInfo.processInfo.isLowPowerModeEnabled` で検知し、UI に「省電力モードでは長文生成が中断されることがあります」と一言出すだけでサポート問い合わせが減りました。
+
+## 私が運用している壁紙アプリでの落とし所
+
+私の場合、累計 5,000 万 DL を超える壁紙アプリ群で、AdMob のリワード動画と AI 生成キャプションを組み合わせるフローを動かしています。「動画を見て戻ってきたらキャプションが完成している」が理想ですが、実際には上記の症状で 1〜2 割が途中で止まっていました。
+
+最終的には、5 秒で完了する短いプロンプトのときだけストリーミングを使い、長いプロンプトは非ストリーミング（`generateContent`）にフォールバックする実装に落ち着きました。ストリーミングはあくまで「タイピング感覚を出す UI 演出」と割り切り、安定性が必要な場面は完了 API に寄せる、という棲み分けです。
+
+## 次のアクション
+
+まずは `URLSessionConfiguration` の 3 行（タイムアウト・`waitsForConnectivity`・専用セッション化）から手を入れてみてください。ここだけで切断率が半分以下になるはずです。そこから ScenePhase 連動の再開ロジックを足していけば、ユーザーがアプリを切り替えても会話が続いていく iOS らしい体験に近づきます。お読みいただきありがとうございました。
