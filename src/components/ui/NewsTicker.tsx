@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH35 — Gemini 3.5 Flash 提供開始、Antigravity 2.0 のエージェント実行エンジンとして Gemini API・AI Studio・Vertex AI で利用可能（5/27）",
-    "AGENTBENCH — Gemini 3.5 Flash が Terminal-Bench 2.1 で 76.2%、MCP Atlas で 83.6%、CharXiv Reasoning で 84.2% を記録（5/27）",
-    "OMNI — Gemini Omni シリーズ発表、image / audio / video / text 入力から現実世界に根拠付けされた動画を出力（5月）",
-    "MANAGED — Managed Agents in Gemini API が公開プレビュー、isolated Linux サンドボックスで stateful autonomous agent を実行（5月）",
-    "FILESEARCH — File Search が gemini-embedding-2 でマルチモーダル検索対応、画像をネイティブに埋め込み・検索可能に（5月）",
-    "AIMODE — Search の AI Mode が Gemini 3.5 Flash 駆動に、入力に応じて拡張する新検索ボックスと AI 提案を提供（5月）",
+    "FLASH35 — Gemini 3.5 Flash が AI Studio / Antigravity / Vertex AI で一般提供、フロンティア比 4 倍高速（5/19）",
+    "PRICING — Gemini 3.5 Flash 価格 $1.50/M input・$9/M output で 3.1 Pro に肉薄、コスト効率重視（5月）",
+    "PRO35 — Gemini 3.5 Pro が来月リリース予告、社内では既に稼働中（2026/6 展開）",
+    "FILESEARCH — File Search マルチモーダル化、gemini-embedding-2 で画像のネイティブ検索に対応（5/5）",
+    "WEBHOOKS — Event-driven Webhooks が Batch API と long-running operations のポーリングを置換（5月）",
+    "INFOAGENT — AI Pro / Ultra 加入者向けに 24/7 Information Agents が今夏ローンチ予定（5月）",
   ],
   en: [
-    "FLASH35 — Gemini 3.5 Flash launches as the agent execution engine for Antigravity 2.0, available via Gemini API, AI Studio, and Vertex AI (May 27)",
-    "AGENTBENCH — Gemini 3.5 Flash posts 76.2% on Terminal-Bench 2.1, 83.6% on MCP Atlas, and 84.2% on CharXiv Reasoning (May 27)",
-    "OMNI — The new Gemini Omni series accepts image, audio, video, and text input and outputs video grounded in real-world knowledge (May)",
-    "MANAGED — Managed Agents in the Gemini API enter public preview, running stateful autonomous agents in isolated Linux sandboxes (May)",
-    "FILESEARCH — File Search now supports multimodal search with gemini-embedding-2, letting you natively embed and search across images (May)",
-    "AIMODE — AI Mode in Search is now powered by Gemini 3.5 Flash, with an expanding search box and AI-driven query suggestions (May)",
+    "FLASH35 — Gemini 3.5 Flash now GA on AI Studio, Antigravity & Vertex AI, 4x faster than frontier models (5/19)",
+    "PRICING — Gemini 3.5 Flash priced at $1.50/M input & $9/M output, close to 3.1 Pro (May)",
+    "PRO35 — Gemini 3.5 Pro coming next month, already running internally (June 2026)",
+    "FILESEARCH — File Search goes multimodal with native image embedding via gemini-embedding-2 (5/5)",
+    "WEBHOOKS — Event-driven Webhooks replace polling for Batch API & long-running operations (May)",
+    "INFOAGENT — 24/7 Information Agents for AI Pro / Ultra subscribers launching this summer (May)",
   ],
 };
 
