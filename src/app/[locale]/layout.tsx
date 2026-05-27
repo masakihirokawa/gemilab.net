@@ -29,6 +29,8 @@ export default async function LocaleLayout({
 
   const messages = (await import(`@/i18n/messages/${locale}.json`)).default;
   const canViewPremium = !!(await getPremiumAccess());
+  // 🔔 FEATURE FLAG: メンバーシップ誘導オーバーレイ (true = 有効 / false = 無効)
+  const SHOW_PROMO_MODAL = false;
 
   return (
     <html lang={locale} suppressHydrationWarning>
@@ -72,7 +74,7 @@ export default async function LocaleLayout({
             <main style={{ paddingTop: 99 }}>{children}</main>
             <Footer />
             <DynamicScrollToTop />
-            {!canViewPremium && <DynamicMembershipPromoModal locale={locale} siteName="Gemini Lab" />}
+            {SHOW_PROMO_MODAL && !canViewPremium && <DynamicMembershipPromoModal locale={locale} siteName="Gemini Lab" />}
             <DynamicCookieBanner
               gaId="G-CJWM68JK57"
               privacyHref={locale === "ja" ? "/privacy" : "/en/privacy"}
