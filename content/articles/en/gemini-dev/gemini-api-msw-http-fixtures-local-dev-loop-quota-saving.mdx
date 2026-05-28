@@ -1,0 +1,284 @@
+---
+title: "Replaying Gemini API Calls Locally with msw and HTTP Fixtures — How I Cut API Quota Across Six Sites with a Record/Replay Pattern"
+slug: "gemini-api-msw-http-fixtures-local-dev-loop-quota-saving"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-05-28T15:45"
+author: "Gemini Lab"
+description: "When you hit the real Gemini API every time you tweak a piece of UI, you end up paying for hundreds of duplicate calls a day. After moving six of my sites to an msw-based record/replay pattern, monthly Gemini billing went unexpectedly quiet. Here's the implementation and operating policy."
+tags: ["msw", "local development", "API quota", "TypeScript", "indie developer", "streaming"]
+highlights:
+  - "A concrete implementation that uses msw at the fetch layer to replay Gemini generateContent and SSE responses from fixtures"
+  - "A record/replay design that cut my combined Gemini calls from about 1,200 per day across six sites down to roughly 80"
+  - "An operating policy that separates UI fixtures from evaluation fixtures, with a refresh procedure for model upgrades"
+---
+
+The coffee had gone cold and I was still fiddling with a loading indicator when I happened to open the Gemini API usage dashboard. The same prompt had been fired eighty times that morning. I just wanted to see how the new bounce felt; my finger had been doing the rest. I'm Masaki Hirokawa, an artist and indie developer running four sites under Dolice Labs plus two more under a separate brand — six in total — and over the last few weeks I've spent serious time figuring out how to stop the "unconscious billing" that creeps into a Gemini-powered codebase.
+
+Hitting the real API every time you tweak a piece of UI looks innocent in a code review. But once you watch the same pattern across six sites for a couple of months, you start noticing that UI iteration and evaluation share the same client, and a workflow that should need ten honest calls per day ends up making well over a hundred because UI tinkering is hidden inside the same fetch path. Rebuilding it so msw sits at the fetch layer and replays HTTP fixtures looked the same from the outside, but my API usage went quiet — and as a side effect, streaming UI bugs became much easier to find.
+
+These notes walk through the four axes I ended up caring about: spinning the local loop quickly, recording fixtures correctly, replaying them in a way that still surfaces real-world bugs, and refusing to conflate UI fixtures with evaluation fixtures.
+
+## What actually breaks when you hit the real API for UI work
+
+It helps to be precise about what's breaking, because on the surface nothing is. Three layers rot quietly when you let the real Gemini API drive every UI iteration.
+
+The first is **iteration speed**. In the admin panel of my wallpaper app, `generateContent` averages 1.4 seconds, and a streaming response completes in about 3.2 seconds. Waiting three seconds every time I nudge a 4px margin breaks the design flow noticeably.
+
+The second is **quota and billing**. Since 2014 I've been routing some of the AdMob revenue from a catalog that has now passed 50 million cumulative downloads into infrastructure for the Lab sites. Watching that money leak into duplicate API calls is the kind of friction I prefer to remove. Gemini 2.5 Flash is cheap on its own, but six sites running an admin panel each turn "just checking the layout" into a few thousand yen a month.
+
+The third — and the most insidious — is that **UI test coverage drops**. A real streaming endpoint returns slightly different lengths each time. I want to deliberately exercise the loading state, the typewriter render, mid-stream cancellation, and error paths, but with the real API everything "kind of works most of the time," and the edge cases drift out of sight.
+
+I spent about two months trying things to solve all three at once. The answer is just "intercept fetch and return canned responses," but the entire game is in how you make, store, and retire those canned responses.
+
+## Why I settled on msw — works in both the Service Worker and Node
+
+I considered nock (old), undici interceptor (ESM headaches), miragejs (overbuilt with an ORM layer), and hand-rolled fetch wrappers (invasive). I ended up standardising on msw across all six sites.
+
+Three reasons. First, msw runs as a Service Worker in the browser and as a native fetch interceptor in Node, which lets the Next.js client and server share the same handlers. Second, I don't have to change a single line of production code to install it, which matters when I'm trying to roll the same setup into six separate repos. Third, streaming responses (SSE) are just "return a ReadableStream," so I can emulate Gemini's `streamGenerateContent` without contortions.
+
+One important caveat: msw needs `public/mockServiceWorker.js` to be present, and Service Workers do not run inside `wrangler dev`. I keep wrangler-dev verification on the real API and only put local UI iteration on msw.
+
+## Directory layout — a shared fixtures module across six sites
+
+When you're rolling the same pattern across six repos, where the fixtures live matters as much as how they're written. I'm not using a monorepo, so I share fixtures through a git submodule with symlinks.
+
+```
+~/repos/
+├── claudelab.net/
+│   └── _gemini_fixtures   -> ../shared/_gemini_fixtures
+├── gemilab.net/
+│   └── _gemini_fixtures   -> ../shared/_gemini_fixtures
+├── rorklab.net/
+│   └── _gemini_fixtures   -> ../shared/_gemini_fixtures
+└── shared/_gemini_fixtures/   ← git repo
+    ├── handlers.ts
+    ├── README.md
+    └── recordings/
+        ├── ui/                ← UI verification (allowed to go stale)
+        │   ├── wallpaper-tag-suggest.sse.md
+        │   ├── review-reply-draft.json
+        │   └── ...
+        └── eval/              ← evaluation (re-record on model updates)
+            ├── 2026-05_gemini-2.5-flash/
+            └── 2026-05_gemini-3-pro/
+```
+
+Separating `ui/` from `eval/` is the foundation for the "freshness policy" below. UI fixtures used for layout work can sit there for a year without issue. Evaluation fixtures, however, lose meaning the moment a model rev ships and have to be re-recorded.
+
+## Step 1 — Record mode: hit the real API exactly once
+
+The first thing you need is a mode that hits the real API and writes the response to disk. I gate this behind `GEMINI_RECORD=1`, and wrap fetch so it teesthe response.
+
+```ts
+// shared/_gemini_fixtures/recorder.ts
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+
+const FIXTURE_DIR = path.resolve(__dirname, "recordings");
+
+export function withRecorder(fetchImpl: typeof fetch): typeof fetch {
+  if (process.env.GEMINI_RECORD !== "1") return fetchImpl;
+
+  return async (input, init) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (!url.includes("generativelanguage.googleapis.com")) {
+      return fetchImpl(input, init);
+    }
+
+    const response = await fetchImpl(input, init);
+    const cloned = response.clone();
+    const isSSE = response.headers.get("content-type")?.includes("event-stream");
+
+    const promptKey = await deriveKey(init?.body);
+    const target = path.join(
+      FIXTURE_DIR,
+      isSSE ? `${promptKey}.sse.md` : `${promptKey}.json`,
+    );
+    await mkdir(path.dirname(target), { recursive: true });
+
+    if (isSSE) {
+      const reader = cloned.body!.getReader();
+      const decoder = new TextDecoder();
+      const chunks: string[] = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(decoder.decode(value));
+      }
+      await writeFile(target, formatSseRecording(chunks), "utf8");
+    } else {
+      const text = await cloned.text();
+      await writeFile(target, prettyJson(text), "utf8");
+    }
+    return response;
+  };
+}
+```
+
+The crucial part is `response.clone()`. You write the recording from the clone so the original stream still reaches the UI. Skip that and the second `body.getReader()` on the consumer side ends up with an empty stream.
+
+`deriveKey()` produces a short hash from prompt and model name, prefixed with a readable label like `wallpaper-tag-suggest`. Without the label, finding a fixture later is genuinely painful.
+
+## Step 2 — msw handlers: serve fixtures back
+
+Once you've recorded, remove `GEMINI_RECORD` and start the app again. msw picks up the handlers and returns the fixture instead of going to Google.
+
+```ts
+// shared/_gemini_fixtures/handlers.ts
+import { http, HttpResponse } from "msw";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+
+const RECORDINGS = path.resolve(__dirname, "recordings/ui");
+
+export const handlers = [
+  http.post(
+    "https://generativelanguage.googleapis.com/v1beta/models/:model:generateContent",
+    async ({ request, params }) => {
+      const body = await request.json();
+      const key = await deriveKey(JSON.stringify(body));
+      const file = path.join(RECORDINGS, `${key}.json`);
+      try {
+        const text = await readFile(file, "utf8");
+        return HttpResponse.json(JSON.parse(text));
+      } catch {
+        return HttpResponse.json(
+          { error: { message: `fixture not found: ${file}` } },
+          { status: 404 },
+        );
+      }
+    },
+  ),
+  http.post(
+    "https://generativelanguage.googleapis.com/v1beta/models/:model:streamGenerateContent",
+    async ({ request }) => {
+      const body = await request.json();
+      const key = await deriveKey(JSON.stringify(body));
+      const file = path.join(RECORDINGS, `${key}.sse.md`);
+      const recording = await readFile(file, "utf8");
+      return new HttpResponse(replaySse(recording), {
+        headers: { "content-type": "text/event-stream" },
+      });
+    },
+  ),
+];
+```
+
+`replaySse()` is a small utility that returns a `ReadableStream` and emits chunks at random 50-150 ms intervals — close to what real SSE feels like. If you make it return everything instantly, your streaming UI verification becomes lazy.
+
+```ts
+function replaySse(recording: string): ReadableStream<Uint8Array> {
+  const lines = recording.split(/\r?\n/);
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    async start(controller) {
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        controller.enqueue(encoder.encode(`${line}\n\n`));
+        await new Promise((r) => setTimeout(r, 50 + Math.random() * 100));
+      }
+      controller.close();
+    },
+  });
+}
+```
+
+That single delay line is what made typewriter-render bug detection actually work. To make sure the user pressing Esc still cancels the stream during replay, I check `signal.aborted` immediately before each enqueue.
+
+## Step 3 — Handling structured output (`responseMimeType: application/json`)
+
+If you lean heavily on structured output, your fixtures end up being plain JSON files, which is convenient. The temptation, though, is to "fix" a schema-violating response inside the fixture so the local run looks clean. Once you start, the fixture and the real behaviour drift, and UI that replays cleanly fails in production.
+
+My rule is: fixtures must contain exactly what the real API returned. Schema violations get fixed on the production code side, not in the fixture. I keep the Zod validation outside the msw handler — the handler only reproduces "this is what the API actually sent." Violations are still useful, so I move them into a separate directory for error UI work.
+
+```
+recordings/ui/error/
+├── schema-violation-missing-tags.json
+├── empty-response-finish-reason-recitation.json
+└── safety-blocked.json
+```
+
+Isolating error fixtures under `error/` makes them explicit to call from a Storybook-style catalog.
+
+## Step 4 — Sharing the same handlers with vitest
+
+The handlers used for UI verification can also drive vitest. Boot msw from `setupFiles`, and use `server.use()` per-test to inject error paths. The test body stays readable while the coverage gets close to integration tests.
+
+```ts
+// vitest.setup.ts
+import { setupServer } from "msw/node";
+import { handlers } from "@dolice/gemini-fixtures";
+
+export const server = setupServer(...handlers);
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+```
+
+The `onUnhandledRequest: "error"` is non-negotiable. Forget it and any unmocked request leaks through to the real API. On my first attempt I missed this, and a single test run on the four-site monorepo emitted dozens of unintended calls in CI. The bill that surprised me at the end of the month was the one from Google Cloud Console, not Cloudflare.
+
+Error paths get layered in locally:
+
+```ts
+import { server } from "../vitest.setup";
+import { http, HttpResponse } from "msw";
+
+it("surfaces the retry UI when the safety filter trips", async () => {
+  server.use(
+    http.post("**/streamGenerateContent", () =>
+      HttpResponse.json(
+        { promptFeedback: { blockReason: "SAFETY" } },
+        { status: 200 },
+      ),
+    ),
+  );
+  // ...UI-side assertions
+});
+```
+
+## Step 5 — The fixture freshness policy
+
+Fixtures are useful only as long as they're trusted. My written rules are:
+
+- **UI fixtures (`recordings/ui/`)** — fine to sit untouched for a year, as long as the API shape doesn't change. Layout, typewriter, cancellation, and error UI verification all live here.
+- **Evaluation fixtures (`recordings/eval/`)** — re-recorded the day a model is updated. Prompt-quality regression and real schema validation rely on these.
+- **Error fixtures (`recordings/ui/error/`)** — at minimum, `finishReason: SAFETY`, `RECITATION`, `MAX_TOKENS`, and a 5xx network error, kept permanently.
+
+Before I wrote this down, I once used a UI fixture for evaluation and shipped a switch to `gemini-3-pro`. The structured output that passed locally broke in production. Since then, evaluation fixtures always have the model ID in the directory name, no exceptions.
+
+## Step 6 — Keep record mode out of CI and production
+
+You also need belt-and-braces protection so record mode never runs by accident. I use three layers:
+
+1. `GEMINI_RECORD=1` lives only in `.env.development.local` and never in `.env.production`.
+2. The `prebuild` script in `package.json` asserts `[ "$GEMINI_RECORD" != "1" ]`.
+3. GitHub Actions workflows force `env.GEMINI_RECORD: ""` as a hard failsafe.
+
+Even so, the way I used to write CGI scripts on my own back in 1997 when I was sixteen, you sometimes type something into a shell you forget about. One morning I had exported `GEMINI_RECORD=1` for a debugging session and accidentally ran `npm run build` from the same shell. The build embedded recorder logic, and only Cloudflare Workers' lack of `fs.writeFile` saved me from writing fixtures into production. That accident is the reason "pick a runtime that can't accidentally write files" became my third defense.
+
+## One month of operational data — what six sites looked like
+
+These numbers are pulled from Google Cloud Console's API metrics, four weeks before and after the switch.
+
+- **Before (4 weeks):** roughly 33,600 Gemini calls per month total, of which about 28,500 (85%) were repeat UI calls
+- **After (4 weeks):** roughly 2,200 calls per month total, with UI calls down to about 380 (17%)
+- **Monthly bill** (a mix of gemini-2.5-flash and gemini-3-pro): from about USD 18 down to about USD 1.4
+- **Side effect:** detected streaming UI bugs rose from 9 to 23 in a single month (typewriter race conditions, leaked AbortController, empty-response UI, and more)
+
+The numbers themselves are modest. What changed more, in my experience, was the rhythm of the design loop. Once you remove the three-second wait, you start poking at details you used to defer.
+
+## A minimal starter — what I would do today
+
+If I were starting from scratch on a new site, here's the smallest viable order:
+
+1. Install `msw` and `@mswjs/data` (the latter pays off later when you want to synthesise fixtures dynamically).
+2. Put three hand-written JSON files in `recordings/ui/` — don't bother with record mode yet.
+3. Wire up `handlers.ts` for a single URL pattern (`generateContent` only).
+4. Skip streaming for the first pass; fixtureise structured output alone.
+5. Once that works, measure your real daily UI call count, then build record mode.
+
+I tried to bring up the complete pipeline on day one and burned out. The five-step path is what I actually rolled across all six sites. On the last two sites I only use structured output, so I never had to build the SSE replay there.
+
+I keep thinking about how my grandfathers, who were temple carpenters, used to say that the act of fixing things with your own hands is itself a form of devotion. Writing fixtures is unglamorous work, but it has become a small daily devotion that protects the stamina I need to run six sites alone. I hope this is useful to anyone else who is wiring Gemini into more than one project at a time.
