@@ -4,25 +4,24 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH35 — Gemini 3.5 Flash が AI Studio / Antigravity / Vertex AI で一般提供、フロンティア比 4 倍高速（5/19）",
-    "PRICING — Gemini 3.5 Flash 価格 $1.50/M input・$9/M output で 3.1 Pro に肉薄、コスト効率重視（5月）",
-    "PRO35 — Gemini 3.5 Pro が来月リリース予告、社内では既に稼働中（2026/6 展開）",
-    "FILESEARCH — File Search マルチモーダル化、gemini-embedding-2 で画像のネイティブ検索に対応（5/5）",
-    "WEBHOOKS — Event-driven Webhooks が Batch API と long-running operations のポーリングを置換（5月）",
-    "INFOAGENT — AI Pro / Ultra 加入者向けに 24/7 Information Agents が今夏ローンチ予定（5月）",
+    "BUILT-IN+CUSTOM — Gemini API で Google 検索 grounding やコード実行を custom function calling と 1 リクエストで併用可能に（5月）",
+    "MAPS GROUNDING — Gemini 3 系で Google Maps grounding 解禁、地理データ・営業時間・経路を citations 付きで取得（5月）",
+    "3.5 PRO — Gemini 3.5 Pro は 6 月一般公開予定、Google 社内で既に稼働中（5/27）",
+    "MULTIMODAL RAG — File Search が画像対応、media_id と page-level citations で verifiable RAG を構築可能（5/5）",
+    "WEBHOOKS — Batch API / long-running operations の状態通知が webhook ベースに統一、ポーリング不要に（5月）",
+    "WWDC × GEMINI — 新 Siri は Gemini ベースのカスタムモデル + Apple Private Cloud Compute で動作との報道（5月）",
   ],
   en: [
-    "FLASH35 — Gemini 3.5 Flash now GA on AI Studio, Antigravity & Vertex AI, 4x faster than frontier models (5/19)",
-    "PRICING — Gemini 3.5 Flash priced at $1.50/M input & $9/M output, close to 3.1 Pro (May)",
-    "PRO35 — Gemini 3.5 Pro coming next month, already running internally (June 2026)",
-    "FILESEARCH — File Search goes multimodal with native image embedding via gemini-embedding-2 (5/5)",
-    "WEBHOOKS — Event-driven Webhooks replace polling for Batch API & long-running operations (May)",
-    "INFOAGENT — 24/7 Information Agents for AI Pro / Ultra subscribers launching this summer (May)",
+    "BUILT-IN+CUSTOM — Gemini API now combines built-in tools (search grounding, code exec) with custom function calls in one request (May)",
+    "MAPS GROUNDING — Gemini 3 models gain Google Maps grounding: geo data, hours, routes with citations (May)",
+    "3.5 PRO — Gemini 3.5 Pro arrives in June, already used internally at Google (5/27)",
+    "MULTIMODAL RAG — File Search goes multimodal: media_id + page-level citations for verifiable RAG (5/5)",
+    "WEBHOOKS — Batch API and long-running operations now notify via webhooks; goodbye polling (May)",
+    "WWDC × GEMINI — New Siri reportedly runs on a custom Gemini-based model via Apple's Private Cloud Compute (May)",
   ],
 };
 
 export function NewsTicker() {
-
   const locale = useLocale();
   const items = NEWS_ITEMS[locale] || NEWS_ITEMS.en;
   const doubled = [...items, ...items];
