@@ -1,0 +1,165 @@
+---
+title: "Why per-turn generationConfig is ignored in Gemini API chat sessions"
+slug: "gemini-api-chat-per-turn-generation-config-not-applied-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-28T11:30"
+author: "Gemini Lab"
+description: "If you pass a different generationConfig (temperature, max_output_tokens, response_schema) to each send_message in a google-genai chat session and the behavior never changes, this walkthrough shows what is actually happening, why the SDK is designed that way, and three workarounds we use in production for review-summary and reply-draft pipelines."
+tags: ["gemini-api", "google-genai", "chat", "generation-config", "temperature", "troubleshooting", "python"]
+---
+
+I have been doing solo iOS/Android app development since 2014 alongside my work as an artist. One of my wallpaper and relaxation apps grew to over a million yen per month in AdMob revenue, and in the back office I run a Gemini API pipeline that summarizes user reviews and drafts replies to them. I wanted the summary side to be tight and deterministic (`temperature=0`), and the reply side to be a little more playful (`temperature=0.8`), so I wrote code that swapped `generation_config` on each `chat.send_message()` call. The behavior never changed. It took me half a day to read the SDK carefully enough to understand why, so here is the breakdown for anyone stuck on the same wall.
+
+## The symptom
+
+The code I started with looked like this:
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+chat = client.chats.create(model="gemini-2.5-flash")
+
+# Strict summary
+chat.send_message(
+    "Summarize the following review in one sentence: ...",
+    config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=120),
+)
+
+# Playful reply
+chat.send_message(
+    "Based on that summary, draft a short reply to the user.",
+    config=types.GenerateContentConfig(temperature=0.8, max_output_tokens=400),
+)
+```
+
+What I expected was that only the second turn would warm up. What actually happened was that both turns came back short and clipped, or both came back long, as if the first `config` had stuck. The per-call `config` was clearly not landing on the wire.
+
+After digging through the `google-genai` changelog I realized this is by design, not a bug.
+
+## Why this happens: chat sessions are designed around a session-level config
+
+The `chats.create()` constructor takes a `config` argument. The `GenerateContentConfig` you pass there becomes the default for every `send_message()` inside that session. The `config` parameter on `send_message()` itself is accepted by the API surface, but in the current SDK it is only partially merged into the outgoing request and several keys do not propagate the way you would expect.
+
+The keys that bite most often are:
+
+- `temperature`, `top_p`, `top_k`
+- `max_output_tokens`
+- `response_mime_type` and `response_schema`
+- `safety_settings`
+
+These are all values that the model is happy to receive per request, but the chat wrapper holds them at session-creation time. Calling `models.generate_content()` directly is fully independent per call, which is why the inconsistency is so easy to miss.
+
+## Fix 1: rebuild the chat session on every turn (smallest patch)
+
+The simplest workaround is to rebuild the chat each turn and feed the prior turns in as `history`. `chats.create()` accepts a `history` argument for exactly this purpose.
+
+```python
+def make_chat(model: str, history: list, cfg: types.GenerateContentConfig):
+    return client.chats.create(model=model, history=history, config=cfg)
+
+history: list = []
+
+# Turn 1: summary mode
+chat1 = make_chat(
+    "gemini-2.5-flash",
+    history,
+    types.GenerateContentConfig(temperature=0.0, max_output_tokens=120),
+)
+r1 = chat1.send_message("Summarize the following review in one sentence: ...")
+history = chat1.get_history()
+
+# Turn 2: reply-draft mode
+chat2 = make_chat(
+    "gemini-2.5-flash",
+    history,
+    types.GenerateContentConfig(temperature=0.8, max_output_tokens=400),
+)
+r2 = chat2.send_message("Based on that summary, draft a short reply to the user.")
+history = chat2.get_history()
+```
+
+`get_history()` returns the `contents` the session has accumulated, so by handing that list to the next `chats.create()` call you keep the appearance of a single conversation while swapping the config per turn.
+
+The detail I always check inside this kind of wrapper is the history shape: roles must alternate between `user` and `model`, and the last entry must be `model` (so the next turn is `user`). If that invariant is broken you will hit the familiar `contents must alternate roles` error.
+
+## Fix 2: skip the chat object and call models.generate_content() yourself
+
+If you can tolerate assembling the history yourself, dropping the chat object and calling `models.generate_content()` with the full `contents` array every time gives you the most predictable behavior. This is what my review pipeline runs on today.
+
+```python
+def call_with_history(
+    model: str,
+    history: list[types.Content],
+    user_text: str,
+    cfg: types.GenerateContentConfig,
+):
+    contents = list(history) + [
+        types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
+    ]
+    response = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=cfg,
+    )
+    new_history = contents + [
+        types.Content(
+            role="model",
+            parts=[types.Part.from_text(text=response.text or "")],
+        )
+    ]
+    return response, new_history
+```
+
+Each call is now fully independent. You can flip temperature, toggle `response_schema`, or change `safety_settings` without worrying about a previous turn leaking through. You trade the convenience of the chat abstraction for far easier debugging when something goes sideways in production.
+
+## Fix 3: turn each config into a named preset
+
+If your codebase keeps reaching for per-turn config switches, it pays to wrap each intent in a small factory function. Inline magic numbers are very hard to read three months later.
+
+```python
+def cfg_summary() -> types.GenerateContentConfig:
+    """Tight and deterministic. For summaries and classification."""
+    return types.GenerateContentConfig(
+        temperature=0.0,
+        top_p=1.0,
+        max_output_tokens=200,
+    )
+
+def cfg_creative_reply() -> types.GenerateContentConfig:
+    """A bit of variation. For reply drafts and title candidates."""
+    return types.GenerateContentConfig(
+        temperature=0.8,
+        top_p=0.95,
+        max_output_tokens=600,
+    )
+
+def cfg_strict_json(schema) -> types.GenerateContentConfig:
+    """JSON mode. response_schema is explicit every time."""
+    return types.GenerateContentConfig(
+        temperature=0.2,
+        response_mime_type="application/json",
+        response_schema=schema,
+    )
+```
+
+My production pipeline only really uses three intents (summary, reply draft, structured-JSON extraction) and I keep these three functions as the single source of truth. Adding the fourth only when a new use case appears has stopped a lot of "why did this prompt suddenly run cold" incidents.
+
+## Triage checklist
+
+If you hit the same symptom, walk through these in order:
+
+- 1. Compare the `config` passed to `chats.create()` against the one passed to `send_message(...)` — are they actually different?
+- 2. Are you calling `client.chats.create()` only once and reusing the session?
+- 3. Is the thing you want to override one of the "settings-style" knobs (temperature, max_output_tokens)? `system_instruction` is session-bound and cannot be flipped per turn.
+- 4. Is your SDK version very old? Run `pip show google-genai` and update — chat-wrapper behavior has changed across releases.
+- 5. If you want to override `response_mime_type` or `response_schema`, drop the chat wrapper and call `models.generate_content` directly.
+
+## Next step
+
+If you already have a working chat-based codebase and only need to vary temperature retroactively, Fix 1 (rebuild the session each turn) is the smallest delta. If you are starting fresh, Fix 2 (`models.generate_content` with history as an argument) will be kinder to future-you.
+
+I burned half a day on this because the chat abstraction was so convenient I trusted it longer than I should have. Hopefully this saves someone the same detour.

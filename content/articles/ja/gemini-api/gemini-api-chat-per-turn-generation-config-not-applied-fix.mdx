@@ -1,0 +1,166 @@
+---
+title: "Gemini API の chat で send_message ごとに温度やトークン上限が変わらない原因"
+slug: "gemini-api-chat-per-turn-generation-config-not-applied-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-05-28T11:30"
+author: "Gemini Lab"
+description: "google-genai SDK の chat セッションで send_message ごとに generationConfig や temperature を渡しているのに、応答の挙動が変わらない・前の設定が引きずられる場合の切り分け手順をまとめました。SDK の設計意図を踏まえた回避策と、現場で使っているラッパー実装まで動くコードで整理しています。"
+tags: ["gemini-api", "google-genai", "chat", "generation-config", "temperature", "troubleshooting", "python"]
+---
+
+2014年からアーティスト活動と並行して個人開発を続けています。最近は AdMob で月収100万円超まで育った癒し系・壁紙系の iOS/Android アプリの裏側で、Gemini API を使ったコメント要約と返信ドラフトの生成パイプラインを動かしています。あるとき、レビュー文の要約は短く決定論的に（temperature 0）出したいのに、返信案は少し遊びを持たせたい（temperature 0.8）と思い、`chat.send_message` の呼び出しごとに `generation_config` を切り替えるコードを書きました。ところが、何度試しても出力が変わらず、同じ温度で動いているような気配がする。SDK の挙動を読み解くまで半日溶かしてしまったので、同じところで立ち止まる方のために原因と回避策を整理します。
+
+## 起きる症状
+
+具体的には次のような書き方をしていました。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+chat = client.chats.create(model="gemini-2.5-flash")
+
+# 要約はカッチリ
+chat.send_message(
+    "次のレビューを1文で要約してください: ...",
+    config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=120),
+)
+
+# 返信は柔らかく
+chat.send_message(
+    "上の要約を踏まえ、ユーザーに対する短い返信を作ってください。",
+    config=types.GenerateContentConfig(temperature=0.8, max_output_tokens=400),
+)
+```
+
+期待していたのは「2回目だけ温度が上がる」挙動です。実際には、2回目も短くカッチリ出てきたり、逆に1回目から長文になってしまったりと、`config` がリクエストごとに反映されていない様子でした。
+
+「これ昔のバージョンだとできたよな」と思って `google-genai` の changelog を遡って気づいたのは、`chat.send_message(..., config=...)` 自体は API としては受け付けるものの、内部で渡される範囲が限定されている、という設計でした。
+
+## 原因: chat セッションは「セッション単位の config」を前提に設計されている
+
+`google-genai` SDK の `chats.create()` は、第二引数に `config` を取ります。この時点で渡した `GenerateContentConfig` が、そのセッション内のすべての `send_message` に既定値として適用されます。`send_message` の `config` 引数は、空き場所として用意されているものの、SDK バージョンや項目によって反映されない・期待通りに混ざらないケースが現状あります。
+
+特に問題になりやすいのは次のような項目です。
+
+- `temperature`、`top_p`、`top_k`
+- `max_output_tokens`
+- `response_mime_type` や `response_schema`
+- `safety_settings`
+
+これらは、本来モデル側に毎回明示してもよい項目ですが、chat のラッパー越しでは「セッション開始時の値」が握ったまま動くことがあります。生の `models.generate_content()` であれば毎回完全に独立しているので、ここに差分が出ることが分かりにくさの正体です。
+
+## 対処1: 1ターンごとに chats.create() を作り直す（最小修正）
+
+性能的にも実装的にも一番楽なのが、ターンごとにセッションを作り直し、過去の発話履歴を自分で渡し直す方法です。`chats.create()` は `history` 引数で初期履歴を受け取れます。
+
+```python
+def make_chat(model: str, history: list, cfg: types.GenerateContentConfig):
+    return client.chats.create(model=model, history=history, config=cfg)
+
+history: list = []
+
+# ターン1: 要約モード
+chat1 = make_chat(
+    "gemini-2.5-flash",
+    history,
+    types.GenerateContentConfig(temperature=0.0, max_output_tokens=120),
+)
+r1 = chat1.send_message("次のレビューを1文で要約してください: ...")
+history = chat1.get_history()
+
+# ターン2: 返信ドラフトモード
+chat2 = make_chat(
+    "gemini-2.5-flash",
+    history,
+    types.GenerateContentConfig(temperature=0.8, max_output_tokens=400),
+)
+r2 = chat2.send_message("上の要約を踏まえ、ユーザーへの短い返信を作ってください。")
+history = chat2.get_history()
+```
+
+`get_history()` はそのセッションが認識している `contents` を返してくれるので、これを次のセッションに引き継げば、見た目の挙動は「一つの会話」のまま、ターンごとに config を差し替えられます。
+
+ポイントは、`history` を毎回正規化することです。私はラッパーの中で「`role` が `user` と `model` を交互に並んでいるか」「最後が `model` で終わっているか（次のターンは `user` の発話）」を必ず検証してから次に渡しています。ここが崩れると、よくある `contents must alternate roles` 系のエラーで止まります。
+
+## 対処2: chat を使わず models.generate_content() を直接呼ぶ
+
+履歴の組み立てが許容できるなら、いっそ chat オブジェクトを使わず、`models.generate_content()` に `contents` を毎回全部渡す書き方の方が、現場では予測可能性が高くなります。
+
+```python
+def call_with_history(
+    model: str,
+    history: list[types.Content],
+    user_text: str,
+    cfg: types.GenerateContentConfig,
+):
+    contents = list(history) + [
+        types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
+    ]
+    response = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=cfg,
+    )
+    # 履歴に新しいやり取りを追加して返す
+    new_history = contents + [
+        types.Content(
+            role="model",
+            parts=[types.Part.from_text(text=response.text or "")],
+        )
+    ]
+    return response, new_history
+```
+
+この書き方なら、`cfg` は完全にリクエストごとに独立します。temperature を切り替えても、`response_schema` を入れたり外したりしても、副作用が起きません。chat オブジェクトの「内部状態を持つ抽象」を捨てる代わりに、トラブル時の原因追跡が劇的に楽になります。私のレビュー要約パイプラインは、最終的にこの形に書き直しました。
+
+## 対処3: 「config プリセット」を関数で切り出す
+
+ターンごとに config を切り替える運用が続くなら、目的別の config を関数として固定化しておくと事故が減ります。マジックナンバーを直書きすると、後から読み返したときに「なぜこの温度なのか」を思い出せなくなるためです。
+
+```python
+def cfg_summary() -> types.GenerateContentConfig:
+    """短く決定論的に。要約・分類などに使う。"""
+    return types.GenerateContentConfig(
+        temperature=0.0,
+        top_p=1.0,
+        max_output_tokens=200,
+    )
+
+def cfg_creative_reply() -> types.GenerateContentConfig:
+    """少しの揺らぎを許す。返信案・タイトル候補などに使う。"""
+    return types.GenerateContentConfig(
+        temperature=0.8,
+        top_p=0.95,
+        max_output_tokens=600,
+    )
+
+def cfg_strict_json(schema) -> types.GenerateContentConfig:
+    """JSON モード。response_schema を毎回明示する。"""
+    return types.GenerateContentConfig(
+        temperature=0.2,
+        response_mime_type="application/json",
+        response_schema=schema,
+    )
+```
+
+私のアプリでは、レビュー要約・返信ドラフト・分析用 JSON 抽出の3種類しか実質使わないので、この3関数だけを集中して管理しています。新しい用途が出てきたら、その時に4つ目を作る、という運用にしてからは「どこかでカッチリ過ぎる温度が混ざる」事故が減りました。
+
+## 切り分けのチェックリスト
+
+同じ症状で立ち止まったら、上から順に確認してみてください。
+
+- 1. `chats.create()` 側に渡した `config` と、後から `send_message(config=...)` に渡した値が違うか
+- 2. `client.chats.create()` を一度しか呼んでいないか（=セッションを使い回しているか）
+- 3. `send_message` で本当に効かせたい項目が、temperature や max_output_tokens といった「設定上書き型」のものか（system_instruction はセッション固定のため対象外）
+- 4. SDK のバージョン（`pip show google-genai`）が極端に古くないか。古いバージョンほど chat 系のラッパーは挙動が変わっている
+- 5. 上書きしたい項目が `response_mime_type` / `response_schema` なら、chat ではなく `models.generate_content` を直接呼ぶ運用に変える
+
+## 次のアクション
+
+もしすでに動いている chat ベースのコードがあり、温度だけ後追いで切り替えたい場合は、対処1（セッション作り直し）への置き換えが最も小さな修正で済みます。これから新しく組むなら、対処2（`models.generate_content` 直呼び + 履歴を引数で受け回す）の方が、半年後の自分にも優しい構造になります。
+
+私自身、chat オブジェクトの便利さに引きずられて遠回りしてしまったので、同じところで時間を溶かす方がひとり減ればうれしいです。お読みいただきありがとうございました。
