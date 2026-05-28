@@ -1,0 +1,267 @@
+---
+title: "Running an SLO and Error Budget for the Gemini API as an Indie Developer — Guarding Four Sites with Burn-Rate Monitoring"
+slug: "gemini-api-slo-error-budget-burn-rate-indie-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-28T02:45"
+author: "Gemini Lab"
+description: "Notes from running the Gemini API inside four production sites as an indie developer. A practical SLO and Error Budget design that fits a single-person operation: Cloudflare Workers and KV for burn-rate calculation, simplified multi-window alerts, and decision rules for what to freeze when the budget runs out."
+tags: ["gemini-api", "slo", "error-budget", "production", "cloudflare-workers", "sre"]
+highlights:
+  - "A TypeScript implementation on Cloudflare Workers and KV that records minute-grained SLI buckets across four sites and computes burn rate against per-site SLO targets"
+  - "A four-tier alert ladder distilled from Google SRE's multi-window multi-burn-rate playbook, sized for an indie operation and tuned to suppress night-time false positives"
+  - "Concrete decision rules for what to freeze when the error budget is spent — feature freeze, Pro-to-Flash demotion, and honest user-facing notices — informed by running AdMob-backed apps in parallel"
+---
+
+One morning at 7 a.m., my phone woke me with a Slack alert. Gemini Lab's API failure rate had been sitting at 4.2% for the last thirty minutes, and I had been quietly oblivious to it the entire time. I had spent that window staring at AdMob's monthly report on a different screen while readers were silently bouncing off the broken pages.
+
+I have been shipping mobile apps as an indie developer since 2014, and there really was an era when "gut feel" was good enough to keep availability acceptable. That worked when I had one app and one service. Today I run Dolice Labs as four parallel content sites, and the Gemini API is threaded thinly through almost every part of them. It is no longer realistic to notice a regression on one site while my attention is on another.
+
+What follows is the SLO and Error Budget design I currently use, built on Cloudflare Workers and KV. It is a trimmed-down version of the multi-window multi-burn-rate alerting in Google's SRE book, taken down to a size a single person can actually run.
+
+## Why "gut feel" stops working once you run several sites
+
+I am Masaki Hirokawa, and for a long time I trusted intuition more than dashboards. When AdMob-backed apps grew past 50 million cumulative downloads and the blog side grew to four sites, the same approach started producing a specific kind of accident.
+
+If the Gemini API started returning errors on one site while I was working inside the editor of another, I would not notice. By the time I did notice, Search Console would already be reporting failed crawls, and the Helpful Content System would have started downgrading the site. The GSC index collapse I lived through on Claude Lab in spring 2026 had several causes, but "time during which I did not realize things were drifting" was a real contributor I do not want to repeat.
+
+Defining an SLO is, in practical terms, the act of writing down — in numbers — how much degradation you are willing to tolerate. Then a small piece of code watches that line for you. Even alone, that structural change reduces the risk of finding out late.
+
+## The smallest set of SLO terms worth memorising
+
+Just enough vocabulary to make the rest of the article work:
+
+- **SLI** (Service Level Indicator) — the metric we measure. Here it is "fraction of successful Gemini API calls."
+- **SLO** (Service Level Objective) — the target value for that SLI. For example, "at least 99.0% over the last 30 days."
+- **Error Budget** — `1 − SLO`. With a 99.0% objective, the budget is 1.0%, allocated across the month.
+- **Burn Rate** — the speed at which the budget is being consumed. 1.0 burns the budget evenly in 30 days; 10.0 burns it in three.
+
+I run different SLOs per site, because Rork Lab (stable traffic on Rork Max no-code material) and Antigravity Lab (smaller, spikier) cannot reasonably share a single target.
+
+<table>
+  <thead>
+    <tr><th>Site</th><th>SLO (30-day success rate)</th><th>Monthly Error Budget</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Claude Lab</td><td>99.0%</td><td>1.0%</td></tr>
+    <tr><td>Gemini Lab</td><td>99.0%</td><td>1.0%</td></tr>
+    <tr><td>Rork Lab</td><td>99.5%</td><td>0.5%</td></tr>
+    <tr><td>Antigravity Lab</td><td>98.5%</td><td>1.5%</td></tr>
+  </tbody>
+</table>
+
+Per-site targets help me avoid both over-engineering small sites and under-protecting large ones.
+
+## Recording SLIs at one-minute granularity on Cloudflare Workers
+
+The core of the implementation is simple: every Gemini API call writes a one-minute counter into Cloudflare KV, and a separate Worker reads those buckets back to compute the burn rate. Durable Objects would be cleaner, but KV is enough at this scale.
+
+```typescript
+// src/lib/slo/recorder.ts — record each Gemini API call into a one-minute bucket
+import type { KVNamespace } from "@cloudflare/workers-types";
+
+export type SiteId = "claudelab" | "gemilab" | "rorklab" | "antigravitylab";
+
+interface MinuteBucket {
+  total: number;
+  errors: number;
+}
+
+const BUCKET_TTL_SECONDS = 60 * 60 * 24 * 35; // 35 days (30-day SLO + buffer)
+
+function bucketKey(site: SiteId, minute: number): string {
+  return `slo:${site}:m:${minute}`;
+}
+
+function currentMinute(): number {
+  return Math.floor(Date.now() / 60_000);
+}
+
+export async function recordCall(
+  kv: KVNamespace,
+  site: SiteId,
+  success: boolean,
+): Promise<void> {
+  const minute = currentMinute();
+  const key = bucketKey(site, minute);
+
+  const existing = await kv.get<MinuteBucket>(key, "json");
+  const next: MinuteBucket = existing
+    ? { total: existing.total + 1, errors: existing.errors + (success ? 0 : 1) }
+    : { total: 1, errors: success ? 0 : 1 };
+
+  await kv.put(key, JSON.stringify(next), {
+    expirationTtl: BUCKET_TTL_SECONDS,
+  });
+}
+```
+
+On the call site, every Gemini API wrapper decides success or failure and always calls `recordCall`. There is a real design choice here: do you record every retry attempt, or only the final outcome the user sees? I record only the user-visible result.
+
+```typescript
+// src/lib/gemini/call.ts — record SLO on each top-level call
+export async function callGemini(
+  env: Env,
+  site: SiteId,
+  prompt: string,
+): Promise<string> {
+  try {
+    const response = await retryWithBackoff(() => rawCall(env, prompt));
+    await recordCall(env.SLO_KV, site, true);
+    return response;
+  } catch (err) {
+    await recordCall(env.SLO_KV, site, false);
+    throw err;
+  }
+}
+```
+
+KV writes are eventually consistent with no ordering guarantee, so read-modify-write inside the same minute can race. At indie traffic levels the collision probability is low enough that I currently accept it; if traffic grows I will move this state to a Durable Object or batch the increments with `waitUntil`.
+
+## Computing burn rate from the buckets
+
+To compute a burn rate, I read N minute buckets back and aggregate them. Maintaining both a short window (5 min / 1 h) and a long window (6 h / 24 h) is what makes the multi-window alerts work later.
+
+```typescript
+// src/lib/slo/burn-rate.ts
+export interface SloConfig {
+  site: SiteId;
+  targetSuccessRate: number; // e.g. 0.99
+}
+
+export interface WindowResult {
+  windowMinutes: number;
+  total: number;
+  errors: number;
+  errorRate: number;
+  burnRate: number; // errorRate / (1 - targetSuccessRate)
+}
+
+async function readWindow(
+  kv: KVNamespace,
+  site: SiteId,
+  windowMinutes: number,
+): Promise<{ total: number; errors: number }> {
+  const now = Math.floor(Date.now() / 60_000);
+  const keys = Array.from({ length: windowMinutes }, (_, i) =>
+    bucketKey(site, now - i),
+  );
+
+  const values = await Promise.all(
+    keys.map((k) => kv.get<MinuteBucket>(k, "json")),
+  );
+
+  return values.reduce(
+    (acc, v) => ({
+      total: acc.total + (v?.total ?? 0),
+      errors: acc.errors + (v?.errors ?? 0),
+    }),
+    { total: 0, errors: 0 },
+  );
+}
+
+export async function computeBurnRate(
+  kv: KVNamespace,
+  cfg: SloConfig,
+  windowMinutes: number,
+): Promise<WindowResult> {
+  const { total, errors } = await readWindow(kv, cfg.site, windowMinutes);
+  const errorRate = total === 0 ? 0 : errors / total;
+  const budget = 1 - cfg.targetSuccessRate;
+  return {
+    windowMinutes,
+    total,
+    errors,
+    errorRate,
+    burnRate: budget === 0 ? 0 : errorRate / budget,
+  };
+}
+```
+
+For a site with a 99.0% SLO (1.0% budget) and a 5.0% error rate over the last hour, the burn rate is 5.0 — meaning at this pace the monthly budget runs out in six days. The number is large enough to feel intuitively urgent.
+
+## A four-tier multi-window ladder, trimmed for one-person operations
+
+The Multi-Window Multi-Burn-Rate ladder from Google SRE is the gold standard for suppressing false positives, but the full combination is awkward to operate alone. I run a simplified ladder:
+
+1. **Severe** — 5-minute burn rate ≥ 14.4. At this pace, one hour burns 2% of the monthly budget. Immediate Slack alert, feature freeze considered.
+2. **High** — 1-hour burn rate ≥ 6.0. Six hours of this burns 5% of the budget. Slack alert.
+3. **Medium** — 6-hour burn rate ≥ 1.0. If it persists for a day, schedule a root-cause investigation during the same week.
+4. **Low** — 24-hour burn rate ≥ 0.5. Logged-only — pick up on a weekend pass.
+
+The thresholds are close to Google Cloud Monitoring's defaults, with a small relaxation for indie reality. Requiring both a short and a long window to exceed their thresholds simultaneously cuts the false-positive rate dramatically.
+
+```typescript
+// src/lib/slo/alert.ts — evaluate multi-window alerts
+export type AlertLevel = "critical" | "high" | "medium" | "low" | "ok";
+
+export async function evaluateAlerts(
+  kv: KVNamespace,
+  cfg: SloConfig,
+): Promise<AlertLevel> {
+  const w5 = await computeBurnRate(kv, cfg, 5);
+  const w60 = await computeBurnRate(kv, cfg, 60);
+  const w360 = await computeBurnRate(kv, cfg, 360);
+  const w1440 = await computeBurnRate(kv, cfg, 1440);
+
+  // Only fire when short AND long windows both cross threshold
+  if (w5.burnRate >= 14.4 && w60.burnRate >= 6.0) return "critical";
+  if (w60.burnRate >= 6.0 && w360.burnRate >= 1.0) return "high";
+  if (w360.burnRate >= 1.0 && w1440.burnRate >= 0.5) return "medium";
+  if (w1440.burnRate >= 0.5) return "low";
+  return "ok";
+}
+```
+
+In practice, only `critical` pushes to my `#dolice-labs-alerts` Slack channel. Everything below that lands in a once-a-day digest email I read in the morning. The number of times my phone wakes me at night dropped sharply, and the long-term stress of running this dropped with it.
+
+## What to freeze when the budget is spent
+
+This is the part that decides whether SLOs are real or decorative. If "nothing happens" when the budget is spent, the SLO becomes a vanity number. I freeze in three phases.
+
+### Phase 1: stop shipping new features
+
+`features.enabled` is a KV-backed flag, and my CI runs a burn-rate check before deploys. If the multi-window state has been at `medium` or worse for six hours, in-flight A/B tests and partial rollouts are paused automatically.
+
+### Phase 2: demote the model one tier
+
+Downgrading Gemini 2.5 Pro to Gemini 2.5 Flash during high burn-rate windows often pulls me out of Google's current failure domain. Even though Pro and Flash share infrastructure, the rate-limiting and throttling behaviour differs enough that, in my logs, there are windows where Pro returns 503 but Flash answers cleanly.
+
+```typescript
+// src/lib/gemini/select-model.ts
+export async function selectModel(
+  kv: KVNamespace,
+  cfg: SloConfig,
+): Promise<"gemini-2.5-pro" | "gemini-2.5-flash"> {
+  const alert = await evaluateAlerts(kv, cfg);
+  if (alert === "critical" || alert === "high") {
+    return "gemini-2.5-flash";
+  }
+  return "gemini-2.5-pro";
+}
+```
+
+### Phase 3: tell users honestly
+
+If `critical` persists for 30 minutes, a KV flag is set that puts a banner on affected pages: "AI features are temporarily unstable." From a reader's perspective, "we know and we're saying so" preserves trust better than silent breakage.
+
+I learned the same thing from running art exhibitions. When something goes wrong on a piece during a show, the worst response is pretending you didn't notice. The same instinct carries over to running technical infrastructure.
+
+## Five gotchas worth writing down before you forget
+
+Six months in, these are the traps I want to remember and pass on.
+
+1. **Zero-traffic minutes** — Including buckets with one or two calls makes the burn rate noisy on low-traffic sites. I drop any bucket with `total < 10` from the window aggregation.
+2. **Retries and "success"** — If an internal retry succeeds, the user saw a success. Decide up front that the SLI records only the user-visible outcome; otherwise the definition will drift later.
+3. **KV consistency** — Cloudflare KV is eventually consistent, so a read-modify-write right after another write can read stale state. Rarely a problem at indie scale, but when the burn rate suddenly drops to zero, this is the place to look first.
+4. **Run a separate cost SLO** — Hitting your availability target while Gemini API costs exceed AdMob revenue defeats the point. I recommend a parallel cost burn rate.
+5. **Revisit your SLOs quarterly** — Make a calendar appointment with yourself. I keep a Notion template for my four-site SLO review (even though it is an audience of one).
+
+## Where to start
+
+I would not recommend rolling SLO out to four sites on day one. I started with Gemini Lab only, watched the numbers for two weeks, then expanded to the remaining three. During the first two weeks I left feature freeze on manual control while the alerting thresholds settled.
+
+I started programming on the internet in 1997 at sixteen, and the idea that "noticing matters" has not changed in the 29 years since. The tooling around indie development has grown a lot more complex, but the underlying habit — staying in a position where you can notice things going wrong, and earning trust quietly — has not. SLOs are a quiet but effective instrument for keeping that habit alive.
+
+Thank you for reading the implementation through. I hope your future mornings of looking at the burn-rate dashboard are the boring kind.
