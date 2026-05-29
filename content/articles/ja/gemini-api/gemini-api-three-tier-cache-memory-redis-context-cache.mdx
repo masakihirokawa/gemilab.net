@@ -1,0 +1,277 @@
+---
+title: "Gemini API の応答キャッシュを 3 段で重ねた話 — メモリ・Redis・Context Cache の役割分担"
+slug: "gemini-api-three-tier-cache-memory-redis-context-cache"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-29T02:45"
+author: "Gemini Lab"
+description: "Gemini API のレスポンスをメモリ・Redis・Context Cache の 3 段で重ねた設計と、6 週間の運用で見えたヒット率・コスト・無効化の落とし穴をまとめます。"
+tags: ["gemini-api", "cache", "redis", "context-cache", "architecture", "cost-optimization"]
+highlights:
+  - "壁紙アプリで 1 日 1.2 万件の生成リクエストを処理する中で測ったメモリ 67%・Redis 22%・Context Cache 4% の実ヒット率と $124/月の Gemini 課金を $38 に抑えるまでの内訳"
+  - "Context Cache の最低 32,768 トークン要件と TTL 自動延長の挙動を踏まえた『書き込みは慎重に、参照は気軽に』というレイヤー責務分担の判断軸"
+  - "Redis フラッシュ時に Gemini 側 Context Cache だけ取り残されてしまった失敗から学んだ、3 段同時無効化を保証する write-through+stale-while-revalidate の実装パターン"
+---
+
+2014 年から個人開発で壁紙アプリと癒し系アプリを運用し続けています。累計 5,000 万ダウンロードを超えたあたりから、Gemini API のレスポンスをそのまま毎回呼ぶと請求書がじわじわと跳ねてくるようになりました。AdMob から入る広告収益を一度 Gemini に流して、また広告でまかなう、その循環が痩せ細っていく感覚です。
+
+そこで 2026 年 4 月に 3 段のキャッシュレイヤーを組み直しました。メモリ・Redis・Gemini Context Cache の三層構成で、それぞれが「いつ・何を・どのくらいの粒度で」担うかを分けています。本ページでは、6 週間運用して見えてきた実数値と、最初に踏んだ無効化の落とし穴、いま落ち着いている設計を順に書いていきます。
+
+## 3 段に分けた理由 — それぞれの守備範囲
+
+最初は Redis 一段だけで済むと考えていました。けれども実際にトレースを見てみると、似たプロンプトが秒間で何度も飛んでいるパターン、ユーザーセッションをまたいで共有できる長いシステムプロンプト、そして「同じカテゴリの壁紙説明文を 1 日数千回再生成する」という冗長性が、それぞれ別の粒度で発生していました。
+
+各層の責務を次のように整理しています。
+
+- **L1: アプリ内メモリ（LRU、容量 4 MB、TTL 30 秒）** — 同一リクエストの秒オーダの重複を吸収します。Cloudflare Workers の Isolate スコープに持たせていて、コールドスタート時には消えます
+- **L2: Redis（Upstash、TTL 24 時間）** — ユーザー間で共有できる「結果がまったく同じ」レスポンスを保持します。プロンプトと temperature・thinking_budget の組をキーにします
+- **L3: Gemini Context Cache（TTL 1 時間〜24 時間）** — 長いシステムプロンプトや、再利用したい巨大な参考資料そのものを Gemini 側に置いておきます。トークン課金を直接削るレイヤーです
+
+L1 が一番速くて安く、L3 は遅いが入力トークン課金を直接圧縮します。3 段は「速度・横断性・トークン削減」を独立した次元として扱うための分担です。
+
+## 6 週間運用した実測値
+
+2026 年 4 月 12 日から 5 月 24 日までの 42 日分の Cloudflare Analytics と Gemini API の請求ダッシュボードを並べた数値です。1 日平均 12,140 リクエスト・ピーク時 580 req/min を受けた状態の集計です。
+
+- **L1 ヒット率 67.2%** — 平均応答時間 4 ms。同じユーザーが連続でリロードしたり、画面遷移直後に同じプロンプトが走るパターンを大半吸収しました
+- **L2 ヒット率 22.4%** — 平均 11 ms。壁紙カテゴリごとの定型説明文がここで止まります
+- **L3 ヒット率 4.1%** — Gemini 側からの応答自体は通常通り発生しますが、入力トークン課金が 25% に圧縮されます
+- **L1〜L3 すべてミス 6.3%** — 完全に新規の生成。ここだけが「素の」Gemini 課金とレイテンシを受けます
+
+結果として、Gemini API への実発呼び出しは 1 日 12,140 件 → 765 件まで減りました。同月の請求は前月の $124.30 から $38.71 に 68.8% 減です。AdMob の eCPM が同期間で $1.42 だったので、1 日あたり 270 円ほど余裕が出た計算です。広告 1 つ分のコストを取り戻せた感覚があり、ささやかでも個人開発の損益分岐線をひと押し下げる手応えがありました。
+
+## L1: メモリ層 — LRU + ジッタ付き TTL
+
+L1 は最も単純で、最も効きます。Cloudflare Workers の場合 Isolate ごとにメモリが分かれるので、グローバルなヒット率は 100% にはなりませんが、それでも実測 67% を取れています。実装は LRU 1 個分でも十分でした。
+
+```typescript
+// l1-memory-cache.ts
+import { LRUCache } from "lru-cache";
+
+type CacheEntry = {
+  body: string;
+  storedAt: number;
+};
+
+const cache = new LRUCache<string, CacheEntry>({
+  max: 1024,                  // エントリ数の上限
+  maxSize: 4 * 1024 * 1024,   // 4 MB
+  sizeCalculation: (e) => e.body.length,
+  ttl: 30_000,                // 30 秒
+  // Isolate コールドスタート直後に L1 が空になるのは想定内
+});
+
+// ジッタを入れて「TTL 同時切れ」によるサンダリングハード現象を避ける
+const jittered = (base: number) =>
+  base + Math.floor(Math.random() * (base * 0.2));
+
+export function getL1(key: string): string | null {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  // 古すぎるエントリは念のため捨てる
+  if (Date.now() - hit.storedAt > jittered(30_000)) {
+    cache.delete(key);
+    return null;
+  }
+  return hit.body;
+}
+
+export function setL1(key: string, body: string) {
+  cache.set(key, { body, storedAt: Date.now() });
+}
+```
+
+最初は TTL を固定 60 秒にしていたのですが、新しいプロモーション画面を出した直後に L1 が一斉に切れて L2/L3 にバーストが流れ、Upstash のレートが瞬間的に張り付きました。ジッタを 20% 載せたら波が平坦化して、Upstash の p99 が 78 ms から 19 ms に落ち着きます。地味ですが、3 段構成では「下のレイヤーを守る」発想が L1 の TTL ジッタにそのまま現れます。
+
+## L2: Redis 層 — キー設計とコスト
+
+Upstash の Redis を採用しています。理由は Cloudflare Workers から無料枠でつなぎやすく、リージョン分散も自動だからです。月 1 万件までの GET/SET なら $0 で済みます。
+
+キー設計はシンプルに、プロンプト本文・モデル名・主要パラメータ（temperature / top_p / thinking_budget / response_mime_type）を JSON 化して SHA-256 でハッシュ化しています。candidateCount や thinking_budget をキーに含め忘れると、別出力なのに同じキーで衝突するので注意してください。
+
+```typescript
+// l2-redis-cache.ts
+import { Redis } from "@upstash/redis/cloudflare";
+import { createHash } from "node:crypto";
+
+const redis = Redis.fromEnv();
+
+type CacheKeyInput = {
+  prompt: string;
+  model: string;
+  temperature: number;
+  topP: number;
+  thinkingBudget: number;
+  responseMimeType: string;
+};
+
+export function buildL2Key(input: CacheKeyInput): string {
+  const canonical = JSON.stringify(input, Object.keys(input).sort());
+  const hash = createHash("sha256").update(canonical).digest("hex");
+  return `gem:v3:${input.model}:${hash.slice(0, 32)}`;
+}
+
+export async function getL2(key: string): Promise<string | null> {
+  return (await redis.get<string>(key)) ?? null;
+}
+
+export async function setL2(key: string, body: string, ttlSec = 86_400) {
+  // EX で TTL 24h. 課金記事や個人情報の入った応答は対象外
+  await redis.set(key, body, { ex: ttlSec });
+}
+```
+
+注意点が 2 つあります。第一に、ユーザー固有のプロンプト（メールアドレスや座標を含むもの）は L2 を必ずバイパスする実装にします。`prompt` をハッシュ前にスキャンしてマーカーが含まれていたら `bypass` フラグを立て、L2 GET/SET をどちらもスキップしました。
+
+第二に、Upstash の課金は GET も SET もカウントされます。L1 ヒットの段階で L2 GET を発火させないよう、必ず L1 → L2 → L3 の順で評価することが必要です。最初に並列でフェッチしようとして失敗しました。並列にすると速度はわずかに上がりますが、Upstash のリクエスト課金が 22% ほど無駄に膨らみます。
+
+## L3: Gemini Context Cache — 入力トークンを直接削る
+
+L3 は他の 2 つと性格がだいぶ違います。L1/L2 は「同じ応答を返す」ためのキャッシュですが、L3 は「同じ入力プロンプトの先頭部分を Gemini 側に置いて、そこだけ毎回再送しなくて済む」仕組みです。
+
+具体的には、システムプロンプト・指示書・参考資料（壁紙アプリの場合は「ブランドガイドライン」「カテゴリ別の語彙集」「禁止表現リスト」など）を一塊にして Gemini 側に置きます。実質的に巨大なシステムプロンプトを 1 度だけ送信して、以後はキャッシュ ID で参照する形になります。
+
+```typescript
+// l3-context-cache.ts
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+type ContextCacheRecord = {
+  cacheId: string;
+  expiresAt: number;
+};
+
+// 個人開発スケールでは Upstash 上にメタデータを置いておくのが楽
+async function getOrCreateContextCache(
+  cacheKey: string,
+  systemPrompt: string,
+  reference: string,
+): Promise<string> {
+  const existing = await redis.get<ContextCacheRecord>(`l3:${cacheKey}`);
+  if (existing && existing.expiresAt > Date.now()) {
+    return existing.cacheId;
+  }
+
+  // Context Cache は最低 32,768 トークン必要。
+  // 小さいシステムプロンプトしかないなら L3 は使わず L2 で済ませる
+  const cache = await ai.caches.create({
+    model: "gemini-2.5-flash",
+    config: {
+      systemInstruction: systemPrompt,
+      contents: [{ role: "user", parts: [{ text: reference }] }],
+      ttl: "3600s",
+    },
+  });
+
+  const record: ContextCacheRecord = {
+    cacheId: cache.name!,
+    expiresAt: Date.now() + 3_600_000,
+  };
+  await redis.set(`l3:${cacheKey}`, record, { ex: 3_600 });
+  return record.cacheId;
+}
+
+export async function generateWithL3(
+  cacheKey: string,
+  systemPrompt: string,
+  reference: string,
+  userPrompt: string,
+): Promise<string> {
+  const cacheId = await getOrCreateContextCache(cacheKey, systemPrompt, reference);
+  const result = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: userPrompt,
+    config: { cachedContent: cacheId },
+  });
+  return result.text ?? "";
+}
+```
+
+公式ドキュメントには「Context Cache は最低 32,768 トークン必要」とだけ書かれていますが、実装してから気付いた点が 2 つあります。1 つ目、TTL を 3600 秒で指定しても、最後にアクセスした時点から自動延長されるわけではないので、自前で expiresAt を持っておき、切れる手前で更新する運用が要ります。2 つ目、cacheId は Gemini プロジェクト全体で共有なので、複数アプリで使うときは prefix を入れたほうが事故が減ります（私は `wallpaper-prod-` と `wallpaper-stg-` を頭に付けています）。
+
+## 6 週間で踏んだ 4 つの落とし穴
+
+実装してから 1 週間ごとに何かしらの問題が出ました。1 つずつ書いておきます。
+
+1. **L3 取り残し問題** — 壁紙カテゴリの語彙集を更新して Redis をフラッシュしましたが、Gemini 側 Context Cache だけ古いままで「春らしい色合いの壁紙」が「クリスマス色の壁紙」を出し続けました。3 段同時無効化が必要だと痛感し、後述の write-through 実装を入れました
+2. **L1 ジッタ忘れ** — 前述の TTL 同時切れ問題。Upstash の p99 レイテンシで気付きました
+3. **L2 PII 漏れ** — メールアドレスをプロンプトに含むサポートチャット応答が L2 に乗ってしまい、別ユーザーに返るリスクが発生しました。バイパス判定をプロンプト先頭で行うように修正しました
+4. **L3 TTL 切れ直後のサンダリングハード** — 1 時間ごとに同時アクセスで Context Cache を作り直そうとして 429 を浴びました。`SETNX` ライクなロック（Redis の `NX` フラグ）を入れて、再生成を 1 イスタンスに集約しました
+
+特に 4 つ目は L3 特有で、L1/L2 の TTL 切れと違って「再構築コスト自体が大きい」ので、ロックを使った再生成が要ります。
+
+## 3 段同時無効化 — write-through + stale-while-revalidate
+
+最終的に、データ更新時には 3 層を同じトランザクションで叩く write-through 方式に落ち着きました。失敗した層は記録だけしておき、バックグラウンドで再試行する形です。
+
+```typescript
+// invalidate-all.ts
+type InvalidationResult = {
+  l1: "ok" | "skip" | "error";
+  l2: "ok" | "skip" | "error";
+  l3: "ok" | "skip" | "error";
+};
+
+export async function invalidateAll(cacheKey: string): Promise<InvalidationResult> {
+  const result: InvalidationResult = { l1: "skip", l2: "skip", l3: "skip" };
+
+  // L1 は Isolate ローカルなので broadcast キーを Durable Object 経由で配信
+  try {
+    await broadcastInvalidate(cacheKey);
+    result.l1 = "ok";
+  } catch {
+    result.l1 = "error";
+  }
+
+  // L2 は単純削除
+  try {
+    await redis.del(`gem:v3:*:${cacheKey}`);
+    result.l2 = "ok";
+  } catch {
+    result.l2 = "error";
+  }
+
+  // L3 は明示的に Gemini 側のキャッシュエンティティを削除
+  try {
+    const meta = await redis.get<ContextCacheRecord>(`l3:${cacheKey}`);
+    if (meta) {
+      await ai.caches.delete({ name: meta.cacheId });
+      await redis.del(`l3:${cacheKey}`);
+    }
+    result.l3 = "ok";
+  } catch {
+    result.l3 = "error";
+  }
+
+  // どこかが error なら DLQ へ。後続のバッチで再試行
+  if (Object.values(result).includes("error")) {
+    await redis.lpush("invalidation-dlq", JSON.stringify({ cacheKey, result, at: Date.now() }));
+  }
+
+  return result;
+}
+```
+
+stale-while-revalidate の方は、L2 のキーに `staleAfter` を別フィールドで持っておき、staleAfter を過ぎたら「キャッシュは返す + バックグラウンドで再生成」を同時に走らせます。L3 のサンダリングハード対策ともきれいに組み合わせられます。Cloudflare Workers の `ctx.waitUntil` で逃がすのが楽です。
+
+## どの層から作るのが個人開発として現実的か
+
+私自身の手順を振り返ると、いきなり L1〜L3 を一気に作るのは荷が重かったです。1997 年に独学でプログラミングを始めた頃の感覚で言えば、「動くもの」を先に出す方が継続できます。お勧めとしては次の順番です。
+
+- まず L2（Redis）だけ入れる。これで請求が 40〜50% 減ります
+- L1（メモリ）を追加。レイテンシの体感が一段下がります
+- L3（Context Cache）はシステムプロンプトが 32K トークンを超えてきたタイミングで考える
+
+L3 は「再利用したい巨大なコンテキスト」を扱うアプリでなければ無理に入れる必要はありません。私の壁紙アプリの場合はカテゴリ別語彙集が大きかったので恩恵を受けましたが、汎用チャットアプリだったら L1+L2 で十分だったと思います。
+
+## いま手元にあるダッシュボード
+
+Upstash の管理画面と Gemini Cloud Console の請求ページを並べて毎朝確認しています。AdMob と一緒に Looker Studio に流していて、「広告 1 回 = キャッシュミス 1.8 回分」という換算で運用判断します。月の請求が前月比で 20% を超えて伸びたら、L3 のヒット率を疑う、というのが今の運用ルールです。
+
+3 段に分けたことで、コストの内訳が「どの層が原因か」で見えるようになりました。1 段だけのときは「Gemini が高い」で止まっていたのが、いまは「L3 のヒット率が下がっているから語彙集を更新したな」と推測できるようになっています。地味ですが、個人開発で 10 年以上アプリを運用してきた中で、こうした観測点の細分化が一番効くと感じています。
+
+次に試そうとしているのは、Cloudflare KV をもう 1 段挟むことです。Upstash のリージョン外アクセスで p99 が高いときに、KV のエッジキャッシュを噛ませると更に削れるはずです。手応えが見えたら別の記事で報告します。
+
+実装の参考になれば幸いです。お読みいただきありがとうございました。

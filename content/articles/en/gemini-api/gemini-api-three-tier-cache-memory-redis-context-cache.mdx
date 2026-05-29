@@ -1,0 +1,268 @@
+---
+title: "Layering Gemini API Response Caches in Three Tiers — How I Split Memory, Redis, and Context Cache"
+slug: "gemini-api-three-tier-cache-memory-redis-context-cache"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-29T02:45"
+author: "Gemini Lab"
+description: "Notes from running a three-tier cache (in-memory, Redis, Gemini Context Cache) in front of the Gemini API for six weeks across a wallpaper app — actual hit rates, billing impact, and the invalidation traps that ate me alive."
+tags: ["gemini-api", "cache", "redis", "context-cache", "architecture", "cost-optimization"]
+highlights:
+  - "Six weeks of production data showing 67% / 22% / 4% hit rates across the three tiers, plus a Gemini bill that dropped from $124/month to $38/month on ~12,000 daily requests"
+  - "Why Gemini Context Cache (with its 32,768-token minimum) belongs at a different layer than Redis, and how to size each tier so they reinforce instead of duplicate each other"
+  - "A write-through plus stale-while-revalidate pattern that finally stopped the 'wrong vocabulary set leaking into yesterday's category' bug we ran into when we tried to flush Redis without invalidating Context Cache"
+---
+
+I'm Hirokawa, an indie developer based in Tokyo. Since 2014 I've been shipping wallpaper and calming-style apps under the name Dolice — they've crossed 50M cumulative downloads, and as I started moving generation work to the Gemini API the bill quietly started to bite. AdMob revenue was getting routed into Gemini, then back into the next ad impression, and the loop kept getting thinner.
+
+In April 2026 I rebuilt the caching layer around three tiers: in-process memory, Redis, and Gemini's own Context Cache. Each one owns a different slice of the problem. Six weeks of production traffic later, here's the part that surprised me, the parts that hurt, and the layout I've settled on.
+
+## Why three tiers and not just one
+
+I started with Redis only, assuming a single layer would be enough. Then I actually looked at the traces and realized three distinct redundancies were happening at three different time scales.
+
+- **L1 — In-process LRU (4 MB, 30s TTL).** Absorbs sub-second duplicates: the same user re-rendering the same screen, page transitions firing the same prompt twice, that kind of thing. Lives in the Cloudflare Workers isolate, so cold starts wipe it
+- **L2 — Redis (Upstash, 24h TTL).** Catches "byte-identical responses" shared across users — promptly hashed with the model name, temperature, top_p, thinking_budget, and response_mime_type
+- **L3 — Gemini Context Cache (1h–24h TTL).** Stores the long system prompt and the reference material itself on Gemini's side, so we don't pay to re-send 50,000 tokens of brand guidelines every request
+
+L1 is the fastest and cheapest, L3 is slower per request but directly cuts the input-token bill. Splitting them is really about keeping speed, cross-user sharing, and token reduction as independent dimensions.
+
+## Six weeks of measured numbers
+
+Numbers below are pulled from Cloudflare Analytics and the Gemini billing dashboard between April 12 and May 24, 2026. About 12,140 requests per day on average, with a peak of 580 req/min.
+
+- **L1 hit rate: 67.2%** — average response time 4 ms
+- **L2 hit rate: 22.4%** — average 11 ms
+- **L3 hit rate: 4.1%** — Gemini still serves the request, but input tokens are billed at roughly 25% of the uncached rate
+- **All-tier miss: 6.3%** — fresh generation, full latency and full bill
+
+Net effect: actual Gemini calls dropped from 12,140/day to 765/day. The month's bill went from $124.30 to $38.71, a 68.8% reduction. At the AdMob eCPM I was seeing that period ($1.42), that's about ¥270/day of breathing room. A single ad's worth of margin recovered — small, but exactly the kind of inch that matters when you're a solo developer trying to nudge the break-even line down.
+
+## L1: in-memory LRU with jittered TTL
+
+L1 is the simplest layer and the one that pays back first. Each Cloudflare Workers isolate has its own memory, so global hit rate caps below 100%, but I'm still measuring 67% in practice.
+
+```typescript
+// l1-memory-cache.ts
+import { LRUCache } from "lru-cache";
+
+type CacheEntry = {
+  body: string;
+  storedAt: number;
+};
+
+const cache = new LRUCache<string, CacheEntry>({
+  max: 1024,
+  maxSize: 4 * 1024 * 1024,   // 4 MB
+  sizeCalculation: (e) => e.body.length,
+  ttl: 30_000,                // 30s
+});
+
+// Jitter avoids "thundering herd" when many entries expire simultaneously
+const jittered = (base: number) =>
+  base + Math.floor(Math.random() * (base * 0.2));
+
+export function getL1(key: string): string | null {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.storedAt > jittered(30_000)) {
+    cache.delete(key);
+    return null;
+  }
+  return hit.body;
+}
+
+export function setL1(key: string, body: string) {
+  cache.set(key, { body, storedAt: Date.now() });
+}
+```
+
+I initially used a fixed 60s TTL. After launching a promo screen, all L1 entries expired at the same instant and the burst slammed L2 — Upstash's p99 spiked to 78 ms. Adding a 20% jitter to the TTL flattened the wave and brought p99 back to 19 ms. A small detail, but in a layered cache the upper layer's job is to *protect* the layer below, and jittered TTLs are a big part of that.
+
+## L2: Redis layer — key design and what to bypass
+
+I'm using Upstash Redis. Cloudflare Workers connects to it cleanly, the free tier covers up to ~10K ops/day, and region replication is automatic.
+
+The key is just `prompt + model + temperature + top_p + thinking_budget + response_mime_type` serialized into a canonical JSON and SHA-256 hashed. Forgetting to include `thinking_budget` will cause collisions — different outputs sharing the same key — so I sort the object keys before hashing.
+
+```typescript
+// l2-redis-cache.ts
+import { Redis } from "@upstash/redis/cloudflare";
+import { createHash } from "node:crypto";
+
+const redis = Redis.fromEnv();
+
+type CacheKeyInput = {
+  prompt: string;
+  model: string;
+  temperature: number;
+  topP: number;
+  thinkingBudget: number;
+  responseMimeType: string;
+};
+
+export function buildL2Key(input: CacheKeyInput): string {
+  const canonical = JSON.stringify(input, Object.keys(input).sort());
+  const hash = createHash("sha256").update(canonical).digest("hex");
+  return `gem:v3:${input.model}:${hash.slice(0, 32)}`;
+}
+
+export async function getL2(key: string): Promise<string | null> {
+  return (await redis.get<string>(key)) ?? null;
+}
+
+export async function setL2(key: string, body: string, ttlSec = 86_400) {
+  await redis.set(key, body, { ex: ttlSec });
+}
+```
+
+Two warnings. First, any prompt containing user-identifiable data (emails, coordinates, payment status) bypasses L2 entirely. I scan the raw prompt for sentinel patterns before hashing, and if anything matches I skip both GET and SET. The risk of cross-user leakage isn't worth the marginal hit rate.
+
+Second, Upstash bills *both* GET and SET. Make sure L1 evaluates fully before L2 GET fires — I initially fetched L1 and L2 in parallel for speed, and that single mistake inflated my Upstash op count by 22%. Sequential L1 → L2 → L3 is the right order.
+
+## L3: Gemini Context Cache — cutting input tokens directly
+
+L3 is structurally different. L1 and L2 return the *same response*; L3 keeps the *same prompt prefix* resident on Gemini's side so you don't pay to retransmit it.
+
+In my wallpaper app this prefix is the brand guidelines, the per-category vocabulary set, and the prohibited-expression list — bundled together, easily 40K+ tokens. Sending that on every request was the single biggest line item before L3 went in.
+
+```typescript
+// l3-context-cache.ts
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+type ContextCacheRecord = {
+  cacheId: string;
+  expiresAt: number;
+};
+
+async function getOrCreateContextCache(
+  cacheKey: string,
+  systemPrompt: string,
+  reference: string,
+): Promise<string> {
+  const existing = await redis.get<ContextCacheRecord>(`l3:${cacheKey}`);
+  if (existing && existing.expiresAt > Date.now()) {
+    return existing.cacheId;
+  }
+
+  // Context Cache requires a minimum of 32,768 tokens.
+  // If your system prompt is small, skip L3 entirely.
+  const cache = await ai.caches.create({
+    model: "gemini-2.5-flash",
+    config: {
+      systemInstruction: systemPrompt,
+      contents: [{ role: "user", parts: [{ text: reference }] }],
+      ttl: "3600s",
+    },
+  });
+
+  const record: ContextCacheRecord = {
+    cacheId: cache.name!,
+    expiresAt: Date.now() + 3_600_000,
+  };
+  await redis.set(`l3:${cacheKey}`, record, { ex: 3_600 });
+  return record.cacheId;
+}
+
+export async function generateWithL3(
+  cacheKey: string,
+  systemPrompt: string,
+  reference: string,
+  userPrompt: string,
+): Promise<string> {
+  const cacheId = await getOrCreateContextCache(cacheKey, systemPrompt, reference);
+  const result = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: userPrompt,
+    config: { cachedContent: cacheId },
+  });
+  return result.text ?? "";
+}
+```
+
+Two things the docs don't make obvious. (1) Specifying `ttl: 3600s` doesn't mean the cache renews on every read — it expires at the absolute time set on creation, so you need to track `expiresAt` yourself and refresh before it lapses. (2) `cacheId` is shared at the Gemini project level, so multi-app or multi-environment setups should prefix names. I use `wallpaper-prod-` and `wallpaper-stg-` to avoid one app accidentally reading another's cache.
+
+## Four production traps in six weeks
+
+Pretty much weekly there was something. Listing them in order they bit:
+
+1. **L3 stranded after Redis flush.** I updated the wallpaper category vocabulary, flushed Redis, and Context Cache happily kept serving last week's "Christmas palette" for the spring category. Three-tier simultaneous invalidation isn't optional
+2. **L1 TTL synchronization (the jitter story above).** Spotted via Upstash p99 spikes
+3. **L2 PII leakage.** A support-chat response with a user's email made it into L2 and was at risk of being served to a different user. Bypass logic now scans the raw prompt
+4. **Thundering herd on L3 expiry.** Every hour, multiple isolates raced to recreate the Context Cache and Gemini returned 429s. Solved with a Redis `NX` lock so only one isolate rebuilds the cache
+
+Trap 4 is L3-specific: unlike L1/L2 where rebuilding is cheap, building a Context Cache is itself expensive, so locking the rebuild is non-negotiable.
+
+## Three-tier write-through invalidation
+
+I ended up with a write-through invalidator that hits all three layers in one go, logs failures, and retries them asynchronously.
+
+```typescript
+// invalidate-all.ts
+type InvalidationResult = {
+  l1: "ok" | "skip" | "error";
+  l2: "ok" | "skip" | "error";
+  l3: "ok" | "skip" | "error";
+};
+
+export async function invalidateAll(cacheKey: string): Promise<InvalidationResult> {
+  const result: InvalidationResult = { l1: "skip", l2: "skip", l3: "skip" };
+
+  // L1 is isolate-local, so use a Durable Object to broadcast the invalidation
+  try {
+    await broadcastInvalidate(cacheKey);
+    result.l1 = "ok";
+  } catch {
+    result.l1 = "error";
+  }
+
+  try {
+    await redis.del(`gem:v3:*:${cacheKey}`);
+    result.l2 = "ok";
+  } catch {
+    result.l2 = "error";
+  }
+
+  try {
+    const meta = await redis.get<ContextCacheRecord>(`l3:${cacheKey}`);
+    if (meta) {
+      await ai.caches.delete({ name: meta.cacheId });
+      await redis.del(`l3:${cacheKey}`);
+    }
+    result.l3 = "ok";
+  } catch {
+    result.l3 = "error";
+  }
+
+  if (Object.values(result).includes("error")) {
+    await redis.lpush("invalidation-dlq", JSON.stringify({ cacheKey, result, at: Date.now() }));
+  }
+
+  return result;
+}
+```
+
+For stale-while-revalidate, L2 entries carry a separate `staleAfter` timestamp. When `staleAfter` passes, the cached response is still returned but a background refresh starts simultaneously — Cloudflare Workers' `ctx.waitUntil` handles it cleanly. This composes well with the L3 thundering-herd lock too.
+
+## What I'd recommend if you're starting from scratch
+
+Looking back, building all three tiers in one go was too much. I'd suggest the order I wish I'd followed:
+
+- Start with **L2 (Redis) only**. This alone trimmed 40–50% of my bill
+- Add **L1 (memory)** when latency starts to feel slow. Cheap to deploy, instantly visible
+- Reach for **L3 (Context Cache)** only when your system prompt + reference material crosses 32K tokens
+
+L3 isn't free engineering effort. If you don't have a large reusable context, L1+L2 is probably enough. My wallpaper app benefits because the per-category vocabulary set is big; a general-purpose chat app probably wouldn't.
+
+## What's on the dashboard now
+
+Upstash's panel and Gemini Cloud Console billing live side-by-side in a Looker Studio board, alongside AdMob. The mental conversion I use is "1 ad impression ≈ 1.8 cache misses." Bill up 20% month over month? Check L3 hit rate first.
+
+Splitting one cache into three changed how I reason about cost. Before, "Gemini is expensive" was the whole story; now I can say "L3 hit rate dropped — the vocabulary set must have been updated." That kind of decomposed observability is, after ten-plus years of running indie apps, the thing that most consistently pays off.
+
+Next experiment: a Cloudflare KV layer between L1 and L2 to absorb the cross-region latency I sometimes see on Upstash p99. If it earns its keep I'll write that up separately.
+
+Thanks for reading — hope some of this is useful for your own setup.
