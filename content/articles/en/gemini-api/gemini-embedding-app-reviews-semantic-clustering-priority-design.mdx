@@ -1,0 +1,242 @@
+---
+title: "Designing a Semantic Clustering Pipeline for App Reviews with Gemini Embeddings"
+slug: "gemini-embedding-app-reviews-semantic-clustering-priority-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-29T15:45"
+author: "Gemini Lab"
+description: "How I cluster 10,000+ app reviews from a wallpaper app with 50M+ downloads using Gemini Embeddings to compute improvement priorities. The three-layer pipeline and cost design that emerged from a year of running it."
+tags: ["embedding", "gemini-api", "clustering", "app-store", "indie-dev"]
+highlights:
+  - "Why task_type=CLUSTERING with output_dimensionality=256 cuts storage by roughly two-thirds without losing cluster quality"
+  - "A three-layer pipeline (incremental embed + HDBSCAN + Gemini 2.5 Flash) that stays under USD 4 per month"
+  - "The weighting that turns cluster size, polarity, and 30-day recency into a decision-ready priority score"
+---
+
+## Starting from the problem that nothing got prioritized
+
+I have been shipping mobile apps as a solo indie developer since 2014, and somewhere past 50 million cumulative downloads the review feed turned into a noisy gold mine. Useful suggestions, drive-by one-star bursts, reports that get the feature name wrong — they all live in the same column. For a while I read them every weekend and held an ordering in my head. Once I started running several apps in parallel, that approach collapsed.
+
+The dangerous failure mode is not "I missed a complaint." It is "I sorted by emotional intensity instead of by impact." A single angry review feels heavier than ten quietly disappointed ones, but the latter is what eats retention. AdMob revenue rides on DAU, which rides on retention, so misordering the backlog directly shows up in next month's earnings. When the Gemini Embedding API stabilized, I rebuilt this ordering as a monthly batch job. After about a year of running it, the three-layer pipeline has settled. This is a record of how it works, written by indie developer and contemporary artist Hirokawa Masaki, who keeps a wallpaper app business afloat alongside an exhibition schedule.
+
+## Why semantic clustering instead of keyword counting
+
+The naive starting point was pulling reviews via the App Store Connect and Google Play Developer APIs, running Japanese and English tokenizers, and ranking by frequency. It works for a week, then three limits become obvious.
+
+First, the same request phrased differently does not merge. "Simpler interface," "too cluttered," and "too many icons on the home screen" all live in different rows even though they are the same complaint. Reviewers reach for whatever word matches their mood, so vocabulary drift is dramatic.
+
+Second, positive and negative sentiment land in the same bucket. The keyword "ads" collects both "too many ads" and "the ad cadence is just right." Compound complaints like "the ad layout is dated and I keep mis-tapping" fragment into unrelated tokens.
+
+Third, multi-language corpora fracture. English "too many ads" and Japanese "広告が多すぎ" never meet, even though they are the same signal. My DL split is roughly 55% English, 30% Japanese, 15% other — cutting English silently distorts the priority order.
+
+Embeddings cross all three boundaries. They cluster by meaning, so vocabulary drift and language gaps disappear. When you want only the negative sentiment about ad volume, you can pull it cleanly with polarity tagging downstream.
+
+## Review ingestion — normalizing three sources
+
+The App Store Connect API returns reviews via the customerReviews relationship, but the page caps and rate limits are tight. The window leans toward the last one to two months, and older reviews drop in and out. Google Play biases toward the most recent week. Social mentions on X and Threads are even thinner, with no consistent hashtag.
+
+Even one of my flagship apps, which carries most of the AdMob revenue, has more than 10,000 lifetime reviews split across Japanese and English. Concatenating three sources without preserving provenance erases the metadata I need later, so I normalize into a single schema with origin intact.
+
+```python
+# Normalized review schema
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal
+
+@dataclass(frozen=True)
+class Review:
+    source: Literal["app_store", "google_play", "x", "threads"]
+    app_id: str
+    locale: str        # "ja-JP" / "en-US" etc.
+    rating: int        # 1-5; social posts get 0
+    title: str         # social posts get an empty string
+    body: str
+    posted_at: datetime
+    review_id: str     # "store:id" for cross-source uniqueness
+    metadata: dict     # device / version / country, kept verbatim
+```
+
+The body must go through `unicodedata.normalize("NFKC", body)` before anything else. App Store reviews routinely contain unnormalized full-width ASCII, and skipping the step silently splits the downstream cache key. I made that mistake in the first month and double-paid for embeddings on two apps until I noticed.
+
+Keeping `metadata` as a JSON column on D1 lets me re-slice the clusters later by device, OS version, or country without rerunning the pipeline. Schema fields you drop at ingest cannot be recovered, so I lean toward keeping everything and pruning at query time.
+
+## Picking the embedding model — narrowing gemini-embedding-001
+
+For Gemini, `gemini-embedding-001` is the obvious choice today. Setting `task_type="CLUSTERING"` activates a different latent space from the retrieval-tuned default. Forgetting this setting drops clustering quality noticeably — under the search-tuned space, "a positive review with similar wording" and "a negative review on the same topic" end up close together, which then confuses HDBSCAN.
+
+Three settings stay locked in production. Always specify `task_type="CLUSTERING"`. Push `output_dimensionality` down to 256 for storage. Batch 100 reviews per request and key each one with a SHA-256 over the normalized body to keep idempotency tight.
+
+The 768-dim vs 256-dim gap is small once HDBSCAN runs. On the wallpaper app data (12,400 reviews in Japanese and English combined), 768 dims produced 73 clusters, 256 produced 71. Intra-cluster drift is negligible, while the storage and query-speed wins are real. Cutting to 256 shrank the D1 row size by about two-thirds, which compounds nicely on Cloudflare's billing.
+
+```python
+import os
+from google import genai
+from google.genai.types import EmbedContentConfig
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def embed_reviews(reviews: list[str], dim: int = 256) -> list[list[float]]:
+    """Embed reviews for clustering at 256 dimensions."""
+    result = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=reviews,
+        config=EmbedContentConfig(
+            task_type="CLUSTERING",
+            output_dimensionality=dim,
+        ),
+    )
+    return [e.values for e in result.embeddings]
+```
+
+Each batch is wrapped with a SHA-256 idempotency check, so identical reviews never get re-embedded across batches. When a batch throws, the fallback path splits it into chunks of five and retries; a single very long review can blow up an entire batch, which I saw twice over half a year.
+
+## Layer one — coarse clustering with HDBSCAN
+
+HDBSCAN runs directly on the embeddings, with no UMAP stage. I tried UMAP first, but on review counts between 5,000 and 15,000 its probabilistic jitter showed up on cluster boundaries: re-running on the same data produced different labels week to week. Production needs deterministic output, and HDBSCAN alone delivers that.
+
+```python
+import hdbscan
+import numpy as np
+
+def cluster(embeddings: np.ndarray, min_cluster_size: int = 8):
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=3,
+        metric="euclidean",     # vectors are unit-normalized
+        cluster_selection_method="leaf",
+    )
+    labels = clusterer.fit_predict(embeddings)
+    return labels, clusterer.probabilities_
+```
+
+`min_cluster_size=8` translates the business rule "I take it seriously when at least eight people say the same thing." Setting it lower invites one-star drive-bys to drive the backlog. `leaf` selection keeps derived sub-issues from being swallowed by parent clusters, which is what `eom` selection tends to do — the "anything about ads" mega-cluster loses all priority resolution.
+
+`min_samples=3` is deliberately small so that small-locale clusters survive. Pushing it to 8 or 10 erases minority-language signals, and those users still deserve to be heard. The priority weighting downstream pushes cluster size to the top, so tiny clusters do not dominate the final order.
+
+## Layer two — letting Gemini summarize each cluster
+
+HDBSCAN returns labels and probabilities, nothing human-readable. Gemini 2.5 Flash gets the five reviews closest to each cluster centroid and returns a JSON summary with topic, exemplars, proposed change, severity, and polarity.
+
+```python
+PROMPT = """\
+You are an analyst helping an app developer prioritize improvements.
+Below are five representative reviews from one semantic cluster.
+Return JSON with these fields:
+- topic: 25-char noun phrase describing the cluster's central complaint
+- examples: up to 3 verbatim quotes (original language)
+- proposed_change: 1-sentence improvement suggestion
+- severity: 1-5 (5 = uninstall-driving)
+- polarity: -1 (complaint) / 0 (neutral) / +1 (praise)
+"""
+
+def summarize_cluster(reviews: list[Review]) -> dict:
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[PROMPT, *[f"- ({r.locale} {r.rating}-star) {r.body}" for r in reviews]],
+        config={"response_mime_type": "application/json"},
+    )
+    return json.loads(response.text)
+```
+
+Flash is the right pick because summarizing 70 clusters once a week costs roughly USD 0.03 to USD 0.06. Pro produces essentially the same 25-char topic phrasing while multiplying the bill by 30x. For an indie business funded by AdMob, Flash is plenty.
+
+The representative reviews are picked by cosine distance from the centroid, not by HDBSCAN's `probabilities_`. I started with probabilities because they looked authoritative, but eyeballing about 20 cases showed that centroid-nearest reviews produce noticeably crisper summaries. Probabilities reflect cluster membership confidence, which is a different concept from "what does this cluster sound like."
+
+## Layer three — turning a cluster into a priority score
+
+A summary alone does not give you an ordering. The weighting that landed in production is: 0.35 on cluster size, 0.30 on the rating gap (cluster average vs global), 0.15 on polarity sign, 0.15 on the 30-day recency ratio, and 0.05 on normalized LLM severity.
+
+```python
+def priority_score(cluster_summary: dict) -> float:
+    size = cluster_summary["size"]
+    rating_gap = cluster_summary["avg_rating"] - GLOBAL_AVG_RATING
+    polarity_adj = -1 if cluster_summary["polarity"] == -1 else 0.2
+    recency = cluster_summary["recent30_ratio"]
+    severity = cluster_summary["severity"] / 5
+
+    return (
+        0.35 * normalize(size, max_size=300)
+        + 0.30 * polarity_adj * abs(rating_gap)
+        + 0.15 * (1 if cluster_summary["polarity"] == -1 else 0)
+        + 0.15 * recency
+        + 0.05 * severity
+    )
+```
+
+Keeping LLM severity at 0.05 contains the blast radius of hallucinations. Cluster size and polarity correlate most directly with real business impact, so the ranking ends up close to a human's. My first attempt weighted severity at 0.30, and Flash kept rating "we love your ads" as a 5, which pushed the wrong clusters to the top. The lesson: do not hand the final ordering to the LLM. The owner is always the person closest to the business.
+
+The 30-day recency ratio exists to surface emerging issues. Two clusters of the same size, one spread across two years and one concentrated in the last month, are not the same problem. The recent one is usually the side effect of a new release or an OS update — flagged early, it stops being a regression.
+
+## Cache and cost design — staying under a few dollars a month
+
+Reviews are mostly differential, so re-embedding everything is wasteful. The cache hierarchy I run has three tiers.
+
+L1 is Cloudflare KV with a `review:hash` key and a 60-day TTL. L2 is a D1 table that permanently stores hash, embedding, posted_at, app_id, and locale. L3 is the monthly re-embed that only touches reviews whose hash is not already in D1 over the last two years.
+
+Looking at the last two months of operations logs, the weekly incremental embed touches 50 to 140 new reviews across roughly 12,400 lifetime records. That fits in two batches of 100, which puts embedding alone at a few cents per month. Combined with Flash for summarization, the monthly ceiling is around USD 4. Against AdMob revenue in the hundreds of dollars per day, cost has stopped being a decision input.
+
+Persisting embeddings in D1 also pays off when a new embedding model ships. Bulk re-embedding past reviews under the new model needs the raw body and hash side-by-side, plus the model version stamp on each row. I keep the previous model's vectors live for clustering until the migration is fully verified — mixing model versions in a single clustering run produces noticeably noisier results.
+
+## Three traps I burned a month each on
+
+Three issues took weeks to track down.
+
+The first was Unicode normalization on review bodies. App Store reviews contain unnormalized full-width ASCII often enough that L1 cache keys split silently. Normalizing every body with NFKC at ingest fixed it.
+
+The second was multi-language cluster merging and splitting. "Too many ads" merges across English and Japanese cleanly. "It crashes" does not — the embedding picks up cultural-context differences. Running a second clustering pass on the topic summaries themselves merges these cousin clusters when needed.
+
+The third was misreading the HDBSCAN noise label. The `-1` bucket is "no cluster," not "low priority." A release-blocking crash on one specific device sat in `-1` for two weeks before I cross-referenced Crashlytics and noticed. Now `-1` reviews get a second pass against Crashlytics and a separate weaker clustering run.
+
+## Comparing paths I evaluated and dropped
+
+A few alternative architectures got serious consideration. They are worth recording.
+
+The first was sending all 10,000+ reviews directly to Gemini 2.5 Pro in 32k-token batches and asking for prioritized issues in JSON. Roughly 30 API calls covered the corpus, and the code was ten lines. After two weeks I dropped it: clusters split across batch boundaries (the same complaint fragmenting into multiple batches) never went away. Embeddings plus clustering ends up cheaper overall and far more stable.
+
+The second was a hybrid with OpenAI's `text-embedding-3-large` and Gemini Embedding side by side. Multilingual quality was the deciding factor — Japanese clustering felt one rung better on Gemini, and English was a wash. Operational simplicity won, and I consolidated on Gemini. I still embed the gold set with both monthly as a sanity check; having two observation points helps me spot the day Gemini's behavior actually shifts.
+
+The third was a commercial ASO tool with a review module (AppFollow, Sensor Tower). Pricing started around USD 200 per month and the prioritization logic was opaque. At my revenue scale, USD 4 of self-hosted infrastructure beats the alternative cleanly. At a larger business this trade-off would be worth revisiting.
+
+## Validating embedding quality with a small gold set
+
+To keep clustering quality stable over time, I maintain a 100-review gold set. I hand-labeled each one with five canonical topics (ad-related, usability, crashes, content requests, subscription complaints). Whenever a new embedding model ships I re-embed the set, force KMeans into five clusters, and measure purity against the ground truth.
+
+A hundred items is small, but it is a fixed cohort. The point is to see drift, not to certify absolute quality. On `gemini-embedding-001` it started at 87% purity and has stayed near 85% for half a year. A 3%-or-more drop sustained over two weeks is the signal I trust to investigate, usually pointing at a review-template fad or an App Store formatting change.
+
+```python
+def evaluate_purity(gold: list[tuple[str, str]]) -> float:
+    """Measure clustering purity against the gold-labeled set."""
+    texts = [t for t, _ in gold]
+    labels_true = [lab for _, lab in gold]
+    vecs = np.array(embed_reviews(texts, dim=256))
+
+    km = KMeans(n_clusters=5, n_init=10, random_state=42).fit(vecs)
+    return purity_score(labels_true, km.labels_)
+```
+
+The script runs once a month from GitHub Actions and posts to Slack. Even without a full observability stack, having one trustworthy number to glance at each month keeps the system honest.
+
+## Connecting back to the workflow — Linear and FCM
+
+Clusters above a priority threshold open Linear issues automatically. The cluster ID is derived deterministically from the HDBSCAN label plus a hash of the five representative reviews, so re-runs append to the existing issue instead of creating duplicates.
+
+```python
+def to_linear_issue(cluster: dict) -> dict:
+    return {
+        "title": f"[Review priority {cluster['priority']:.2f}] {cluster['topic']}",
+        "description": format_cluster_description(cluster),
+        "labels": ["user-feedback", cluster["app_id"], polarity_label(cluster)],
+        "stateId": LINEAR_TRIAGE_STATE_ID,
+    }
+```
+
+Users who reviewed an app get an opt-in Firebase Cloud Messaging push when the issue closest to their wording ships. The reopen rate measured internally is about 8.4% above baseline. eCPM matters, but reactivated users contribute to DAU in a way that compounds across months. Building a small gratitude loop like this was only feasible once the embedding pipeline stabilized.
+
+## A year in
+
+I have been writing code since 1997, when an indie developer in Tokyo could already feel the international community through a dial-up modem. The review feed is hard to read alone, but read carefully it always converts into coherent requests. Gemini Embeddings did the translation step at a scale I could not handle solo as a contemporary artist running both a studio practice and an app business.
+
+My grandfathers on both sides were temple carpenters. The kind of joinery you cannot see is what holds the building up for centuries. Code and reviews work the same way: the unseen layers, kept clean and patient, end up mattering most. The next experiment on my list is correlating churn weight per cluster against Firestore session data. When that one works, I will write it up separately.
+
+Hope this gives you a starting point if you are running into the same review backlog problem from a wallpaper app or any indie product. Thanks for reading.
