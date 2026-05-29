@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "BUILT-IN+CUSTOM — Gemini API で Google 検索 grounding やコード実行を custom function calling と 1 リクエストで併用可能に（5月）",
-    "MAPS GROUNDING — Gemini 3 系で Google Maps grounding 解禁、地理データ・営業時間・経路を citations 付きで取得（5月）",
-    "3.5 PRO — Gemini 3.5 Pro は 6 月一般公開予定、Google 社内で既に稼働中（5/27）",
-    "MULTIMODAL RAG — File Search が画像対応、media_id と page-level citations で verifiable RAG を構築可能（5/5）",
-    "WEBHOOKS — Batch API / long-running operations の状態通知が webhook ベースに統一、ポーリング不要に（5月）",
-    "WWDC × GEMINI — 新 Siri は Gemini ベースのカスタムモデル + Apple Private Cloud Compute で動作との報道（5月）",
+    "GEMINI35FLASH — Gemini 3.5 Flash 発表、Terminal-Bench 2.1 で 76.2% を達成しエージェント・コーディング特化（5/19）",
+    "PRO35NEXT — Gemini 3.5 Pro が来月（6月）一般提供予定、Google が既に内部運用中",
+    "FLASHLITE — gemini-3.1-flash-lite GA、速度・スケール・コスト最適化の安価モデル（5/7）",
+    "FILESEARCH — File Search がマルチモーダル化、gemini-embedding-2 で画像をネイティブ embed & search（5/5）",
+    "WEBHOOKS — Gemini API に Webhooks サポート追加、Batch API の polling を置換（5/4）",
+    "MANAGEDAGT — Managed Agents が Gemini API に登場、1 API コールで Antigravity エージェントの Linux sandbox を provision",
   ],
   en: [
-    "BUILT-IN+CUSTOM — Gemini API now combines built-in tools (search grounding, code exec) with custom function calls in one request (May)",
-    "MAPS GROUNDING — Gemini 3 models gain Google Maps grounding: geo data, hours, routes with citations (May)",
-    "3.5 PRO — Gemini 3.5 Pro arrives in June, already used internally at Google (5/27)",
-    "MULTIMODAL RAG — File Search goes multimodal: media_id + page-level citations for verifiable RAG (5/5)",
-    "WEBHOOKS — Batch API and long-running operations now notify via webhooks; goodbye polling (May)",
-    "WWDC × GEMINI — New Siri reportedly runs on a custom Gemini-based model via Apple's Private Cloud Compute (May)",
+    "GEMINI35FLASH — Gemini 3.5 Flash announced with 76.2% on Terminal-Bench 2.1, tuned for agents & coding (5/19)",
+    "PRO35NEXT — Gemini 3.5 Pro rolling out next month (June), already in use internally at Google",
+    "FLASHLITE — gemini-3.1-flash-lite hits GA, optimized for speed, scale, and cost efficiency (5/7)",
+    "FILESEARCH — File Search goes multimodal with gemini-embedding-2 for native image embed & search (5/5)",
+    "WEBHOOKS — Gemini API adds Webhooks support, replacing polling for Batch API & long-running ops (5/4)",
+    "MANAGEDAGT — Managed Agents land in Gemini API: one call provisions an Antigravity agent in a Linux sandbox",
   ],
 };
 
