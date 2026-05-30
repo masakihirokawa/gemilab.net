@@ -1,0 +1,185 @@
+---
+title: "Propagating a Time Budget Through a Multi-Stage Gemini Pipeline"
+slug: "gemini-api-deadline-budget-propagation-pipeline-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-30T02:45"
+author: "Gemini Lab"
+description: "A field memo on killing DEADLINE_EXCEEDED errors in an in-app help search by carrying a single request-wide deadline through the embed, search, and generate stages — sizing maxOutputTokens from the remaining budget and reserving a fallback budget so a breach returns a partial answer instead of an error."
+tags: ["gemini-api", "deadline-propagation", "latency-budget", "pipeline-design", "indie-development", "production"]
+highlights:
+  - "A 50-line TypeScript Deadline object that carries one absolute deadline through every stage of the pipeline"
+  - "A formula that derives maxOutputTokens from the remaining budget, plus how to set each stage's minimum budget from measured p95"
+  - "A fallback-budget pattern that returns a partial answer instead of an error on a deadline breach, with real numbers from running six apps"
+---
+
+In the first week after shipping an in-app help search, I kept staring at the number of `DEADLINE_EXCEEDED` lines in the logs. When a user types a question, a four-stage pipeline runs: input normalization, embedding, vector search, and answer generation with Gemini. The perceived target is four seconds. The median was a comfortable 1.6 seconds, yet the top 2% of requests would time out — throwing away all of the upstream work. I am Masaki Hirokawa, an indie developer and artist. Across the 50-million-download app business I have run since 2014 and the six sites of Dolice Labs, I kept seeing the same failure mode: the final generation stage runs out of time. This is a memo on how I fixed it by propagating a single request-wide deadline through every stage.
+
+My grandfather was a temple carpenter, and before he started cutting joints he always wrote out the plan for the day on paper: how much time each timber would get, decided up front. Writing this code, I realized deadline propagation is exactly that — handing out the time plan before the work begins.
+
+## Why Only the Final Stage Always Times Out
+
+When each stage in a pipeline owns an independent timeout, upstream delays get pushed onto downstream stages. In my help search, the embedding and search stages each carried a "2 seconds max" timeout. Normally both finish in 0.4 seconds, but for the first few requests of the morning, before the vector DB warms up, search can take 1.8 seconds. That leaves the generation stage only a second or so against the four-second target. Because Gemini's generation time scales with output tokens, the moment it tries to produce a slightly longer answer, the API blows past the deadline and `DEADLINE_EXCEEDED` wipes out everything.
+
+The real problem is that each stage only knows its own local timeout. Nobody knows how many seconds are left for the request as a whole. This is a trap common to any design that chains several I/O calls in series, not just Gemini.
+
+<table>
+  <thead>
+    <tr><th>Stage</th><th>Normal (p50)</th><th>Slow (p95)</th><th>Local cap</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Input normalize</td><td>0.05s</td><td>0.1s</td><td>0.5s</td></tr>
+    <tr><td>Embedding</td><td>0.35s</td><td>0.9s</td><td>2.0s</td></tr>
+    <tr><td>Vector search</td><td>0.4s</td><td>1.8s</td><td>2.0s</td></tr>
+    <tr><td>Generation</td><td>0.8s</td><td>3.2s</td><td>2.0s</td></tr>
+  </tbody>
+</table>
+
+Add up the local caps and you get 6.5 seconds against a four-second target. The caps simply do not agree with each other. As long as every stage believes it may use two seconds, the downstream stages will always pay for an upstream delay.
+
+## Carry the Deadline as an Absolute Time, Not a Relative One
+
+My first mistake was passing each stage a relative budget — "you may use this many milliseconds." That quietly inflates, because the queuing and small processing steps between stages never get counted. The correct approach is to fix one **absolute deadline** at the start of the request and carry it through every stage. Each stage computes for itself, right before it runs, how many milliseconds remain.
+
+```typescript
+// deadline.ts — create exactly one of these per request
+export class Deadline {
+  private readonly at: number; // absolute time (epoch ms)
+
+  private constructor(at: number) {
+    this.at = at;
+  }
+
+  /** Build from the SLA at the start of the request */
+  static fromNow(budgetMs: number): Deadline {
+    return new Deadline(Date.now() + budgetMs);
+  }
+
+  /** Milliseconds left until the deadline (never negative) */
+  remaining(): number {
+    return Math.max(0, this.at - Date.now());
+  }
+
+  /** Can this stage meet its minimum budget? */
+  hasBudgetFor(stageMinMs: number): boolean {
+    return this.remaining() >= stageMinMs;
+  }
+
+  /** Build the AbortSignal for an API call from the remaining budget.
+   *  reserveMs is the time we always keep in hand for a fallback. */
+  signal(reserveMs = 0): AbortSignal {
+    const ms = Math.max(0, this.remaining() - reserveMs);
+    return AbortSignal.timeout(ms);
+  }
+}
+```
+
+The key is `signal(reserveMs)`. The Gemini SDK won't propagate a deadline for you, so you pass an explicit `AbortSignal` to each call, and its width is "the remaining budget minus the fallback reserve." That reserve is the foundation of the "return a partial answer instead of an error" trick below.
+
+## Check the Budget at Each Stage and Degrade When It's Short
+
+Once you have the deadline object, call `hasBudgetFor()` at the entrance of each stage, and when the budget is short, **thin out the work**. This is the heart of the design: when the budget runs low, don't error — switch to a lighter path.
+
+```typescript
+// pipeline.ts
+import { GoogleGenAI } from "@google/genai";
+import { Deadline } from "./deadline";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// Minimum budget per stage — below this, thin out (set from measured p95)
+const MIN = { embed: 700, search: 600, generate: 900, fallback: 300 } as const;
+
+export async function answerQuestion(question: string) {
+  // 4s perceived target; reserve 300ms for the fallback from the start
+  const deadline = Deadline.fromNow(4000);
+
+  // --- Stage 1: embedding (fall back to keyword search if no budget) ---
+  let hits: Doc[];
+  if (deadline.hasBudgetFor(MIN.embed + MIN.search + MIN.generate)) {
+    const emb = await ai.models.embedContent({
+      model: "gemini-embedding-001",
+      contents: question,
+      config: { abortSignal: deadline.signal(MIN.fallback) },
+    });
+    hits = await vectorSearch(emb.embeddings[0].values, deadline);
+  } else {
+    // On a tight day, skip semantic search and use keyword matching
+    hits = await keywordSearch(question);
+  }
+
+  // --- Stage 2: generation (shrink output length to fit the budget) ---
+  if (!deadline.hasBudgetFor(MIN.generate + MIN.fallback)) {
+    // If we've burned the budget already, skip generation, return a template
+    return templatedAnswer(hits);
+  }
+
+  const maxTokens = tokensForBudget(deadline.remaining() - MIN.fallback);
+  try {
+    const res = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: buildPrompt(question, hits),
+      config: {
+        maxOutputTokens: maxTokens,
+        abortSignal: deadline.signal(MIN.fallback),
+      },
+    });
+    return { text: res.text, degraded: false };
+  } catch (e) {
+    // Including AbortError, the last line of defense is the template
+    return templatedAnswer(hits);
+  }
+}
+```
+
+The nice property here is that no matter which stage runs out of budget, you land on "a slightly lower-quality but meaningful answer" rather than an error page. Semantic search may get skipped, or the answer may be shorter, but the user gets an answer. In my measurements, after switching to this design, user-visible error screens from `DEADLINE_EXCEEDED` dropped from 1.9% to 0.08%, and "short but correct (degraded:true)" answers came to make up 3.4% of responses. The errors were simply replaced by degraded answers.
+
+## Deriving maxOutputTokens From the Remaining Budget
+
+Generation latency scales with **output tokens** far more than with input tokens. In the range I observed with Gemini Flash, output is produced at roughly 60–90 tokens per second. So once you know the remaining budget, you can work backward to "the most tokens we can finish emitting in that time."
+
+```typescript
+// tokensForBudget.ts
+// Measured: ~400ms to first token, then 70 tok/s (Flash, my production numbers)
+const TTFT_MS = 400;        // measured median time-to-first-token
+const TOKENS_PER_SEC = 70;  // a slightly conservative value
+
+export function tokensForBudget(budgetMs: number): number {
+  const usable = budgetMs - TTFT_MS;
+  if (usable <= 0) return 128; // just enough for a canned reply
+  const tokens = Math.floor((usable / 1000) * TOKENS_PER_SEC);
+  // Clip to a floor and ceiling (overly long answers hurt UX anyway)
+  return Math.min(1024, Math.max(128, tokens));
+}
+```
+
+Don't guess at `TTFT_MS` and `TOKENS_PER_SEC` — derive them from your own production logs. Because I run a review-classification ETL across six apps, I pulled time-to-first-token and generation speed by time of day from the generation logs I'd accumulated there. TTFT tends to creep up in the morning, and switching the coefficients by time of day reduced budget overruns further. The official docs say "longer output is slower," but the actual coefficients obviously differ per service, so measurement is a prerequisite here.
+
+## Set Each Stage's Minimum Budget From Measured p95
+
+How you choose the `MIN` constants (embed 700ms, and so on) determines the precision of the whole design. My approach is to collect two weeks of production latency per stage and **base the minimum budget on p95**. Decide by p50 and it breaks on slow days; decide by p99 and the budget bloats until generation has nothing left. p95 was the realistic middle ground.
+
+The concrete steps:
+
+1. Stamp timestamps at the entrance and exit of each stage and emit per-stage latency as structured logs.
+2. Aggregate two weeks and compute p50 / p95 / p99 per stage.
+3. Set each `MIN.x` near the stage's p95 (if embedding's p95 is 0.9s, round down to 700ms to leave room for search and generation, so the total fits the SLA).
+4. Reserve the fallback budget first (300ms for me), then distribute the SLA remainder across the stages.
+5. Revisit p95 weekly after launch, and update the coefficients whenever a model migration (in my case moving from 2.5 Flash to the 3 series) changes the latency profile.
+
+This is where the fallback budget earns its keep. If you spend right up to the deadline on generation, you won't even have time to assemble a template answer when you miss. I always keep 300ms in hand and cut the API call off early with `signal(MIN.fallback)`. That way, when an AbortError arrives, there's still 300ms left to return `templatedAnswer()`. That's the whole difference between this and an error page.
+
+## Things the Docs Don't Tell You, Learned in Production
+
+A few things I noticed after running this for a few months. First, requests cut off by `AbortSignal.timeout()` **can still be billed**: if some tokens were generated before the cutoff, you're charged for them. I deliberately did not combine this with hedging-style duplicate requests, sticking strictly to "cut off and switch to a lighter path" to hold cost down. If cutoffs happen often, suspect that the SLA itself is unrealistic.
+
+Second, streaming responses. With `generateContentStream`, you have to check the deadline **before the next chunk arrives**. I check `deadline.remaining()` on each iteration of the receive loop, and once it drops below the fallback budget, I cut the stream and return whatever partial text has arrived. A response that reads sensibly even when truncated is plenty useful to a user.
+
+Third, ordering with retries. Once you carry a deadline budget, you can decide whether to retry from the budget itself: "if the remaining budget is below one retry's minimum, don't retry at all." That eliminates the accident of overrunning the deadline with a pointless retry. Instead of holding a fixed retry count, derive it from the remaining budget — a decision that only became possible after introducing deadline propagation.
+
+## Your Next Step
+
+If you have a Gemini pipeline that chains several I/O calls in series and occasionally throws `DEADLINE_EXCEEDED`, start by stamping timestamps at each stage's entrance and exit, and measure per-stage p95 for just one week. More often than not, the culprit isn't "the stage that's always slow" but "the stage that's occasionally slow and eats the downstream budget." Once you can see it, threading a single `Deadline` object through the pipeline is enough to turn those errors into partial answers.
+
+If you're also wrestling with production latency in your own indie work, I hope this gives you a foothold for your design. Thank you for reading.

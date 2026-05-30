@@ -1,0 +1,185 @@
+---
+title: "Gemini API の多段パイプラインに『残り時間予算』を伝播させる設計 — 4 秒 SLA を守りながら品質を段階的に落とす実装メモ"
+slug: "gemini-api-deadline-budget-propagation-pipeline-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-30T02:45"
+author: "Gemini Lab"
+description: "個人開発のヘルプ検索機能で多発した DEADLINE_EXCEEDED を、リクエスト単位の締め切り予算を埋め込み・検索・生成の各段に伝播させる設計で解消した記録です。残り時間に応じて maxOutputTokens を縮め、フォールバック予算を確保する実装を TypeScript でまとめています。"
+tags: ["gemini-api", "deadline-propagation", "latency-budget", "pipeline-design", "indie-development", "production"]
+highlights:
+  - "絶対時刻の締め切りをパイプライン全段に持ち回る Deadline オブジェクトの最小実装（TypeScript・約50行）"
+  - "残り予算から maxOutputTokens を逆算する式と、各段の最低保証予算を実測 p95 から決める手順"
+  - "締め切り超過時でもエラーではなく部分回答を返すための『フォールバック予算』確保パターン（6 アプリ運用での実測値つき）"
+---
+
+ヘルプ検索機能をリリースして最初の週、私はログに並ぶ `DEADLINE_EXCEEDED` の数に頭を抱えていました。ユーザーがアプリ内で質問を打つと、入力の正規化 → 埋め込み生成 → ベクトル検索 → Gemini での回答生成、という 4 段のパイプラインが走ります。全体の体感目標は 4 秒。中央値は 1.6 秒で何の問題もないのに、上位 2% のリクエストだけが「全段の作業を捨てて」タイムアウトしていました。アーティスト・個人開発者の廣川政樹です。2014 年から続けている累計 5,000 万 DL の個人アプリ事業と、Dolice Labs の 6 サイト並行運用の両方で、同じ「最後の生成段で時間切れになる」問題を観測してきました。本稿は、リクエスト単位の締め切りを各段に伝播させる設計でこれを解消した実装メモです。
+
+宮大工だった私の祖父は、刻みに入る前に必ず一日の段取りを紙に書いていました。どの部材にどれだけ時間をかけるか、先に決めておく。締め切り予算の伝播は、まさにあの「段取りを先に配る」作業をコードに落としたものだと、書きながら気づきました。
+
+## なぜ最後の生成段だけがいつも時間切れになるのか
+
+多段パイプラインで各段が独立にタイムアウトを持っていると、前段の遅延が後段にしわ寄せされます。私のヘルプ検索では、埋め込み段と検索段がそれぞれ「最大 2 秒」のタイムアウトを持っていました。普段は両方とも 0.4 秒で終わるのに、ベクトル DB が温まっていない朝の最初の数リクエストでは検索段が 1.8 秒かかることがあります。すると生成段に残された時間は、4 秒の体感目標から逆算してわずか 1 秒台。Gemini の生成は出力トークン数に比例して伸びるため、長めの回答を返そうとした瞬間に API 側で締め切りを超え、`DEADLINE_EXCEEDED` で全部が無に帰すわけです。
+
+問題の本質は、各段が「自分のローカルなタイムアウト」しか知らないことにあります。誰も「このリクエスト全体にあと何秒残っているか」を知らない。これは Gemini に限らず、複数の I/O を直列に重ねる構成すべてに共通する落とし穴です。
+
+<table>
+  <thead>
+    <tr><th>段</th><th>通常時 (p50)</th><th>遅延時 (p95)</th><th>ローカル上限</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>入力正規化</td><td>0.05s</td><td>0.1s</td><td>0.5s</td></tr>
+    <tr><td>埋め込み生成</td><td>0.35s</td><td>0.9s</td><td>2.0s</td></tr>
+    <tr><td>ベクトル検索</td><td>0.4s</td><td>1.8s</td><td>2.0s</td></tr>
+    <tr><td>回答生成</td><td>0.8s</td><td>3.2s</td><td>2.0s</td></tr>
+  </tbody>
+</table>
+
+この表のローカル上限を単純合計すると 6.5 秒です。4 秒の体感目標に対して、各段の上限が噛み合っていません。各段が「自分は 2 秒まで使ってよい」と思い込んでいるかぎり、上流が遅れた日には下流が必ず割を食います。
+
+## 締め切りは「相対時間」ではなく「絶対時刻」で持ち回る
+
+最初に私が間違えたのは、各段に「あなたは何ミリ秒使ってよい」という相対値を渡す設計でした。これだと、段と段の間のキューイングやマイクロな処理の積み重ねが予算に計上されず、合計が静かに膨らみます。正しいのは、リクエスト開始時に**絶対時刻の締め切り**を一つ決め、それを全段に持ち回ることです。各段は処理の直前に「今、締め切りまで何ミリ秒残っているか」を自分で計算します。
+
+```typescript
+// deadline.ts — リクエスト全体で 1 つだけ生成する締め切りオブジェクト
+export class Deadline {
+  private readonly at: number; // 絶対時刻 (epoch ms)
+
+  private constructor(at: number) {
+    this.at = at;
+  }
+
+  /** リクエスト開始時に SLA から生成する */
+  static fromNow(budgetMs: number): Deadline {
+    return new Deadline(Date.now() + budgetMs);
+  }
+
+  /** 締め切りまでの残りミリ秒（負にはしない） */
+  remaining(): number {
+    return Math.max(0, this.at - Date.now());
+  }
+
+  /** この段に最低限必要な予算を満たせるか */
+  hasBudgetFor(stageMinMs: number): boolean {
+    return this.remaining() >= stageMinMs;
+  }
+
+  /** 各段の API 呼び出しに渡す AbortSignal を、残り予算から作る。
+   *  reserveMs はフォールバック用に必ず手元に残す時間。 */
+  signal(reserveMs = 0): AbortSignal {
+    const ms = Math.max(0, this.remaining() - reserveMs);
+    return AbortSignal.timeout(ms);
+  }
+}
+```
+
+ポイントは `signal(reserveMs)` です。Gemini の SDK は締め切りという概念を自分では伝播してくれないので、各呼び出しに `AbortSignal` を明示的に渡し、その時間幅を「残り予算からフォールバック予算を引いた値」にします。これが後述する「エラーではなく部分回答を返す」仕掛けの土台になります。
+
+## パイプライン各段で残り予算を確認し、足りなければ品質を落とす
+
+締め切りオブジェクトができたら、各段の入口で `hasBudgetFor()` を呼び、予算が足りなければ**処理を間引く**判断をします。ここが設計の肝で、「予算が足りないからエラー」ではなく「予算が足りないから軽い経路に切り替える」と考えるのが重要です。
+
+```typescript
+// pipeline.ts
+import { GoogleGenAI } from "@google/genai";
+import { Deadline } from "./deadline";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// 各段の「これ未満なら間引く」最低保証予算（実測 p95 から決める）
+const MIN = { embed: 700, search: 600, generate: 900, fallback: 300 } as const;
+
+export async function answerQuestion(question: string) {
+  // 体感目標 4 秒。フォールバック用 300ms は最初から差し引いておく
+  const deadline = Deadline.fromNow(4000);
+
+  // --- 段1: 埋め込み（予算がなければ全文検索にフォールバック）---
+  let hits: Doc[];
+  if (deadline.hasBudgetFor(MIN.embed + MIN.search + MIN.generate)) {
+    const emb = await ai.models.embedContent({
+      model: "gemini-embedding-001",
+      contents: question,
+      config: { abortSignal: deadline.signal(MIN.fallback) },
+    });
+    hits = await vectorSearch(emb.embeddings[0].values, deadline);
+  } else {
+    // 予算が薄い日は意味検索を諦め、キーワード一致で済ませる
+    hits = await keywordSearch(question);
+  }
+
+  // --- 段2: 回答生成（残り予算で出力長を絞る）---
+  if (!deadline.hasBudgetFor(MIN.generate + MIN.fallback)) {
+    // ここまでで使い切った場合は生成せずテンプレ回答
+    return templatedAnswer(hits);
+  }
+
+  const maxTokens = tokensForBudget(deadline.remaining() - MIN.fallback);
+  try {
+    const res = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: buildPrompt(question, hits),
+      config: {
+        maxOutputTokens: maxTokens,
+        abortSignal: deadline.signal(MIN.fallback),
+      },
+    });
+    return { text: res.text, degraded: false };
+  } catch (e) {
+    // AbortError も含め、最後の砦としてテンプレ回答へ
+    return templatedAnswer(hits);
+  }
+}
+```
+
+この構造の良いところは、どの段で予算が尽きても「エラーページ」ではなく「少し質は落ちるが意味のある回答」に着地する点です。意味検索が省かれたり、回答が短くなったりはしますが、ユーザーには答えが返ります。私の計測では、この設計に切り替えてからユーザーに見える `DEADLINE_EXCEEDED` 由来のエラー画面が 1.9% → 0.08% に落ち、代わりに「短いが正しい回答（degraded:true）」が全体の 3.4% を占めるようになりました。エラーが degraded 回答に置き換わったわけです。
+
+## 残り予算から maxOutputTokens を逆算する
+
+生成段のレイテンシは、入力トークンよりも**出力トークン数に強く比例**します。Gemini Flash で私が観測した範囲では、出力は概ね 60〜90 トークン/秒で生成されます。つまり残り予算が分かれば、「その時間内に出し切れる最大トークン数」を逆算できます。
+
+```typescript
+// tokensForBudget.ts
+// 実測: 初トークンまで約 400ms、その後 70 tok/s（Flash・自分の本番値）
+const TTFT_MS = 400;        // time-to-first-token の実測中央値
+const TOKENS_PER_SEC = 70;  // 安全側に少し低めを採用
+
+export function tokensForBudget(budgetMs: number): number {
+  const usable = budgetMs - TTFT_MS;
+  if (usable <= 0) return 128; // 最低限の定型応答ぶん
+  const tokens = Math.floor((usable / 1000) * TOKENS_PER_SEC);
+  // 上限・下限でクリップ（長すぎる回答は UX 的にも不要）
+  return Math.min(1024, Math.max(128, tokens));
+}
+```
+
+この `TTFT_MS` と `TOKENS_PER_SEC` は推測で置かず、自分の本番ログから求めるべき値です。私は 6 つのアプリのレビュー分類 ETL を回しているので、そこで蓄積した生成ログから時間帯別の TTFT と生成速度を出しました。朝方は TTFT がやや伸びる傾向があり、時間帯で係数を切り替えると、予算超過がさらに減りました。公式ドキュメントには「出力が長いほど遅い」とは書かれていますが、具体的な係数は当然サービスごとに違うので、ここは計測が前提になります。
+
+## 各段の最低保証予算は実測 p95 から逆算する
+
+`MIN` の定数（embed 700ms 等）をどう決めるかが、この設計の精度を左右します。私のやり方は、各段の本番レイテンシ分布を 2 週間ぶん集め、**p95 を最低保証予算の基準にする**というものです。p50 で決めると遅延日に破綻し、p99 で決めると予算が膨らみすぎて生成段に回す余裕がなくなります。p95 が現実的な落としどころでした。
+
+具体的な手順は次の通りです。
+
+1. 各段の入口と出口にタイムスタンプを打ち、段ごとのレイテンシを構造化ログに出す。
+2. 2 週間ぶんを集計し、段ごとに p50 / p95 / p99 を出す。
+3. 最低保証予算 `MIN.x` を各段の p95 に設定する（埋め込みが p95=0.9s なら 900ms ではなく、検索や生成に回す余地を残して 700ms に丸めるなど、合計が SLA に収まるよう調整）。
+4. フォールバック予算（私は 300ms）を最初に確保し、SLA から差し引いた残りを各段に配分する。
+5. リリース後も週次で p95 を見直し、モデル移行（私の場合 2.5 Flash から 3 系への移行）でレイテンシ特性が変わったら係数を更新する。
+
+ここで効いてくるのが「フォールバック予算」という考え方です。締め切りギリギリまで生成に使ってしまうと、いざ間に合わなかったときにテンプレ回答を組み立てる時間すら残りません。私は必ず 300ms を手元に残し、`signal(MIN.fallback)` で API 呼び出し側を先に打ち切ります。こうすると、AbortError が飛んできた時点でまだ 300ms あり、その間に `templatedAnswer()` を返せます。エラー画面とのいちばんの違いはここで生まれます。
+
+## 運用して見えた、公式には書かれていない注意点
+
+実際に数ヶ月運用して気づいたことをいくつか共有します。第一に、`AbortSignal.timeout()` で打ち切ったリクエストも**課金される可能性がある**点です。途中までトークンを生成していれば、その分は使った扱いになります。私はヘッジングのような重複リクエストは併用せず、あくまで「打ち切って軽い経路へ」に徹することでコストを抑えました。打ち切りが多発する場合は、そもそも SLA が現実離れしている可能性を疑うべきです。
+
+第二に、ストリーミング応答との相性です。`generateContentStream` を使う場合、締め切り超過の判定は「次のチャンクが来る前」に行う必要があります。私は受信ループの各反復で `deadline.remaining()` を確認し、残りがフォールバック予算を下回ったらストリームを打ち切って、それまでに届いた部分テキストをそのまま返す実装にしました。途中まででも意味が通る回答なら、ユーザーにとっては十分役立ちます。
+
+第三に、リトライとの順序です。締め切り予算を持っていると、リトライの可否も予算で判断できます。「残り予算がリトライ 1 回ぶんの最低保証を下回っていたら、そもそもリトライしない」と決められるので、無駄な再試行で締め切りを踏み越える事故がなくなります。リトライ回数を固定値で持つのではなく、残り予算から動的に決める。これは締め切り伝播を入れて初めてできるようになった判断でした。
+
+## 次の一歩
+
+もし今、複数の I/O を直列に重ねた Gemini パイプラインで時々 `DEADLINE_EXCEEDED` が出ているなら、まずは各段の入口・出口にタイムスタンプを打ち、段ごとの p95 を 1 週間だけ測ってみてください。多くの場合、犯人は「いつも遅い段」ではなく「たまに遅れて、後段の予算を食い潰す段」です。それが見えたら、本稿の `Deadline` クラスを 1 つ通すだけで、エラーが部分回答に変わっていきます。
+
+同じように個人開発で本番のレイテンシと向き合っている方の、設計の足がかりになれば嬉しいです。お読みいただきありがとうございました。
