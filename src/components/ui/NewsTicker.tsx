@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMINI35FLASH — Gemini 3.5 Flash 発表、Terminal-Bench 2.1 で 76.2% を達成しエージェント・コーディング特化（5/19）",
-    "PRO35NEXT — Gemini 3.5 Pro が来月（6月）一般提供予定、Google が既に内部運用中",
-    "FLASHLITE — gemini-3.1-flash-lite GA、速度・スケール・コスト最適化の安価モデル（5/7）",
-    "FILESEARCH — File Search がマルチモーダル化、gemini-embedding-2 で画像をネイティブ embed & search（5/5）",
-    "WEBHOOKS — Gemini API に Webhooks サポート追加、Batch API の polling を置換（5/4）",
-    "MANAGEDAGT — Managed Agents が Gemini API に登場、1 API コールで Antigravity エージェントの Linux sandbox を provision",
+    "FLASH35 — Gemini 3.5 FlashがGA、agentic/codingでGemini 3.1 Proを上回る性能（5/19）",
+    "INTERACT — Interactions APIが破壊的変更、outputs→stepsへ。旧スキーマは6/8に削除（5月）",
+    "MANAGED — Managed Agentsがpublic preview、Googleホストの隔離Linuxで自律エージェントを実行（5/19）",
+    "FLASHLITE — Gemini 3.1 Flash-LiteがGA、速度・スケール・コスト効率を重視（5/7）",
+    "FILESEARCH — File Searchがgemini-embedding-2でマルチモーダル検索に対応（5/5）",
+    "IO2026 — Google I/O 2026開催、Gemini・Antigravity・AI Studioの大型アップデート（5/19）",
   ],
   en: [
-    "GEMINI35FLASH — Gemini 3.5 Flash announced with 76.2% on Terminal-Bench 2.1, tuned for agents & coding (5/19)",
-    "PRO35NEXT — Gemini 3.5 Pro rolling out next month (June), already in use internally at Google",
-    "FLASHLITE — gemini-3.1-flash-lite hits GA, optimized for speed, scale, and cost efficiency (5/7)",
-    "FILESEARCH — File Search goes multimodal with gemini-embedding-2 for native image embed & search (5/5)",
-    "WEBHOOKS — Gemini API adds Webhooks support, replacing polling for Batch API & long-running ops (5/4)",
-    "MANAGEDAGT — Managed Agents land in Gemini API: one call provisions an Antigravity agent in a Linux sandbox",
+    "FLASH35 — Gemini 3.5 Flash hits GA, beating Gemini 3.1 Pro on agentic & coding benchmarks (May 19)",
+    "INTERACT — Interactions API breaking change: outputs to steps; legacy schema removed June 8 (May)",
+    "MANAGED — Managed Agents enter public preview, running autonomous agents in Google-hosted sandboxes (May 19)",
+    "FLASHLITE — Gemini 3.1 Flash-Lite reaches GA, tuned for speed, scale and cost efficiency (May 7)",
+    "FILESEARCH — File Search adds multimodal search via gemini-embedding-2 (May 5)",
+    "IO2026 — Google I/O 2026 brings major updates to Gemini, Antigravity and AI Studio (May 19)",
   ],
 };
 
