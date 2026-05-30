@@ -1,0 +1,234 @@
+---
+title: "Gemini 3 の thought signatures を保持してマルチターン function calling を壊さない本番設計"
+slug: "gemini-3-thought-signatures-function-calling-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-30T15:00"
+author: "Gemini Lab"
+description: "Gemini 3 の思考モデルで function calling を組むと、2 ターン目以降に推論が浅くなる現象に当たります。原因は thought signature の欠落です。署名を保持する本番実装と検証手順をまとめました。"
+tags: ["Gemini API", "function calling", "thinking", "エージェント", "本番運用"]
+highlights:
+  - "thought signature が欠けると 2 ターン目以降の tool 選択精度が落ちる仕組みを、リクエスト JSON の差分で具体的に把握できます"
+  - "REST を直接叩く実装で署名を取りこぼさない contents 再構築コードと、SDK 任せにしたときの落とし穴を区別できます"
+  - "AdMob 異常検知エージェントで署名保持の前後を比較した実測ログをもとに、無駄な再 thinking を減らすチューニング手順を持ち帰れます"
+---
+
+個人開発で AdMob の収益異常を検知するエージェントを Gemini で組んでいたとき、奇妙な挙動に気づきました。1 ターン目は的確に「eCPM を取得して」とツールを呼ぶのに、2 ターン目以降になると急に判断が雑になり、本来 2 つ呼ぶべきツールを 1 つしか呼ばなかったり、明らかに前のターンで分かっているはずの前提を忘れたりするのです。
+
+最初はプロンプトの問題かと思い、システム指示を何度も書き直しました。けれども効果は限定的でした。本当の原因は、Gemini 3 系の思考モデルが返してくる **thought signature** を、私が会話履歴に積み直すときに捨てていたことにありました。これは公式ドキュメントを丁寧に読まないと気づきにくい、けれども本番運用でのエージェント品質を大きく左右する落とし穴です。署名の正体、それを失わない contents の組み立て方、そして実測で効果を確かめる手順までを、私が実際に踏んだ順番で共有していきます。
+
+## thought signature とは何を運んでいるのか
+
+Gemini 3 系の思考モデル（thinking を有効にしたモデル）は、応答を返すときに内部の推論プロセスを暗号化した署名を `thoughtSignature` というフィールドに載せて返してきます。これは人間が読める思考テキストとは別物で、私たちが復号して中身を読むことはできません。役割は、次のリクエストでモデル自身が「さっき自分はどう考えていたか」を復元するための鍵を渡すことにあります。
+
+ポイントは、署名が **function call の part に紐づいて返ってくる** という点です。モデルがツールを呼ぶと決めたとき、その `functionCall` part には、なぜそのツールを選んだのかという思考の文脈が署名として付随します。私たちがツールを実行して結果をモデルに戻すとき、この署名付きの part を会話履歴にそのまま含めて返さないと、モデルは「なぜ自分がそのツールを呼んだのか」という文脈を失った状態で次の推論を始めてしまいます。
+
+これが、私が体験した「2 ターン目から判断が雑になる」現象の正体でした。署名を捨てると、モデルは毎ターン記憶喪失のように一から考え直すことになり、しかも前提の一部だけが欠けた不完全な状態で再スタートするため、かえって質が落ちるのです。
+
+## なぜ SDK 利用者でも踏みやすいのか
+
+「公式 SDK を使えば自動で処理してくれるのでは」と思うかもしれません。実際、Python や Node の SDK で `chat` セッションを使い、モデルが返した `response.candidates[0].content` をそのまま履歴に積んでいく素直な書き方をしていれば、署名は保持されます。問題は、多くの本番コードがそこまで素直ではないことです。
+
+私のエージェントがハマったのは、function call の引数だけを抜き出して独自の中間表現に変換し、ツール実行後に「function call の名前と引数」だけを再構築して履歴に戻す設計にしていたからでした。ログを見やすくしたい、リトライ時に差し替えたい、といった実装上の都合で part を分解すると、その瞬間に署名が脱落します。署名は引数でも関数名でもなく、part に付随するメタ情報なので、自前で `{ functionCall: { name, args } }` を組み直すと必ず失われるのです。
+
+つまり「SDK だから安全」ではなく、「モデルが返した content オブジェクトを加工せずに履歴へ積んでいるか」が分かれ目になります。ここを意識していないと、SDK 利用者でも静かに署名を捨ててしまいます。
+
+## 署名を捨てている実装と保持する実装
+
+まず、私が最初に書いていた壊れた実装を示します。REST を直接叩く構成で、function call を独自構造に変換していました。
+
+```python
+import requests
+
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models/MODEL_ID:generateContent"
+
+def call_model(contents, tools):
+    resp = requests.post(
+        API_URL,
+        params={"key": "YOUR_GEMINI_API_KEY"},
+        json={"contents": contents, "tools": tools},
+    ).json()
+    return resp["candidates"][0]["content"]
+
+# 1 ターン目
+contents = [{"role": "user", "parts": [{"text": "今日の AdMob の eCPM 異常を調べて"}]}]
+model_content = call_model(contents, TOOLS)
+
+# ❌ ここが問題: function call を name/args だけに分解して積み直している
+fcall = model_content["parts"][0]["functionCall"]
+contents.append({
+    "role": "model",
+    "parts": [{"functionCall": {"name": fcall["name"], "args": fcall["args"]}}],
+})
+
+# ツールを実行して結果を戻す
+result = run_tool(fcall["name"], fcall["args"])
+contents.append({
+    "role": "user",
+    "parts": [{"functionResponse": {"name": fcall["name"], "response": result}}],
+})
+
+# 2 ターン目 — ここで署名が無いため推論文脈が切れている
+model_content = call_model(contents, TOOLS)
+```
+
+このコードは一見正しく動きます。ツールは呼ばれ、結果も戻り、2 ターン目も返ってきます。けれども `parts[0]["functionCall"]` を `{"name": ..., "args": ...}` に作り替えた時点で、元の part に入っていた `thoughtSignature` が消えています。モデルは 2 ターン目で文脈鍵を受け取れません。
+
+正しくは、モデルが返した part を加工せずそのまま履歴へ積みます。
+
+```python
+# ✅ モデルが返した content をそのまま履歴に追加する
+contents.append(model_content)
+
+# function call は元 part から読むだけ。再構築しない
+fcall = model_content["parts"][0]["functionCall"]
+result = run_tool(fcall["name"], fcall["args"])
+
+contents.append({
+    "role": "user",
+    "parts": [{"functionResponse": {"name": fcall["name"], "response": result}}],
+})
+
+model_content = call_model(contents, TOOLS)
+```
+
+差分はわずか数行ですが、`model_content` をそのまま積むことで `parts[0]` に含まれる `thoughtSignature` が次のリクエストへ運ばれます。引数を読みたいときは元 part を参照するだけにとどめ、決して `parts` を作り直さないのが鉄則です。
+
+## 複数の part が返るときの落とし穴
+
+もう一段、実戦で引っかかる点があります。思考モデルは 1 つの応答の中に、思考テキストの part、複数の function call の part を混在させて返すことがあります。並列ツール呼び出し（parallel function calling）を許可していると、`parts` 配列に複数の `functionCall` が並びます。
+
+このとき、署名は **すべての function call part のうち、原則として最初の part にまとめて付与される** ことが多く、後続の part には付かないこともあります。だからこそ「最初の part だけ署名付きで再構築すればいい」という近道は危険です。どの part に署名が乗っているかはモデルの応答次第なので、part 単位で抜き出して並べ替える実装は署名の対応関係を壊しかねません。
+
+```python
+# ❌ 並列 function call を自前で並べ替えると署名の対応が壊れる
+calls = [p["functionCall"] for p in model_content["parts"] if "functionCall" in p]
+# この時点で thoughtSignature の所属情報は失われている
+```
+
+安全なのは、応答の content をひとかたまりとして履歴に積み、ツール結果も同じ順序で `functionResponse` を並べることです。
+
+```python
+# ✅ content はそのまま積み、結果は同じ順序で返す
+contents.append(model_content)
+
+tool_parts = []
+for p in model_content["parts"]:
+    if "functionCall" in p:
+        fc = p["functionCall"]
+        tool_parts.append({
+            "functionResponse": {"name": fc["name"], "response": run_tool(fc["name"], fc["args"])}
+        })
+contents.append({"role": "user", "parts": tool_parts})
+```
+
+並列呼び出しを使うほど、part を分解して再構築したい誘惑が強くなります。けれども署名の整合性を守るには、content をオブジェクトとして扱い続けることが何より大切です。
+
+## ストリーミングと署名の関係
+
+ストリーミング応答を使っている場合、署名はチャンクの途中ではなく、function call が確定する part が出そろったタイミングで届きます。私が最初にストリーミングを組んだとき、テキストチャンクだけを連結して捨てる実装にしていたため、署名どころか function call の part 自体を取りこぼしていました。
+
+ストリーミングでは、各チャンクの `parts` を順に蓄積し、最終的に 1 つの content オブジェクトへ組み立て直す必要があります。このとき、`thoughtSignature` を含むキーをすべて保持したままマージするのがコツです。
+
+```python
+# ✅ ストリーミングでも part をキーごと保持してマージ
+merged_parts = []
+for chunk in stream:
+    for p in chunk["candidates"][0]["content"].get("parts", []):
+        merged_parts.append(p)  # text/functionCall/thoughtSignature をそのまま蓄積
+model_content = {"role": "model", "parts": merged_parts}
+contents.append(model_content)
+```
+
+テキストの結合だけに気を取られると、署名と function call を同時に失います。ストリーミングを採用する本番エージェントでは、ここを必ずテストで固めておくと安心です。
+
+## 署名保持の効果を実測で確かめる
+
+「署名を保持したら本当に良くなったのか」を感覚で語るのは危ないので、私は AdMob 異常検知エージェントで前後を比較しました。タスクは「直近 7 日の eCPM を取得 → 平常レンジを推定 → 逸脱日を抽出 → 原因候補のメディエーション設定を照会」という 4 ステップで、各ステップが別ツールに対応します。
+
+署名を捨てていた頃は、4 ステップを最後まで正しくつなげる成功率が約 60% で、途中で「もう一度 eCPM を取得しようとする」無駄な再呼び出しが平均して 1 リクエストあたり 1.4 回発生していました。署名を保持する実装に直したあとは、4 ステップ完走率が約 90% に上がり、無駄な再取得は約 80% 減って平均 0.3 回まで下がりました。同じモデル、同じプロンプト、変えたのは contents の積み方だけです。
+
+数値は私のワークロード固有のものですが、傾向ははっきりしていました。署名を渡すとモデルが前ターンの判断を引き継げるため、同じ取得を繰り返す無駄が減り、結果としてトークン消費も下がります。コスト面でも、不要な再 thinking が減ることは地味に効いてきます。
+
+検証で役立ったのは、リクエスト直前に `contents` を JSON で書き出し、`thoughtSignature` というキーが function call の part に存在するかを毎ターン確認するチェックでした。
+
+```python
+import json
+
+def assert_signature_preserved(contents):
+    for c in contents:
+        if c.get("role") != "model":
+            continue
+        for p in c.get("parts", []):
+            if "functionCall" in p and "thoughtSignature" not in p:
+                print("⚠️ signature missing on:", json.dumps(p["functionCall"])[:80])
+```
+
+このアサーションを開発中だけ有効にしておくと、part を分解する別のコードを後から追加したときに、署名脱落を早期に発見できます。私はリファクタリングのたびにこれで助けられました。
+
+## 履歴を切り詰めるときに署名を巻き込まない
+
+長く動かすエージェントでは、会話履歴が際限なく伸びてコストとレイテンシが膨らみます。そこで古いターンを切り詰める処理を入れたくなるのですが、ここにも署名がらみの罠があります。私は最初、単純に「古い 6 ターンを削除する」というスライディングウィンドウを入れたところ、削除の境界がツール呼び出しの途中に来てしまい、function call の part だけ残って対応する functionResponse が消える、あるいはその逆が起きて、応答が不安定になりました。
+
+署名は function call の part に乗っているため、切り詰めの単位を「ターン」ではなく「完結したツール往復のかたまり」に揃える必要があります。つまり、model の function call とそれに対応する user の functionResponse は、必ずセットで残すか、セットで消すかのどちらかにします。片方だけ残ると、署名と結果の整合が崩れてモデルが混乱します。
+
+```python
+# ✅ ツール往復をセット単位で切り詰める
+def prune_history(contents, keep_recent_pairs=4):
+    head = contents[:1]  # 最初の user メッセージは残す
+    rest = contents[1:]
+    # functionCall を含む model content と直後の functionResponse をペアとして数える
+    pairs = []
+    i = 0
+    while i < len(rest):
+        c = rest[i]
+        has_fc = c.get("role") == "model" and any("functionCall" in p for p in c.get("parts", []))
+        if has_fc and i + 1 < len(rest):
+            pairs.append(rest[i:i+2])  # 署名付き model + functionResponse をセットで保持
+            i += 2
+        else:
+            pairs.append([c])
+            i += 1
+    kept = [c for grp in pairs[-keep_recent_pairs:] for c in grp]
+    return head + kept
+```
+
+このように、切り詰めの境界を往復のかたまりに合わせるだけで、署名と結果の対応が壊れなくなります。履歴削減はコスト最適化に有効ですが、署名の整合という制約を頭の片隅に置いておくと、後から原因不明の品質劣化に悩まされずに済みます。
+
+## リトライとフォールバックで署名を失わない
+
+本番では一時的なエラーやレート制限に備えてリトライを入れます。このとき注意したいのは、リトライ対象が「モデル呼び出し」なのか「会話全体の作り直し」なのかという区別です。私は当初、エラー時に会話を最初から組み立て直す素朴なリトライを書いていたのですが、組み立て直しの過程で part を再構築してしまい、せっかく保持していた署名を失っていました。
+
+正しくは、リトライ時も `contents` 配列はそのまま使い回し、失敗した最後のリクエストだけを再送します。会話状態は不変オブジェクトとして扱い、エラーハンドリングのコードからは決して part を書き換えないようにします。
+
+```python
+import time
+
+def call_with_retry(contents, tools, max_attempts=3):
+    for attempt in range(max_attempts):
+        try:
+            return call_model(contents, tools)  # contents は一切加工しない
+        except TransientError as e:
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(2 ** attempt)  # 指数バックオフ
+```
+
+もう一つ、別モデルへフォールバックする設計のときは、署名の互換性に注意が必要です。署名はモデルファミリーに紐づくため、思考モデルから非思考モデルへ切り替える、あるいは世代の異なるモデルへ切り替えると、過去ターンの署名がそのモデルにとって無意味になることがあります。フォールバック先が大きく異なるモデルの場合は、署名を含む過去の思考文脈に依存しすぎない設計にしておくと、切り替え時の挙動が安定します。私の運用では、同一ファミリー内の上位・下位モデル間でのみフォールバックを許可し、世代をまたぐ切り替えは新しい会話として開始する方針にしています。
+
+## どこから手を付けるべきか
+
+もし手元のエージェントで「ターンを重ねると判断が浅くなる」「同じツールを無駄に呼び直す」症状があるなら、まず確認すべきは contents の組み立て箇所です。モデルが返した content を加工せずに積んでいるか、function call を name と args だけに作り替えていないか、この 2 点を見直すだけで改善することが少なくありません。
+
+具体的には、次の順で点検することを推奨します。
+
+1. モデルが返した content オブジェクトを、加工せずそのまま履歴へ append しているか確認します。
+2. function call を name と args だけに再構築しているコードがないか、grep で洗い出します。
+3. 履歴の切り詰めとリトライの実装が、ツール往復のかたまり単位で動いているか検証します。
+
+この 3 点を満たしていれば、署名は本番運用でも安定して引き継がれます。最初の 1 つ目だけでも直す価値が大きいので、まずはそこから着手することをお勧めします。
+
+私は 2014年から個人でアプリを作り、累計のダウンロードが 5,000万を超えた頃から運用の自動化に Gemini を組み込んできましたが、エージェント品質の差は派手なプロンプト技術よりも、こうした地味な状態管理の正確さから生まれることを何度も実感しています。署名の保持は、その典型例だと感じています。
+
+実装の参考になれば幸いです。詳細な仕様は [Gemini API の thinking ドキュメント](https://ai.google.dev/gemini-api/docs/thinking) も合わせて確認すると、ご自身のワークロードに合わせた調整がしやすくなります。

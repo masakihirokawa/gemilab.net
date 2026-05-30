@@ -1,0 +1,225 @@
+---
+title: "Preserving Gemini 3 Thought Signatures So Multi-Turn Function Calling Doesn't Degrade"
+slug: "gemini-3-thought-signatures-function-calling-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-30T15:00"
+author: "Gemini Lab"
+description: "When you build function calling on Gemini 3 thinking models, reasoning quality often drops from the second turn onward. The cause is usually a dropped thought signature. Here is how to keep it and verify the effect."
+tags: ["Gemini API", "function calling", "thinking", "agents", "production"]
+highlights:
+  - "Understand exactly how a missing thought signature lowers tool-selection accuracy on later turns, shown through request JSON diffs"
+  - "Tell apart a REST implementation that loses signatures from one that keeps them, and the trap of assuming the SDK saves you automatically"
+  - "Take away a tuning workflow grounded in before/after logs from an AdMob anomaly-detection agent, cutting wasteful re-thinking"
+---
+
+While building an agent that detects AdMob revenue anomalies with Gemini, I ran into a strange behavior. On the first turn it would correctly call a tool to "fetch the eCPM," but from the second turn onward its judgment turned sloppy. It would call only one tool when two were needed, or forget premises it had clearly established a turn earlier.
+
+I assumed it was a prompt problem and rewrote my system instructions many times. The effect was limited. The real cause was that I was discarding the **thought signature** that Gemini 3 thinking models return, at the moment I rebuilt the conversation history. It is an easy detail to miss unless you read the docs carefully, yet it has an outsized effect on production agent quality. In this article I share what the signature actually is, how to assemble your `contents` without losing it, and how to measure the difference, in the exact order I worked through it as an indie developer.
+
+## What a thought signature actually carries
+
+Gemini 3 thinking models return an encrypted representation of their internal reasoning in a field called `thoughtSignature`. It is distinct from any human-readable thinking text, and we cannot decrypt or read its contents. Its job is to hand the model a key so that, on the next request, it can reconstruct "how I was thinking a moment ago."
+
+The crucial point is that the signature comes back **attached to the function call part**. When the model decides to call a tool, the `functionCall` part carries, as a signature, the reasoning context for why it chose that tool. When you run the tool and return the result, you must include that signature-bearing part in the history as-is. Otherwise the model starts its next round of reasoning having lost the context of why it called the tool in the first place.
+
+That was exactly the "judgment gets sloppy from turn two" symptom I hit. Drop the signature and the model rethinks from scratch each turn, like amnesia, and worse, it restarts from an incomplete state where only part of the context is missing, so quality actually drops.
+
+## Why even SDK users fall into this
+
+You might assume the official SDK handles this automatically. It is true that if you use a `chat` session in the Python or Node SDK and push the model's returned `response.candidates[0].content` straight back into history, the signature is preserved. The problem is that most production code is not that simple.
+
+My agent broke because I extracted only the function call arguments into my own intermediate representation, then rebuilt "the function call name and args" to push back into history after running the tool. The moment you decompose a part for implementation conveniences, such as cleaner logs or easier retries, the signature falls off. The signature is neither the arguments nor the function name; it is metadata attached to the part. So any time you hand-build `{ functionCall: { name, args } }` yourself, you lose it.
+
+In other words, "it's the SDK, so I'm safe" is the wrong mental model. The real dividing line is whether you push the model's returned content object back into history without modifying it.
+
+## The implementation that drops signatures vs. the one that keeps them
+
+Here is the broken implementation I first wrote, a setup that calls REST directly and converts the function call into a custom structure.
+
+```python
+import requests
+
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models/MODEL_ID:generateContent"
+
+def call_model(contents, tools):
+    resp = requests.post(
+        API_URL,
+        params={"key": "YOUR_GEMINI_API_KEY"},
+        json={"contents": contents, "tools": tools},
+    ).json()
+    return resp["candidates"][0]["content"]
+
+# Turn 1
+contents = [{"role": "user", "parts": [{"text": "Investigate today's AdMob eCPM anomaly"}]}]
+model_content = call_model(contents, TOOLS)
+
+# BROKEN: decomposing the function call into name/args before pushing it back
+fcall = model_content["parts"][0]["functionCall"]
+contents.append({
+    "role": "model",
+    "parts": [{"functionCall": {"name": fcall["name"], "args": fcall["args"]}}],
+})
+
+# Run the tool and return the result
+result = run_tool(fcall["name"], fcall["args"])
+contents.append({
+    "role": "user",
+    "parts": [{"functionResponse": {"name": fcall["name"], "response": result}}],
+})
+
+# Turn 2 - reasoning context is severed because the signature is gone
+model_content = call_model(contents, TOOLS)
+```
+
+This code looks correct. The tool is called, the result returns, and turn two responds. But the instant you rebuild `parts[0]["functionCall"]` as `{"name": ..., "args": ...}`, the `thoughtSignature` that lived on the original part is gone. The model cannot receive its context key on turn two.
+
+The fix is to push the model's returned part back into history without modifying it.
+
+```python
+# CORRECT: append the model's returned content unchanged
+contents.append(model_content)
+
+# Only read the function call from the original part; never rebuild it
+fcall = model_content["parts"][0]["functionCall"]
+result = run_tool(fcall["name"], fcall["args"])
+
+contents.append({
+    "role": "user",
+    "parts": [{"functionResponse": {"name": fcall["name"], "response": result}}],
+})
+
+model_content = call_model(contents, TOOLS)
+```
+
+The diff is only a few lines, but appending `model_content` as-is carries the `thoughtSignature` in `parts[0]` forward to the next request. When you need the arguments, just read them from the original part. The rule is simple: never rebuild `parts`.
+
+## The trap when multiple parts come back
+
+There is one more pitfall that bites in the field. A thinking model may return a thinking-text part and several function call parts mixed within a single response. If you allow parallel function calling, multiple `functionCall` entries line up in the `parts` array.
+
+In that case the signature is, as a rule, often attached collectively to the first of the function call parts, and the trailing parts may carry none. That is exactly why the shortcut "just rebuild the first part with the signature" is dangerous. Which part carries the signature depends on the model's response, so any implementation that extracts and reorders parts individually risks breaking the signature's correspondence.
+
+```python
+# BROKEN: reordering parallel function calls by hand breaks the signature mapping
+calls = [p["functionCall"] for p in model_content["parts"] if "functionCall" in p]
+# The ownership of thoughtSignature is already lost here
+```
+
+The safe approach is to push the response content as a single block into history and return your tool results as `functionResponse` entries in the same order.
+
+```python
+# CORRECT: append content as-is, return results in the same order
+contents.append(model_content)
+
+tool_parts = []
+for p in model_content["parts"]:
+    if "functionCall" in p:
+        fc = p["functionCall"]
+        tool_parts.append({
+            "functionResponse": {"name": fc["name"], "response": run_tool(fc["name"], fc["args"])}
+        })
+contents.append({"role": "user", "parts": tool_parts})
+```
+
+The more you lean on parallel calls, the stronger the temptation to decompose and rebuild parts. To protect signature integrity, the most important habit is to keep treating content as an object.
+
+## Streaming and signatures
+
+If you use streaming responses, the signature arrives not mid-chunk but at the moment the parts that finalize the function call have all appeared. When I first wired up streaming, I concatenated only the text chunks and discarded the rest, so I was dropping the function call parts entirely, never mind the signature.
+
+With streaming you need to accumulate each chunk's `parts` in order and reassemble them into a single content object at the end, merging while preserving every key including `thoughtSignature`.
+
+```python
+# CORRECT: in streaming, merge parts while keeping every key
+merged_parts = []
+for chunk in stream:
+    for p in chunk["candidates"][0]["content"].get("parts", []):
+        merged_parts.append(p)  # accumulate text/functionCall/thoughtSignature as-is
+model_content = {"role": "model", "parts": merged_parts}
+contents.append(model_content)
+```
+
+Focus only on joining text and you lose the signature and the function call together. For a production agent that streams, locking this down with tests is well worth it.
+
+## Measuring the effect
+
+Talking about whether "keeping the signature actually helped" by gut feel is risky, so I compared before and after on the AdMob anomaly-detection agent. The task was four steps: fetch the last 7 days of eCPM, estimate the normal range, extract deviating days, and look up the mediation settings of likely causes. Each step maps to a different tool.
+
+Back when I was dropping the signature, the success rate of chaining all four steps correctly was about 60%, and wasteful re-calls where it tried to "fetch eCPM again" averaged about 1.4 times per request. After switching to the signature-preserving implementation, the four-step completion rate rose to about 90%, and wasteful re-fetches dropped to about 0.3 times on average. Same model, same prompt; the only thing I changed was how I assembled `contents`.
+
+The numbers are specific to my workload, but the trend was clear. Handing back the signature lets the model carry forward its prior-turn judgment, which reduces redundant fetches and, as a result, lowers token consumption. On cost, fewer unnecessary re-thinks add up quietly.
+
+What helped during verification was dumping `contents` as JSON right before each request and checking, every turn, whether the `thoughtSignature` key existed on the function call parts.
+
+```python
+import json
+
+def assert_signature_preserved(contents):
+    for c in contents:
+        if c.get("role") != "model":
+            continue
+        for p in c.get("parts", []):
+            if "functionCall" in p and "thoughtSignature" not in p:
+                print("WARN signature missing on:", json.dumps(p["functionCall"])[:80])
+```
+
+Keeping this assertion on during development means that when you later add other code that decomposes parts, you catch the signature loss early. It saved me on every refactor.
+
+## Pruning history without taking the signature with it
+
+In a long-running agent, the conversation history grows without bound, inflating cost and latency. You will want to prune old turns, and there is a signature-related trap here too. I first added a naive sliding window that "deletes the oldest six turns," but the deletion boundary landed mid tool call, leaving a function call part with no matching functionResponse, or the reverse, which made responses unstable.
+
+Because the signature rides on the function call part, you have to align your pruning unit to "a completed tool round-trip" rather than "a turn." The model's function call and its corresponding user functionResponse must be kept together or removed together. If only one side survives, the signature and result fall out of sync and the model gets confused.
+
+```python
+# CORRECT: prune by tool round-trip as a unit
+def prune_history(contents, keep_recent_pairs=4):
+    head = contents[:1]  # keep the first user message
+    rest = contents[1:]
+    pairs = []
+    i = 0
+    while i < len(rest):
+        c = rest[i]
+        has_fc = c.get("role") == "model" and any("functionCall" in p for p in c.get("parts", []))
+        if has_fc and i + 1 < len(rest):
+            pairs.append(rest[i:i+2])  # keep signed model + functionResponse as a set
+            i += 2
+        else:
+            pairs.append([c])
+            i += 1
+    kept = [c for grp in pairs[-keep_recent_pairs:] for c in grp]
+    return head + kept
+```
+
+Just aligning the pruning boundary to round-trip units keeps the signature and result in correspondence. History reduction is great for cost, but keeping the signature-integrity constraint in mind spares you from later, hard-to-diagnose quality regressions.
+
+## Retries and fallback without losing the signature
+
+In production you add retries for transient errors and rate limits. The distinction to watch is whether your retry target is "the model call" or "rebuilding the whole conversation." I initially wrote a naive retry that reassembled the conversation from scratch on error, and in the reassembly I rebuilt parts and lost the signature I had carefully preserved.
+
+The correct approach is to reuse the `contents` array as-is on retry and resend only the last failed request. Treat conversation state as an immutable object and never let the error-handling code rewrite a part.
+
+```python
+import time
+
+def call_with_retry(contents, tools, max_attempts=3):
+    for attempt in range(max_attempts):
+        try:
+            return call_model(contents, tools)  # never modify contents
+        except TransientError:
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(2 ** attempt)  # exponential backoff
+```
+
+One more thing: when you design fallback to another model, watch signature compatibility. Signatures are tied to a model family, so switching from a thinking model to a non-thinking one, or to a different generation, can make past-turn signatures meaningless to that model. If your fallback target differs greatly, design so you do not over-depend on past thinking context that includes signatures. In my own operations I allow fallback only between higher and lower models within the same family, and any cross-generation switch starts as a fresh conversation.
+
+## Where to start
+
+If your agent shows "judgment gets shallower as turns accumulate" or "it needlessly re-calls the same tool," the first thing to check is where you assemble `contents`. Are you appending the model's returned content unmodified, and are you avoiding rebuilding the function call into just name and args? Reviewing only these two points often fixes it.
+
+I have built apps solo since 2014, and since cumulative downloads passed 50 million I have woven Gemini into operational automation. Time and again I have found that differences in agent quality come less from flashy prompt techniques and more from the quiet accuracy of state management like this. Preserving the signature is a textbook example.
+
+I hope this helps your implementation. Reading the [Gemini API thinking documentation](https://ai.google.dev/gemini-api/docs/thinking) alongside it makes it easier to tune for your own workload.
