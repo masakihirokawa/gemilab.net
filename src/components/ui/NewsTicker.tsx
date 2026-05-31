@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH35 — Gemini 3.5 FlashがGA、agentic/codingでGemini 3.1 Proを上回る性能（5/19）",
-    "INTERACT — Interactions APIが破壊的変更、outputs→stepsへ。旧スキーマは6/8に削除（5月）",
-    "MANAGED — Managed Agentsがpublic preview、Googleホストの隔離Linuxで自律エージェントを実行（5/19）",
-    "FLASHLITE — Gemini 3.1 Flash-LiteがGA、速度・スケール・コスト効率を重視（5/7）",
-    "FILESEARCH — File Searchがgemini-embedding-2でマルチモーダル検索に対応（5/5）",
-    "IO2026 — Google I/O 2026開催、Gemini・Antigravity・AI Studioの大型アップデート（5/19）",
+    "FLASH35 — Google I/O 2026でGemini 3.5 Flashを発表、他フロンティアモデル比4倍高速（5月）",
+    "IMAGEGA — gemini-3.1-flash-imageとgemini-3-pro-imageがGA化、ネイティブ画像生成に対応（5/28）",
+    "AGENTS — Gemini APIにManaged Agentsが追加、1回のAPIコールで推論・ツール実行するエージェントを起動（5月）",
+    "AISTUDIO — Google AI StudioのBuildエージェントがNano Bananaで画像を自動生成（5月）",
+    "ANDROID — Google AI Studioがネイティブvibe codingでAndroidアプリ生成に対応（5月）",
+    "FLASHLITE — gemini-3.1-flash-liteがGA、速度とコスト効率を最適化（5月）",
   ],
   en: [
-    "FLASH35 — Gemini 3.5 Flash hits GA, beating Gemini 3.1 Pro on agentic & coding benchmarks (May 19)",
-    "INTERACT — Interactions API breaking change: outputs to steps; legacy schema removed June 8 (May)",
-    "MANAGED — Managed Agents enter public preview, running autonomous agents in Google-hosted sandboxes (May 19)",
-    "FLASHLITE — Gemini 3.1 Flash-Lite reaches GA, tuned for speed, scale and cost efficiency (May 7)",
-    "FILESEARCH — File Search adds multimodal search via gemini-embedding-2 (May 5)",
-    "IO2026 — Google I/O 2026 brings major updates to Gemini, Antigravity and AI Studio (May 19)",
+    "FLASH35 — Gemini 3.5 Flash debuts at Google I/O 2026, running 4x faster than other frontier models (May)",
+    "IMAGEGA — gemini-3.1-flash-image and gemini-3-pro-image reach GA for native image generation (May 28)",
+    "AGENTS — Gemini API adds Managed Agents: spin up a reasoning, tool-using agent in a single API call (May)",
+    "AISTUDIO — Google AI Studio's Build agent auto-generates images on the fly with Nano Banana (May)",
+    "ANDROID — Google AI Studio adds native vibe coding to build Android apps (May)",
+    "FLASHLITE — gemini-3.1-flash-lite reaches GA, optimized for speed and cost efficiency (May)",
   ],
 };
 
