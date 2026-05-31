@@ -1,0 +1,258 @@
+---
+title: "Gemini Embedding モデルを切り替える日：無停止リインデックスの設計"
+slug: "gemini-embedding-model-migration-zero-downtime-reindex"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-05-31T02:45"
+author: "Gemini Lab"
+description: "埋め込みモデルを新しくすると、過去に作った全ベクトルが使えなくなります。サービスを止めずに数十万件のベクトルを作り直す二重インデックス方式を、再開可能な再生成ジョブとクエリ側の抽象化層のコード付きで設計します。"
+tags: ["Gemini API", "Embedding", "ベクトル検索", "アーキテクチャ", "本番運用", "RAG"]
+highlights:
+  - "埋め込みモデルを変えると既存ベクトルが互換性を失う理由と、その不整合を検知する具体的な方法がわかる"
+  - "サービスを止めずに数十万件を作り直す二重インデックス方式を、再開可能な再生成ジョブのコード付きで設計できる"
+  - "再エンベッドのトークンコストを事前に見積もり、レート制限の中で安全に流し切る運用設計を学べる"
+---
+
+# Gemini Embedding モデルを切り替える日：無停止リインデックスの設計
+
+埋め込み（Embedding）を使った検索機能は、一度動き始めると驚くほど静かに働き続けます。私が2014年から運営しているアプリ群でも、レビューの意味的クラスタリングやFAQ検索に埋め込みを使っていて、しばらく触らなくても問題なく動きます。ところがある日、必ずこの問いが訪れます。「新しい埋め込みモデルに乗り換えたい。でも、これまで作った数十万件のベクトルはどうなるのか」と。
+
+結論を先に書きます。**別のモデルで作ったベクトルは、互いに比較できません。** 古いモデルで作った蔵書ベクトルに、新しいモデルで作ったクエリベクトルをぶつけると、検索結果は静かに、しかし確実に壊れます。エラーは出ません。次元数が同じなら計算はできてしまうからです。だからこそ厄介なのです。サービスを止めず、検索品質も落とさずに全ベクトルを作り直すための設計を、これから実際に動くコードとともに組み立てていきましょう。
+
+## なぜ「ただ作り直す」では済まないのか
+
+埋め込みモデルが違えば、ベクトルが生きている空間そのものが違います。`text-embedding-004` が描く意味の地図と、`gemini-embedding-001` が描く地図は、座標系が一致していません。同じ「猫」という単語でも、配置される場所が変わります。
+
+ここで多くの人が最初につまずくのが、次元数の罠です。新旧のモデルがたまたま同じ次元数（たとえば768次元）を返すと、コサイン類似度の計算は何事もなく通ってしまいます。例外も警告も出ません。出力されるのは「それらしいけれど微妙に的を外した検索結果」です。ユーザーは「なんだか検索の精度が落ちた気がする」と感じ、しかし原因は特定されないまま放置されます。これは私が運用初期に実際に冷や汗をかいたパターンで、**「動いているように見える」ことが最大の危険**だと痛感しました。
+
+つまり、モデルを切り替えるとは、クエリ側の1行を書き換えることではなく、**蔵書側の全ベクトルを新しい空間で作り直す（リインデックスする）こと**を意味します。そしてその作り直しには、数十万件分のAPI呼び出しと、無視できないコストと、それなりの時間がかかります。
+
+## 設計の全体像：二重インデックス（Blue/Green）
+
+無停止で切り替える鍵は、データベースのスキーマ移行と同じ発想です。新しいインデックスを裏でこっそり作り上げ、品質が確認できてから一気に切り替えます。
+
+具体的には、次の5段階で進めます。
+
+1. **新インデックスの準備**：新モデル用の格納先を、旧インデックスとは別に用意します。
+2. **背景での再生成**：全ドキュメントを新モデルで埋め込み直し、新インデックスへ書き込みます。この間も旧インデックスは通常どおり検索を提供し続けます。
+3. **二重書き込み**：移行期間中に追加・更新される新規ドキュメントは、旧・新の両方へ書き込みます。これで作り直しが追い越されません。
+4. **シャドー検証とカナリア切り替え**：一部のクエリだけ新インデックスへも流し、結果を比較します。問題なければ読み取り先を新インデックスへ切り替えます。
+5. **旧インデックスの撤去**：一定期間ロールバック用に残し、安定を確認してから削除します。
+
+この流れを支えるために、まず「ベクトルがどのモデルで作られたか」を必ず記録する設計にします。これが全体の土台です。
+
+## 土台：ベクトルにモデルのバージョンを刻む
+
+最初にやるべきは、すべてのベクトルに「どのモデルで作られたか」のタグを付けることです。これがないと、空間が混ざっても気づけません。
+
+```python
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+# 埋め込みモデルの定義を一箇所に集約します。
+# モデルを増やすときはここに追記するだけにします。
+EMBEDDING_MODELS = {
+    "v1": {"name": "text-embedding-004", "dim": 768},
+    "v2": {"name": "gemini-embedding-001", "dim": 1536},
+}
+
+# 現在「正」とするバージョン。切り替えはこの1行の変更で完結させます。
+ACTIVE_EMBEDDING_VERSION = "v1"
+
+@dataclass
+class VectorRecord:
+    doc_id: str
+    embedding: list[float]
+    model_version: str          # "v1" / "v2" など。空間の身分証明書です。
+    indexed_at: str
+
+    def is_compatible_with(self, query_version: str) -> bool:
+        # 同じモデルバージョンでなければ比較してはいけません。
+        return self.model_version == query_version
+```
+
+ポイントは `model_version` を必ず保存することです。次元数だけでは不十分で、`v1` と `v2` がたまたま同じ次元になった瞬間に、先ほどの「静かな破壊」が起きます。文字列のバージョンタグは、その事故を構造的に防ぐ最も安価な保険です。
+
+## クエリ側の抽象化層：空間を混ぜない門番
+
+検索を実行する側には、必ず「同じ空間どうしでしか比較しない」ことを強制する層を置きます。
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def embed_query(text: str, version: str) -> list[float]:
+    """指定バージョンのモデルでクエリを埋め込みます。"""
+    model_name = EMBEDDING_MODELS[version]["name"]
+    result = client.models.embed_content(
+        model=model_name,
+        contents=text,
+        config={"task_type": "RETRIEVAL_QUERY"},
+    )
+    return result.embeddings[0].values
+
+def search(query: str, store, version: str = ACTIVE_EMBEDDING_VERSION, top_k: int = 5):
+    """指定バージョンの空間内だけで検索します。"""
+    q_vec = embed_query(query, version)
+    # store 側も同じ version のベクトルだけを対象に絞り込みます。
+    candidates = store.fetch_by_version(version)
+    scored = [
+        (rec.doc_id, _cosine(q_vec, rec.embedding))
+        for rec in candidates
+        if rec.is_compatible_with(version)   # 念のための二重チェック
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:top_k]
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+```
+
+ここで `task_type` を `RETRIEVAL_QUERY` にしている点に注目してください。Gemini の埋め込みは、クエリ用と蔵書用で `task_type` を使い分けると検索精度が上がります。蔵書側は `RETRIEVAL_DOCUMENT` を使います。移行のときも、この対応関係を新旧で揃えておかないと、比較条件が変わって品質評価が濁ります。
+
+## 心臓部：再開可能な再生成ジョブ
+
+数十万件の再エンベッドは、途中で必ず何かが起きます。レート制限、ネットワーク断、デプロイによるプロセス再起動。だから再生成ジョブは**いつ落ちても、続きから再開できる**ように作ります。鍵は「どこまで終わったか」を永続化することです。
+
+```python
+import time
+import logging
+
+logger = logging.getLogger("reindex")
+
+def reembed_corpus(
+    store,
+    checkpoint_store,
+    target_version: str = "v2",
+    batch_size: int = 100,
+    max_retries: int = 5,
+):
+    """全ドキュメントを target_version のモデルで埋め込み直します。
+    チェックポイントから再開できるため、途中で落ちても安全です。
+    """
+    model_name = EMBEDDING_MODELS[target_version]["name"]
+    last_done = checkpoint_store.get(f"reindex:{target_version}") or ""
+
+    # まだ新バージョンで埋め込んでいないドキュメントだけを取り出します。
+    pending = store.iter_documents(after_id=last_done)
+
+    batch = []
+    for doc in pending:
+        batch.append(doc)
+        if len(batch) >= batch_size:
+            _flush_batch(store, checkpoint_store, batch, model_name,
+                         target_version, max_retries)
+            batch = []
+    if batch:
+        _flush_batch(store, checkpoint_store, batch, model_name,
+                     target_version, max_retries)
+
+def _flush_batch(store, checkpoint_store, batch, model_name,
+                 target_version, max_retries):
+    texts = [d.text for d in batch]
+    for attempt in range(max_retries):
+        try:
+            res = client.models.embed_content(
+                model=model_name,
+                contents=texts,
+                config={"task_type": "RETRIEVAL_DOCUMENT"},
+            )
+            for doc, emb in zip(batch, res.embeddings):
+                store.upsert(VectorRecord(
+                    doc_id=doc.id,
+                    embedding=emb.values,
+                    model_version=target_version,
+                    indexed_at=datetime.now(timezone.utc).isoformat(),
+                ))
+            # バッチが書き終わってからチェックポイントを進めます。
+            # 順序が逆だと、落ちたときに取りこぼしが出ます。
+            checkpoint_store.set(f"reindex:{target_version}", batch[-1].id)
+            logger.info("reembedded up to %s", batch[-1].id)
+            return
+        except Exception as e:
+            wait = min(2 ** attempt, 60)   # 指数バックオフ（上限60秒）
+            logger.warning("batch failed (%s), retry in %ss", e, wait)
+            time.sleep(wait)
+    raise RuntimeError(f"batch permanently failed at {batch[-1].id}")
+```
+
+この実装で**最も大切なのは、チェックポイントを「書き込み成功の後」に進めること**です。順序を逆にすると、upsert の前にプロセスが落ちたときにそのバッチが永久に飛ばされ、新インデックスに穴が空きます。穴の空いたインデックスは、検索結果からそのドキュメントだけが静かに消えるという、最も見つけにくい不具合を生みます。私はこの順序を、データベースのトランザクションログと同じ感覚で扱うようにしています。宮大工だった祖父が「墨付けを間違えたら、その後どれだけ丁寧に削っても柱は合わない」と言っていたのを、こういう順序設計のたびに思い出します。
+
+## コストと時間を、流す前に見積もる
+
+再エンベッドは無料ではありません。流し始める前に、必ず総量を見積もります。見積もりの式はとても単純です。
+
+```
+総コスト ≒ ドキュメント数 × 1件あたりの平均トークン数 × 100万トークンあたりの単価 ÷ 1,000,000
+```
+
+たとえば30万件のドキュメントがあり、平均500トークンだとすると、合計1.5億トークンです。仮に100万トークンあたりの単価を $X とすると、総額は `150 × $X` になります。**単価は時期やモデルで変わるため、必ず最新の公式料金を確認してください。** ここで伝えたいのは金額そのものより、「桁を把握してから流す」という習慣です。私はこの見積もりを怠って、テスト環境で気軽にフルリインデックスを2回繰り返し、無駄な費用を出した苦い経験があります。
+
+時間の見積もりも同じくらい重要です。レート制限が1分あたりのリクエスト数（RPM）で効くため、バッチサイズと並列度から所要時間を逆算します。
+
+- 1バッチ100件、1分あたり許容60リクエストなら、毎分6,000件
+- 30万件 ÷ 6,000件 = 50分（理論値）
+- 実際にはリトライや遅延で1.5〜2倍を見込み、**90分前後を計画値**にします
+
+この「理論値に1.5〜2倍の余裕を乗せる」という補正は、私がアプリのバッチ処理全般で経験的に使っている安全係数です。理論どおりに終わったことは、ほとんどありません。
+
+## 二重書き込みで、作り直しを追い越されないようにする
+
+再生成に90分かかる間も、サービスは生きています。新しいドキュメントが追加されますし、既存ドキュメントも編集されます。ここを放置すると、再生成が終わった頃には新インデックスがすでに古くなっています。
+
+そこで、移行期間中の書き込みは新旧両方へ流します。
+
+```python
+def upsert_document(store, doc, migration_active: bool):
+    """移行期間中は両方の空間へ書き込みます。"""
+    versions = ["v1"]
+    if migration_active:
+        versions.append("v2")   # 新空間にも同時に反映します
+
+    for ver in versions:
+        model_name = EMBEDDING_MODELS[ver]["name"]
+        res = client.models.embed_content(
+            model=model_name,
+            contents=doc.text,
+            config={"task_type": "RETRIEVAL_DOCUMENT"},
+        )
+        store.upsert(VectorRecord(
+            doc_id=doc.id,
+            embedding=res.embeddings[0].values,
+            model_version=ver,
+            indexed_at=datetime.now(timezone.utc).isoformat(),
+        ))
+```
+
+二重書き込みを始めるタイミングは、**再生成ジョブを起動する直前**にします。先に二重書き込みをオンにしてからバルク再生成を流せば、移行中の更新は確実にどちらかの経路で新空間に届きます。逆にすると、二重書き込みをオンにする前に編集されたドキュメントが取りこぼされます。
+
+## 切り替え前の検証：シャドーとカナリア
+
+新インデックスが完成しても、いきなり全ユーザーを切り替えるのは乱暴です。まずはシャドー検証で、同じクエリを新旧両方に投げて結果を比較します。
+
+実運用で私が見ている指標は、主に次の3つです。
+
+- **Recall@5 の一致率**：旧インデックスの上位5件のうち、新インデックスでも上位に残る割合。極端に低ければ、`task_type` の付け方や次元設定を疑います。
+- **平均類似度スコアの分布**：新空間で全体的にスコアが下がっていないか。下がっていれば正規化や次元削減の設定ミスを疑います。
+- **ゼロヒット率**：「1件も返らない」クエリの割合。これが増えていたら、再生成に穴が空いている兆候です。
+
+シャドーで問題がなければ、カナリアとして読み取りトラフィックの数%だけを新インデックスへ向け、エラー率とユーザー行動（クリック率や再検索率）を観察します。ここまで通って初めて、`ACTIVE_EMBEDDING_VERSION` を `v2` に切り替えます。
+
+## 公式ドキュメントには書かれていない運用上の勘どころ
+
+最後に、API リファレンスには載っていないけれど、実際にやってみて初めてわかった点をいくつか共有します。
+
+まず、**次元数を下げる移行は、モデル切り替えと同じくらい慎重に扱う**べきです。Gemini の埋め込みは出力次元を縮められますが（ストレージ削減に有効）、768次元から256次元へ落とすと、これも別空間への移行です。次元を変えるなら、それもひとつの `model_version` として扱い、リインデックスの対象に含めてください。
+
+次に、**旧インデックスはすぐに消さないこと**です。切り替え後、最低でも1〜2週間は残します。新空間で予期しない品質低下が見つかったとき、`ACTIVE_EMBEDDING_VERSION` を `v1` に戻すだけで即座にロールバックできる状態を保つのは、夜中のインシデント対応で何度も自分を救ってくれました。
+
+そして、**再生成ジョブはオフピークに流す**こと。私は4つの技術ブログを並行運用していて、バッチ処理を意図的に時間分散させています。埋め込みの再生成も同じで、検索トラフィックが少ない深夜帯に流せば、レート制限の枠をユーザーのクエリと奪い合わずに済みます。
+
+埋め込みモデルの切り替えは、一見するとモデル名を1つ書き換えるだけの作業に見えます。けれど実際には、空間という見えない土台を丸ごと作り直す、静かで大きな引っ越しです。次にモデルを切り替えるときは、まずベクトルにバージョンタグが付いているかを確認してみてください。そこが整っていれば、残りの設計はこの記事の順番どおりに、落ち着いて進められます。
+
+同じようにベクトル検索を長く運用している方の参考になれば幸いです。お読みいただきありがとうございました。

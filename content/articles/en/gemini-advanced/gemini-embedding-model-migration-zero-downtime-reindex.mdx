@@ -1,0 +1,258 @@
+---
+title: "The Day You Switch Gemini Embedding Models: Designing a Zero-Downtime Reindex"
+slug: "gemini-embedding-model-migration-zero-downtime-reindex"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-05-31T02:45"
+author: "Gemini Lab"
+description: "Upgrade your embedding model and every vector you ever stored becomes incompatible. Here is a dual-index design for re-embedding hundreds of thousands of vectors without downtime, complete with a resumable reindex job and a query-side abstraction layer."
+tags: ["Gemini API", "Embedding", "Vector Search", "Architecture", "Production", "RAG"]
+highlights:
+  - "Understand exactly why a new embedding model makes old vectors incompatible, and how to detect that silent mismatch"
+  - "Design a dual-index migration that re-embeds hundreds of thousands of documents without downtime, with a resumable reindex job"
+  - "Estimate the token cost of re-embedding up front and run it safely within rate limits"
+---
+
+# The Day You Switch Gemini Embedding Models: Designing a Zero-Downtime Reindex
+
+Embedding-based search has a way of working quietly for a long time. Across the apps I have run since 2014, I use embeddings for semantic clustering of reviews and for FAQ search, and they keep working for months without a second thought. Then one day the question always arrives: "I want to move to a newer embedding model. But what happens to the hundreds of thousands of vectors I already built?"
+
+Let me give the answer first. **Vectors produced by different models cannot be compared.** If you query a corpus embedded with model A using a query embedded with model B, your search results break — quietly, but surely. No error is raised, because if the dimensions happen to match, the math still runs. That is exactly what makes it dangerous. In this article we will build, with working code, a design that re-embeds your entire corpus without taking the service down and without degrading search quality.
+
+## Why "just re-embed it" is not enough
+
+Different embedding models live in different spaces. The map of meaning that `text-embedding-004` draws does not share a coordinate system with the one `gemini-embedding-001` draws. Even the word "cat" lands somewhere else.
+
+This is where many people first stumble: the dimension trap. If the old and new models happen to return the same dimensionality (say, 768), your cosine similarity computation runs without complaint. No exception, no warning. What comes out is "plausible but subtly wrong" results. Users feel that "search seems a little worse lately," but the cause is never pinned down and the problem festers. This is a pattern I genuinely broke a sweat over early in operations, and it taught me that **"appearing to work" is the single greatest risk.**
+
+In other words, switching models is not a matter of editing one line on the query side. It means **rebuilding every vector on the corpus side in the new space (reindexing)**. And that rebuild costs hundreds of thousands of API calls, non-trivial money, and a meaningful amount of time.
+
+## The overall design: dual index (blue/green)
+
+The key to a zero-downtime switch is the same idea as a database schema migration. You quietly build the new index in the background and cut over only after you have verified its quality.
+
+Concretely, proceed in five phases.
+
+1. **Prepare the new index**: provision storage for the new model separately from the old index.
+2. **Re-embed in the background**: re-embed every document with the new model and write to the new index. The old index keeps serving search the whole time.
+3. **Dual-write**: during the migration window, write every newly added or updated document to both the old and the new index, so the rebuild never falls behind.
+4. **Shadow and canary**: route a fraction of queries to the new index too and compare results. If all is well, switch reads to the new index.
+5. **Decommission the old index**: keep it around for rollback for a while, then delete it once you are confident.
+
+To support this flow, we first make sure every vector records which model produced it. That is the foundation of the whole thing.
+
+## Foundation: stamp the model version onto every vector
+
+The first thing to do is tag every vector with "which model produced it." Without it, you cannot tell when spaces get mixed.
+
+```python
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+# Keep embedding model definitions in one place.
+# Adding a model means only appending here.
+EMBEDDING_MODELS = {
+    "v1": {"name": "text-embedding-004", "dim": 768},
+    "v2": {"name": "gemini-embedding-001", "dim": 1536},
+}
+
+# The version treated as "active." A switch is completed by editing this one line.
+ACTIVE_EMBEDDING_VERSION = "v1"
+
+@dataclass
+class VectorRecord:
+    doc_id: str
+    embedding: list[float]
+    model_version: str          # "v1" / "v2" — the ID card of the space.
+    indexed_at: str
+
+    def is_compatible_with(self, query_version: str) -> bool:
+        # Never compare across different model versions.
+        return self.model_version == query_version
+```
+
+The point is to always store `model_version`. Dimensionality alone is not enough: the moment `v1` and `v2` happen to share a dimension count, the "silent breakage" above occurs. A string version tag is the cheapest possible insurance against that accident, and it prevents it structurally.
+
+## The query-side abstraction layer: a gatekeeper that never mixes spaces
+
+On the search side, always place a layer that enforces "only compare within the same space."
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def embed_query(text: str, version: str) -> list[float]:
+    """Embed a query with the model of the given version."""
+    model_name = EMBEDDING_MODELS[version]["name"]
+    result = client.models.embed_content(
+        model=model_name,
+        contents=text,
+        config={"task_type": "RETRIEVAL_QUERY"},
+    )
+    return result.embeddings[0].values
+
+def search(query: str, store, version: str = ACTIVE_EMBEDDING_VERSION, top_k: int = 5):
+    """Search only within the space of the given version."""
+    q_vec = embed_query(query, version)
+    # Narrow the store to vectors of the same version only.
+    candidates = store.fetch_by_version(version)
+    scored = [
+        (rec.doc_id, _cosine(q_vec, rec.embedding))
+        for rec in candidates
+        if rec.is_compatible_with(version)   # belt-and-suspenders check
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:top_k]
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+```
+
+Notice that `task_type` is set to `RETRIEVAL_QUERY`. Gemini embeddings improve retrieval quality when you distinguish `task_type` between queries and documents; the corpus side uses `RETRIEVAL_DOCUMENT`. During migration, if you do not keep this correspondence aligned between old and new, your comparison conditions shift and your quality evaluation gets muddied.
+
+## The heart: a resumable reindex job
+
+Re-embedding hundreds of thousands of records will always be interrupted by something — rate limits, network drops, a process restart from a deploy. So build the reindex job so that **whenever it dies, it resumes from where it left off.** The key is to persist "how far we got."
+
+```python
+import time
+import logging
+
+logger = logging.getLogger("reindex")
+
+def reembed_corpus(
+    store,
+    checkpoint_store,
+    target_version: str = "v2",
+    batch_size: int = 100,
+    max_retries: int = 5,
+):
+    """Re-embed all documents with the target_version model.
+    It can resume from a checkpoint, so it is safe even if it dies midway.
+    """
+    model_name = EMBEDDING_MODELS[target_version]["name"]
+    last_done = checkpoint_store.get(f"reindex:{target_version}") or ""
+
+    # Pull only documents not yet embedded under the new version.
+    pending = store.iter_documents(after_id=last_done)
+
+    batch = []
+    for doc in pending:
+        batch.append(doc)
+        if len(batch) >= batch_size:
+            _flush_batch(store, checkpoint_store, batch, model_name,
+                         target_version, max_retries)
+            batch = []
+    if batch:
+        _flush_batch(store, checkpoint_store, batch, model_name,
+                     target_version, max_retries)
+
+def _flush_batch(store, checkpoint_store, batch, model_name,
+                 target_version, max_retries):
+    texts = [d.text for d in batch]
+    for attempt in range(max_retries):
+        try:
+            res = client.models.embed_content(
+                model=model_name,
+                contents=texts,
+                config={"task_type": "RETRIEVAL_DOCUMENT"},
+            )
+            for doc, emb in zip(batch, res.embeddings):
+                store.upsert(VectorRecord(
+                    doc_id=doc.id,
+                    embedding=emb.values,
+                    model_version=target_version,
+                    indexed_at=datetime.now(timezone.utc).isoformat(),
+                ))
+            # Advance the checkpoint only after the batch is written.
+            # Reverse this order and a crash will skip records.
+            checkpoint_store.set(f"reindex:{target_version}", batch[-1].id)
+            logger.info("reembedded up to %s", batch[-1].id)
+            return
+        except Exception as e:
+            wait = min(2 ** attempt, 60)   # exponential backoff (cap 60s)
+            logger.warning("batch failed (%s), retry in %ss", e, wait)
+            time.sleep(wait)
+    raise RuntimeError(f"batch permanently failed at {batch[-1].id}")
+```
+
+The **single most important thing in this implementation is to advance the checkpoint after the write succeeds.** Reverse the order and, if the process dies before the upsert, that batch is skipped forever, leaving a hole in the new index. A holed index makes exactly one document silently disappear from results — the hardest kind of bug to find. I treat this ordering with the same care as a database transaction log. My grandfather, a temple carpenter, used to say that "if you mark the ink line wrong, no amount of careful planing afterward will make the pillar fit." I remember that line every time I design an ordering like this.
+
+## Estimate cost and time before you press start
+
+Re-embedding is not free. Always estimate the total before you start. The formula is simple.
+
+```
+total cost ≈ docs × avg tokens per doc × price per 1M tokens ÷ 1,000,000
+```
+
+For example, 300,000 documents at an average of 500 tokens is 150M tokens. If the price per 1M tokens is $X, the total is `150 × $X`. **Prices change by period and model, so always check the latest official pricing.** What I want to convey is less the number itself than the habit of "know the order of magnitude before you run it." I once neglected this estimate and casually ran a full reindex twice in a test environment, wasting real money — a lesson I learned the hard way.
+
+Estimating time matters just as much. Because rate limits apply per requests-per-minute (RPM), back-calculate the duration from batch size and concurrency.
+
+- 100 records per batch, 60 requests per minute allowed → 6,000 records per minute
+- 300,000 ÷ 6,000 = 50 minutes (theoretical)
+- In practice, allow 1.5–2× for retries and delays, so **plan for around 90 minutes**
+
+That correction of "multiply the theoretical figure by 1.5–2×" is a safety factor I have come to use empirically across all my app batch jobs. Things almost never finish exactly on schedule.
+
+## Dual-write so the rebuild is never overtaken
+
+During the 90 minutes of re-embedding, the service is alive. New documents are added, existing ones are edited. Ignore this and by the time the rebuild finishes, the new index is already stale.
+
+So during the migration window, route writes to both old and new.
+
+```python
+def upsert_document(store, doc, migration_active: bool):
+    """During migration, write to both spaces."""
+    versions = ["v1"]
+    if migration_active:
+        versions.append("v2")   # reflect into the new space simultaneously
+
+    for ver in versions:
+        model_name = EMBEDDING_MODELS[ver]["name"]
+        res = client.models.embed_content(
+            model=model_name,
+            contents=doc.text,
+            config={"task_type": "RETRIEVAL_DOCUMENT"},
+        )
+        store.upsert(VectorRecord(
+            doc_id=doc.id,
+            embedding=res.embeddings[0].values,
+            model_version=ver,
+            indexed_at=datetime.now(timezone.utc).isoformat(),
+        ))
+```
+
+Turn dual-writing on **immediately before launching the reindex job**. If you enable dual-writing first and then run the bulk reindex, every update during migration is guaranteed to reach the new space through one path or the other. Reverse the order and documents edited before dual-write turned on get dropped.
+
+## Verification before cutover: shadow and canary
+
+Even once the new index is complete, flipping all users over at once is reckless. Start with shadow verification: send the same query to both old and new and compare results.
+
+In production, I mainly watch three metrics.
+
+- **Recall@5 agreement rate**: of the old index's top 5, how many remain near the top in the new index. If it is dramatically low, suspect the `task_type` assignment or the dimension setting.
+- **Distribution of average similarity scores**: have scores dropped across the board in the new space? If so, suspect a normalization or dimension-reduction misconfiguration.
+- **Zero-hit rate**: the fraction of queries that return nothing. If this rises, it is a sign of a hole in the rebuild.
+
+If shadow is clean, send a few percent of read traffic to the new index as a canary and watch error rates and user behavior (click-through and re-search rates). Only after passing all this do you switch `ACTIVE_EMBEDDING_VERSION` to `v2`.
+
+## Operational know-how that is not in the docs
+
+Finally, a few things the API reference does not cover, which I only learned by actually doing it.
+
+First, **treat a dimensionality reduction as carefully as a model switch.** Gemini embeddings let you shrink the output dimension (great for storage savings), but dropping from 768 to 256 is also a migration to a different space. If you change dimensions, treat that too as its own `model_version` and include it in the reindex scope.
+
+Second, **do not delete the old index right away.** Keep it for at least a week or two after cutover. Keeping yourself in a state where, if an unexpected quality regression appears in the new space, you can roll back instantly by reverting `ACTIVE_EMBEDDING_VERSION` to `v1` — that has saved me more than once during a midnight incident.
+
+Third, **run the reindex job during off-peak hours.** I run four technical blogs in parallel and deliberately spread my batch jobs across time. Embedding regeneration is the same: run it in the small hours when search traffic is low, and you avoid fighting your users' queries for the rate-limit budget.
+
+Switching embedding models looks, at a glance, like editing a single model name. In reality it is a quiet, large move — rebuilding the invisible foundation that is the vector space itself. The next time you switch models, start by checking whether your vectors carry a version tag. With that in place, the rest of the design proceeds calmly, in the order laid out here.
+
+If you also run vector search over the long haul, I hope this helps. Thank you for reading.
