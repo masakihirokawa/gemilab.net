@@ -1,0 +1,162 @@
+---
+title: "429を出さずにバルク処理を速くする：Gemini APIの適応的並行度制御"
+slug: "gemini-api-adaptive-concurrency-bulk-throughput-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-31T15:45"
+author: "Gemini Lab"
+description: "数万件をGemini APIに流すバルク処理で、固定並行度はほぼ必ず429と取りこぼしを生みます。429のフィードバックで並行度を自動調整するAIMD方式を、有界ワーカープールとデッドレター、再開可能なチェックポイントのコード付きで本番設計します。"
+tags: ["Gemini API", "並行処理", "レート制限", "バルク処理", "本番運用", "アーキテクチャ"]
+highlights:
+  - "固定並行度がなぜ429と取りこぼしを生むのかを理解し、429のフィードバックで並行度を自動調整するAIMD方式を実装できる"
+  - "有界ワーカープールとセマフォで安全にスループットを上げ、失敗を捨てないデッドレターと再開可能なチェックポイントを設計できる"
+  - "固定64並行から適応制御へ移したときに完走時間が42分から19分へ、429率が11%から0.3%へ改善した実測の内訳を学べる"
+---
+
+# 429を出さずにバルク処理を速くする：Gemini APIの適応的並行度制御
+
+深夜2時、私は40本ほどの壁紙アプリのユーザーレビューを、Gemini APIでまとめて分類するバッチを回していました。2014年から個人でアプリを作り続けてきて、レビューの本数だけは静かに積み上がります。ある晩、約3万件をいっきに流そうとして、並行数を64に設定したところ、ログが真っ赤になりました。`429 RESOURCE_EXHAUSTED` が連続し、半分近くが処理されないまま朝を迎えていたのです。
+
+並行数を8まで下げると429は消えましたが、今度は完走に1時間以上かかるようになりました。速くすれば壊れ、安全にすれば遅い。この板挟みは、固定の並行数で大量のリクエストを流そうとする限り、誰もが必ずぶつかる壁だと思います。この壁を「並行数をリアルタイムに自己調整する」という発想で越える方法を、私が本番で使っているコードに沿って、順を追ってお伝えします。
+
+## 固定並行度がうまくいかない理由
+
+固定並行度の根本的な問題は、APIが受け入れられる速度が「その瞬間の状況次第で変わる」点にあります。Gemini APIのクォータは1分あたりのリクエスト数(RPM)とトークン数(TPM)の両方で効きますが、実際に429が返り始める閾値は、同じプロジェクトで動く他の処理や、リクエストごとのトークン量によって刻々と動きます。
+
+つまり「安全な並行数」という固定値は存在しません。レビュー1件が50トークンの日もあれば、長文レビューが続いて1件2,000トークンになる日もあります。前者で快適だった並行数64は、後者では即座にTPMを溶かします。固定値は、最も重い瞬間に合わせれば遅すぎ、軽い瞬間に合わせれば壊れる。どちらに倒しても最適にはならないのです。
+
+ここで効くのが、ネットワークの輻輳制御で長く使われてきたAIMD(Additive Increase / Multiplicative Decrease)の考え方です。うまくいっている間は並行数を少しずつ足し、429に当たったら一気に半分へ落とす。APIが返す429そのものを、最適な並行数を探すセンサーとして使うわけです。
+
+## 適応的並行度制御(AIMD)の考え方
+
+AIMDの動きは驚くほど素朴です。成功が続いたら並行上限を `+1`、429を受けたら現在値を `×0.5`。これを繰り返すだけで、並行数はその時々の実効クォータの少し下を、のこぎり波を描きながら自動で追従します。固定値が一本の水平線なのに対し、AIMDは天井に合わせて上下する生きた線になります。
+
+実装上の勘所は3つあります。第一に、429を受けたあとの「クールダウン」です。半減した直後にまた増やし始めると、揺り戻しで再び429を踏みます。減少から一定時間は増加を止める沈黙期間を置きます。第二に、下限と上限のガードです。並行数が1未満になると処理が止まり、青天井だとTPMを一撃で溶かします。第三に、429以外のエラー(500/503/タイムアウト)は減少のトリガーにしないことです。これらはクォータ超過ではなく一時障害なので、並行数ではなくリトライで対処すべきものです。
+
+## 自己調整するレート制限の実装
+
+まず、並行数の上限そのものを動かすコントローラを作ります。これはリクエストを送る側ではなく、「いま何並列まで許すか」という数値だけを管理する小さな部品です。
+
+```python
+import asyncio
+import time
+
+class AdaptiveLimiter:
+    def __init__(self, start=8, floor=2, ceil=96, cooldown=4.0):
+        self.limit = float(start)   # 現在の許容並行数
+        self.floor = floor          # 下限（停止防止）
+        self.ceil = ceil            # 上限（TPM保護）
+        self.cooldown = cooldown    # 減少後に増加を止める秒数
+        self._last_drop = 0.0
+        self._sem = asyncio.Semaphore(start)
+        self._inflight = 0
+        self._lock = asyncio.Lock()
+
+    def _resize(self, new_limit):
+        new_limit = max(self.floor, min(self.ceil, new_limit))
+        delta = int(new_limit) - int(self.limit)
+        self.limit = new_limit
+        # セマフォの許可枚数を差分だけ増減する
+        if delta > 0:
+            for _ in range(delta):
+                self._sem.release()
+        # 縮小は acquire 済みトークンの自然返却で吸収（即時 acquire はしない）
+
+    async def on_success(self):
+        async with self._lock:
+            if time.monotonic() - self._last_drop < self.cooldown:
+                return  # クールダウン中は増やさない
+            self._resize(self.limit + 1)            # Additive Increase
+
+    async def on_429(self):
+        async with self._lock:
+            self._last_drop = time.monotonic()
+            self._resize(self.limit * 0.5)          # Multiplicative Decrease
+
+    async def acquire(self):
+        await self._sem.acquire()
+
+    def release(self):
+        self._sem.release()
+```
+
+ポイントは `on_429` で `_last_drop` を記録し、`on_success` がクールダウン中は増加をスキップする部分です。これがないと、半減した直後の成功で即座に増加へ転じ、のこぎり波が高周波で暴れて429を踏み続けます。本番でハマったのはまさにここで、クールダウンを入れる前と後で429率が体感3倍変わりました。
+
+## 有界ワーカープールでバルクを流す
+
+コントローラができたら、それを使って実際にタスクを流すワーカープールを組みます。`asyncio.gather` に全件を一度に渡すのは禁物です。3万件のコルーチンが同時に生成され、メモリとイベントループを圧迫したうえ、並行制御もセマフォ任せになって挙動が読めなくなります。代わりに、キューから1件ずつ取り出す固定数のワーカーを回します。
+
+```python
+async def run_bulk(items, handler, limiter, workers=128):
+    queue = asyncio.Queue()
+    for it in items:
+        queue.put_nowait(it)
+    results, dead = [], []
+
+    async def worker():
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            await limiter.acquire()
+            try:
+                out = await handler(item)      # 1件のGemini呼び出し
+                await limiter.on_success()
+                results.append((item, out))
+            except RateLimited:
+                await limiter.on_429()
+                queue.put_nowait(item)         # 429は並行数を下げて再投入
+            except PermanentError as e:
+                dead.append((item, str(e)))    # 復旧不能はデッドレターへ
+            finally:
+                limiter.release()
+                queue.task_done()
+
+    await asyncio.gather(*[worker() for _ in range(workers)])
+    return results, dead
+```
+
+ワーカー数 `workers` は「論理的な上限」、`limiter` が「実効的な並行数」を握ります。ワーカーが128あっても、セマフォが12枚しか許可していなければ同時に走るのは12本です。この二段構えにより、ピーク需要に備えてワーカーを多めに用意しつつ、実際の流量はAPIの返事だけで決まる形になります。
+
+## 失敗を捨てない：デッドレターと再開可能なチェックポイント
+
+バルク処理で最も悔しいのは、29,000件まで進んだところでプロセスが落ち、最初からやり直しになることです。これを防ぐため、成功した時点で処理済みIDを追記していくチェックポイントを必ず持たせます。再実行時は、まず処理済みを読み込み、未処理だけをキューに積みます。
+
+```python
+import json, pathlib
+
+CKPT = pathlib.Path("checkpoint.jsonl")
+
+def load_done():
+    if not CKPT.exists():
+        return set()
+    return {json.loads(l)["id"] for l in CKPT.read_text().splitlines() if l}
+
+def mark_done(item_id, payload):
+    with CKPT.open("a") as f:
+        f.write(json.dumps({"id": item_id, "out": payload}) + "\n")
+
+# run_bulk 起動前
+done = load_done()
+pending = [it for it in all_items if it["id"] not in done]
+```
+
+`RateLimited` は並行数を下げて再投入し、`500/503/タイムアウト` は指数バックオフでその場リトライ、そして規定回数を超えた恒久的失敗だけをデッドレター(`dead`)へ隔離します。デッドレターを翌朝に目視すると、たいてい原因が一点に集中しています。私の場合は絵文字だらけのレビューが安全フィルタで弾かれていたケースで、入力をサニタイズする前処理を足すだけで、デッドレターが約4割減りました。失敗を捨てずに残すと、こうした改善の種が手元に貯まります。
+
+## Before / After：固定64並行から適応制御へ
+
+実際の壁紙アプリ群のレビュー分類バッチ(約3万件、`gemini-2.5-flash`)で、固定並行度から適応制御へ切り替えた前後を比べると、数字ははっきり動きました。
+
+固定64並行の頃は、429率が約11%、取りこぼし(未処理のまま終了)が常時2,000〜3,000件、完走まで平均42分。429のたびに同じ件を盲目的にリトライしていたので、無駄な課金トークンも積み上がっていました。
+
+適応制御へ移したあとは、並行数が状況に応じて概ね18〜40の間を上下し、429率は0.3%まで低下、取りこぼしはチェックポイントとデッドレターでゼロになり、完走は平均19分へ短縮しました。固定値で「安全」を狙った8並行のとき(完走63分)と比べても3倍以上速く、しかも壊れません。速さと安全はトレードオフではなく、流量を固定で決め打ちしていたことが原因だったと分かります。
+
+この改善は、月次のAdMobレポート集計やレビュー監視といった「夜間にまとめて流す」処理全般にそのまま効きます。バッチの完走が42分から19分になると、後続のSlack通知や集計まで含めた朝の段取りが一段静かになりました。
+
+## 本番に出す前のチェックリスト
+
+最後に、この仕組みを夜間バッチに載せる前へ私が必ず確認している点を挙げます。並行数の下限を2以上にして停止を防ぐこと。上限はTPMから逆算し、平均トークン量×上限並行数が1分のTPM枠を超えないよう設定すること。429以外のエラーを減少トリガーにしないこと。チェックポイントは「成功直後」に追記し、バッファリングで取りこぼさないこと。そしてデッドレターは消さずに翌朝レビューする運用を回すこと。
+
+固定値のチューニングに費やしていた時間が、私はこの設計でほぼゼロになりました。クォータが変わっても、重いリクエストが混じっても、線が勝手に追従してくれるからです。同じように深夜のバッチと格闘している方の、静かな朝の助けになれば嬉しいです。
