@@ -1,0 +1,178 @@
+---
+title: "Gemini を組み込んだ機能の採算を、機能単位で見る設計 — 残す・直す・畳むを判断するために"
+slug: "gemini-api-feature-unit-economics-sunset-decision-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-01T02:45"
+author: "Gemini Lab"
+description: "Gemini API のコストはアカウント単位では見えても、機能単位の採算までは見えてきません。リクエストに機能タグを付けてコスト台帳を作り、AdMob や課金の収益シグナルと突き合わせて貢献利益を算出し、残す・直す・畳むを判断する設計を、実際に運用しているコードとともにまとめました。"
+tags: ["gemini-api", "ユニットエコノミクス", "コスト管理", "本番運用", "AdMob", "意思決定"]
+highlights:
+  - "リクエストに機能タグを付けてコストを機能単位で台帳化する、実行可能な記録レイヤの実装"
+  - "AdMob・アプリ内課金・エンゲージメントの収益シグナルとコストを突き合わせ、機能ごとの貢献利益を算出する SQL とその読み方"
+  - "貢献利益と改善余地の2軸で残す・直す・畳むを切り分ける判断マトリクスと、私が実際に1機能を畳んだときの数値"
+---
+
+ある月の半ば、私が運営する壁紙アプリの1つで「キャプション自動生成」という小さな機能の Gemini API コストが、その機能が生んでいる広告収益を上回っていることに気づきました。アプリ全体では黒字なので、月末の請求書を眺めているだけでは絶対に見えてこない赤字でした。アカウント単位のコストは Google Cloud のコンソールで分かりますが、「どの機能が」「いくら稼いで」「いくら使っているか」は、こちらが意図して設計しない限り、どこにも残らないのです。
+
+2014年から個人でアプリ開発を続け、累計5,000万ダウンロードのアプリ群を AdMob とアプリ内課金で運営してきましたが、AI 機能を本番に組み込むようになってから、この「機能単位の採算が見えない」問題が一気に重くなりました。従来の機能はコストがほぼゼロ（一度書けば動き続ける）だったのに対し、Gemini を呼ぶ機能はユーザーが使うたびに従量課金が発生します。つまり、機能ごとに損益計算書（P&L）を持つ発想が、ここで初めて必要になったのです。
+
+ここでは、リクエスト単位のコスト記録を出発点に、収益シグナルと突き合わせて機能ごとの貢献利益を出し、「残す・直す・畳む」を判断するまでの設計を共有します。コストを記録するところまでは[usageMetadata で本番アプリのコストを記録する実装パターン](/articles/gemini-api/gemini-api-usage-metadata-cost-tracking-production)で扱いましたので、本稿はその先、「記録したコストを意思決定に変える層」に焦点を当てます。
+
+## なぜ機能単位の採算は放っておくと永遠に見えないのか
+
+コストと収益が、別々の場所で・別々の粒度で記録されているからです。コストは Google Cloud の請求や `usageMetadata` に「モデル単位・アカウント単位」で溜まります。一方、収益は AdMob のダッシュボードに「広告ユニット単位」で、課金は App Store / Google Play に「プロダクト単位」で溜まります。この3つは、どれも「機能」という軸を持っていません。
+
+私が最初にやってしまった失敗は、コストだけを必死に下げようとしたことでした。プロンプトを短くし、Flash-Lite に寄せ、キャッシュを効かせ——確かにコストは2割ほど下がりました。けれども「その機能はそもそも残すべきだったのか」という問いには、まったく答えていなかったのです。コスト最適化は採算判断の代わりにはなりません。採算は収益と並べて初めて意味を持ちます。
+
+そこで設計の出発点を、「すべての Gemini リクエストに、それがどの機能のためのものかを示すタグを必ず付ける」というルールに置きました。地味ですが、これがないと後段の集計が一切できません。
+
+## ステップ1：機能タグ付きのコスト台帳をつくる
+
+リクエストを送る関数を1か所に集約し、呼び出し元が `feature` を渡すことを強制します。下のコードはそのまま動く最小構成です（Python・`google-genai` SDK 想定）。
+
+```python
+import time
+import sqlite3
+from google import genai
+
+client = genai.Client()  # GEMINI_API_KEY を環境変数から読む
+
+# Flash の概算単価（1M トークンあたり USD）。実際の単価は料金表で確認してください。
+PRICE_PER_1M = {
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
+    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
+}
+
+def _cost_usd(model: str, usage) -> float:
+    p = PRICE_PER_1M.get(model)
+    if not p:
+        return 0.0
+    in_tok = usage.prompt_token_count or 0
+    out_tok = (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)
+    return in_tok / 1_000_000 * p["input"] + out_tok / 1_000_000 * p["output"]
+
+def generate_tracked(feature: str, model: str, contents, db: sqlite3.Connection):
+    """feature タグ必須。コストを台帳に1行記録してからレスポンスを返す。"""
+    t0 = time.time()
+    resp = client.models.generate_content(model=model, contents=contents)
+    u = resp.usage_metadata
+    db.execute(
+        "INSERT INTO ai_cost_ledger (ts, feature, model, in_tok, out_tok, cost_usd, latency_ms) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (
+            int(t0), feature, model,
+            u.prompt_token_count or 0,
+            (u.candidates_token_count or 0) + (u.thoughts_token_count or 0),
+            _cost_usd(model, u),
+            int((time.time() - t0) * 1000),
+        ),
+    )
+    db.commit()
+    return resp
+```
+
+台帳のスキーマはこれだけです。
+
+```sql
+CREATE TABLE ai_cost_ledger (
+  id        INTEGER PRIMARY KEY,
+  ts        INTEGER NOT NULL,   -- UNIX 秒
+  feature   TEXT NOT NULL,      -- 例: "caption_gen", "wallpaper_tagging"
+  model     TEXT NOT NULL,
+  in_tok    INTEGER NOT NULL,
+  out_tok   INTEGER NOT NULL,
+  cost_usd  REAL NOT NULL,
+  latency_ms INTEGER NOT NULL
+);
+CREATE INDEX idx_ledger_feature_ts ON ai_cost_ledger (feature, ts);
+```
+
+ポイントは、`feature` を引数で「必ず」受け取る形にして、デフォルト値を持たせないことです。デフォルトを許すと、急いでいるときに無タグのリクエストが混ざり、半年後に「`unknown` が全コストの3割」という、いちばん知りたくない集計結果を見ることになります。私はこれを一度やりました。タグの強制は、未来の自分への配慮だと考えています。
+
+## ステップ2：収益シグナルを機能に結びつける
+
+ここが本稿のいちばん難しいところです。収益は機能に直接ひもづいていないので、近似でつなぐ必要があります。私は次の3種類のシグナルを使い分けています。
+
+1. アプリ内課金（IAP）に直結する機能 — これは最も素直です。課金イベントの直前に使われた機能であれば、その課金の一部または全部をその機能に帰属させます。
+2. 広告収益に寄与する機能 — 機能の利用が「もう1セッション続ける」「もう1枚見る」を生むなら、追加で表示された広告インプレッション × その日の eCPM を収益として帰属させます。
+3. リテンションに効く機能 — 直接の収益はないが、継続率を押し上げる機能。これは金額ではなく「7日継続率の差分」として別軸で持ちます。
+
+広告系のシグナルは、アプリ側で「機能を使ったセッション」と「使っていないセッション」の広告インプレッション数を記録しておき、その差分に eCPM を掛けて概算します。完璧な帰属は不可能なので、私は「過大評価しない」方向に倒すと決めています。つまり、迷ったら収益を低めに、コストは全額計上する。こうしておけば、採算が黒と出た機能は本当に黒だと信じられます。
+
+収益側の最小スキーマはこうしています。
+
+```sql
+CREATE TABLE feature_revenue (
+  id          INTEGER PRIMARY KEY,
+  ts          INTEGER NOT NULL,
+  feature     TEXT NOT NULL,
+  source      TEXT NOT NULL,   -- "iap" / "admob" / "retention"
+  revenue_usd REAL NOT NULL    -- retention は 0 とし、別途 retention_delta を持つ
+);
+```
+
+## ステップ3：貢献利益を算出して読む
+
+コストと収益が同じ `feature` 軸に揃ったら、突き合わせは1本の SQL で済みます。直近30日の機能別貢献利益を出すクエリです。
+
+```sql
+WITH cost AS (
+  SELECT feature, SUM(cost_usd) AS cost_usd, COUNT(*) AS calls
+  FROM ai_cost_ledger
+  WHERE ts >= strftime('%s','now','-30 days')
+  GROUP BY feature
+),
+rev AS (
+  SELECT feature, SUM(revenue_usd) AS revenue_usd
+  FROM feature_revenue
+  WHERE ts >= strftime('%s','now','-30 days')
+  GROUP BY feature
+)
+SELECT
+  c.feature,
+  c.calls,
+  ROUND(c.cost_usd, 2)                                AS cost_usd,
+  ROUND(COALESCE(r.revenue_usd, 0), 2)                AS revenue_usd,
+  ROUND(COALESCE(r.revenue_usd, 0) - c.cost_usd, 2)   AS contribution_usd,
+  ROUND(c.cost_usd / NULLIF(c.calls, 0) * 1000, 4)    AS cost_per_1k_calls
+FROM cost c
+LEFT JOIN rev r ON r.feature = c.feature
+ORDER BY contribution_usd ASC;   -- 赤字を上に
+```
+
+`ORDER BY contribution_usd ASC` で並べているのは、黒字機能を褒めるためではなく、赤字機能を最初に目に入れるためです。冒頭で触れたキャプション生成機能は、このクエリで貢献利益がマイナスとして一番上に出てきました。`cost_per_1k_calls`（1,000回あたりコスト）を併記しているのは、利用回数が少ないだけの機能と、1回あたりが高すぎる機能を区別するためです。前者は伸ばせばよく、後者は単価そのものを直す必要があります。
+
+## ステップ4：残す・直す・畳むを判断する
+
+数値が出たら、次は判断です。私は「貢献利益」と「改善余地」の2軸で4象限に分けて考えています。
+
+- 貢献利益がプラスで、改善余地も大きい：**伸ばす**。プロンプトや UX に投資する価値があります。
+- 貢献利益がプラスで、改善余地は小さい：**そのまま残す**。触らないのが正解です。
+- 貢献利益がマイナスで、改善余地が大きい：**直す**。安いモデルへの切り替え、キャッシュ、出力長の削減を試す。1か月の改善デッドラインを切ります。
+- 貢献利益がマイナスで、改善余地も小さい：**畳む**。これがいちばん勇気のいる判断です。
+
+「改善余地」をどう見積もるかですが、私は次の3つを確認します。第一に、より安いモデル（Flash → Flash-Lite）で品質要件を満たせるか。第二に、`cachedContent` や応答キャッシュで呼び出し回数そのものを減らせるか。第三に、収益側を上げられるか（その機能の利用を課金やリテンションにもっと強く結びつけられるか）。この3つすべてに「ノー」と答えが出たら、改善余地は小さいと判断します。
+
+冒頭のキャプション生成機能は、Flash-Lite に落とすと品質が露骨に下がり、キャッシュは入力がユーザー画像ごとに異なるため効かず、収益への寄与経路も作れませんでした。3つすべてがノーだったので、私はこの機能を畳みました。畳んだ後、アプリ全体のレビュー評価も継続率も動かなかったことが、その判断が正しかったことを静かに裏づけてくれました。コストは月あたり数十ドル分が消え、それは別の黒字機能の改善に回せました。
+
+## 公式ドキュメントには書かれていない運用上の勘どころ
+
+第一に、`thoughts_token_count`（思考トークン）を出力側のコストに必ず含めることです。2.5 系の思考モデルでは、これを見落とすと機能のコストを実際より小さく見積もってしまい、赤字機能を黒字だと誤認します。上のコードで `out_tok` に思考トークンを足しているのはこのためです。
+
+第二に、収益の帰属は「四半期ごとに見直す」と割り切ることです。完璧な帰属モデルを作ろうとすると終わりません。私は3か月ごとに帰属ルールを点検し、その間は同じルールで一貫して測る方を選んでいます。測り方を頻繁に変えると、機能間の比較ができなくなるからです。
+
+第三に、畳む判断は1度きりにしないことです。畳んだ機能でも、半年後にモデルの単価が下がれば採算が反転することがあります。畳んだ機能のタグと当時の数値は台帳に残しておき、料金改定のたびに「今なら黒字に戻るか」を再計算します。技術は静かに変わり続けるので、判断も一度きりにはしないのが私の流儀です。
+
+## つまずきやすいところ
+
+- タグ設計を細かくしすぎると、1機能あたりのサンプルが減って判断のノイズが増えます。最初は画面・ユースケース単位の粗い粒度から始め、赤字が疑われた機能だけ細分化するのが実用的です。
+- コスト単価をコードに直書きすると、料金改定のたびに過去の集計が狂います。単価は日付付きのテーブルで持ち、`ts` に対応する単価で再計算できるようにしておくと安全です。
+- 収益を過大に見積もると、本来畳むべき機能を温存してしまいます。迷ったら収益は低め・コストは全額、の原則を守ってください。
+
+## 次の一歩
+
+まずは台帳テーブルを1つ作り、いちばんコストが気になっている機能のリクエスト1本にタグを付けるところから始めてみてください。1機能でも30日分のコストと収益が並ぶと、これまで勘で語っていた「この機能、元が取れているのか」という問いに、初めて数字で答えられるようになります。
+
+同じように個人開発で AI 機能の採算に向き合っている方の、判断材料の一つになれば幸いです。最後までお読みいただき、ありがとうございました。

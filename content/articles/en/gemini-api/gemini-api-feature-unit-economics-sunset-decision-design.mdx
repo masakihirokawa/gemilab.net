@@ -1,0 +1,178 @@
+---
+title: "Measuring the Economics of Each Gemini-Powered Feature — So You Can Keep It, Fix It, or Retire It"
+slug: "gemini-api-feature-unit-economics-sunset-decision-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-01T02:45"
+author: "Gemini Lab"
+description: "Gemini API costs are visible at the account level, but the profitability of an individual feature never shows up on its own. This guide shows how to tag every request, build a per-feature cost ledger, join it with revenue signals from AdMob and in-app purchases to compute contribution margin, and decide whether to keep, fix, or retire each feature — with the code I actually run."
+tags: ["gemini-api", "unit-economics", "cost-management", "production", "AdMob", "decision-making"]
+highlights:
+  - "A runnable recording layer that tags every request so cost is captured per feature, not just per account"
+  - "The SQL that joins cost with AdMob, in-app purchase, and engagement revenue signals to compute each feature's contribution margin — and how to read it"
+  - "A keep / fix / retire decision matrix built on contribution margin and improvement headroom, plus the real numbers from the one feature I actually retired"
+---
+
+Halfway through one month, I noticed that a small "auto-caption" feature in one of my wallpaper apps was costing more in Gemini API calls than it was earning in ad revenue. The app as a whole was profitable, so this loss would never have surfaced from staring at the monthly invoice. Account-level cost is visible in the Google Cloud console, but "which feature earns what, and spends what" lives nowhere unless you deliberately design for it.
+
+I have built apps independently since 2014, running a portfolio with over 50 million cumulative downloads on AdMob and in-app purchases. But once I began wiring Gemini into production, this "I can't see per-feature economics" problem suddenly got heavy. Traditional features cost essentially nothing to run after you write them, whereas a feature that calls Gemini bills you every time a user touches it. For the first time, I needed each feature to carry its own profit-and-loss statement.
+
+Here I want to share the design that takes you from per-request cost recording to per-feature contribution margin, and finally to a keep / fix / retire decision. I covered the recording side in [an implementation pattern for tracking production cost with usageMetadata](/articles/gemini-api/gemini-api-usage-metadata-cost-tracking-production), so this article focuses on the layer above it: turning recorded cost into a decision.
+
+## Why per-feature economics stays invisible if you leave it alone
+
+Because cost and revenue are recorded in different places, at different granularities. Cost accumulates in Google Cloud billing and `usageMetadata` by model and by account. Revenue accumulates in your AdMob dashboard by ad unit, and purchases land in the App Store or Google Play by product. None of these three carries a "feature" axis.
+
+My first mistake was to attack cost alone. I shortened prompts, shifted to Flash-Lite, leaned on caching — and cost did drop by about 20%. But none of that answered the real question: should this feature have existed at all? Cost optimization is not a substitute for a profitability decision. Profitability only means something when it sits next to revenue.
+
+So I set the starting point of the whole design as one rule: every Gemini request must carry a tag saying which feature it is for. It is unglamorous, but without it none of the downstream aggregation is possible.
+
+## Step 1: Build a cost ledger tagged by feature
+
+Funnel every request through a single function, and force the caller to pass a `feature`. The code below runs as-is (Python, the `google-genai` SDK).
+
+```python
+import time
+import sqlite3
+from google import genai
+
+client = genai.Client()  # reads GEMINI_API_KEY from the environment
+
+# Approximate Flash unit prices (USD per 1M tokens). Confirm actual prices on the pricing page.
+PRICE_PER_1M = {
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
+    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
+}
+
+def _cost_usd(model: str, usage) -> float:
+    p = PRICE_PER_1M.get(model)
+    if not p:
+        return 0.0
+    in_tok = usage.prompt_token_count or 0
+    out_tok = (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)
+    return in_tok / 1_000_000 * p["input"] + out_tok / 1_000_000 * p["output"]
+
+def generate_tracked(feature: str, model: str, contents, db: sqlite3.Connection):
+    """feature tag is mandatory. Record one ledger row, then return the response."""
+    t0 = time.time()
+    resp = client.models.generate_content(model=model, contents=contents)
+    u = resp.usage_metadata
+    db.execute(
+        "INSERT INTO ai_cost_ledger (ts, feature, model, in_tok, out_tok, cost_usd, latency_ms) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (
+            int(t0), feature, model,
+            u.prompt_token_count or 0,
+            (u.candidates_token_count or 0) + (u.thoughts_token_count or 0),
+            _cost_usd(model, u),
+            int((time.time() - t0) * 1000),
+        ),
+    )
+    db.commit()
+    return resp
+```
+
+The ledger schema is just this.
+
+```sql
+CREATE TABLE ai_cost_ledger (
+  id        INTEGER PRIMARY KEY,
+  ts        INTEGER NOT NULL,   -- UNIX seconds
+  feature   TEXT NOT NULL,      -- e.g. "caption_gen", "wallpaper_tagging"
+  model     TEXT NOT NULL,
+  in_tok    INTEGER NOT NULL,
+  out_tok   INTEGER NOT NULL,
+  cost_usd  REAL NOT NULL,
+  latency_ms INTEGER NOT NULL
+);
+CREATE INDEX idx_ledger_feature_ts ON ai_cost_ledger (feature, ts);
+```
+
+The key is to take `feature` as a required argument with no default value. If you allow a default, an untagged request will slip in whenever you are in a hurry, and six months later you will see the one result you least want to see: "`unknown` is 30% of all cost." I did exactly that once. Forcing the tag is a small kindness to your future self.
+
+## Step 2: Attach revenue signals to features
+
+This is the hardest part of the whole design. Revenue is not directly tied to features, so you have to connect them by approximation. I use three kinds of signal, depending on the feature.
+
+1. Features tied directly to in-app purchases — the cleanest case. If a feature was used right before a purchase event, attribute part or all of that purchase to it.
+2. Features that drive ad revenue — if using the feature produces "one more session" or "one more view," attribute the extra ad impressions multiplied by that day's eCPM as revenue.
+3. Features that affect retention — no direct revenue, but they lift continuation rates. I hold these not as a dollar figure but as a separate axis: the difference in 7-day retention.
+
+For the ad-related signal, I record ad impression counts for "sessions that used the feature" versus "sessions that did not," and multiply the difference by eCPM for an estimate. Perfect attribution is impossible, so I have decided to always err toward not overstating revenue. When in doubt, count revenue low and cost in full. That way, any feature that comes out black is genuinely black.
+
+The minimal revenue schema looks like this.
+
+```sql
+CREATE TABLE feature_revenue (
+  id          INTEGER PRIMARY KEY,
+  ts          INTEGER NOT NULL,
+  feature     TEXT NOT NULL,
+  source      TEXT NOT NULL,   -- "iap" / "admob" / "retention"
+  revenue_usd REAL NOT NULL    -- retention rows use 0; keep retention_delta separately
+);
+```
+
+## Step 3: Compute and read contribution margin
+
+Once cost and revenue share the same `feature` axis, the join is a single SQL query. Here is per-feature contribution margin for the last 30 days.
+
+```sql
+WITH cost AS (
+  SELECT feature, SUM(cost_usd) AS cost_usd, COUNT(*) AS calls
+  FROM ai_cost_ledger
+  WHERE ts >= strftime('%s','now','-30 days')
+  GROUP BY feature
+),
+rev AS (
+  SELECT feature, SUM(revenue_usd) AS revenue_usd
+  FROM feature_revenue
+  WHERE ts >= strftime('%s','now','-30 days')
+  GROUP BY feature
+)
+SELECT
+  c.feature,
+  c.calls,
+  ROUND(c.cost_usd, 2)                                AS cost_usd,
+  ROUND(COALESCE(r.revenue_usd, 0), 2)                AS revenue_usd,
+  ROUND(COALESCE(r.revenue_usd, 0) - c.cost_usd, 2)   AS contribution_usd,
+  ROUND(c.cost_usd / NULLIF(c.calls, 0) * 1000, 4)    AS cost_per_1k_calls
+FROM cost c
+LEFT JOIN rev r ON r.feature = c.feature
+ORDER BY contribution_usd ASC;   -- losses at the top
+```
+
+I order by `contribution_usd ASC` not to applaud the profitable features but to put the loss-making ones in front of my eyes first. The caption feature from the opening came out at the top with a negative contribution. I include `cost_per_1k_calls` (cost per 1,000 calls) to distinguish a feature that is simply used rarely from one that is too expensive per call. The former you can grow; the latter needs its unit cost fixed.
+
+## Step 4: Decide to keep, fix, or retire
+
+Once the numbers are in, the next thing is judgment. I think in four quadrants on two axes: contribution margin and improvement headroom.
+
+- Positive margin, large headroom: **grow it**. Worth investing in the prompt and the UX.
+- Positive margin, small headroom: **leave it alone**. Not touching it is the right answer.
+- Negative margin, large headroom: **fix it**. Try a cheaper model, caching, shorter output. I set a one-month deadline for the fix.
+- Negative margin, small headroom: **retire it**. This is the decision that takes the most courage.
+
+To estimate "headroom," I check three things. First, can a cheaper model (Flash to Flash-Lite) still meet the quality bar? Second, can `cachedContent` or a response cache cut the call count itself? Third, can I lift the revenue side (tie the feature's usage more strongly to purchases or retention)? When the answer to all three is no, headroom is small.
+
+For that caption feature, dropping to Flash-Lite visibly degraded quality, caching did not help because the input differed per user image, and I could find no path to revenue. All three were no, so I retired it. After I did, neither the app's review rating nor its retention moved — a quiet confirmation that the decision was right. A few dozen dollars a month disappeared from cost, and I redirected that into improving a profitable feature.
+
+## Operational nuances the docs do not mention
+
+First, always fold `thoughts_token_count` into output-side cost. With the 2.5 thinking models, missing this makes you underestimate a feature's cost and mistake a loss-maker for a winner. That is why `out_tok` adds the thinking tokens in the code above.
+
+Second, accept that revenue attribution is reviewed quarterly, not perfected. Trying to build a flawless attribution model never ends. I inspect the attribution rules every three months and, in between, choose to measure consistently with the same rules. Change the method too often and you lose the ability to compare features against each other.
+
+Third, never treat a retirement decision as final. A retired feature can flip back to profitable six months later if the model's unit price drops. Keep the retired feature's tag and its numbers in the ledger, and recompute "would this be black today?" every time pricing changes. Technology keeps shifting quietly, so I keep my decisions open to revision too.
+
+## Common pitfalls
+
+- Make the tag scheme too fine-grained and each feature gets too few samples, adding noise to the decision. Start coarse — by screen or use case — and only subdivide the features you suspect are losing money.
+- Hard-coding unit prices in code corrupts past aggregates every time pricing changes. Hold prices in a dated table so you can recompute using the price that applied at each `ts`.
+- Overstate revenue and you will preserve a feature you should have retired. When in doubt, hold to the principle: revenue low, cost in full.
+
+## Your next step
+
+Start by creating a single ledger table and tagging one request in the feature whose cost worries you most. Even with one feature, once 30 days of cost and revenue sit side by side, you can finally answer with a number the question you used to answer by gut: is this feature actually paying for itself?
+
+If you are wrestling with the economics of AI features in your own indie work, I hope this gives you one more thing to reason with. Thank you for reading to the end.
