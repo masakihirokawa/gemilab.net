@@ -32,7 +32,6 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/gemini-advanced/gemini-31-computer-use-complete-guide", to: "/articles/gemini-advanced" },
   { from: "/articles/gemini-advanced/google-project-mariner-complete-guide", to: "/articles/gemini-advanced" },
   { from: "/articles/gemini-advanced/gemini-gems-custom-instructions-click-conversion-optimization", to: "/articles/gemini-advanced" },
-  { from: "/articles/gemini-advanced/gemma-4-architecture-benchmarks-gemini-comparison", to: "/articles/gemini-advanced" },
   { from: "/articles/gemini-advanced/gemini-lyria-3-pro-music-generation-guide", to: "/articles/gemini-advanced" },
   { from: "/articles/gemini-advanced/gemini-chrome-auto-browse-guide", to: "/articles/gemini-advanced" },
   { from: "/articles/gemini-advanced/gemini-computer-use-complete-setup-guide", to: "/articles/gemini-advanced" },
