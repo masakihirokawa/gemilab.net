@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH35 — Google I/O 2026でGemini 3.5 Flashを発表、他フロンティアモデル比4倍高速（5月）",
-    "IMAGEGA — gemini-3.1-flash-imageとgemini-3-pro-imageがGA化、ネイティブ画像生成に対応（5/28）",
-    "AGENTS — Gemini APIにManaged Agentsが追加、1回のAPIコールで推論・ツール実行するエージェントを起動（5月）",
-    "AISTUDIO — Google AI StudioのBuildエージェントがNano Bananaで画像を自動生成（5月）",
-    "ANDROID — Google AI Studioがネイティブvibe codingでAndroidアプリ生成に対応（5月）",
-    "FLASHLITE — gemini-3.1-flash-liteがGA、速度とコスト効率を最適化（5月）",
+    "FLASH35 — Gemini 3.5 FlashがGA、agentic/コーディングで高速かつフロンティア級の性能（2026）",
+    "OMNI — Gemini Omniが登場、動画起点であらゆる入力からあらゆる出力を生成（2026）",
+    "AGENTS — Gemini APIのManaged Agentsがpublic preview、隔離Linuxサンドボックスで自律エージェント（2026）",
+    "FILESEARCH — File Searchがマルチモーダル検索対応、gemini-embedding-2で画像をネイティブ埋め込み（2026）",
+    "WEBHOOK — イベント駆動WebhookがBatch API・長時間処理のポーリングを置換（2026）",
+    "DEPRECATE — gemini-3.1-flash-image-previewとgemini-3-pro-image-previewが6/25に停止、移行を前倒し推奨（2026）",
   ],
   en: [
-    "FLASH35 — Gemini 3.5 Flash debuts at Google I/O 2026, running 4x faster than other frontier models (May)",
-    "IMAGEGA — gemini-3.1-flash-image and gemini-3-pro-image reach GA for native image generation (May 28)",
-    "AGENTS — Gemini API adds Managed Agents: spin up a reasoning, tool-using agent in a single API call (May)",
-    "AISTUDIO — Google AI Studio's Build agent auto-generates images on the fly with Nano Banana (May)",
-    "ANDROID — Google AI Studio adds native vibe coding to build Android apps (May)",
-    "FLASHLITE — gemini-3.1-flash-lite reaches GA, optimized for speed and cost efficiency (May)",
+    "FLASH35 — Gemini 3.5 Flash reaches GA with fast, frontier-grade agentic and coding performance (2026)",
+    "OMNI — Gemini Omni arrives, generating any output from any input starting with video (2026)",
+    "AGENTS — Gemini API Managed Agents enter public preview with isolated Linux sandboxes (2026)",
+    "FILESEARCH — File Search adds multimodal search, embedding images natively via gemini-embedding-2 (2026)",
+    "WEBHOOK — Event-driven webhooks replace polling for the Batch API and long-running operations (2026)",
+    "DEPRECATE — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down June 25 — migrate early (2026)",
   ],
 };
 
