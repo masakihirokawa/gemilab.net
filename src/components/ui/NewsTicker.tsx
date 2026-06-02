@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH35 — Gemini 3.5 FlashがGA、agentic/コーディングで高速かつフロンティア級の性能（2026）",
-    "OMNI — Gemini Omniが登場、動画起点であらゆる入力からあらゆる出力を生成（2026）",
-    "AGENTS — Gemini APIのManaged Agentsがpublic preview、隔離Linuxサンドボックスで自律エージェント（2026）",
-    "FILESEARCH — File Searchがマルチモーダル検索対応、gemini-embedding-2で画像をネイティブ埋め込み（2026）",
-    "WEBHOOK — イベント駆動WebhookがBatch API・長時間処理のポーリングを置換（2026）",
-    "DEPRECATE — gemini-3.1-flash-image-previewとgemini-3-pro-image-previewが6/25に停止、移行を前倒し推奨（2026）",
+    "FLASH35 — Gemini 3.5 Flashが一般提供（GA）、agentic/コーディングで持続的フロンティア性能（6月）",
+    "AGENTS — Managed Agentsが公開プレビュー、Googleホストの隔離Linuxサンドボックスで自律実行（6月）",
+    "FILESEARCH — File Searchがマルチモーダル化、gemini-embedding-2で画像をネイティブに検索（6月）",
+    "WEBHOOK — イベント駆動WebhookがBatch APIと長時間オペレーションのポーリングを置き換え（6月）",
+    "DEPRECATE — gemini-3.1-flash-image-previewとgemini-3-pro-image-previewが6/25にシャットダウン（6月）",
+    "ENTERPRISE — Gemini 3.5 FlashはEnterpriseで6/8以降デフォルト有効、機能トグルは廃止（6月）",
   ],
   en: [
-    "FLASH35 — Gemini 3.5 Flash reaches GA with fast, frontier-grade agentic and coding performance (2026)",
-    "OMNI — Gemini Omni arrives, generating any output from any input starting with video (2026)",
-    "AGENTS — Gemini API Managed Agents enter public preview with isolated Linux sandboxes (2026)",
-    "FILESEARCH — File Search adds multimodal search, embedding images natively via gemini-embedding-2 (2026)",
-    "WEBHOOK — Event-driven webhooks replace polling for the Batch API and long-running operations (2026)",
-    "DEPRECATE — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down June 25 — migrate early (2026)",
+    "FLASH35 — Gemini 3.5 Flash is now GA, built for sustained frontier performance on agentic and coding tasks (Jun)",
+    "AGENTS — Managed Agents launch in public preview, running in Google-hosted isolated Linux sandboxes (Jun)",
+    "FILESEARCH — File Search goes multimodal, embedding and searching images natively via gemini-embedding-2 (Jun)",
+    "WEBHOOK — Event-driven webhooks replace polling for the Batch API and long-running operations (Jun)",
+    "DEPRECATE — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on June 25 (Jun)",
+    "ENTERPRISE — Gemini 3.5 Flash becomes default for Enterprise users after June 8, with the toggle removed (Jun)",
   ],
 };
 
