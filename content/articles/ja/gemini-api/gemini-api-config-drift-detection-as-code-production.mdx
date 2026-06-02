@@ -1,0 +1,231 @@
+---
+title: "Gemini APIの設定ドリフトを止める — モデルID・安全設定をコード化して環境差を検出する"
+slug: "gemini-api-config-drift-detection-as-code-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-02T02:45"
+author: "Gemini Lab"
+description: "同じコードなのにアプリごとに挙動が違う原因の多くは、モデルIDや安全設定の環境差です。設定をコード化し、本番の実効設定をスナップショットして差分を検出する設計を、実装レベルで解説します。"
+tags: ["Gemini API", "設定管理", "本番運用", "個人開発者", "CI"]
+highlights:
+  - "設定ドリフトが静かに事故になる仕組みと、検出すべき7項目の優先順位"
+  - "モデルID・安全設定・生成パラメータをコード化する単一の真実の源の実装"
+  - "本番の実効設定をスナップショットし、環境間の差分をCIで止めるゲートの作り方"
+---
+
+「アプリAだけ、なぜか出力が短く切れる」。複数のアプリで同じ Gemini 統合を使い回していると、こうした"片方だけ"の不具合に何度かぶつかります。コードを何度見比べても差は見つからない。原因はコードではなく、**環境ごとに少しずつズレた設定（config drift）**でした。アプリAの本番だけ `max_output_tokens` が古い値のまま残っていた、というだけの話です。
+
+（私・廣川政樹は2014年から個人開発で複数のアプリを運営しており、現在は壁紙・癒し系を中心に6本前後のアプリで Gemini API を併用しています。設定の食い違いで深夜に原因を追った経験が、この記事の出発点です。）
+
+設定ドリフトは、コードレビューでは捕まりません。`git diff` に出てこないからです。モデルIDや安全設定は環境変数やダッシュボードの設定値として外部化されることが多く、コードと別の場所で静かにズレていきます。ここで扱うのは、Gemini 統合の設定を「コード化（config-as-code）」し、本番で実際に効いている設定をスナップショットして、環境間の差分を機械的に検出する設計です。祖父が宮大工で「手を動かすことが一つの信心だ」と言っていたのを思い出すのですが、設定もまた、目に見えないところを丁寧に揃えておくほど後で楽になる領域です。
+
+## 設定ドリフトはなぜ静かに事故になるのか
+
+ドリフトが厄介なのは、**壊れた瞬間にエラーにならない**点です。`max_output_tokens` が小さすぎても 200 が返ってきます。`safety_settings` が緩い環境では通っていたプロンプトが、別の環境の厳しめ設定で `finish_reason: SAFETY` になります。どちらも例外を投げないので、監視のエラー率には乗りません。ユーザーレビューで「途中で切れる」と指摘されて初めて気づく、という遅延が生まれます。
+
+私が実際に検出した範囲では、ドリフトしやすい設定は次の7項目です。発生頻度と影響度から、検出の優先順位をつけています。
+
+1. **モデルID** — 最重要。`gemini-2.5-flash` のまま放置 vs `gemini-3.2-flash` へ更新済み、のように世代が割れる。出力品質とコストが両方ズレる
+2. **`max_output_tokens`** — 出力が途中で切れる典型原因。デフォルト値の変更時に更新漏れが起きやすい
+3. **`safety_settings`** — しきい値の不一致で片方だけブロックされる
+4. **`temperature` / `top_p`** — 再現性とトーンがズレる。A/Bテストの残骸が本番に残りがち
+5. **`system_instruction`** — プロンプト改善の反映漏れ。アプリごとにコピペ運用していると最も腐りやすい
+6. **`thinking_config`（thinking budget）** — レイテンシとコストに直結。検証用の大きな値が残ると課金が跳ねる
+7. **APIバージョン / SDKバージョン** — `v1beta` と `v1` の混在など。挙動の差は小さいが原因切り分けを難しくする
+
+ポイントは、これらが**コードのリポジトリ外に散らばっている**ことです。環境変数、シークレットマネージャ、Remote Config、ダッシュボードの手動設定。散らばっているほどドリフトします。最初の一手は、これらを一箇所のコードに集約することです。
+
+## 設定を「単一の真実の源」にコード化する
+
+まず、Gemini に渡す設定を型付きのスキーマとして定義します。Pydantic を使うと、値の検証とシリアライズが同時に手に入ります。次のコードは、ドリフト検出の対象になる設定を1つのモデルにまとめたものです。
+
+```python
+# gemini_config.py
+from pydantic import BaseModel, Field
+from typing import Literal
+import hashlib
+import json
+
+class SafetyThreshold(BaseModel):
+    category: str
+    threshold: Literal[
+        "BLOCK_NONE", "BLOCK_ONLY_HIGH",
+        "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_LOW_AND_ABOVE",
+    ]
+
+class GeminiConfig(BaseModel):
+    """1アプリ1環境ぶんの Gemini 実効設定。これを単一の真実の源とする。"""
+    app_id: str
+    environment: Literal["dev", "staging", "production"]
+    model_id: str = Field(pattern=r"^gemini-[\d.]+-(flash|pro)(-lite)?$")
+    api_version: Literal["v1", "v1beta"] = "v1"
+    max_output_tokens: int = Field(ge=1, le=65536)
+    temperature: float = Field(ge=0.0, le=2.0)
+    top_p: float = Field(ge=0.0, le=1.0)
+    thinking_budget: int = Field(ge=0, le=24576)
+    safety_settings: list[SafetyThreshold]
+    system_instruction_sha: str  # 本文ではなくハッシュで管理する
+
+    def fingerprint(self) -> str:
+        """app_id/environment を除いた"効き目"だけのハッシュ。環境間比較に使う。"""
+        payload = self.model_dump(exclude={"app_id", "environment"})
+        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+```
+
+ここで効いてくるのが `fingerprint()` です。`app_id` と `environment` を除いた設定本体をハッシュ化することで、「dev と production で効き目が同じか」を1つの文字列の一致で判定できます。`system_instruction` は本文ではなくハッシュ（`system_instruction_sha`）で持つのがコツです。本文をそのまま比較すると差分が読みにくく、シークレットが混ざるリスクもあるためです。
+
+各アプリの設定は、コードと同じリポジトリに置いた JSON で宣言します。これが「あるべき姿（desired state）」です。
+
+```python
+# configs/wallpaper_app.production.json
+{
+  "app_id": "wallpaper-app",
+  "environment": "production",
+  "model_id": "gemini-3.2-flash",
+  "api_version": "v1",
+  "max_output_tokens": 2048,
+  "temperature": 0.4,
+  "top_p": 0.95,
+  "thinking_budget": 0,
+  "safety_settings": [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
+  ],
+  "system_instruction_sha": "a1b2c3d4e5f60718"
+}
+```
+
+## 本番の「実効設定」をスナップショットする
+
+宣言した設定（あるべき姿）と、本番で実際に効いている設定（現実の姿）は、別物として扱う必要があります。ここがドリフト検出の核心です。あるべき姿を信じてはいけません。**実際に API へ渡している値を、稼働中のプロセスから吸い出す**のです。
+
+次の関数は、リクエスト送信時に組み立てている `GenerationConfig` を、そのまま `GeminiConfig` に変換してスナップショットします。アプリ起動時、あるいは定期ヘルスチェックで呼び出します。
+
+```python
+# snapshot.py
+from google import genai
+from google.genai import types
+from gemini_config import GeminiConfig, SafetyThreshold
+import hashlib
+
+def snapshot_effective_config(
+    app_id: str,
+    environment: str,
+    model_id: str,
+    gen_config: types.GenerateContentConfig,
+    system_instruction: str,
+) -> GeminiConfig:
+    """実際にリクエストへ渡している設定を、検証可能なスナップショットに変換する。"""
+    safety = [
+        SafetyThreshold(category=s.category.name, threshold=s.threshold.name)
+        for s in (gen_config.safety_settings or [])
+    ]
+    instr_sha = hashlib.sha256(
+        system_instruction.encode("utf-8")
+    ).hexdigest()[:16]
+
+    return GeminiConfig(
+        app_id=app_id,
+        environment=environment,
+        model_id=model_id,
+        api_version="v1",
+        max_output_tokens=gen_config.max_output_tokens,
+        temperature=gen_config.temperature,
+        top_p=gen_config.top_p,
+        thinking_budget=(
+            gen_config.thinking_config.thinking_budget
+            if gen_config.thinking_config else 0
+        ),
+        safety_settings=safety,
+        system_instruction_sha=instr_sha,
+    )
+```
+
+このスナップショットを各環境から集めて、`fingerprint()` を突き合わせます。指紋が一致すれば「効き目は同じ」、割れていればドリフトです。
+
+```python
+# detect.py
+import json, glob
+from gemini_config import GeminiConfig
+
+def load_desired() -> dict[str, GeminiConfig]:
+    out = {}
+    for path in glob.glob("configs/*.json"):
+        with open(path, encoding="utf-8") as f:
+            cfg = GeminiConfig(**json.load(f))
+        out[f"{cfg.app_id}:{cfg.environment}"] = cfg
+    return out
+
+def diff_configs(desired: GeminiConfig, effective: GeminiConfig) -> list[str]:
+    """あるべき姿と実効設定の差分を、項目名のリストで返す。"""
+    drifts = []
+    a = desired.model_dump(exclude={"app_id", "environment"})
+    b = effective.model_dump(exclude={"app_id", "environment"})
+    for key in a:
+        if a[key] != b[key]:
+            drifts.append(f"{key}: desired={a[key]!r} effective={b[key]!r}")
+    return drifts
+```
+
+`diff_configs` は、どの項目がズレているかを人間が読める形で返します。`fingerprint()` で「ズレている／いない」を高速に判定し、ズレていたら `diff_configs` で詳細を出す、という二段構えにすると、環境数が増えても破綻しません。私の6アプリ × 3環境 = 18構成でも、突き合わせは1秒未満で終わります。
+
+## CIゲートに組み込んで、main で止める
+
+検出ロジックができたら、CI で main ブランチへのマージ前に走らせます。あるべき姿（リポジトリの JSON）どうしを比較し、本来一致すべき環境間（例: staging と production）で指紋が割れていたら失敗させます。
+
+```python
+# ci_gate.py
+import sys
+from detect import load_desired, diff_configs
+
+def main() -> int:
+    desired = load_desired()
+    failed = False
+    apps = {k.split(":")[0] for k in desired}
+
+    for app in sorted(apps):
+        prod = desired.get(f"{app}:production")
+        stg = desired.get(f"{app}:staging")
+        if not (prod and stg):
+            continue
+        # api_version 以外は staging と production で一致すべき
+        if prod.fingerprint() != stg.fingerprint():
+            print(f"DRIFT [{app}] staging != production")
+            for line in diff_configs(prod, stg):
+                print(f"  {line}")
+            failed = True
+
+    if failed:
+        print("Config drift detected. Align environments before merge.")
+        return 1
+    print("No config drift. All environments aligned.")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+このゲートを導入してから、私の運用では「片方の環境だけモデルIDが古い」事故がゼロになりました。導入前は月に1〜2回、デプロイ後しばらくしてユーザーレビューで気づくパターンがありました。検出が「ユーザー指摘」から「マージ前」に前倒しされたことの効果が大きいです。GitHub Actions であれば、設定 JSON が変更された PR だけでこのゲートを走らせれば十分です。
+
+## 公式ドキュメントには書かれていない運用上の落とし穴
+
+ここからは、本番運用で実際に気づいた、ドキュメントには載っていない注意点と、その回避策を共有します。
+
+まず、**SDKがデフォルト値を静かに埋める**点に注意が必要です。`GenerateContentConfig` で `temperature` を指定しないと、SDKやモデル側のデフォルトが適用されます。このデフォルトはモデル世代で変わることがあり、明示していないパラメータほどドリフトの温床になります。私は「省略せず全部明示する」方針に切り替えました。指紋が安定し、差分も追いやすくなります。
+
+次に、**`thinking_budget` の扱い**です。検証時に大きな値を入れたまま本番へ流すと、レイテンシとコストが跳ねます。私の場合、検証用の大きな値が残った週はコストが約2倍に膨らんでいました。`gemini-3.2-flash` 系では、私の用途（壁紙カテゴリの分類）だと thinking を 0 にしても精度はほぼ落ちず（手元の計測で誤差は2%以内）、レスポンスは体感で30%ほど速くなりました。この実害を一度味わったので、検出7項目に thinking_budget を入れています。
+
+もう一つ、**`system_instruction` をハッシュで管理する**判断です。最初は本文をそのまま設定に含めていましたが、差分が長くなりすぎてゲートのログが読めなくなりました。ハッシュにすると「変わったかどうか」は分かるが「何が変わったか」は分からない、という割り切りですが、本文の中身はプロンプト管理側（バージョン管理）に任せ、ドリフト検出は「ズレているか」の一点に集中させるのが実用的でした。
+
+## 状況別の推奨アプローチ
+
+最後に、規模や体制に応じた現実的な落としどころを挙げます。私はこの順序での判断を推奨します。
+
+**アプリが1〜2本の個人開発の場合**は、CIゲートまで作り込む必要はないかもしれません。`gemini_config.py` のスキーマ定義と `fingerprint()` だけ用意し、アプリ起動時にログへ指紋を出すだけでも十分です。「いつもと違う指紋が出ていないか」を目視できれば、初期のドリフトはほぼ防げます。
+
+**アプリが3本以上、または複数環境を運用する場合**は、この記事のCIゲートまで入れる価値があります。環境が増えるほど人間の記憶では追えなくなり、機械的な突き合わせの費用対効果が跳ね上がります。私が18構成でゲートを常用しているのはこの理由です。
+
+**チームで運用する場合**は、設定 JSON の変更に必ずレビューを必須化してください。設定をコード化する最大の利点は、ダッシュボードでの"こっそり変更"を `git` の履歴に乗せられることです。誰がいつ `max_output_tokens` を変えたかが追えるだけで、原因切り分けの時間が大きく縮みます。
+
+設定ドリフトは派手な障害ではありませんが、静かにユーザー体験を削り、原因追跡に時間を奪います。次の一歩として、まずは自分の本番設定を1つスナップショットして指紋を出し、別環境と突き合わせてみてください。一致していれば安心が一つ増え、割れていれば、おそらく見つけるべきだった何かが見つかります。お読みいただきありがとうございました。
