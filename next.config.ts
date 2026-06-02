@@ -118,7 +118,6 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/gemini-basics/gemini-gems-custom-instructions-best-practices", to: "/articles/gemini-basics" },
   { from: "/articles/gemini-basics/google-stitch-vibe-design-voice-canvas-complete-guide-2026", to: "/articles/gemini-basics" },
   { from: "/articles/gemini-basics/gemini-3-pro-guide", to: "/articles/gemini-basics" },
-  { from: "/articles/gemini-basics/gemini-complete-guide-2026", to: "/articles/gemini-basics" },
   { from: "/articles/gemini-basics/gemini-2-5-flash-vs-pro-when-to-use", to: "/articles/gemini-basics" },
   { from: "/articles/gemini-dev/google-ai-studio-troubleshooting-guide", to: "/articles/gemini-dev" },
   { from: "/articles/gemini-dev/nemoclaw-gemini-beginners-guide", to: "/articles/gemini-dev" },
