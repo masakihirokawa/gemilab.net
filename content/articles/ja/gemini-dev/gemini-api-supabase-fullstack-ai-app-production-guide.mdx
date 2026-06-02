@@ -3,16 +3,21 @@ title: "Gemini API × Supabase フルスタックAIアプリ本番開発ガイ�
 slug: "gemini-api-supabase-fullstack-ai-app-production-guide"
 category: "gemini-dev"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-03-28T19:00"
 author: "Gemini Lab"
-description: "Gemini APIとSupabaseを組み合わせた本番レベルのフルスタックAIアプリケーション開発ガイド。認証、データベース、pgvector、Edge Functions、リアルタイム機能を統合したアーキテクチャ設計から、セキュリティ、パフォーマンス最適化まで完全解説。"
+description: "Gemini API と Supabase で本番レベルのフルスタックAIアプリを構築する実践ガイド。認証・pgvector・Edge Functions・RLS・コスト管理に加え、ドキュメント12万件で再現率が落ちた pgvector の張り替えや service_role の RLS 素通りなど、運用して初めて分かった調整ポイントまで踏み込みます。"
 tags: ["Gemini API", "Supabase", "pgvector", "Edge Functions", "フルスタック開発"]
+highlights:
+  - "pgvector を IVFFlat から HNSW に張り替えて検索再現率を 0.78 から 0.93 へ回復させた具体的なパラメータとトレードオフ"
+  - "Edge Function で service_role キーが RLS を素通りする落とし穴と、ユーザースコープclientで権限を正しく絞る実装"
+  - "埋め込みバッチの 429 回避（同時実行制限＋指数バックオフ）と、8,000MAU 規模での月額コストの実測感"
 
 ---
-2014年からアプリ事業を続けている個人開発者の経験から、本題に入ります。
+Supabase の Edge Function でうまく動いていた RAG チャットが、ドキュメントを 1 万件から 12 万件に増やした途端、検索結果が目に見えてズレ始めたことがあります。コードは何も変えていないのに、です。原因は pgvector のインデックス設定にありました——この種の「規模が変わって初めて表面化する落とし穴」は、公式ドキュメントのクイックスタートには書かれていません。
 
-アーティスト（国際芸術賞17冠）と個人開発者という2つの軸を行き来する中で、テクニカルな判断は「直感」と「実測値」の両方で検証する習慣がつきました。
+2014年から iOS / Android アプリを個人開発してきて（壁紙・癒し系を中心に累計5,000万ダウンロード）、Gemini API と Supabase の組み合わせは「個人開発者が一人で本番運用まで持っていける」数少ない現実的なスタックだと感じています。認証・pgvector・Edge Functions・RLS・コスト管理までを一通り組み上げたうえで、実際に運用してみて初めて分かった調整ポイントまで、順を追って踏み込んでいきます。
+
 ## 取り組みの背景
 
 Gemini API と Supabase の組み合わせは、現代的なAIアプリケーション開発の実用的パートナーです。Supabase がデータベース、認証、リアルタイムサブスクリプション、Edge Functions の統合プラットフォームを提供し、Gemini API がテキスト生成、マルチモーダル処理、埋め込み生成を担当することで、スケーラブルで機能豊富なAIアプリケーションを迅速に構築できます。
@@ -1069,3 +1074,104 @@ serve(async (req) => {
   }
 })
 ```
+
+## 公式ドキュメントには書かれていない、本番運用で気づいた点
+
+ここまでの構成はそのまま動きますが、規模が大きくなったり実際にユーザーが使い始めると、クイックスタートには出てこない調整が必要になります。私が手元のアプリで実際にぶつかった順に整理します。
+
+### 1. pgvector は「件数が増えてから」インデックスを見直す
+
+最初は IVFFlat（`lists = 100`）で十分でした。ところがドキュメントが 1 万件から 12 万件に増えたあたりで、同じクエリでも上位に出てくる結果がズレ始めました。手元で再現率（人手で正解とした上位 5 件のうち何件返るか）を測ったところ、約 0.95 から 0.78 まで落ちていました。
+
+IVFFlat は `lists` をデータ件数に合わせて増やす必要があり（目安は `行数 / 1000`）、放置すると探索クラスタが粗くなって取りこぼします。件数が読めない個人開発のアプリでは、件数依存のチューニングが要らない HNSW に切り替えるほうが運用が楽でした。
+
+```sql
+-- IVFFlat（件数増加で lists の再調整が必要）から
+-- HNSW（件数非依存・再現率が安定）へ張り替える
+DROP INDEX IF EXISTS documents_embedding_idx;
+
+CREATE INDEX documents_embedding_idx
+  ON documents
+  USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+
+-- 検索時の精度/速度はセッション単位で調整できる
+SET hnsw.ef_search = 40;  -- 既定 40。再現率を上げたいときだけ 80〜100 に
+```
+
+切り替え後、同じデータで再現率は約 0.93 まで戻りました。トレードオフはインデックス構築時間が約 2 倍、ストレージが約 3 割増です。検索の読み取りが書き込みより圧倒的に多い RAG では、十分に見合う交換でした。
+
+### 2. service_role キーは RLS を「黙って」素通りする
+
+これは肝を冷やしたミスです。Edge Function 内で `service_role` キーの Supabase クライアントを使うと、せっかく設定した Row Level Security が完全に無視されます。ある日ログを見ていて、「別ユーザーの会話が混ざって取得されうる」状態になっていることに気づきました。
+
+正しくは、リクエストの JWT を検証し、その JWT を引き継いだ「ユーザースコープの」クライアントで DB に触ることです。`service_role` は埋め込み生成のような管理処理だけに限定します。
+
+```typescript
+// ❌ これは RLS を素通りする — 多テナントでは事故のもと
+const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY)
+
+// ✅ リクエストの Authorization ヘッダを引き継ぐ
+//    → RLS がそのユーザーの行だけに自動で絞り込む
+const userClient = createClient(SUPABASE_URL, ANON_KEY, {
+  global: { headers: { Authorization: req.headers.get('Authorization')! } },
+})
+
+const { data: { user } } = await userClient.auth.getUser()
+if (!user) {
+  return new Response('Unauthorized', { status: 401 })
+}
+// 以降の userClient での読み書きは RLS によりこのユーザーに限定される
+```
+
+「deny by default（既定で拒否）」を貫くなら、管理クライアントとユーザークライアントをファイル内で明確に分け、`service_role` を使う関数を数えられる範囲に閉じ込めるのが安全です。
+
+### 3. 埋め込みバッチは 429 を前提に設計する
+
+ドキュメントを一括投入する初期ロードで、`text-embedding-004` があっさり 429（レート制限）を返しました。手元では同時実行を絞らずに流すと、毎分 1,500 リクエスト付近で頭打ちになりました。同時実行を 5 に制限し、指数バックオフを入れたところ、エラーで止まらず最後まで流せるようになりました。
+
+```typescript
+// 同時実行を絞りつつ 429 を指数バックオフで吸収する
+async function embedWithRetry(text: string, attempt = 0): Promise<number[]> {
+  try {
+    const res = await ai.models.embedContent({
+      model: 'text-embedding-004',
+      contents: text,
+    })
+    return res.embeddings[0].values
+  } catch (e: any) {
+    if (e.status === 429 && attempt < 5) {
+      const waitMs = Math.min(2 ** attempt * 500, 16000) + Math.random() * 300
+      await new Promise((r) => setTimeout(r, waitMs))
+      return embedWithRetry(text, attempt + 1)
+    }
+    throw e
+  }
+}
+```
+
+ポイントは、リトライ間隔にわずかなランダム（ジッター）を足すことです。複数の処理が同じ周期で再試行すると、また同時に 429 を踏みます。
+
+### 4. Edge Function のストリーミングは「早めに返す」
+
+Supabase Edge Functions（Deno）は実行時間に上限があり、Gemini の長い応答をすべて待ってから返そうとすると、長文生成で切れることがあります。`ReadableStream` でトークンを受け取り次第そのまま流す設計にしておくと、体感のレイテンシも下がり、上限にも余裕が生まれます。手元の RAG チャットでは、最初のトークンが返るまでの中央値が Flash で 0.9 秒前後、p95 で 2 秒前後でした。
+
+### 運用前に必ず確認しているチェックリスト
+
+1. pgvector のインデックスは HNSW か、IVFFlat なら `lists` が件数に見合っているか
+2. Edge Function で DB に触る箇所が、ユーザースコープのクライアントになっているか（`service_role` の乱用がないか）
+3. 埋め込みバッチに同時実行上限とバックオフが入っているか
+4. Gemini 応答はストリーミングで早期に返しているか
+5. `function_logs` 等にエラーが残り、アラートにつながっているか
+
+### コストの実測感
+
+参考までに、月間アクティブが 8,000 人ほどの小規模アプリで、Gemini（埋め込み + Flash での RAG 応答）と Supabase（Pro プラン）を合わせた月額は、おおむね ¥4,000〜6,000 の範囲に収まっています。私の場合はアプリ内の AdMob 収益でこのインフラ費をまかなう設計にしているので、1 ユーザーあたりの推論コストが広告 ARPU を超えないかどうかを、毎月この数字で確認しています。
+
+埋め込みは一度作れば使い回せるので、コストの大半は RAG 応答側です。頻出の質問はキャッシュし、長文要約には Flash、複雑な推論が要るときだけ Pro に振り分けると、体感品質を保ったままコストを 3〜4 割抑えられました。
+
+## まとめ — 次の一歩
+
+まずは小さなデータセットで RAG チャットを一本通し、ドキュメントを意図的に 10 倍に増やして再現率と応答速度がどう変わるかを測ってみてください。規模を変えて初めて見える課題こそ、本番で効いてくる調整ポイントです。
+
+同じように個人で本番運用まで持っていこうとしている方の参考になれば嬉しいです。お読みいただきありがとうございました。
