@@ -1,0 +1,249 @@
+---
+title: "A Lightweight Gemini Backend with Bun and Hono — Reclaiming the Small Tools of Indie Development"
+slug: "gemini-api-bun-hono-lightweight-backend-production-guide"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-06-02T16:00"
+author: "Gemini Lab"
+description: "Has your Node and Express Gemini backend grown heavy with dependencies and build times? Here is how I moved one to Bun and Hono — folding streaming, rate limiting, cost caps, testing, and self-hosting into a single light runtime — along with the pitfalls I hit in production."
+tags: ["gemini-api", "bun", "hono", "backend", "streaming", "indie-dev", "production", "cloudflare-workers"]
+highlights:
+  - "Move a bloated Node + Express Gemini backend onto Bun + Hono and cut dependencies and cold start with a measured, reproducible setup"
+  - "Split streaming, rate limiting, cost caps, and observability into small one-file middlewares you can reuse across several indie apps"
+  - "Run the exact same code on both Cloudflare Workers and a Bun self-host, and decide which to lean on based on your own cost structure"
+---
+
+Late one night, fixing a tiny internal tool that does nothing more than call Gemini, I noticed its `node_modules` had crept past 300MB. The whole job was: take one app review, return a summary. Yet it was dragging Express, a TypeScript build, and a process manager for hot reload, and every small change meant waiting for the environment to spin back up.
+
+I have built iOS and Android apps on my own since 2014 — these days mostly wallpaper and calm, well-being titles, several running in parallel. Cumulative downloads have passed 50 million, and revenue comes mainly from AdMob. The apps themselves are Swift and Kotlin, but the small tools behind them — review analysis, metadata generation, image tagging — I had long left on the same recycled Node and Express stack. Moving one of them to Bun and Hono made it noticeably lighter, so I want to leave behind the reasoning as much as the code.
+
+## Why I decided to add "one more backend"
+
+Let me be honest up front: most of my production backends still run on Cloudflare Workers. For a few hundred yen a month I get global edge deployment, and I can add a Worker per app without operations falling apart. So this is not a "move everything to Bun" story.
+
+The trigger was local development experience. Workers are wonderful in production, but when I want to iterate on a long Gemini stream locally, nudging the rate-limit logic a little at a time, the emulator restarts and build waits add up. For a small tool I run by hand, an environment where install, run, and test all live in one binary fits the limited hands of indie development better.
+
+Bun is a runtime, a package manager, and a test runner at once. Hono is a routing framework on top that stays close to web standards (`Request` / `Response`) — and it also runs unchanged on Cloudflare Workers. That means "iterate locally on Bun, ship the same code to Workers" actually holds. That is what made the extra environment worth its keep.
+
+## What changes from Node + Express — the smallest Before / After
+
+Let me start with the dullest and most effective difference. Here is an endpoint that calls Gemini once, in Express and then in Hono.
+
+The Express version I used to write:
+
+```ts
+// server.express.ts — the old way
+import express from "express";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+const app = express();
+app.use(express.json());
+
+const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+
+app.post("/summarize", async (req, res) => {
+  try {
+    const model = genai.getGenerativeModel({ model: "gemini-2.5-flash" });
+    const result = await model.generateContent(req.body.text);
+    res.json({ summary: result.response.text() });
+  } catch (e) {
+    res.status(500).json({ error: "failed" });
+  }
+});
+
+app.listen(3000, () => console.log("listening on 3000"));
+```
+
+The same thing in Hono:
+
+```ts
+// server.ts — Bun + Hono
+import { Hono } from "hono";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+const app = new Hono();
+const genai = new GoogleGenerativeAI(Bun.env.GEMINI_API_KEY!);
+
+app.post("/summarize", async (c) => {
+  const { text } = await c.req.json();
+  const model = genai.getGenerativeModel({ model: "gemini-2.5-flash" });
+  const result = await model.generateContent(text);
+  return c.json({ summary: result.response.text() });
+});
+
+export default app; // Bun and Workers both accept this as-is
+```
+
+The line count barely differs, but the real difference is the final `export default app`. Express's `app.listen` is code that "starts" a server, bound to its environment. Hono only "exposes" a function that takes a `Request` and returns a `Response`, leaving who starts it — Bun's server, the Workers runtime, `app.request()` inside a test — to the caller. That single fact is what later lets the same code run in two places.
+
+Running it is just `bun run server.ts`. No `ts-node`, no `nodemon`. Switch to `bun --hot server.ts` and hot reload comes built in. On my machine, `node_modules` dropped from roughly 300MB on the Express setup to the low 40s of MB, and `bun install` finished in under a second. More than the numbers, the "edit, try" round trip simply felt lighter — which matters for a tool you touch every day.
+
+## Streaming with SSE — don't degrade the mobile experience
+
+For summaries or draft generation, making users wait for the full text ruins the app experience. Using Gemini's `generateContentStream`, we push tokens little by little over Server-Sent Events (SSE). Hono ships a `streamSSE` helper that rides web-standard streams cleanly.
+
+```ts
+import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+const app = new Hono();
+const genai = new GoogleGenerativeAI(Bun.env.GEMINI_API_KEY!);
+
+app.post("/summarize/stream", (c) => {
+  return streamSSE(c, async (stream) => {
+    const { text } = await c.req.json();
+    const model = genai.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+    const result = await model.generateContentStream(text);
+    let aborted = false;
+    stream.onAbort(() => { aborted = true; }); // detect client disconnect
+
+    for await (const chunk of result.stream) {
+      if (aborted) break;            // stop billable generation after disconnect
+      const piece = chunk.text();
+      if (piece) await stream.writeSSE({ data: piece, event: "token" });
+    }
+    if (!aborted) await stream.writeSSE({ data: "[DONE]", event: "end" });
+  });
+});
+
+export default app;
+```
+
+The single most important thing here is `stream.onAbort`. On mobile, connections die mid-flight all the time — the user closes the screen, the network drops. If you keep iterating `for await` without noticing the disconnect, you keep generating tokens nobody receives, and you are billed for them. Set a flag in `onAbort` and break at the top of the loop, and the wasted output tokens stop. I forgot this at first, and after closing the app mid-test many times, the bill for output I never used crept up. The smaller the tool, the easier such holes are to leave open.
+
+On the client (Swift) side, read line by line with `URLSession`'s `bytes(for:)`, pull out the `data:` lines, and render incrementally. Closing the stream when you receive `event: end` is enough.
+
+## Hold rate limiting and cost caps in "one file"
+
+In indie development, the scariest thing is a bug or someone's prank hammering the API until an unexpected bill arrives at month end. Beyond Gemini's own quota, keeping a cap inside your own backend buys peace of mind. In Hono you slot it in as middleware, so the logic stays in one file.
+
+```ts
+// middleware/budget.ts — cap daily calls per app
+import type { MiddlewareHandler } from "hono";
+
+const DAILY_CALL_LIMIT = 5000;
+const counters = new Map<string, { day: string; calls: number }>();
+
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+export const budgetGuard: MiddlewareHandler = async (c, next) => {
+  const key = c.req.header("x-app-id") ?? "default";
+  const now = today();
+  const cur = counters.get(key);
+
+  if (!cur || cur.day !== now) {
+    counters.set(key, { day: now, calls: 0 }); // reset when the date rolls over
+  }
+  const entry = counters.get(key)!;
+
+  if (entry.calls >= DAILY_CALL_LIMIT) {
+    return c.json({ error: "daily budget exceeded" }, 429);
+  }
+  entry.calls += 1;
+  await next();
+};
+```
+
+Attach it with `app.use("/summarize/*", budgetGuard)` and you throttle daily calls per app (`x-app-id` header). It is an in-memory counter, so it resets on process restart, but that is plenty for a local tool or a small single-process server. For production that fans out across instances like Workers, this is the entry point to swap in KV or Durable Objects. As long as the middleware's outer interface stays the same, you can replace only the storage later — that is the comfortable part of Hono.
+
+My policy is simple: **keep cost caps in three layers — Gemini's quota, your own middleware, and billing-side alerts.** Lean on any one alone, and that one will be bypassed by an unexpected path. With several apps in flight, one runaway tends to eat the budget of the others, so per-`x-app-id` isolation pays off especially well.
+
+## Test fast — verify without the network
+
+Another sweet spot of Bun + Hono is test speed. Because of `export default app`, you can hit routes directly with `app.request()` without starting a server. Stub only the Gemini call, and there is no network, no emulator — results return in milliseconds.
+
+```ts
+// budget.test.ts — run with Bun's test runner
+import { expect, test } from "bun:test";
+import app from "./server";
+
+test("returns 429 once the rate cap is exceeded", async () => {
+  const call = () =>
+    app.request("/summarize", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-app-id": "test" },
+      body: JSON.stringify({ text: "sample" }),
+    });
+
+  let last = 200;
+  for (let i = 0; i < 5001; i++) last = (await call()).status;
+  expect(last).toBe(429);
+});
+```
+
+Run with `bun test`, and logic like this with no external I/O finishes instantly. I lock down the parts that "quietly raise the bill when broken" — rate limits, prompt assembly — with unit tests before shipping. Beyond writing working code, making the failure modes visible in tests is what pays off for a tool you run for a long time.
+
+## Leave one line of cost behind
+
+In production you always end up wanting to know "how much am I spending right now?" Gemini responses include `usageMetadata`, giving input, output, and thinking token counts. Write that out as one structured log line and you can later aggregate consumption by app and by day.
+
+```ts
+function logUsage(appId: string, model: string, usage: any) {
+  // JSON Lines to stdout — a shape you can later pipe into jq or BigQuery
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(),
+    appId,
+    model,
+    inputTokens: usage?.promptTokenCount ?? 0,
+    outputTokens: usage?.candidatesTokenCount ?? 0,
+    totalTokens: usage?.totalTokenCount ?? 0,
+  }));
+}
+```
+
+In practice I drop this line into a file on a Bun self-host, or into storage via Logpush on Workers, and aggregate once a week. When you run several apps in parallel, intuition is unreliable about "which tool quietly burns tokens." For me, the image-tagging tools turned out several times heavier per request than the summarizers — something this aggregation made plain. Keep the numbers, and you choose what to optimize by evidence instead of by guess.
+
+## Switch the same code between Cloudflare Workers and a Bun self-host
+
+This is where I felt the lightness most. Thanks to `export default app`, you prepare just two ways to start, and run the exact same app body in both environments.
+
+To stand it up locally on Bun, the entry is a few lines:
+
+```ts
+// bun.ts — Bun self-host entry
+import app from "./server";
+Bun.serve({ port: 3000, fetch: app.fetch });
+console.log("Bun listening on http://localhost:3000");
+```
+
+To put it on Cloudflare Workers, the entry stays `export default app`; you just add a `wrangler.toml`. The only real difference is how you read environment variables — funnel `Bun.env` through `c.env` (the Workers binding) and the branching stays minimal.
+
+```toml
+# wrangler.toml
+name = "gemini-mini-backend"
+main = "server.ts"
+compatibility_date = "2026-06-01"
+```
+
+For the decision itself, I lay it out like this:
+
+1. **Firm up locally on Bun first.** Pin the streaming and rate-limit logic with `app.request()` unit tests. No network, no emulator, so iteration is fast.
+2. **Look at the shape of your traffic.** If it is near-zero most of the time with occasional spikes, the Workers edge plus pay-per-use wins decisively. If it leans on heavy libraries (image processing, custom binaries) with back-to-back requests, a single resident Bun server can be the simpler answer.
+3. **Match only state placement to the environment.** Counters and caches: KV on Workers, in-process memory or SQLite on a resident Bun. Leave the routing body untouched.
+
+So Bun and Workers are not either/or. I settled into "develop on Bun, serve on Workers, and run a resident Bun only when a native binary is required."
+
+## Pitfalls I hit in production, and what fixed them
+
+Lighter though it became, I stumbled a few times during the move. So you don't repeat the same ruts, here are only the fixes that worked.
+
+First, mixing `Bun.env` and `process.env`. Locally, `Bun.env` auto-reads `.env`, but `Bun` simply does not exist on Workers. I consolidated env access into one helper and branched on `typeof Bun !== "undefined"`. Calling `Bun.env` directly all over the place throws at runtime on the Workers side.
+
+Second, buffering during streaming. What arrives instantly on local Bun can clump and lag when a reverse proxy or some CDN sits in the path. Adding `Cache-Control: no-cache`, and `X-Accel-Buffering: no` where needed, tamed the intermediate buffers. Measuring "time to first token" on the client helps you catch this kind of regression early.
+
+Third, dependency compatibility. Bun covers Node-compatible APIs broadly, but some packages that lean hard on native addons may not run as-is. Gemini's official SDK and lightweight utilities were fine; taking inventory of "which dependencies do I truly need" before the move makes the move itself lighter. In the process I got to throw out several dependencies I no longer used.
+
+## Where to lean on Bun, and where to keep Workers
+
+After living with both for about half a month, here is where I stand. In short, I landed on **Bun for "small tools I touch by hand every day," and Workers for "things served continuously to users around the world."**
+
+Tools like review analysis and metadata generation — ones I run locally and keep tweaking — turn Bun's "one binary, fully self-contained" lightness directly into development speed. Endpoints hit straight from the apps, meanwhile, stay on Workers for the edge delivery and zero-scale benefits. And because both share the same Hono app through `export default app`, carrying a middleware grown on one side over to the other is painless.
+
+In indie development, operational weight piles up with the number of tools. That is exactly why I treat "lightness" as a feature in its own right. As a small step you can take today, pick one of your small Express tools, rewrite it into the `export default app` shape, and start it on Bun. Leave the core logic alone and swap only the entry point. That alone also readies the same tool to travel to Workers next.
+
+If you are juggling several small tools of your own, I hope this becomes the nudge for a little inventory. Thank you for reading to the end.
