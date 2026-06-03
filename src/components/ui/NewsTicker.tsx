@@ -6,18 +6,18 @@ const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
     "FLASH35 — Gemini 3.5 Flashが一般提供（GA）、agentic/コーディングで持続的フロンティア性能（6月）",
     "AGENTS — Managed Agentsが公開プレビュー、Googleホストの隔離Linuxサンドボックスで自律実行（6月）",
+    "SCHEMA — Interactions APIのレガシースキーマが6/8に廃止、outputs→stepsへの移行が必須（6月）",
+    "SEARCH — Gemini 3.5 FlashがSearchのAI Modeとアプリで全世界展開、誰でも利用可能に（6月）",
     "FILESEARCH — File Searchがマルチモーダル化、gemini-embedding-2で画像をネイティブに検索（6月）",
-    "WEBHOOK — イベント駆動WebhookがBatch APIと長時間オペレーションのポーリングを置き換え（6月）",
     "DEPRECATE — gemini-3.1-flash-image-previewとgemini-3-pro-image-previewが6/25にシャットダウン（6月）",
-    "ENTERPRISE — Gemini 3.5 FlashはEnterpriseで6/8以降デフォルト有効、機能トグルは廃止（6月）",
   ],
   en: [
     "FLASH35 — Gemini 3.5 Flash is now GA, built for sustained frontier performance on agentic and coding tasks (Jun)",
     "AGENTS — Managed Agents launch in public preview, running in Google-hosted isolated Linux sandboxes (Jun)",
+    "SCHEMA — The Interactions API legacy schema is removed on June 8; migrate from outputs to steps now (Jun)",
+    "SEARCH — Gemini 3.5 Flash rolls out globally across Search AI Mode and the Gemini app for everyone (Jun)",
     "FILESEARCH — File Search goes multimodal, embedding and searching images natively via gemini-embedding-2 (Jun)",
-    "WEBHOOK — Event-driven webhooks replace polling for the Batch API and long-running operations (Jun)",
     "DEPRECATE — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on June 25 (Jun)",
-    "ENTERPRISE — Gemini 3.5 Flash becomes default for Enterprise users after June 8, with the toggle removed (Jun)",
   ],
 };
 
