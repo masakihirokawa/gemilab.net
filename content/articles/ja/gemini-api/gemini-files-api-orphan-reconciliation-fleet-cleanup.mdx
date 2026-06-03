@@ -1,0 +1,228 @@
+---
+title: "Gemini Files API の孤児ファイルを棚卸しする — 多アプリ運用の照合と自動クリーンアップ設計"
+slug: "gemini-files-api-orphan-reconciliation-fleet-cleanup"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-03T15:45"
+author: "Gemini Lab"
+description: "Files API にアップロードしたファイルは48時間で静かに消えます。多アプリ運用で発生する孤児ファイルとクォータ消費を、自前DBとの照合と定期クリーンアップで統制する本番設計を、壁紙アプリ運営の実装メモとしてまとめました。"
+tags: ["Gemini API", "Files API", "本番運用", "コスト最適化", "個人開発"]
+highlights:
+  - "Files API の48時間自動失効を前提に、自前DBと照合して孤児ファイルを検出する照合スクリプトの実装"
+  - "アップロード件数が日次で数千件規模になったときに効くクォータ・コストの会計と、削除を先送りしない設計判断"
+  - "6本のアプリを1人で並行運用するための、ファイル命名規約とクリーンアップ・ジョブの運用ルール"
+---
+
+ある朝、壁紙アプリの画像分類バッチが「`File ... is not found`」を連発して止まっていました。前夜にアップロードしたはずの画像が、Gemini の Files API 側から消えていたのです。原因はすぐに分かりました。Files API のファイルは、アップロードから48時間で自動的に失効します。私はそれを「知っているつもり」でしたが、実際の運用ではその前提を設計に織り込めていませんでした。
+
+私は2014年から個人でアプリを作り続けていて、壁紙・癒し系を中心に累計5,000万ダウンロードほどのユーザーに使っていただいています。最近は、その壁紙アセットのカテゴリ分類を Gemini のマルチモーダル機能に任せていて、6本のアプリ分の画像を日々まとめてアップロードしています。件数が増えるほど、この「48時間で消える」という仕様と、消える前後の状態管理が運用の急所になりました。ここでまとめたいのは、単発の「消えたファイルをどうするか」という対処ではありません。多アプリ運用で孤児ファイルとクォータ消費をどう統制するか、その照合とクリーンアップの設計を実装込みで共有します。
+
+## Files API のライフサイクルを正確に把握する
+
+最初に、設計の土台になる事実を正確に押さえておきます。曖昧なまま運用に乗せると、後で必ず痛い目を見ます。
+
+Files API にアップロードしたファイルには、いくつか動かしようのない制約があります。第一に、保存期間は48時間で、これは延長できません。第二に、プロジェクトあたりの合計ストレージには上限があり、超えると新規アップロードが弾かれます。第三に、アップロード直後のファイルは `PROCESSING` 状態で、`ACTIVE` になるまで推論に使えません。動画など大きなファイルでは、この処理待ちが無視できない長さになります。
+
+つまり Files API は「永続ストレージ」ではなく「48時間だけ有効な一時的な受け渡し場所」です。ここを取り違えると、アップロードしたファイルの `uri` を自前のデータベースに保存して使い回そうとして、翌々日に全滅する、という事故が起きます。私が最初にやったのが、まさにこれでした。
+
+状態を確認するコードはこうなります。アップロード後に `ACTIVE` を待つ部分は、本番運用では必ず必要になります。
+
+```python
+import time
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def upload_and_wait(path: str, timeout_s: int = 120):
+    """アップロードして ACTIVE になるまで待つ。PROCESSING のまま使うと失敗する。"""
+    f = client.files.upload(file=path)
+    deadline = time.time() + timeout_s
+    while f.state.name == "PROCESSING":
+        if time.time() > deadline:
+            # 処理が長引くファイルは握りつぶさず、呼び出し側に判断を委ねる
+            raise TimeoutError(f"{f.name} stuck in PROCESSING")
+        time.sleep(2)
+        f = client.files.get(name=f.name)
+    if f.state.name != "ACTIVE":
+        raise RuntimeError(f"{f.name} ended in state {f.state.name}")
+    return f
+```
+
+ここで大事なのは、`PROCESSING` のまま推論に渡さないこと、そしてタイムアウトを設けて無限ループにしないことです。私は当初 `sleep` だけで待っていて、処理が詰まったファイル1件のせいでバッチ全体が朝まで止まっていたことがありました。
+
+## 「アップロードして忘れる」設計が破綻する理由
+
+個人開発でありがちなのが、アップロードしたら後は API が面倒を見てくれるだろう、という素朴な期待です。小さな検証では問題が表面化しないので、なおさら気づきにくいのが厄介なところです。
+
+私が最初に書いていたコードは、おおよそ次のようなものでした。問題のある書き方として、まず見てください。
+
+```python
+# Before: アップロードしっぱなしで状態を一切記録しない
+def classify_wallpaper(path: str):
+    f = client.files.upload(file=path)
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[f, "この画像を30カテゴリのいずれかに分類してください"],
+    )
+    return resp.text
+    # f は二度と参照されない。削除もしない。記録も残らない。
+```
+
+この書き方には三つの問題があります。ひとつ目は、アップロードしたファイルを削除していないので、48時間は無駄にストレージを占有し続けることです。ふたつ目は、どのファイルをいつアップロードしたかの記録がないので、後から「いま何件分のファイルが Files API 側に残っているのか」を把握できないことです。みっつ目は、分類処理が途中で失敗したとき、すでにアップロード済みのファイルが宙に浮いてしまうことです。これが孤児ファイルです。
+
+1日に数十件なら、48時間で勝手に消えるので実害は小さく見えます。けれども6本のアプリで合計数千件をアップロードするようになると話が変わります。失効を待つだけの設計では、ストレージ上限に張り付いて新規アップロードが弾かれ始めますし、何より「いま何が残っているか分からない」状態そのものが、運用の不安の種になります。アプリ事業の収益はほぼ AdMob に依存していて、私は1円単位でコストに敏感です。把握できないリソースが裏で動いているのは、それだけで気持ちが悪いものでした。
+
+## 自前DBとFiles APIの状態を照合する
+
+破綻を防ぐ鍵は、Files API を「信頼できる唯一の状態」として扱わないことです。Files API 側の状態は48時間で勝手に変わってしまうので、それとは別に、自分が「何を、どのアプリのために、いつアップロードしたか」を自前で記録しておきます。そのうえで、両者を定期的に照合します。
+
+私は SQLite の小さなテーブルひとつで管理しています。個人開発ではこれで十分です。
+
+```python
+import sqlite3
+import datetime
+
+def init_db(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS uploads (
+            file_name   TEXT PRIMARY KEY,   -- Files API の name (files/xxxx)
+            app_id      TEXT NOT NULL,      -- どのアプリ向けか
+            local_path  TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL,      -- ISO8601 (UTC)
+            purpose     TEXT NOT NULL,      -- classify / variation など
+            done        INTEGER DEFAULT 0   -- 推論まで完了したか
+        )
+    """)
+    conn.commit()
+
+def record_upload(conn, f, app_id: str, local_path: str, purpose: str):
+    conn.execute(
+        "INSERT OR REPLACE INTO uploads VALUES (?, ?, ?, ?, ?, 0)",
+        (f.name, app_id, local_path,
+         datetime.datetime.now(datetime.timezone.utc).isoformat(), purpose),
+    )
+    conn.commit()
+```
+
+照合の考え方はシンプルです。Files API 側に存在するファイルの集合と、自前DBに「未完了（`done=0`）」として記録されているファイルの集合を突き合わせます。すると、三つのカテゴリに分かれます。
+
+まず、両方に存在し、まだ使う予定のもの。これは正常な進行中のファイルです。次に、Files API 側にだけ存在し、自前DBに記録がないもの。これは記録を取り損ねたか、別経路でアップロードされた、素性の分からないファイルです。そして、自前DBには「未完了」とあるのに Files API 側から消えているもの。これは48時間で失効したか、途中で削除されたものなので、DB側を「失効」として畳む必要があります。
+
+```python
+def reconcile(conn):
+    remote = {f.name: f for f in client.files.list()}
+    rows = conn.execute(
+        "SELECT file_name, app_id, uploaded_at FROM uploads WHERE done = 0"
+    ).fetchall()
+    local_pending = {r[0]: r for r in rows}
+
+    only_remote = set(remote) - set(local_pending)   # 素性不明
+    only_local  = set(local_pending) - set(remote)   # 失効済み
+    both        = set(remote) & set(local_pending)   # 進行中
+
+    # 失効していた未完了ファイルは、DB を畳んで再アップロード対象にする
+    for name in only_local:
+        conn.execute("UPDATE uploads SET done = -1 WHERE file_name = ?", (name,))
+    conn.commit()
+    return {"unknown": only_remote, "expired": only_local, "active": both}
+```
+
+`client.files.list()` はページングされるので、件数が多いときはイテレータをそのまま回せば内部でページを辿ってくれます。ここで `only_remote`、つまり素性の分からないファイルが出てくると、運用がどこかでほころんでいる証拠です。私はこの値を毎回ログに出して、ゼロでない日は原因を追うようにしています。
+
+## 孤児ファイルを検出して明示的に削除する
+
+照合ができれば、削除の判断は機械的に下せます。ポイントは、48時間の失効に頼らず、使い終わったファイルを能動的に削除することです。受動的に消えるのを待つと、その間ずっとストレージとクォータを消費しますし、何より状態が不確かなままになります。
+
+推論が終わったファイルは、その場で削除して記録を完了させます。先ほどの破綻していたコードを、ライフサイクルを管理する形に書き直すとこうなります。
+
+```python
+# After: アップロード→記録→推論→削除→完了記録 を1サイクルで閉じる
+def classify_wallpaper(conn, path: str, app_id: str):
+    f = upload_and_wait(path)
+    record_upload(conn, f, app_id, path, purpose="classify")
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[f, "この画像を30カテゴリのいずれかに分類してください"],
+        )
+        category = resp.text.strip()
+    finally:
+        # 成否にかかわらず、このサイクルで上げたファイルは責任を持って削除する
+        try:
+            client.files.delete(name=f.name)
+        except Exception:
+            pass  # 既に消えていても問題ない。次回の照合で吸収する
+        conn.execute("UPDATE uploads SET done = 1 WHERE file_name = ?", (f.name,))
+        conn.commit()
+    return category
+```
+
+`finally` の中で削除しているのが肝です。分類処理が例外で落ちても、アップロードしたファイルが孤児にならずに必ず削除されます。`files.delete` が失敗しても握りつぶしているのは、すでに失効して消えている可能性があるからで、その齟齬は次回の照合が吸収してくれます。削除を「ベストエフォート＋照合で回収」の二段構えにしておくと、個々の削除呼び出しの失敗に神経質にならずに済みます。
+
+照合で見つかった素性不明のファイル（`only_remote`）も、一定の年齢を超えていたら削除します。安全のため、アップロード直後のものを誤って消さないよう、作成からの経過時間で足切りします。
+
+```python
+def sweep_unknown(unknown_names, min_age_hours: float = 1.0):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    swept = 0
+    for name in unknown_names:
+        f = client.files.get(name=name)
+        created = datetime.datetime.fromisoformat(
+            f.create_time.isoformat() if hasattr(f.create_time, "isoformat")
+            else str(f.create_time)
+        )
+        if (now - created).total_seconds() >= min_age_hours * 3600:
+            client.files.delete(name=name)
+            swept += 1
+    return swept
+```
+
+## 定期クリーンアップをジョブにする
+
+ここまでのピースを、1日に数回走る小さなジョブにまとめます。私はアプリの画像分類バッチが一段落するオフピークの時間帯に、このクリーンアップを差し込んでいます。
+
+```python
+def cleanup_job(db_path: str = "uploads.db"):
+    conn = sqlite3.connect(db_path)
+    init_db(conn)
+    result = reconcile(conn)
+
+    swept = sweep_unknown(result["unknown"], min_age_hours=1.0)
+    metrics = {
+        "active": len(result["active"]),
+        "expired": len(result["expired"]),
+        "unknown_found": len(result["unknown"]),
+        "unknown_swept": swept,
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    # 失効として畳んだ未完了ファイルは、再アップロードのキューに戻す
+    requeue = conn.execute(
+        "SELECT local_path, app_id FROM uploads WHERE done = -1"
+    ).fetchall()
+    conn.close()
+    print(metrics)
+    return metrics, requeue
+```
+
+このジョブが返す `metrics` を毎回ログに残しておくと、運用の健康状態が一目で分かります。`unknown_found` が継続的にゼロでなければ、どこかのコードパスが削除や記録を取りこぼしています。`expired` が増えているなら、推論が48時間以内に終わっていない、つまりアップロードと処理の間隔が開きすぎているサインです。私の場合、6本のアプリのバッチ実行時刻が偏っていた時期に `expired` が跳ね上がり、実行をオフピークに分散し直すきっかけになりました。数字を持っていなければ、この調整はできませんでした。
+
+## コストとクォータをどう会計するか
+
+Files API のアップロードと保存そのものには課金されませんが、推論で消費する入力トークンには当然コストがかかります。画像1枚あたりのトークン量は解像度に依存するため、アップロード前にリサイズしておくとトークンとコストの両方が下がります。ここは照合とは別の最適化ですが、ライフサイクル管理と同じテーブルで件数を持っておくと、コストの按分が一気に楽になります。
+
+私は `uploads` テーブルに `app_id` を持たせているので、「今月、どのアプリのために何件アップロードして推論したか」を SQL 一本で集計できます。AdMob 収益はアプリ単位で見えるので、コストもアプリ単位で並べられると、どのアプリの自動化が割に合っているかを判断できます。個人開発では、この「アプリ単位での採算の見える化」が意思決定をかなり楽にしてくれました。
+
+クォータについては、合計ストレージ上限よりも、むしろ単位時間あたりのリクエスト数の方が先に効いてくることが多いです。多アプリのバッチを同時刻に走らせると、アップロードと推論のリクエストが一気に集中します。私は各アプリのバッチ開始時刻を30〜45分ずつずらして、ピークをならすようにしています。これは記事サイトの自動更新でオフピークに処理を分散しているのと同じ発想で、リソースの山を平らにするほど運用は安定します。
+
+## 多アプリ運用のための運用ルール
+
+最後に、6本のアプリを1人で回すために決めている、コードの外側のルールを共有します。仕組みだけでなく、運用の約束ごとがあって初めて破綻が防げると考えています。
+
+ひとつ目は、ファイル名（`display_name`）に必ずアプリIDと用途を埋め込むことです。`wp-classify-<appid>-<日付>-<連番>` のような規約にしておくと、`files.list()` の結果を眺めるだけで、どのアプリの何のためのファイルかが分かります。照合で素性不明ファイルが出たときの原因追跡が、これだけで格段に速くなります。
+
+ふたつ目は、削除を先送りしないことです。「48時間で消えるから放っておいてよい」という考え方を、私は意識的に捨てました。能動的に削除して記録を完了させる運用を推奨します。状態が常に確定していて、結果的に運用の手間が減りますし、上限への張り付きも回避できます。受動的な失効に頼ると、いつどれだけ残っているかが永遠に曖昧なままになります。
+
+みっつ目は、照合ジョブのメトリクスを必ず人が見る場所に出すことです。私はオフピークのクリーンアップ結果を簡単なログに残し、`unknown_found` と `expired` を毎日確認しています。自動化は「動いているはず」では危うく、数字で「動いている」と確認できて初めて信頼できると感じています。
+
+Files API は、使い方を誤れば翌々日に静かにファイルを消していく仕様ですが、48時間という制約を設計に正面から織り込んでしまえば、むしろ後始末を強制してくれる気持ちのよい仕組みになります。次に画像や音声を Files API に投げる処理を書くときは、アップロードと同じ関数の中に削除と記録まで書き切ってみてください。それだけで、孤児ファイルに悩まされる日々から抜け出せるはずです。同じように多アプリを個人で運用している方の参考になれば嬉しいです。

@@ -1,0 +1,228 @@
+---
+title: "Reconciling Orphaned Gemini Files API Uploads Across a Fleet of Apps"
+slug: "gemini-files-api-orphan-reconciliation-fleet-cleanup"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-03T15:45"
+author: "Gemini Lab"
+description: "Files API uploads quietly expire after 48 hours. Here's how I keep orphaned files and quota under control across six apps, using reconciliation against my own database and a scheduled cleanup job — written up as production notes from running wallpaper apps."
+tags: ["Gemini API", "Files API", "Production", "Cost Optimization", "Indie Development"]
+highlights:
+  - "A reconciliation script that detects orphaned files by comparing the Files API against your own database, built around the 48-hour expiry"
+  - "How to account for quota and cost once uploads reach thousands per day, and why you should delete actively instead of waiting for expiry"
+  - "Naming conventions and a cleanup job that let one person run six apps in parallel without losing track of state"
+---
+
+One morning my wallpaper-classification batch was throwing `File ... is not found` over and over and had stalled. Images I was certain I had uploaded the night before had simply vanished from Gemini's Files API. The reason was immediate: files uploaded to the Files API expire automatically 48 hours after upload. I "knew" that, in the sense that I had read it, but I had never actually built that fact into my design.
+
+I have been building apps on my own since 2014, mostly wallpaper and relaxation titles, and they have reached somewhere around 50 million downloads in total. Lately I let Gemini's multimodal capabilities handle the category classification of those wallpaper assets, uploading images for six apps in daily batches. The more volume I pushed through, the more this "expires in 48 hours" behavior — and the state management around it — became the pressure point of the whole operation. This article is not about the one-off question of "what do I do when a file disappears." It is about how to keep orphaned files and quota consumption under control across a fleet of apps, with the reconciliation and cleanup design written out in code.
+
+## Get the Files API lifecycle exactly right
+
+Start with the facts that anchor the design. Run something to production on a fuzzy understanding of these and you will get hurt later.
+
+Files uploaded to the Files API come with a few constraints you cannot negotiate. First, retention is 48 hours, and it cannot be extended. Second, there is a cap on total storage per project; exceed it and new uploads are rejected. Third, a freshly uploaded file sits in the `PROCESSING` state and cannot be used for inference until it becomes `ACTIVE`. For large files such as video, that processing wait can be long enough to matter.
+
+In other words, the Files API is not persistent storage. It is a temporary hand-off area that is valid for 48 hours. Miss that, and you end up saving the `uri` of an uploaded file in your own database to reuse it, only to watch everything break two days later. That is exactly what I did first.
+
+The code to check state looks like this. The part that waits for `ACTIVE` after upload is non-negotiable in production.
+
+```python
+import time
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def upload_and_wait(path: str, timeout_s: int = 120):
+    """Upload and wait until ACTIVE. Using it while PROCESSING will fail."""
+    f = client.files.upload(file=path)
+    deadline = time.time() + timeout_s
+    while f.state.name == "PROCESSING":
+        if time.time() > deadline:
+            # Don't swallow stuck files; let the caller decide
+            raise TimeoutError(f"{f.name} stuck in PROCESSING")
+        time.sleep(2)
+        f = client.files.get(name=f.name)
+    if f.state.name != "ACTIVE":
+        raise RuntimeError(f"{f.name} ended in state {f.state.name}")
+    return f
+```
+
+The important parts are not handing a `PROCESSING` file to inference, and setting a timeout so you never spin forever. Early on I waited with `sleep` alone, and a single file stuck in processing kept my whole batch frozen until morning.
+
+## Why "upload and forget" falls apart
+
+A common pattern in solo development is the naive assumption that once you upload, the API will take care of the rest. It is insidious precisely because small experiments never surface the problem.
+
+My first version looked roughly like this. Look at it as the cautionary example.
+
+```python
+# Before: upload and never track state
+def classify_wallpaper(path: str):
+    f = client.files.upload(file=path)
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[f, "Classify this image into one of 30 categories"],
+    )
+    return resp.text
+    # f is never referenced again. Never deleted. Never recorded.
+```
+
+This has three problems. First, the uploaded file is never deleted, so it wastes storage for a full 48 hours. Second, there is no record of which file was uploaded when, so you can never answer "how many files are currently sitting on the Files API side." Third, when classification fails partway through, the already-uploaded file is left dangling. That is an orphaned file.
+
+At a few dozen a day, the damage looks small because expiry cleans up after 48 hours. But once you are uploading several thousand a day across six apps, the story changes. A design that only waits for expiry will pin against the storage cap and start rejecting new uploads, and more importantly, the state of "I don't know what's still out there" becomes a constant source of operational anxiety. My app revenue depends almost entirely on AdMob, so I am sensitive to cost down to the yen. Resources running in the background that I cannot account for felt wrong on their own.
+
+## Reconcile your own database against the Files API
+
+The key to preventing the collapse is refusing to treat the Files API as the single source of truth. Its state changes on its own after 48 hours, so separately I keep my own record of what I uploaded, for which app, and when. Then I reconcile the two on a schedule.
+
+I manage this with a single small SQLite table. For solo development that is plenty.
+
+```python
+import sqlite3
+import datetime
+
+def init_db(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS uploads (
+            file_name   TEXT PRIMARY KEY,   -- Files API name (files/xxxx)
+            app_id      TEXT NOT NULL,      -- which app it's for
+            local_path  TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL,      -- ISO8601 (UTC)
+            purpose     TEXT NOT NULL,      -- classify / variation etc.
+            done        INTEGER DEFAULT 0   -- did inference complete?
+        )
+    """)
+    conn.commit()
+
+def record_upload(conn, f, app_id: str, local_path: str, purpose: str):
+    conn.execute(
+        "INSERT OR REPLACE INTO uploads VALUES (?, ?, ?, ?, ?, 0)",
+        (f.name, app_id, local_path,
+         datetime.datetime.now(datetime.timezone.utc).isoformat(), purpose),
+    )
+    conn.commit()
+```
+
+The reconciliation logic is simple. Compare the set of files that exist on the Files API side with the set recorded as "not done" (`done=0`) in your own database. You get three categories.
+
+First, files in both sets that you still intend to use: these are healthy, in-progress files. Second, files that exist only on the Files API side with no local record: these are of unknown provenance, either records you failed to capture or uploads from another path. Third, files your database marks as "not done" but that have disappeared from the Files API side: these expired at 48 hours or were deleted midway, so you need to close out the database row as expired.
+
+```python
+def reconcile(conn):
+    remote = {f.name: f for f in client.files.list()}
+    rows = conn.execute(
+        "SELECT file_name, app_id, uploaded_at FROM uploads WHERE done = 0"
+    ).fetchall()
+    local_pending = {r[0]: r for r in rows}
+
+    only_remote = set(remote) - set(local_pending)   # unknown provenance
+    only_local  = set(local_pending) - set(remote)   # expired
+    both        = set(remote) & set(local_pending)   # in progress
+
+    # Mark expired-but-unfinished files for re-upload
+    for name in only_local:
+        conn.execute("UPDATE uploads SET done = -1 WHERE file_name = ?", (name,))
+    conn.commit()
+    return {"unknown": only_remote, "expired": only_local, "active": both}
+```
+
+`client.files.list()` is paginated, so for large counts you can iterate it directly and it walks the pages internally. When `only_remote` — the files of unknown provenance — is non-empty, that is evidence that some code path is leaking. I log this value every run and chase down the cause on any day it is not zero.
+
+## Detect and explicitly delete orphaned files
+
+Once reconciliation works, deletion decisions become mechanical. The point is to actively delete files you are done with, rather than relying on the 48-hour expiry. Waiting for passive expiry consumes storage and quota the whole time, and worse, leaves state uncertain.
+
+When inference finishes, delete the file on the spot and close out the record. Rewriting the broken version above into a lifecycle-managed form gives this.
+
+```python
+# After: upload -> record -> infer -> delete -> mark done in one closed cycle
+def classify_wallpaper(conn, path: str, app_id: str):
+    f = upload_and_wait(path)
+    record_upload(conn, f, app_id, path, purpose="classify")
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[f, "Classify this image into one of 30 categories"],
+        )
+        category = resp.text.strip()
+    finally:
+        # Whatever happens, take responsibility for the file this cycle uploaded
+        try:
+            client.files.delete(name=f.name)
+        except Exception:
+            pass  # Already gone is fine; the next reconcile absorbs it
+        conn.execute("UPDATE uploads SET done = 1 WHERE file_name = ?", (f.name,))
+        conn.commit()
+    return category
+```
+
+The deletion inside `finally` is the crux. Even if classification throws, the uploaded file is always deleted instead of becoming an orphan. Swallowing a failed `files.delete` is intentional: the file may already have expired, and reconciliation will absorb that discrepancy next time. Making deletion a two-layer "best effort plus reconciliation sweep" frees you from being neurotic about any single delete call.
+
+Files of unknown provenance found by reconciliation (`only_remote`) also get deleted once they pass a certain age. For safety, I gate on time since creation so I never accidentally delete something just uploaded.
+
+```python
+def sweep_unknown(unknown_names, min_age_hours: float = 1.0):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    swept = 0
+    for name in unknown_names:
+        f = client.files.get(name=name)
+        created = datetime.datetime.fromisoformat(
+            f.create_time.isoformat() if hasattr(f.create_time, "isoformat")
+            else str(f.create_time)
+        )
+        if (now - created).total_seconds() >= min_age_hours * 3600:
+            client.files.delete(name=name)
+            swept += 1
+    return swept
+```
+
+## Turn cleanup into a scheduled job
+
+Assemble these pieces into a small job that runs a few times a day. I slot this cleanup into the off-peak window after the image-classification batches settle down.
+
+```python
+def cleanup_job(db_path: str = "uploads.db"):
+    conn = sqlite3.connect(db_path)
+    init_db(conn)
+    result = reconcile(conn)
+
+    swept = sweep_unknown(result["unknown"], min_age_hours=1.0)
+    metrics = {
+        "active": len(result["active"]),
+        "expired": len(result["expired"]),
+        "unknown_found": len(result["unknown"]),
+        "unknown_swept": swept,
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    # Re-queue expired-but-unfinished files for upload
+    requeue = conn.execute(
+        "SELECT local_path, app_id FROM uploads WHERE done = -1"
+    ).fetchall()
+    conn.close()
+    print(metrics)
+    return metrics, requeue
+```
+
+Logging the `metrics` this job returns every run gives you the operation's health at a glance. If `unknown_found` is persistently non-zero, some code path is dropping a deletion or a record. If `expired` is climbing, inference is not finishing within 48 hours — a sign the gap between upload and processing is too wide. In my case `expired` spiked during a period when the batch run times for the six apps were clustered together, which is what prompted me to re-spread the runs across off-peak hours. Without the number, I could not have made that adjustment.
+
+## How to account for cost and quota
+
+The Files API does not charge for the upload or the storage itself, but the input tokens consumed during inference cost money, of course. Token count per image depends on resolution, so resizing before upload lowers both tokens and cost. That is a separate optimization from reconciliation, but holding the counts in the same table makes cost allocation far easier.
+
+Because my `uploads` table carries `app_id`, a single SQL query tells me "this month, how many files did I upload and run inference on, per app." AdMob revenue is visible per app, so being able to line up cost per app too lets me judge which app's automation actually pays off. For solo development, making per-app economics visible has made decisions noticeably easier.
+
+As for quota, requests per unit time often bind before the total storage cap does. Run multi-app batches at the same time and upload and inference requests all pile up at once. I stagger each app's batch start time by 30 to 45 minutes to flatten the peak. It is the same idea as spreading my article-site automation across off-peak hours: the flatter you make the resource peaks, the more stable the operation.
+
+## Operating rules for running a fleet
+
+Finally, here are the rules outside the code that I keep in order to run six apps alone. I believe collapse is only prevented when the mechanism is paired with operational promises.
+
+First, always embed the app ID and purpose in the file's `display_name`. A convention like `wp-classify-<appid>-<date>-<seq>` means just glancing at the `files.list()` output tells you which app and purpose a file belongs to. When reconciliation turns up unknown files, this alone makes tracing the cause far faster.
+
+Second, never defer deletion. I consciously dropped the "it expires in 48 hours so I can leave it" mindset. Actively deleting and closing out the record keeps state always settled and, in the end, reduces operational effort. Lean on passive expiry and how much is left when becomes forever uncertain.
+
+Third, always surface the reconciliation job's metrics somewhere a human looks. I keep the off-peak cleanup results in a simple log and check `unknown_found` and `expired` daily. Automation is dangerous on "it should be running"; I have come to trust it only when I can confirm "it is running" with a number.
+
+The Files API will quietly delete your files two days later if you misuse it, but build the 48-hour constraint squarely into your design and it becomes a pleasant mechanism that forces you to clean up after yourself. The next time you write something that throws an image or audio file at the Files API, try writing the deletion and the record inside the very same function as the upload. That alone should get you out of the days of being plagued by orphaned files. I hope this helps anyone else running a fleet of apps on their own.
