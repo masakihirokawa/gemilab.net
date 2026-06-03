@@ -1,0 +1,182 @@
+---
+title: "Gemini 生成物の来歴を残す — 再現と監査のためのプロベナンス設計"
+slug: "gemini-api-generation-provenance-reproducibility-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-03T02:45"
+author: "Gemini Lab"
+description: "数ヶ月後に「この出力はどのモデルとプロンプトで作ったのか」が追えなくなる前に。Gemini の生成物へ来歴メタデータを刻み、品質調査とモデル移行を再現可能にする設計をまとめます。"
+tags: ["Gemini API", "プロベナンス", "再現性", "本番運用", "個人開発者"]
+highlights:
+  - "生成1件ごとに刻むべき来歴フィールドの最小セット（モデル版・プロンプトハッシュ・温度・seed・入出力ハッシュ）"
+  - "温度0でも揺れる Gemini で「何が再現でき、何が再現できないか」の実測ベースの線引き"
+  - "壁紙分類アプリの誤分類を3分で再現できた、来歴サイドカーの保存先トレードオフ"
+---
+
+アプリの壁紙自動分類に Gemini を使い始めて半年ほど経った頃、一枚の画像が「夜景」ではなく「抽象」に分類されている、というユーザー報告を受け取りました。直したいと思ったのですが、その分類を下したのがどのモデルだったのか、どんなプロンプトを渡していたのか、手元のログからは追えませんでした。出力だけが残っていて、来歴（プロベナンス）が残っていなかったのです。
+
+私は2014年から個人開発でアプリを運営してきました。累計5,000万ダウンロードを超えるなかで、壁紙・癒し・引き寄せ系のアプリを Gemini で支えています。生成 AI を本番に組み込むと、こうした「あとから理由を問われる」場面が必ず来ます。そのとき手がかりになるのは出力そのものではなく、その出力が「いつ・どのモデルとプロンプトと設定で」生まれたかという来歴です。ここでは、生成物に来歴を刻み込み、半年後でも当時の条件を組み直せるようにするための設計を、実装レベルでまとめます。
+
+## 来歴として最低限刻むべきフィールド
+
+来歴は欲張ると保存コストが膨らみ、削りすぎると再現の役に立ちません。私が壁紙分類と要約系の機能で実際に運用して、過不足がなかった最小セットは次の通りです。
+
+まず生成条件として、モデル名（`gemini-2.5-flash` のような ID）、その時点のモデル世代、温度・`thinking_budget`・`seed` といった生成パラメータ。次に内容の指紋として、プロンプトテンプレートの ID とその正規化ハッシュ、入力全文のハッシュ、出力全文のハッシュ。最後に環境として、SDK のバージョンと生成時刻。これだけで「同じ条件をもう一度組めるか」「出力が当時と変わっていないか」の両方を判定できます。
+
+ここで重要なのは、プロンプト全文をそのまま保存しないことです。プロンプトには利用者の入力が混ざることがあり、PII を抱え込むリスクがあります。全文ではなくハッシュを残し、テンプレートだけを別途バージョン管理するのが安全です。
+
+```python
+import hashlib
+import json
+import time
+from dataclasses import dataclass, asdict
+
+def canonical_prompt(template_id: str, variables: dict) -> str:
+    # 変数の順序ゆらぎを排除してから結合し、同じ意味の入力を同じ文字列にそろえる
+    normalized = json.dumps(
+        variables, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return f"{template_id}\x1f{normalized}"
+
+def sha256_short(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+@dataclass
+class Provenance:
+    model: str
+    model_generation: str
+    prompt_template_id: str
+    prompt_hash: str
+    temperature: float
+    thinking_budget: int | None
+    seed: int | None
+    input_hash: str
+    output_hash: str
+    sdk_version: str
+    created_at: float
+```
+
+## プロンプトを「ハッシュで固定する」ということ
+
+来歴の心臓部はプロンプトハッシュです。ただし素朴に「プロンプト文字列を SHA-256 にかける」だけだと、同じ意味なのにハッシュが変わる事故が起きます。変数の順序が違う、空白が一つ多い、改行コードが混ざる。こうした表記ゆれを吸収するために、ハッシュを取る前に正規化（canonicalization）を挟みます。
+
+上の `canonical_prompt` は、テンプレート ID と「キーでソートした変数の JSON」を区切り文字で連結します。これにより `{"style": "夜景", "lang": "ja"}` と `{"lang": "ja", "style": "夜景"}` は同じハッシュになります。テンプレート本文そのものは別管理にして、テンプレートを書き換えたら ID を上げる運用にすると、「プロンプトの中身が変わったのにハッシュが同じ」という最悪のケースを避けられます。
+
+私はテンプレート ID に `wallpaper-classify-v3` のような版番号を含め、本文をリポジトリでバージョン管理しています。本文を1文字でも変えたら版番号を上げる、という規律だけで、来歴の信頼性は大きく変わります。宮大工だった祖父たちは、刻んだ墨付けを残すことで後の世代が同じ仕事をたどれるようにしていました。プロンプトハッシュは、それと同じ「あとからたどれる墨付け」だと感じています。
+
+## 生成呼び出しを来歴つきでラップする
+
+来歴は「あとで付けよう」とすると必ず付け忘れます。生成呼び出しそのものを薄くラップして、出力と来歴を必ず一緒に返すようにするのが確実です。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+SDK_VERSION = "google-genai 1.x"
+MODEL = "gemini-2.5-flash"
+MODEL_GENERATION = "2.5"
+
+def generate_with_provenance(
+    template_id: str,
+    variables: dict,
+    prompt_text: str,
+    *,
+    temperature: float = 0.0,
+    seed: int | None = 7,
+    thinking_budget: int | None = None,
+):
+    config = types.GenerateContentConfig(temperature=temperature, seed=seed)
+    response = client.models.generate_content(
+        model=MODEL, contents=prompt_text, config=config
+    )
+    output = response.text
+
+    prov = Provenance(
+        model=MODEL,
+        model_generation=MODEL_GENERATION,
+        prompt_template_id=template_id,
+        prompt_hash=sha256_short(canonical_prompt(template_id, variables)),
+        temperature=temperature,
+        thinking_budget=thinking_budget,
+        seed=seed,
+        input_hash=sha256_short(prompt_text),
+        output_hash=sha256_short(output),
+        sdk_version=SDK_VERSION,
+        created_at=time.time(),
+    )
+    return output, prov
+```
+
+呼び出し側は `output, prov = generate_with_provenance(...)` と受け取るだけです。来歴を返さない経路をコードレビューで弾けるよう、生 API を直接叩く箇所はラッパー以外に作らない、という方針をチームでなくても自分一人の規律として徹底しています。
+
+## 温度0でも完全には再現できない — その線引き
+
+ここが最も誤解されやすい点です。`temperature=0` と `seed` を固定すれば毎回まったく同じ出力になる、と思いがちですが、Gemini ではそうなりません。温度0は「最も確率の高いトークンを選ぶ」傾向を強めますが、決定性を保証するものではないからです。バックエンドのモデル更新、浮動小数点演算の非決定性、ハードウェアの差で、同じ入力でも出力が揺れます。
+
+私の壁紙分類での実測では、温度0・seed 固定でも、同一画像を100回投げると数件は別カテゴリに振れました。一致率はおおむね97%前後で、3%は揺れる、という肌感です。だからこそ来歴設計では「何を再現できるか」を分けて考える必要があります。
+
+再現できるのは生成条件です。どのモデル・どのプロンプト・どの設定だったかは、来歴があれば完全に組み直せます。再現できないのは出力のビット単位の一致です。これは諦め、代わりに `output_hash` を「当時の出力と今の出力が同じか」を判定する照合キーとして使います。ハッシュが一致すれば当時と完全に同一、一致しなければ「揺れたのか、それとも条件が変わったのか」を来歴の他フィールドから切り分ける、という運用です。再現性を「条件の再現」と「出力の照合」に分けて捉えると、設計がぶれません。
+
+## 来歴をどこに保存するか — 埋め込み・サイドカー・DB
+
+保存先には大きく三つの選択肢があり、それぞれ性格が違います。状況別の推奨を述べます。
+
+第一は出力への埋め込みです。生成した JSON の中に `_provenance` キーを足す方式で、出力と来歴が物理的に離れない強みがあります。ただし出力スキーマを汚すため、利用者に返すデータとは分けたい場合に向きません。
+
+第二はサイドカーです。出力本体とは別ファイル・別レコードに来歴を置き、共通の ID で結びます。私の壁紙分類はこれを採用しています。出力スキーマを汚さず、来歴だけを後から消す・圧縮するといった運用がしやすいためです。
+
+第三は専用テーブルへの一元化です。横断クエリ（「先月の特定プロンプトハッシュの生成だけ抽出」など）が必要なら、これが最も強い方式です。
+
+```python
+import sqlite3
+
+def save_provenance(db, record_id: str, output: str, prov: Provenance):
+    db.execute(
+        "INSERT INTO generations(id, output, prov) VALUES(?, ?, ?)",
+        (record_id, output, json.dumps(asdict(prov), ensure_ascii=False)),
+    )
+    db.commit()
+
+def replay_conditions(db, record_id: str) -> dict:
+    # 当時の生成条件を組み直すための来歴を引き出す
+    row = db.execute(
+        "SELECT prov FROM generations WHERE id = ?", (record_id,)
+    ).fetchone()
+    prov = json.loads(row[0])
+    return {
+        "model": prov["model"],
+        "prompt_template_id": prov["prompt_template_id"],
+        "prompt_hash": prov["prompt_hash"],
+        "temperature": prov["temperature"],
+        "seed": prov["seed"],
+    }
+```
+
+個人開発の規模なら、まずサイドカーで始めて、横断調査の必要が出てから専用テーブルへ移すのが現実的だと考えています。最初から大げさな基盤を組む必要はありません。
+
+## 監査が効いた瞬間 — 誤分類を3分で再現する
+
+冒頭の誤分類報告に戻ります。来歴を入れた後の同種のトラブルでは、対応がまるで変わりました。報告された画像の ID から来歴を引き、`replay_conditions` で当時の条件を組み直し、同じプロンプトテンプレートと設定で再実行する。ここまでおよそ3分でした。
+
+再現してみると、誤分類はモデルの揺れではなく、プロンプトテンプレートを `v2` から `v3` に上げたときに分類カテゴリの説明文を削ってしまったことが原因だと、来歴のテンプレート ID からすぐに特定できました。来歴がなければ、出力だけを眺めて「モデルが悪いのか、プロンプトが悪いのか」を何時間も悩んでいたはずです。
+
+この調査の速さは、AdMob 収益に直結する機能ほど効いてきます。分類の質が体験を左右し、体験が継続率を左右するからです。本番で問題が起きたとき、原因切り分けにかかる時間そのものが、個人開発では最も希少な資源です。来歴は、その時間を買い戻すための投資だと捉えています。
+
+## 導入で踏みやすい落とし穴
+
+最後に、来歴設計を本番へ入れる際につまずきやすい点を、対処とあわせて挙げます。
+
+1. ハッシュ前に PII を除去していない。入力全文をそのままハッシュにかけても PII は復元できませんが、ログにプロンプト本文を一緒に吐いていると漏れます。来歴に残すのはハッシュだけにして、本文ログは分離してください。
+2. プロンプト本文を変えたのにテンプレート ID を据え置いた。これをやると別物のプロンプトが同じハッシュを持ち、来歴が嘘をつきます。本文変更時は必ず版番号を上げる規律で回避します。
+3. SDK バージョンを記録していない。SDK 更新でデフォルト値が変わると挙動が静かに変わります。`sdk_version` を残しておくと、モデルを疑う前に環境差を疑えます。
+4. 来歴を「成功時だけ」記録している。エラーや空出力こそ再現したい対象です。失敗時にも来歴を残すと、トラブル調査の解像度が一段上がります。
+
+これらはどれも、最初の設計で1行ずつ手当てしておけば防げるものばかりです。あとから足そうとすると、過去分の来歴が欠けたまま固定化してしまいます。
+
+## 次の一歩
+
+まずは一番トラブルが多い生成経路を一つ選び、そこだけに `generate_with_provenance` のような薄いラッパーを通してください。全経路を一度に置き換える必要はありません。一つの経路で「3分で当時の条件を組み直せる」体験を一度味わえば、来歴を残す価値は具体的な手応えとして分かるはずです。
+
+同じように本番で生成 AI を運用されている方の、原因切り分けの一助になれば嬉しいです。
