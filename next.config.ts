@@ -49,7 +49,6 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/gemini-api/multimodal-api-guide", to: "/articles/gemini-api" },
   { from: "/articles/gemini-api/thinking-level-guide", to: "/articles/gemini-api" },
   { from: "/articles/gemini-api/gemini-api-realtime-translation-chat-app", to: "/articles/gemini-api" },
-  { from: "/articles/gemini-api/gemini-thought-signatures-guide", to: "/articles/gemini-api" },
   { from: "/articles/gemini-api/gemini-api-flex-priority-inference-guide", to: "/articles/gemini-api" },
   { from: "/articles/gemini-api/gemini-api-vuejs3-ai-chat-composables-guide", to: "/articles/gemini-api" },
   { from: "/articles/gemini-api/gemini-api-notion-integration-guide", to: "/articles/gemini-api" },
