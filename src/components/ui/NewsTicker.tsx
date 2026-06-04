@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH35 — Gemini 3.5 Flashが一般提供（GA）、agentic/コーディングで持続的フロンティア性能（6月）",
-    "AGENTS — Managed Agentsが公開プレビュー、Googleホストの隔離Linuxサンドボックスで自律実行（6月）",
-    "SCHEMA — Interactions APIのレガシースキーマが6/8に廃止、outputs→stepsへの移行が必須（6月）",
-    "SEARCH — Gemini 3.5 FlashがSearchのAI Modeとアプリで全世界展開、誰でも利用可能に（6月）",
-    "FILESEARCH — File Searchがマルチモーダル化、gemini-embedding-2で画像をネイティブに検索（6月）",
-    "DEPRECATE — gemini-3.1-flash-image-previewとgemini-3-pro-image-previewが6/25にシャットダウン（6月）",
+    "FLASH-GA — Gemini 3.5 Flashが一般提供、agentic/コーディングで高速かつフロンティア性能（6月）",
+    "AGENTS — Gemini APIのManaged Agentsが公開プレビュー、隔離Linuxサンドボックスで自律実行（6月）",
+    "SCHEMA — Interactions APIの旧スキーマ（outputs→steps）が6/8に撤去、移行猶予わずか（6月）",
+    "SUNSET — 画像プレビュー系モデルが6/25にシャットダウン予定（6月）",
+    "SEARCH — File Searchがマルチモーダル対応、gemini-embedding-2で画像も検索可能に（6月）",
+    "CLI — Gemini Code Assist向けGemini CLIが6/18に個人/Pro/Ultra層で提供終了（6月）",
   ],
   en: [
-    "FLASH35 — Gemini 3.5 Flash is now GA, built for sustained frontier performance on agentic and coding tasks (Jun)",
-    "AGENTS — Managed Agents launch in public preview, running in Google-hosted isolated Linux sandboxes (Jun)",
-    "SCHEMA — The Interactions API legacy schema is removed on June 8; migrate from outputs to steps now (Jun)",
-    "SEARCH — Gemini 3.5 Flash rolls out globally across Search AI Mode and the Gemini app for everyone (Jun)",
-    "FILESEARCH — File Search goes multimodal, embedding and searching images natively via gemini-embedding-2 (Jun)",
-    "DEPRECATE — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on June 25 (Jun)",
+    "FLASH-GA — Gemini 3.5 Flash reaches general availability with fast frontier performance on agentic and coding tasks (Jun)",
+    "AGENTS — Gemini API's Managed Agents enter public preview, running autonomously in isolated Linux sandboxes (Jun)",
+    "SCHEMA — The Interactions API legacy schema (outputs→steps) is removed on June 8; the migration window is closing (Jun)",
+    "SUNSET — Image-preview models are scheduled to shut down on June 25 (Jun)",
+    "SEARCH — File Search goes multimodal, embedding and searching images via gemini-embedding-2 (Jun)",
+    "CLI — Gemini CLI stops serving Gemini Code Assist for individual/Pro/Ultra tiers on June 18 (Jun)",
   ],
 };
 
