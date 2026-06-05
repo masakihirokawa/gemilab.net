@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH-GA — Gemini 3.5 Flashが一般提供、agentic/コーディングで高速かつフロンティア性能（6月）",
-    "AGENTS — Gemini APIのManaged Agentsが公開プレビュー、隔離Linuxサンドボックスで自律実行（6月）",
-    "SCHEMA — Interactions APIの旧スキーマ（outputs→steps）が6/8に撤去、移行猶予わずか（6月）",
-    "SUNSET — 画像プレビュー系モデルが6/25にシャットダウン予定（6月）",
-    "SEARCH — File Searchがマルチモーダル対応、gemini-embedding-2で画像も検索可能に（6月）",
-    "CLI — Gemini Code Assist向けGemini CLIが6/18に個人/Pro/Ultra層で提供終了（6月）",
+    "FLASH3.5 — Gemini 3.5 Flashが一般提供に、エージェント・コーディングで持続的なフロンティア性能（6月）",
+    "MANAGED-AGENTS — Gemini APIでManaged Agentsが公開プレビュー、Googleホストの隔離Linuxサンドボックスで自律エージェントを構築（6月）",
+    "ANTIGRAVITY-AGENT — 汎用Antigravity Agent（Managed Agent）が公開プレビュー、計画・コード実行・ファイル管理・Web閲覧を自律実行（6月）",
+    "SCHEMA — Interactions APIのスキーマがoutputs→stepsへ、旧スキーマは6/8に削除（破壊的変更）（6月）",
+    "DEPRECATION — gemini-3.1-flash-image-preview／gemini-3-pro-image-previewが6/25に停止（6月）",
+    "FILESEARCH — File Searchがマルチモーダル対応（gemini-embedding-2）、イベント駆動Webhooksも追加（6月）",
   ],
   en: [
-    "FLASH-GA — Gemini 3.5 Flash reaches general availability with fast frontier performance on agentic and coding tasks (Jun)",
-    "AGENTS — Gemini API's Managed Agents enter public preview, running autonomously in isolated Linux sandboxes (Jun)",
-    "SCHEMA — The Interactions API legacy schema (outputs→steps) is removed on June 8; the migration window is closing (Jun)",
-    "SUNSET — Image-preview models are scheduled to shut down on June 25 (Jun)",
-    "SEARCH — File Search goes multimodal, embedding and searching images via gemini-embedding-2 (Jun)",
-    "CLI — Gemini CLI stops serving Gemini Code Assist for individual/Pro/Ultra tiers on June 18 (Jun)",
+    "FLASH3.5 — Gemini 3.5 Flash reaches general availability for sustained frontier performance on agentic and coding tasks (Jun)",
+    "MANAGED-AGENTS — Managed Agents launch in public preview on the Gemini API, running in secure Google-hosted Linux sandboxes (Jun)",
+    "ANTIGRAVITY-AGENT — A general-purpose Antigravity Agent ships in public preview, autonomously planning, coding, managing files, and browsing the web (Jun)",
+    "SCHEMA — The Interactions API schema moves from outputs to steps; the legacy schema is removed on Jun 8 (Jun)",
+    "DEPRECATION — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on Jun 25 (Jun)",
+    "FILESEARCH — File Search adds multimodal support via gemini-embedding-2, plus event-driven webhooks (Jun)",
   ],
 };
 
