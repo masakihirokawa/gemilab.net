@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SIRI — WWDC 2026（6/8）で刷新Siriのクラウド機能をGeminiが担うと報道、Appleは約1.2兆パラメータのカスタムGeminiモデルに年間約10億ドルとも",
-    "API — Interactions APIの旧スキーマが6/8に削除（outputs→steps・response_format変更）、未移行のコードは動かなくなります（6/8）",
-    "CLI — 6/18にGemini CLIとCode Assist IDE拡張がPro・Ultra・個人向けの提供を終了、Antigravityへの移行が案内されています（6/18）",
-    "IMAGE — 画像モデルgemini-3.1-flash-image-previewとgemini-3-pro-image-previewが6/25にシャットダウン（6/25）",
-    "GEMINI3.5 — Gemini 3.5 FlashがGA、エージェント/コーディングで最も賢く約4倍高速、Antigravity・API・AI Studio等で利用可能（6月）",
-    "VIDEO2IMAGE — 動画を入力に高品質なサムネイル・ポスター・インフォグラフィックを生成する動画→画像生成に対応（gemini-3.1-flash-image）",
+    "WWDC — WWDC 2026が6/8開幕。刷新版SiriはGoogle Geminiベースで動くと報じられ、Apple Intelligenceの中核がGeminiに移る動きに注目",
+    "API — Interactions APIの旧スキーマが6/8に削除（新スキーマoutputs→steps、response_formatは5/26デフォルト化済み）。移行は本日が最終期限",
+    "FLASH3.5 — Gemini 3.5 FlashがGA。1Mトークン・最大64k出力で、Terminal-Bench 2.1 76.2%などエージェント/コーディングで3.1 Pro超え",
+    "AGENTS — Managed Agentsが公開プレビュー。API1コールで隔離Linuxサンドボックス付きエージェントを起動し、Bash/Python/Node・ブラウジングに対応",
+    "DEPRECATE — gemini-3.1-flash-image-preview／gemini-3-pro-image-previewは6/25に停止予定。早めの移行を",
+    "SEARCH — File Searchがマルチモーダル検索に対応。gemini-embedding-2で画像を埋め込み・検索できるように",
   ],
   en: [
-    "SIRI — At WWDC 2026 (Jun 8), Siri's cloud features are reportedly powered by Gemini, with Apple said to pay Google about $1B a year for a custom ~1.2T-parameter model",
-    "API — The Interactions API legacy schema is removed on Jun 8 (outputs to steps, response_format changes); unmigrated code will break (Jun 8)",
-    "CLI — On Jun 18, Gemini CLI and Code Assist IDE extensions stop serving the Pro, Ultra, and individual tiers, pointing developers to Antigravity (Jun 18)",
-    "IMAGE — The gemini-3.1-flash-image-preview and gemini-3-pro-image-preview models shut down on Jun 25 (Jun 25)",
-    "GEMINI3.5 — Gemini 3.5 Flash is GA: the most intelligent model for agentic and coding work, about 4x faster, across Antigravity, the API, AI Studio and more (Jun)",
-    "VIDEO2IMAGE — Video-to-image generation arrives on gemini-3.1-flash-image, turning a video into high-quality thumbnails, posters, and infographics",
+    "WWDC — WWDC 2026 opens Jun 8; the revamped Siri is reported to run on Google Gemini, moving the core of Apple Intelligence toward Gemini",
+    "API — The legacy Interactions API schema is removed Jun 8 (new outputs->steps schema; response_format defaulted May 26). Today is the migration deadline",
+    "FLASH3.5 — Gemini 3.5 Flash is GA: 1M-token context, up to 64k output, beating 3.1 Pro on agentic/coding (Terminal-Bench 2.1 76.2%)",
+    "AGENTS — Managed Agents enter public preview: one API call spins up an agent with an isolated Linux sandbox supporting Bash/Python/Node and browsing",
+    "DEPRECATE — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on Jun 25; migrate early",
+    "SEARCH — File Search now supports multimodal search, embedding and querying images via gemini-embedding-2",
   ],
 };
 
