@@ -233,3 +233,217 @@ Both of my grandfathers were temple carpenters. They used to say, in their own q
 If you are running an app on top of Gemini API and want to avoid an incident like mine, I would start with exactly one thing: sample 1% of your Gemini responses into object storage with a 30-day retention. Just that. It will let you diagnose half of the inexplicable client crashes you have not yet had. Dual-Emit and Sunset protocols become natural to introduce once the observability layer is in place.
 
 I am still learning my way through this. If you are running anything at similar scale as a solo developer, I hope this is useful. Thank you for reading.
+
+
+## Why schemas always change
+
+It is essentially impossible to ship a schema that survives a year unchanged. The reasons are predictable:
+
+- **User expectations shift** — "category was enough; now we need a sub-category"
+- **Model capability shifts** — a new Gemini version can return a richer shape
+- **Downstream needs shift** — DB indexes, frontend display
+- **You spot the original mistake too late** — `tags: string` should have been `tags: string[]`
+
+These are all things you only notice once 10,000+ records have flowed through production. The lesson: do not aim for "never change." Aim for **"change without breaking anything."**
+
+## Three layers — Gemini schema, stored schema, domain model
+
+The center of my design is splitting the schema into three independent layers, each changing on its own cadence.
+
+```
+[Gemini schema]   →  JSON Schema sent to the API
+       ↓ parse
+[Stored schema (versioned)]  →  type that lands in Postgres / Firestore / KV
+       ↓ map
+[Domain model]   →  type the application code reads
+```
+
+Splitting them this way keeps each kind of change from cascading:
+
+- **Change only the Gemini schema** → existing stored data stays as-is; new records use the new schema
+- **Change only the stored schema** → migration is needed, but Gemini and the app code stay still
+- **Change only the domain model** → application-level concern, storage untouched
+
+The skeleton looks like this:
+
+```typescript
+// schemas/v1/article-classification.ts
+export const GeminiSchemaV1 = {
+  type: "object",
+  properties: {
+    category: { type: "string", enum: ["tech", "lifestyle", "business"] },
+    confidence: { type: "number" },
+  },
+  required: ["category", "confidence"],
+} as const;
+
+export interface StoredV1 {
+  schemaVersion: 1;
+  category: "tech" | "lifestyle" | "business";
+  confidence: number;
+  createdAt: string;
+}
+
+// schemas/v2/article-classification.ts
+export const GeminiSchemaV2 = {
+  type: "object",
+  properties: {
+    category: { type: "string", enum: ["tech", "lifestyle", "business"] },
+    subCategory: { type: "string" },
+    confidence: { type: "number" },
+  },
+  required: ["category", "confidence"],
+} as const;
+
+export interface StoredV2 {
+  schemaVersion: 2;
+  category: "tech" | "lifestyle" | "business";
+  subCategory: string | null;
+  confidence: number;
+  createdAt: string;
+}
+
+// domain/article-classification.ts
+export interface Classification {
+  primary: string;
+  secondary: string | null;  // always null for V1
+  confidence: number;
+}
+
+export function toDomain(stored: StoredV1 | StoredV2): Classification {
+  return {
+    primary: stored.category,
+    secondary: stored.schemaVersion === 2 ? stored.subCategory : null,
+    confidence: stored.confidence,
+  };
+}
+```
+
+**The single most important rule: every stored record carries `schemaVersion`**. Without it, code cannot tell which shape it is reading. Records I stored without version tags have cost me, in retrospect, far more time to read back than every other migration cost combined.
+
+## Four kinds of change, four levels of difficulty
+
+Schema changes fall into four buckets that demand very different procedures.
+
+### 1. Add a field — easy
+
+Add a non-required field. Mark it optional in both the Gemini schema and the stored schema. Old data simply has the field as `null`. Risk is low; running V1 and V2 in parallel is unnecessary.
+
+### 2. Change a type — moderate
+
+Going from `tags: string` to `tags: string[]` is a real version bump.
+
+```typescript
+function migrateV1toV2(v1: { tags: string }): { tags: string[] } {
+  return { tags: v1.tags ? v1.tags.split(",").map(s => s.trim()) : [] };
+}
+```
+
+Existing data is converted by a background job in stages. **The non-negotiable: keep both V1 and V2 readable during the transition.** A "convert everything in one go" plan loses every record on the day of failure.
+
+### 3. Rename a field — handle with care
+
+Renaming `title` to `headline` is a four-phase procedure: add the new field, write both, switch reads to the new field, retire the old. This is the classic Expand-Contract pattern that Stripe and GitHub use on their public APIs.
+
+```typescript
+// Phase 1: write both
+function write(record: { headline?: string; title?: string }) {
+  const value = record.headline ?? record.title;
+  return { headline: value, title: value };  // keep for old readers
+}
+
+// Phase 2: stop reading the old field
+// Phase 3: stop writing the old field
+// Phase 4: drop the old field from the schema
+```
+
+Each phase needs at least a week of soak time. Production exposes the readers you forgot about; the soak window is your only chance to discover them. New Gemini requests can return `headline` from Phase 1, but the storage layer still carries both fields for the duration.
+
+### 4. Retire a field — hardest
+
+Removing a field demands the most caution. Are you really sure no downstream consumer reads it? My standing rule is **at least three months of deprecation announcement** before deletion. Channels: a JSDoc deprecation note in code, an internal Slack heads-up, and a public-facing API consumer changelog.
+
+## How to communicate version to Gemini
+
+Gemini accepts a fresh schema per request, so versioning is a client-side responsibility. I instrument every call with the schema version so the migration can be observed in production.
+
+```typescript
+async function classify(text: string, version: 1 | 2 = 2): Promise<Classification> {
+  const schema = version === 2 ? GeminiSchemaV2 : GeminiSchemaV1;
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: text,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: schema,
+    },
+  });
+
+  const parsed = JSON.parse(response.text!);
+  const stored = saveWithVersion(parsed, version);
+  await logUsage({
+    schemaVersion: version,
+    inputTokens: response.usageMetadata?.promptTokenCount,
+    outputTokens: response.usageMetadata?.candidatesTokenCount,
+  });
+  return toDomain(stored);
+}
+```
+
+Knowing which version is producing what share of traffic lets you visualize migration progress. My team puts the V1 / V2 ratio on a Grafana panel and reviews it weekly. When the ratio plateaus unexpectedly, that is the first signal of a code path still creating V1 records.
+
+## Phased upgrade of legacy data
+
+Past data should be converted in stages, never in one go. The five-step pattern I use:
+
+1. **Filter records where `schemaVersion = 1`**
+2. **Run a small batch (100 records), measure error rate**
+3. **If errors are below 1%, ramp the batch size up**
+4. **Failed records go to a separate queue; fix the converter and replay**
+5. **24 hours after rewriting to V2, re-verify the old field's consistency**
+
+```typescript
+async function migrateBatch(size: number) {
+  const records = await db.query<StoredV1>({
+    where: { schemaVersion: 1 },
+    limit: size,
+  });
+
+  const failures: Array<{ id: string; error: string }> = [];
+  for (const record of records) {
+    try {
+      const upgraded = migrateV1toV2(record);
+      await db.update(record.id, upgraded);
+    } catch (err) {
+      failures.push({ id: record.id, error: String(err) });
+    }
+  }
+
+  console.log(`Migrated ${records.length - failures.length}/${records.length}`);
+  if (failures.length > 0) {
+    await db.insertFailureQueue(failures);
+  }
+  return { processed: records.length, failures: failures.length };
+}
+```
+
+Start at 100, watch error rate and runtime, then ramp 1,000 / 5,000 / 10,000. **Never discard failed records** — push them to a side queue so you can diagnose later why they did not convert. Some of the most useful schema observations come out of this queue.
+
+## A pitfall: Gemini "remembers" old enums
+
+A subtler issue I noticed in long-running services: when you narrow an enum in V2 (say, splitting `tech` into `tech-news` and `tech-tutorial`), the model occasionally returns a mix of old and new values, especially if the prompt history contains the old names. Old categories quietly slip back in.
+
+The fix that worked: **never narrow an enum in place**. Always widen — keep all old values, add new ones — and migrate downstream consumers to ignore the old ones explicitly. Widening is safe; narrowing fights the model's prior. Treating enums as append-only datasets removed an entire class of mysterious validation failures.
+
+## What to do this week
+
+If you have no schema change in mind right now, the single highest-leverage habit to adopt is **adding `schemaVersion` to every stored record**. That alone makes future-you ten times more efficient when the inevitable change request arrives.
+
+```typescript
+interface Stored {
+  schemaVersion: number;
+  // ... other fields
+}
+```
+
+Designing schemas to grow, not to be permanent, is the quiet investment that turns a Gemini-powered feature from "throwaway prototype" into "system that survives." It is not glamorous. It is the lever that separates code I will be glad I wrote in two years from code I will be cleaning up in two years.

@@ -273,3 +273,305 @@ Implicit Caching を最大限活用したいなら、会話履歴は先頭から
 Context Caching のトラブルは「動いているように見えて実は効いていない」パターンが大半を占める。本番環境に導入する際は、`usage_metadata.cached_content_token_count` をリクエストごとにログに記録し、日次でキャッシュヒット率を集計するモニタリングを組み込むことを勧める。ヒット率が50%を下回っていたら、この記事の診断手順を上から順に確認してみてほしい。
 
 コスト最適化の詳細は「[Gemini API Context Caching コスト最適化ガイド](/articles/gemini-api/gemini-api-context-caching-cost-optimization)」、エラーハンドリングのリトライ実装は「[Gemini API エラーハンドリング＆リトライパターン実践ガイド](/articles/gemini-api/gemini-api-error-handling-retry-patterns)」を参照してほしい。
+
+## Groundingが動作しない5つの典型パターン
+
+症状で分類すると、Grounding失敗はおおむね以下の5パターンに集約されます。
+
+**パターン1**: リクエストは通るがモデルが検索を使わない（古い知識で回答する）
+**パターン2**: `groundingMetadata` フィールドがレスポンスに含まれない
+**パターン3**: 検索は走るが `searchEntryPoint` がない（引用が表示されない）
+**パターン4**: 一部のプロンプトでは動き、別のプロンプトでは動かない
+**パターン5**: APIエラー（400 / 403 / 429）で弾かれる
+
+それぞれ原因が異なるため、順番に確認します。
+
+## パターン1: モデルが検索を使わずに回答する
+
+最も多い原因は「`tools` パラメータの指定方法が誤っている」か「動的検索閾値（`dynamic_retrieval_config` の `dynamic_threshold`）が高すぎる」のどちらかです。
+
+### Grounding ツールの正しい指定方法
+
+```python
+import google.generativeai as genai
+
+genai.configure(api_key="YOUR_API_KEY")
+
+model = genai.GenerativeModel(
+    model_name="gemini-2.5-pro",
+    tools="google_search_retrieval"  # ❌ 文字列指定は無効
+)
+```
+
+これは動作しません。`tools` に渡すのは `genai.Tool` オブジェクトでなければならありません。
+
+```python
+import google.generativeai as genai
+from google.generativeai import types
+
+genai.configure(api_key="YOUR_API_KEY")
+
+# ✅ 正しい指定方法（動的閾値なし = 常に検索）
+model = genai.GenerativeModel(
+    model_name="gemini-2.5-pro",
+    tools=[
+        types.Tool(
+            google_search_retrieval=types.GoogleSearchRetrieval()
+        )
+    ]
+)
+
+response = model.generate_content("2026年4月の最新ニュースを教えて")
+print(response.text)
+```
+
+### 動的閾値を下げる
+
+`dynamic_threshold` はモデルが「検索が必要かどうか」を判断するスコア閾値で、デフォルトは約0.7です。質問が「一般知識で答えられる」とモデルが判断すると、検索をスキップします。
+
+```python
+# ✅ 常に検索を実行したい場合は閾値を0に設定
+model = genai.GenerativeModel(
+    model_name="gemini-2.5-pro",
+    tools=[
+        types.Tool(
+            google_search_retrieval=types.GoogleSearchRetrieval(
+                dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                    mode=types.DynamicRetrievalConfig.Mode.MODE_DYNAMIC,
+                    dynamic_threshold=0.0  # 0 = 常に検索
+                )
+            )
+        )
+    ]
+)
+```
+
+ただし `dynamic_threshold=0.0` にすると全クエリで検索が走るため、APIコストが増加します。「最新情報を要求する質問のみ検索させたい」場合は0.3〜0.5程度が実用的な落とし所です。
+
+## パターン2: groundingMetadata がレスポンスに含まれない
+
+検索は走っているように見えるが、`response.candidates[0].grounding_metadata` が `None` か空のまま、というケース。
+
+まず確認すべきは**モデルバージョン**です。Groundingをサポートするのは `gemini-1.5-pro`・`gemini-1.5-flash`・`gemini-2.0-flash`・`gemini-2.5-pro`・`gemini-2.5-flash` など一部のモデルに限られます。`gemini-1.0-pro` や `gemini-nano` は対象外です。
+
+```python
+# 現在のモデル名を確認
+import google.generativeai as genai
+
+for model in genai.list_models():
+    if "google_search_retrieval" in [m.name for m in model.supported_generation_methods]:
+        print(model.name)
+```
+
+次に確認するのはレスポンスの**safety ratings**です。Groundingによって返ってきた検索結果が安全フィルタに引っかかると、レスポンスが途中でカットされ `grounding_metadata` も欠落することがあります。
+
+```python
+response = model.generate_content(prompt)
+
+# 安全評価とブロック理由を確認
+for candidate in response.candidates:
+    print("finish_reason:", candidate.finish_reason)
+    for rating in candidate.safety_ratings:
+        print(f"  {rating.category}: {rating.probability}")
+    
+    if candidate.grounding_metadata:
+        print("grounding_metadata found")
+        for chunk in candidate.grounding_metadata.grounding_chunks:
+            print(f"  source: {chunk.web.uri}")
+    else:
+        print("grounding_metadata: None")
+```
+
+`finish_reason` が `SAFETY` になっていれば、プロンプトかレスポンス内容が安全フィルタに触れています。
+
+## パターン3: searchEntryPoint が欠落する
+
+`grounding_metadata` は存在するが `search_entry_point` が空、あるいは `grounding_supports` が少ない場合、レンダリングされるべき「引用バッジ」が表示されません。
+
+これは主に**プロンプトが短すぎる**か、**モデルが既存知識で十分だと判断した**場合に起こる。Groundingの引用は、モデルが実際に検索結果を参照して回答を生成したときだけ付与されます。
+
+```python
+# ❌ 引用が付きにくいプロンプト例
+prompt = "Gemini APIの最新情報"
+
+# ✅ 引用が付きやすいプロンプト例（具体的な問いかけ）
+prompt = "Gemini API の2026年4月時点での最新モデル名と料金を教えてください。公式情報を参照して回答してください。"
+```
+
+また `grounding_metadata.web_search_queries` を確認すると、実際にどんな検索クエリが発行されたかがわかる。
+
+```python
+if response.candidates[0].grounding_metadata:
+    meta = response.candidates[0].grounding_metadata
+    print("検索クエリ:", meta.web_search_queries)
+    print("引用チャンク数:", len(meta.grounding_chunks))
+    print("サポート件数:", len(meta.grounding_supports))
+```
+
+検索クエリが空なら、モデルは検索をまったく実行していません。
+
+## パターン4: 特定のプロンプトでのみ動作しない
+
+「昨日は動いたのに今日は動かない」「このプロンプトだけ失敗する」という現象は、**コンテンツポリシー**か**プロンプトの意図の曖昧さ**が原因であることが多いです。
+
+Gemini のGrounding機能は、政治的・センシティブなトピックについては検索を意図的にスキップすることがあります。これはAPIの設計上の挙動であり、ユーザー側でオーバーライドする方法は現時点では提供されていません。
+
+一方、プロンプトに「〜について教えて」という曖昧な表現が含まれていると、モデルは一般知識で対応できると判断してしまう場合があります。明確に「最新情報を検索して」という指示を加えると改善することがあります。
+
+```python
+# より確実にGroundingを使わせるシステム指示の例
+system_instruction = """
+あなたはリアルタイム情報アシスタントです。
+回答には必ずGoogle検索で最新情報を確認し、情報源を明示してください。
+推測や学習済みの古い情報のみで回答することは避けてください。
+"""
+
+model = genai.GenerativeModel(
+    model_name="gemini-2.5-pro",
+    system_instruction=system_instruction,
+    tools=[
+        types.Tool(
+            google_search_retrieval=types.GoogleSearchRetrieval(
+                dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                    dynamic_threshold=0.1
+                )
+            )
+        )
+    ]
+)
+```
+
+## パターン5: APIエラーで弾かれる
+
+### 403 エラー: Grounding 利用には課金設定が必要
+
+```
+google.api_core.exceptions.PermissionDenied: 403 Grounding with Google Search is not available for free tier
+```
+
+Groundingは**無料枠（Free Tier）では利用できない**。Google AI Studio の課金を有効にし、有料プランに移行する必要があります。
+
+### 400 エラー: Function Calling との同時使用
+
+```
+google.api_core.exceptions.InvalidArgument: 400 Tool use with GoogleSearchRetrieval is not compatible with other tools
+```
+
+Grounding用のGoogleSearchRetrievalと、カスタムFunction Callingツールを**同一リクエストで混在させると400エラー**になります。これは現時点での制約で、どちらか一方を選ぶ必要があります。
+
+```python
+# ❌ NG: Grounding と Function Calling の混在
+tools = [
+    types.Tool(google_search_retrieval=types.GoogleSearchRetrieval()),
+    types.Tool(function_declarations=[my_custom_function])  # エラーになる
+]
+
+# ✅ OK: 別々のリクエストで処理する
+# Step 1: Function Calling でデータ取得
+# Step 2: 取得したデータを context に入れて Grounding リクエスト
+```
+
+### 429 エラー: レート制限
+
+GroundingはAPIコールのたびに検索を実行するため、通常より高頻度でレート制限に達します。`dynamic_threshold` を適切に設定するか、キャッシュ戦略を組み合わせることで緩和できます。
+
+```python
+import time
+from google.api_core.exceptions import ResourceExhausted
+
+def grounding_with_retry(model, prompt, max_retries=3):
+    """指数バックオフ付きGroundingリクエスト"""
+    for attempt in range(max_retries):
+        try:
+            return model.generate_content(prompt)
+        except ResourceExhausted as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt  # 1s, 2s, 4s
+            print(f"429エラー。{wait}秒後にリトライ（{attempt + 1}/{max_retries}）")
+            time.sleep(wait)
+```
+
+## 原因を切り分ける診断スクリプト
+
+上記のパターンを一通り確認できる診断スクリプトを書いた。詰まったときの最初のステップとして使ってほしい。
+
+```python
+import google.generativeai as genai
+from google.generativeai import types
+
+genai.configure(api_key="YOUR_API_KEY")
+
+def diagnose_grounding(prompt: str, model_name: str = "gemini-2.5-pro"):
+    """Groundingの動作を診断するスクリプト"""
+    print(f"=== Grounding 診断 ===")
+    print(f"モデル: {model_name}")
+    print(f"プロンプト: {prompt[:50]}...")
+    print()
+
+    # 設定: 常に検索（dynamic_threshold=0.0）
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        tools=[
+            types.Tool(
+                google_search_retrieval=types.GoogleSearchRetrieval(
+                    dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                        mode=types.DynamicRetrievalConfig.Mode.MODE_DYNAMIC,
+                        dynamic_threshold=0.0
+                    )
+                )
+            )
+        ]
+    )
+
+    try:
+        response = model.generate_content(prompt)
+        candidate = response.candidates[0]
+
+        print(f"[finish_reason] {candidate.finish_reason}")
+        
+        # Safety ratings
+        blocked = any(r.probability.name in ["HIGH", "MEDIUM"] 
+                     for r in candidate.safety_ratings)
+        print(f"[safety_blocked] {blocked}")
+        if blocked:
+            for r in candidate.safety_ratings:
+                print(f"  - {r.category.name}: {r.probability.name}")
+
+        # Grounding metadata
+        meta = candidate.grounding_metadata
+        if meta is None:
+            print("[grounding_metadata] なし → ツール設定またはモデル非対応の可能性")
+        else:
+            queries = meta.web_search_queries
+            chunks = meta.grounding_chunks
+            supports = meta.grounding_supports
+            print(f"[search_queries] {queries}")
+            print(f"[grounding_chunks] {len(chunks)} 件")
+            print(f"[grounding_supports] {len(supports)} 件")
+            has_entry = bool(meta.search_entry_point and meta.search_entry_point.rendered_content)
+            print(f"[search_entry_point] {'あり' if has_entry else 'なし'}")
+
+        print()
+        print("[レスポンス本文]")
+        print(response.text[:200])
+
+    except Exception as e:
+        print(f"[エラー] {type(e).__name__}: {e}")
+
+# 使い方
+diagnose_grounding("2026年4月の最新AI技術ニュースを教えてください")
+```
+
+## 全体を振り返って
+
+Grounding が動かないとき、最初に確認すべき順序は次の通りです。
+
+1. **課金プランを確認**（Free Tierは非対応）
+2. **`tools` の渡し方を確認**（文字列ではなく `genai.Tool` オブジェクト）
+3. **`dynamic_threshold` を下げる**（0.0〜0.3にして強制検索）
+4. **モデル名を確認**（対応モデルか？）
+5. **Function Calling との混在を避ける**（別リクエストに分離）
+6. **診断スクリプトで `finish_reason` と `grounding_metadata` をログ出力**
+
+Grounding はGeminiの最も差別化された機能の一つだが、設定の細かさゆえに詰まりやすい。上記のチェックリストを起点に原因を絞り込んでほしい。
