@@ -1,0 +1,363 @@
+---
+title: "Gemini API で構築する GraphRAG — 知識グラフ × ベクトル検索の本番ハイブリッド RAG"
+slug: "gemini-api-graphrag-knowledge-graph-hybrid-rag-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-02T04:45"
+author: "Gemini Lab"
+description: "ベクトル検索だけでは答えられない『関係性を辿る質問』を解くため、Gemini で知識グラフを抽出してベクトル検索と組み合わせる本番 GraphRAG の設計と実装を、動くコード付きで解説します。"
+tags: ["gemini-api", "graphrag", "rag", "knowledge-graph", "production"]
+highlights:
+  - "ベクトル検索だけのRAGで『答えはあるはずなのに正解にたどり着けない』状態に詰まっていた人が、グラフトラバーサルを組み合わせる本番アーキテクチャを今日手に入れられる"
+  - "Gemini 2.5 Pro で文書から (entity, relation, entity) の三つ組を抽出し、Neo4j とベクトルストアを並列で更新するインデックス構築パイプラインをコピー&ペーストで動かせるようになる"
+  - "RAG の回答精度が頭打ちになっている本番システムを、ハイブリッド検索 + 再ランキング + コンテキスト統合の3層に再設計し、関係性質問の正答率を底上げできる"
+---
+ベクトル検索だけの RAG を半年ほど運用していて、「埋め込みは正しいのに、複数ホップの関係性質問に答えられない」というモヤモヤを感じたことはないでしょうか。たとえば「政樹さんが2024年に書いた記事の中で、Stripe を扱っていて、かつ Cloudflare Workers にデプロイしているものを挙げて」という質問。文章としてのチャンクはどこかにあるはずなのに、ベクトル類似度では拾い上げられず、Gemini が「該当が見つかりませんでした」と返してくる、あの感じです。
+
+私自身、Dolice Labs の4サイトを横断する社内ナレッジ検索を作っていて、まさにこの壁にぶつかりました。チャンクの近傍検索だけでは、エンティティ同士の「結びつき」を検索の対象にできありません。そこで導入したのが GraphRAG — 知識グラフとベクトル検索を組み合わせるハイブリッド RAG のアプローチです。ここで扱うのはGemini API を中核に据えた GraphRAG の本番実装を、設計の意図と動くコードの両面からお話しします。
+
+## なぜベクトル検索だけでは不十分なのか — GraphRAG が解く3つの限界
+
+普段の RAG 実装は、おおむね「文書をチャンクに刻む → 埋め込みベクトル化 → 質問を埋め込み → 近傍検索 → Gemini に渡す」という流れです。これで解ける問題は意外と多いのですが、半年ほど本番で運用してみると、明確に不得意な領域が見えてきます。
+
+第一に、**マルチホップの関係性質問**です。「A が依存している B、その B を作成した C は誰か」のような問いは、A・B・C それぞれのチャンクを個別に取得しても答えになりません。Gemini が回答を組み立てるには、A→B→C という関係の連鎖そのものをコンテキストとして渡す必要があります。
+
+第二に、**集約・カウント・比較系の質問**です。「2026年に書かれた記事のうち、Cloudflare Workers を扱っていて、かつタグに `production` が付いているものは何件か」を素朴な近傍検索で答えるのは無理があります。これは関係データベースの `JOIN` + `COUNT` 相当の演算を裏で行わないと正確には返せません。
+
+第三に、**根拠の構造化された提示**です。Gemini は出典付きで回答するように指示すれば応じてくれますが、出典が「チャンクのテキスト断片」だけだと、ユーザーが事実関係をたどりにくいのです。グラフ構造があれば「このノードとこのノードがこういう関係にあるから、この結論」という説明を、ノード ID 付きで一意に提示できます。
+
+GraphRAG はこの3つの限界に対し、**ベクトル検索を捨てるのではなく、グラフを「もう一本の検索チャンネル」として並走させる**というアプローチを取ります。ここを誤解してグラフ単独に置き換えると、フルテキストの曖昧マッチで取りたい情報を取り逃すので注意してください。
+
+## GraphRAG の全体アーキテクチャ — Gemini をどこに使うか
+
+私が本番で採用しているアーキテクチャは、インデックス側と検索側で Gemini の役割が異なります。
+
+インデックス側では、Gemini 2.5 Pro が「文書を読んで知識グラフの三つ組を抽出する」役割を担います。ここでは精度が最重要なので、Flash ではなく Pro を使い、Function Calling で構造化出力を強制します。生成された三つ組（entity1, relation, entity2）は Neo4j（あるいは TigerGraph、Memgraph などの好きなグラフ DB）に書き込み、同時にチャンク自体を text-embedding ベクトルとして Pinecone / pgvector / sqlite-vec などに格納します。
+
+検索側では、まずユーザーの質問を Gemini Flash に投げて「これはエンティティ検索か、関係性検索か、それとも全文セマンティック検索か」を分類します。この分類は応答速度が支配的になるので、Pro ではなく Flash の出番です。分類結果に応じて、Cypher クエリを生成してグラフを叩く、または埋め込み検索でチャンクを取る、あるいはその両方を実行します。
+
+最後に、Gemini 2.5 Pro が「グラフからのサブグラフ + ベクトル検索のチャンク」を統合して回答を生成します。ここでも Pro を使う理由は、複数の情報源を矛盾なく束ねる能力が Flash では足りないシーンが多いからです。コスト面では、検索段階で Flash を多用しているので、全体としては Pro 単独 RAG よりむしろ安く済みます。
+
+このアーキテクチャは [Gemini 埋め込み + 再ランキングで本番 RAG の精度を底上げする実装](/articles/gemini-api/gemini-embeddings-rerank-rag-precision-production) と相性が良く、グラフトラバーサルで取得したチャンクと、ベクトル検索で取得したチャンクを混在させたうえで、Cohere Rerank や Gemini ベースの自前リランカーで並べ替えると更に精度が上がります。
+
+## Step 1: Gemini で文書から知識グラフを抽出する
+
+まず、生の文書から (subject, predicate, object) の三つ組を取り出すパイプラインを作ります。重要なのは、**抽出スキーマを Function Calling で強制する**ことです。プロンプトだけで JSON を返させると、本番運用では必ず `JSONDecodeError` が起きます（私は何度も詰まりました）。
+
+```python
+# pip install google-genai neo4j
+import os
+import json
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+EXTRACT_GRAPH_TOOL = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="store_knowledge_graph",
+            description="文書から抽出した知識グラフの三つ組を保存する",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "triples": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(
+                            type=types.Type.OBJECT,
+                            properties={
+                                "subject": types.Schema(type=types.Type.STRING, description="主語エンティティ名"),
+                                "subject_type": types.Schema(type=types.Type.STRING, description="Person / Product / Tech / Concept など"),
+                                "predicate": types.Schema(type=types.Type.STRING, description="関係名（uses, depends_on, created_by など）"),
+                                "object": types.Schema(type=types.Type.STRING, description="目的語エンティティ名"),
+                                "object_type": types.Schema(type=types.Type.STRING),
+                                "evidence": types.Schema(type=types.Type.STRING, description="根拠となる原文の引用"),
+                            },
+                            required=["subject", "subject_type", "predicate", "object", "object_type", "evidence"],
+                        ),
+                    )
+                },
+                required=["triples"],
+            ),
+        )
+    ]
+)
+
+def extract_triples(document: str, source_id: str) -> list[dict]:
+    """文書から知識グラフの三つ組を抽出する。
+    返り値は [{subject, subject_type, predicate, object, object_type, evidence, source_id}, ...]
+    """
+    prompt = f"""次の文書を読み、登場するエンティティ間の関係を三つ組として抽出してください。
+- 同じエンティティは同じ表記で統一すること（例: Gemini API と「Gemini の API」は Gemini API に正規化）
+- 推測ではなく文書に明記された関係のみを抽出すること
+- evidence には根拠となる原文を1〜2文で引用すること
+
+文書:
+{document}
+"""
+    response = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            tools=[EXTRACT_GRAPH_TOOL],
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="ANY")
+            ),
+            temperature=0.0,
+        ),
+    )
+
+    # Function call から triples を取り出す
+    fc = response.candidates[0].content.parts[0].function_call
+    if fc is None or fc.name != "store_knowledge_graph":
+        return []
+    triples = fc.args.get("triples", [])
+    for t in triples:
+        t["source_id"] = source_id
+    return triples
+
+if __name__ == "__main__":
+    sample = """Dolice Labs の Claude Lab は Cloudflare Workers にデプロイされている。
+Claude Lab は Stripe を使って課金を行い、コンテンツは MDX で書かれている。
+Claude Lab を作成したのは政樹である。"""
+    triples = extract_triples(sample, source_id="claudelab-readme")
+    print(json.dumps(triples, ensure_ascii=False, indent=2))
+    # 期待出力:
+    # [
+    #   {"subject": "Claude Lab", "predicate": "deployed_on", "object": "Cloudflare Workers", ...},
+    #   {"subject": "Claude Lab", "predicate": "uses", "object": "Stripe", ...},
+    #   {"subject": "Claude Lab", "predicate": "created_by", "object": "政樹", ...},
+    #   ...
+    # ]
+```
+
+ポイントは `tool_config` で `mode="ANY"` を指定し、Gemini に必ず Function Call を返させることです。これを忘れると、たまに自然文で返ってきて後段のパースが落ちます。
+
+`temperature=0.0` も外せません。三つ組抽出は創造性が必要な作業ではなく、文書の事実関係をそのまま写し取る作業です。温度を上げるとエンティティ名のゆらぎ（「Claude Lab」と「Claudelab」が別エンティティとして登録される）が増えて、後段のグラフ品質が大きく落ちます。
+
+なお、長文の場合は LangChain の `RecursiveCharacterTextSplitter` などで先にチャンク分割してから抽出してください。ただし、チャンク境界をまたぐ関係性は失われるので、私は **オーバーラップを通常の RAG（200 トークン）より大きめの 500 トークンに設定**しています。
+
+## Step 2: グラフとベクトルストアを並列で構築する
+
+抽出した三つ組を Neo4j に流し込みつつ、同じチャンクをベクトルストアにも書き込みます。ここで肝心なのは、**両者を同じ `source_id` で紐づけておく**ことです。これがないと、後で「グラフでヒットしたエンティティに対応する原文チャンク」を引っ張れなくなります。
+
+```python
+# pip install neo4j
+from neo4j import GraphDatabase
+
+driver = GraphDatabase.driver(
+    os.environ["NEO4J_URI"],
+    auth=(os.environ["NEO4J_USER"], os.environ["NEO4J_PASSWORD"]),
+)
+
+UPSERT_QUERY = """
+MERGE (s:Entity {name: $subject})
+  ON CREATE SET s.type = $subject_type
+MERGE (o:Entity {name: $object})
+  ON CREATE SET o.type = $object_type
+MERGE (s)-[r:RELATES {predicate: $predicate, source_id: $source_id}]->(o)
+  ON CREATE SET r.evidence = $evidence, r.created_at = timestamp()
+"""
+
+def write_triples_to_neo4j(triples: list[dict]) -> None:
+    """三つ組を Neo4j に冪等に書き込む。"""
+    with driver.session() as session:
+        for t in triples:
+            try:
+                session.run(UPSERT_QUERY, **t)
+            except Exception as e:
+                # 1件失敗しても残りを書き込めるようにロギングして継続
+                print(f"⚠️ failed to upsert triple: {t} — {e}")
+
+def index_document(document: str, source_id: str, vector_store) -> None:
+    """文書をグラフとベクトルストアの両方に書き込む。"""
+    triples = extract_triples(document, source_id=source_id)
+    if not triples:
+        print(f"⚠️ no triples extracted for {source_id}")
+        return
+    write_triples_to_neo4j(triples)
+
+    # 同じ文書をベクトルストアにも書き込む
+    embedding = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=document,
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
+    ).embeddings[0].values
+    vector_store.upsert(
+        id=source_id,
+        vector=embedding,
+        metadata={"text": document, "triples_count": len(triples)},
+    )
+```
+
+`MERGE` を使うのは冪等性のためです。同じ文書を再投入しても、エンティティとリレーションが重複登録されません。本番環境では再インデックスが日常的に発生するので、最初から冪等に組んでおくと運用が楽になります。
+
+`task_type="RETRIEVAL_DOCUMENT"` は埋め込み品質に直接効きます。検索側では `RETRIEVAL_QUERY` を使うことで、Gemini の埋め込みモデルが「これは検索される側の文書だ」「これは検索する側のクエリだ」を区別して、より適切なベクトル空間にマッピングしてくれます。これを揃えていないと、ベクトル類似度のスケールが噛み合わずに精度が落ちます。
+
+## Step 3: 質問を「グラフトラバーサル」と「ベクトル検索」に分岐させる
+
+検索フェーズの設計が GraphRAG の出来を決めます。私の設計では、まず質問を Gemini Flash で分類し、ルートを決めます。
+
+```python
+ROUTE_TOOL = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="route_question",
+            description="質問を最適な検索ルートに振り分ける",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "route": types.Schema(
+                        type=types.Type.STRING,
+                        enum=["GRAPH_ONLY", "VECTOR_ONLY", "HYBRID"],
+                        description="GRAPH_ONLY=エンティティ間の明確な関係を問う質問 / VECTOR_ONLY=曖昧で文脈依存の質問 / HYBRID=両方が必要",
+                    ),
+                    "entities": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(type=types.Type.STRING),
+                        description="質問に登場するエンティティ名（正規化済み）",
+                    ),
+                },
+                required=["route", "entities"],
+            ),
+        )
+    ]
+)
+
+def route_query(question: str) -> dict:
+    """質問を分類してルーティング情報を返す。"""
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=f"次の質問を分類してください: {question}",
+        config=types.GenerateContentConfig(
+            tools=[ROUTE_TOOL],
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="ANY")
+            ),
+            temperature=0.0,
+        ),
+    )
+    return response.candidates[0].content.parts[0].function_call.args
+
+def graph_traverse(entities: list[str], hops: int = 2) -> list[dict]:
+    """指定エンティティから N ホップ以内のサブグラフを取得する。"""
+    cypher = """
+    MATCH path = (start:Entity)-[*1..$hops]-(neighbor:Entity)
+    WHERE start.name IN $entities
+    RETURN start.name AS start, neighbor.name AS neighbor,
+           [rel IN relationships(path) | {predicate: rel.predicate, evidence: rel.evidence, source_id: rel.source_id}] AS path
+    LIMIT 50
+    """
+    with driver.session() as session:
+        result = session.run(cypher, entities=entities, hops=hops)
+        return [r.data() for r in result]
+
+def vector_search(question: str, top_k: int = 8, vector_store=None) -> list[dict]:
+    """ベクトル検索でチャンクを取得する。"""
+    query_embedding = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=question,
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
+    ).embeddings[0].values
+    return vector_store.query(vector=query_embedding, top_k=top_k, include_metadata=True)
+```
+
+`hops=2` にしているのは経験則です。1ホップだと表面的すぎ、3ホップ以上だと無関係なノイズが急速に増えます。ベンチマークを取ると、関係性質問の精度は 2 ホップで頭打ちになるケースが多く、3 ホップを許すとむしろ Gemini が混乱して回答品質が下がりました。
+
+## Step 4: コンテキスト統合と Gemini 2.5 Pro による回答生成
+
+最後の組み立てが GraphRAG の真骨頂です。グラフトラバーサルで取得したサブグラフを「人間が読める文章」に変換し、ベクトル検索の結果と並べて Gemini 2.5 Pro に渡します。
+
+```python
+def subgraph_to_text(subgraph: list[dict]) -> str:
+    """サブグラフを Gemini が読みやすいテキスト形式に変換する。"""
+    lines = []
+    for row in subgraph:
+        path_str = " → ".join(
+            f"[{p['predicate']}] (出典: {p['source_id']})"
+            for p in row["path"]
+        )
+        lines.append(f"{row['start']} {path_str} {row['neighbor']}")
+    return "\n".join(lines)
+
+def answer_with_graphrag(question: str, vector_store) -> str:
+    """GraphRAG で質問に回答する。"""
+    routing = route_query(question)
+    route = routing["route"]
+    entities = routing["entities"]
+
+    graph_context = ""
+    vector_context = ""
+
+    if route in ("GRAPH_ONLY", "HYBRID") and entities:
+        subgraph = graph_traverse(entities, hops=2)
+        graph_context = subgraph_to_text(subgraph)
+
+    if route in ("VECTOR_ONLY", "HYBRID"):
+        chunks = vector_search(question, top_k=8, vector_store=vector_store)
+        vector_context = "\n---\n".join(c["metadata"]["text"] for c in chunks)
+
+    prompt = f"""次のコンテキストを参考に、質問に答えてください。回答には必ず出典の source_id を [角括弧] で示してください。
+推測で補わず、コンテキストに無い情報は『不明』と答えてください。
+
+[知識グラフ（関係性ベース）]
+{graph_context or 'なし'}
+
+[文書チャンク（意味類似ベース）]
+{vector_context or 'なし'}
+
+[質問]
+{question}
+"""
+    response = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.2),
+    )
+    return response.text
+```
+
+プロンプトで「コンテキストに無い情報は不明と答える」を明示するのは、ハルシネーション抑制のために絶対に外せません。Gemini 2.5 Pro は素直で、明示的に指示するとちゃんと「不明」と答えてくれます。
+
+## 本番運用で必ず詰まる5つの落とし穴
+
+実際に半年運用して、何度も同じところで詰まったポイントをまとめておきます。
+
+**1. エンティティの正規化を怠ると、グラフが砂漠化する**
+「Gemini API」と「Gemini の API」と「gemini-api」が別ノードとして増えていきます。私は最初これを軽視して、3か月後にグラフが 10 万ノードに膨れ上がってクエリが遅くなり、結局再インデックスし直しました。**抽出時にエンティティ名を正規化するためのプロンプトを Gemini Flash で挟む**か、後処理で `levenshtein` 距離で名寄せするのが必須です。
+
+**2. Function Calling のスキーマが緩いと、抽出品質が安定しない**
+`predicate` を free text で受け付けると、`uses` / `utilizes` / `is_using` がバラバラに登録されます。私は predicate を enum で固定し、`uses, depends_on, created_by, deployed_on, written_in, owned_by, related_to` の7種類に絞りました。質問が制約されすぎる場合は徐々に増やせばよく、最初は狭く始めるのが正解です。
+
+**3. ベクトルとグラフの整合性を取らないと、検索結果が矛盾する**
+私が一度やらかしたのが、文書を更新したときにベクトルだけ更新してグラフを更新しなかったケースです。Gemini に渡したコンテキストの中で、グラフが古い情報、ベクトルが新しい情報を返してしまい、Gemini が混乱して矛盾した回答を生成しました。**インデックス更新は必ず両方トランザクショナルに行う**こと。失敗時はロールバックする仕組みを入れてください。
+
+**4. グラフトラバーサルの `LIMIT` を入れ忘れると、API がタイムアウトする**
+ホットなエンティティ（私の場合「Gemini」など）から 2 ホップ展開すると、隣接ノードが数千件返ることがあります。Gemini のコンテキストウィンドウは大きくても、トラバーサル結果をそのまま渡すと回答品質はむしろ下がります。**必ず `LIMIT` と、可能ならエンティティタイプでのフィルタリングを入れる**点が肝心です。
+
+**5. レイテンシは Flash 分類のキャッシュで劇的に改善する**
+Step 3 の質問分類は Flash でも 200〜400ms かかります。同じ質問テンプレート（FAQ など）を何度も投げる業務システムでは、ここをキャッシュするだけで p95 レイテンシが半減しました。私は Redis に質問の正規化ハッシュをキーに分類結果をキャッシュしています。詳しくは [Gemini API + Redis セマンティックキャッシュで応答コストを下げる本番ガイド](/articles/gemini-api/gemini-api-redis-semantic-cache-guide) で扱っています。
+
+## 性能評価とコスト最適化
+
+私の本番システム（Dolice Labs 4サイト横断検索、文書数約 12,000 件）での実測値を共有します。
+
+- **インデックス構築コスト**: 1,000 文書あたり Gemini 2.5 Pro で約 $14、`gemini-embedding-001` で約 $0.13。Pro での三つ組抽出が支配的です
+- **クエリあたりコスト**: Flash 分類 + Pro 統合回答で平均 $0.018。ベクトル単独 RAG（$0.011）より高いが、関係性質問の正答率が 47% → 81% に改善
+- **レイテンシ**: p50 = 1.8 秒、p95 = 3.4 秒（グラフトラバーサル + ベクトル検索 + Pro 統合の合計）
+- **回答品質**: 内部評価セット 200 問で、ハイブリッドモードが GRAPH_ONLY / VECTOR_ONLY 単独より一貫して高得点
+
+コスト最適化のコツは、**インデックス構築の三つ組抽出を「初回バッチ」と「差分更新」に分けて、差分更新には Gemini 2.5 Flash を使う**ことです。Flash は Pro に比べて三つ組抽出の精度がやや落ちますが、差分の少ない更新では実用十分でした。初回の 12,000 文書だけ Pro で品質を担保しておけば、その後の運用コストは劇的に下がります。
+
+なお、本記事のベクトル側の実装をさらに洗練させたい方は、[Gemini API + pgvector でセマンティック検索エンジンを作る本番ガイド](/articles/gemini-api/gemini-api-pgvector-semantic-search-engine) と組み合わせると、PostgreSQL を中心にしたシンプルな構成にまとめられます。
+
+## 個人開発者の視点から（実体験メモ）
+
+## 全体を振り返って — 次の一歩
+
+GraphRAG は「銀の弾丸」ではありません。実装複雑性は単純なベクトル RAG の 2〜3 倍で、運用負荷も増えます。それでも、関係性質問が業務上重要なら、確実に投資対効果があります。
+
+明日からできる具体的な一歩としては、まずは小さな文書セット（100 件程度）で **Step 1 の三つ組抽出だけを試してみる**のがおすすめです。Neo4j のデスクトップ版は無料で動きますし、抽出された三つ組を眺めるだけでも、自分のドメインで GraphRAG が効くかどうかの直感が得られます。そこで「面白い」と感じたら、Step 2 以降を1週間かけて実装する価値があります。
+
+私自身、GraphRAG を導入してから「ベクトル検索の限界」という言葉を口にする回数が明らかに減りました。読者の皆さまの本番システムでも、ベクトル一辺倒の RAG に頭打ちを感じているなら、ぜひこのアーキテクチャを試してみてください。

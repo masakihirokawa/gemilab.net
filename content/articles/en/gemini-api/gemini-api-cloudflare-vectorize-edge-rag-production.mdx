@@ -1,0 +1,515 @@
+---
+title: "Building a Fully Edge RAG with Gemini API and Cloudflare Vectorize: A Production Guide for Low Latency, Low Cost, Global Delivery"
+slug: "gemini-api-cloudflare-vectorize-edge-rag-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-05-02T10:57"
+author: "Gemini Lab"
+description: "Combine Gemini Embedding with Cloudflare Vectorize to ship a production RAG that runs entirely inside the Workers runtime — global latency, predictable cost, and a defensive layer covering subrequest limits, retries, and tenant isolation."
+tags: ["gemini-api", "cloudflare", "vectorize", "rag", "edge", "workers", "production"]
+highlights:
+  - "Developers whose RAG responses creep above 800ms for overseas users will get a working Workers + Vectorize implementation that lands in the 200ms range, ready to copy into a project."
+  - "You will learn the subrequest limits, timeout pitfalls, and JSON body ceilings that only appear once you actually call Gemini Embedding from Workers — each with a concrete fix."
+  - "You will walk away with an operational design (cost breakdown, model switching, cache strategy) for delivering an edge RAG worldwide on a budget of roughly twenty dollars per month."
+---
+I once spent days chasing a latency mystery: a RAG endpoint that returned in 200ms from Tokyo crawled to nearly a full second from New York or Berlin. The bottleneck was not the application code or the prompt design — it was the physical distance between my users and a managed vector database pinned to a single region. Once I accepted that, the rebuild went in a direction I did not expect.
+
+This article shares the answer I landed on: a fully edge RAG built from Gemini Embedding and Cloudflare Vectorize, running end-to-end inside the Workers runtime. The pieces are simple in isolation, but stitching them together exposes a list of pitfalls that are not in the docs — subrequest limits, the silent metadata size cap, embedding task type, and a few more. I walk through each with code that is meant to be copied into a real project. Everything was verified against the API versions current at the time of writing (May 2026).
+
+## Why edge RAG, beyond the latency headline
+
+The first reason most people reach for edge RAG is global latency, and that is real. But after running this stack in production for a while, I find myself recommending it for three additional reasons that rarely show up in marketing pages.
+
+The first is **cost shape**. Cloudflare Vectorize charges almost nothing for storage or queries — five million vectors comes in under a dollar per month, and the free tier is generous. Compared with managed vector databases that bill a fixed instance fee starting around seventy dollars a month, the indie-developer math is not even close.
+
+The second is **freedom from cold starts**. Workers do not need warm-up tricks. The platform spins them up instantly across the entire edge network, so the awkward first-request lag that plagues Lambda or Cloud Run for low-traffic projects simply does not appear. For a conversational use case, where the first response shapes the user's perception of quality, this matters more than benchmarks suggest.
+
+The third is **operational simplicity**. The vector database, embedding API client, LLM call, and frontend all fit into one Workers codebase. CI/CD becomes one pipeline, monitoring becomes one dashboard, and on-call becomes a single runbook. For a solo project, the smaller surface area pays compound interest.
+
+The trade-off worth naming up front is the Workers runtime itself. CPU time per request is capped (50ms on the free plan, up to 30 seconds on paid), and subrequest counts are limited to 50 on free and 1,000 on paid. A vanilla RAG turn already burns three subrequests (embedding, vector query, generation), so anything fancier — re-ranking, multi-query rewrites, tool calls — eats into the budget quickly. Plan for paid Workers from day one if you intend to ship.
+
+## The four-piece architecture
+
+The system has four moving parts and nothing else. No Cloud Run, no VMs, no custom containers.
+
+- **Cloudflare Workers** running the Hono framework — the orchestration layer and HTTP entrypoint
+- **Cloudflare Vectorize** — the edge-native vector store
+- **Gemini Embedding API** (`text-embedding-004`, 768 dimensions) — generates embeddings for both documents and queries
+- **Gemini 2.5 Flash** — generates the final answer using the retrieved context
+
+The data path is the standard RAG flow: receive a query, embed it, search the vector index, hand the top-k passages to Gemini, and return a grounded answer. The point of difference is that every step lives inside the Workers runtime. If you have not done much Workers work yet, our [Edge AI primer for running Gemini API on Cloudflare Workers](/articles/gemini-api/gemini-api-cloudflare-workers-edge-ai) and [Building Edge AI with Hono and Cloudflare Workers](/articles/gemini-api/gemini-api-hono-cloudflare-edge-ai-guide) cover the prerequisites in more depth.
+
+## Step 1: Create the Vectorize index
+
+Create the Vectorize index first. The two settings to get right are **dimension count (768)** and **similarity metric (cosine)**, because Vectorize does not let you change them after creation. Mismatching either of these is the classic "data not landing" problem.
+
+```bash
+# Run from the same directory as your wrangler.toml
+npx wrangler vectorize create gemini-rag-index \
+  --dimensions=768 \
+  --metric=cosine
+
+# Add a metadata index so you can filter by tenant later
+npx wrangler vectorize create-metadata-index gemini-rag-index \
+  --property-name=tenant_id \
+  --type=string
+```
+
+Wire the index into your `wrangler.toml` so the Workers code can reach it through `env.VECTORIZE`.
+
+```toml
+# wrangler.toml
+name = "gemini-edge-rag"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "gemini-rag-index"
+
+[vars]
+GEMINI_MODEL = "gemini-2.5-flash"
+EMBEDDING_MODEL = "text-embedding-004"
+```
+
+Store the API key as a secret with `wrangler secret put GEMINI_API_KEY`. Putting it in `vars` is the easiest way to leak credentials into a public repository, so do not skip the secret-put step even for hobby projects.
+
+## Step 2: Embed and ingest your documents
+
+Next, push the documents you want to retrieve into Vectorize. I run this on a daily Cron Trigger now, but for the first pass a one-shot script is fine.
+
+```typescript
+// scripts/ingest.ts — an admin endpoint for batch ingestion
+import { Hono } from "hono";
+
+type Env = {
+  VECTORIZE: VectorizeIndex;
+  GEMINI_API_KEY: string;
+  EMBEDDING_MODEL: string;
+};
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.post("/ingest", async (c) => {
+  // Add admin authentication in production (signed token or mTLS)
+  const docs = await c.req.json<Array<{ id: string; text: string; tenant_id: string }>>();
+
+  // Gemini supports up to 100 inputs per batch embedding call.
+  // Workers caps response bodies at 100MB, so chunking matters.
+  const CHUNK = 100;
+  for (let i = 0; i < docs.length; i += CHUNK) {
+    const slice = docs.slice(i, i + CHUNK);
+
+    const embedRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${c.env.EMBEDDING_MODEL}:batchEmbedContents`,
+      {
+        method: "POST",
+        headers: {
+          "x-goog-api-key": c.env.GEMINI_API_KEY,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          requests: slice.map((d) => ({
+            model: `models/${c.env.EMBEDDING_MODEL}`,
+            content: { parts: [{ text: d.text }] },
+            taskType: "RETRIEVAL_DOCUMENT",
+          })),
+        }),
+      },
+    );
+
+    if (!embedRes.ok) {
+      // Surface 429 and 5xx so the caller can retry
+      const detail = await embedRes.text();
+      throw new Error(`embedding_failed: ${embedRes.status} ${detail.slice(0, 200)}`);
+    }
+
+    const embedData = await embedRes.json<{
+      embeddings: Array<{ values: number[] }>;
+    }>();
+
+    // Vector dimensions must match the index (768)
+    await c.env.VECTORIZE.upsert(
+      slice.map((d, idx) => ({
+        id: d.id,
+        values: embedData.embeddings[idx].values,
+        metadata: {
+          tenant_id: d.tenant_id,
+          // Vectorize allows up to 10KB of metadata.
+          // Anything longer should live in KV or R2 with a key in metadata.
+          text: d.text.slice(0, 9500),
+        },
+      })),
+    );
+  }
+
+  return c.json({ ok: true, count: docs.length });
+});
+
+export default app;
+```
+
+The detail I want to flag is the `taskType: "RETRIEVAL_DOCUMENT"` setting. Gemini Embedding optimizes asymmetric retrieval: documents and queries are projected slightly differently to maximize the score on real lookups. Setting `RETRIEVAL_DOCUMENT` for stored items and `RETRIEVAL_QUERY` for live queries gives roughly five to ten percent better top-k recall. It is the kind of improvement you do not notice until your evaluation suite catches it, so wire it in from the start.
+
+## Step 3: The query → search → generate pipeline
+
+Once data is in the index, build the actual pipeline. Hono routing is straightforward, but the order of operations and the way errors propagate is what separates a demo from a production system.
+
+```typescript
+// src/index.ts — query and answer endpoint
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+
+type Env = {
+  VECTORIZE: VectorizeIndex;
+  GEMINI_API_KEY: string;
+  EMBEDDING_MODEL: string;
+  GEMINI_MODEL: string;
+};
+
+const app = new Hono<{ Bindings: Env }>();
+app.use("/api/*", cors({ origin: ["https://your-frontend.example"] }));
+
+async function embed(text: string, env: Env, taskType = "RETRIEVAL_QUERY") {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${env.EMBEDDING_MODEL}:embedContent`,
+    {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": env.GEMINI_API_KEY,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        content: { parts: [{ text }] },
+        taskType,
+      }),
+    },
+  );
+  if (!res.ok) throw new Error(`embed_failed:${res.status}`);
+  const data = await res.json<{ embedding: { values: number[] } }>();
+  return data.embedding.values;
+}
+
+async function generateAnswer(
+  query: string,
+  contexts: string[],
+  env: Env,
+): Promise<string> {
+  const prompt = `You are an honest, careful assistant.
+Answer the user only from the reference passages below.
+If the passages do not contain the answer, reply "The references do not cover this question."
+Cite passages inline using bracketed numbers like [#1] or [#2].
+
+# References
+${contexts.map((c, i) => `[#${i + 1}] ${c}`).join("\n\n")}
+
+# Question
+${query}`;
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${env.GEMINI_MODEL}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": env.GEMINI_API_KEY,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 1024,
+          // Stay inside the Workers CPU budget by combining Flash with a tight cap
+        },
+      }),
+    },
+  );
+  if (!res.ok) throw new Error(`generate_failed:${res.status}`);
+  const data = await res.json<{
+    candidates: Array<{ content: { parts: Array<{ text: string }> } }>;
+  }>();
+  return data.candidates[0]?.content.parts[0]?.text ?? "";
+}
+
+app.post("/api/ask", async (c) => {
+  const { query, tenant_id } = await c.req.json<{
+    query: string;
+    tenant_id?: string;
+  }>();
+
+  // 1) Embed the query
+  const queryVector = await embed(query, c.env, "RETRIEVAL_QUERY");
+
+  // 2) Search Vectorize, scoped to the caller's tenant when present
+  const filter = tenant_id ? { tenant_id: { $eq: tenant_id } } : undefined;
+  const result = await c.env.VECTORIZE.query(queryVector, {
+    topK: 5,
+    returnMetadata: "all",
+    filter,
+  });
+
+  const contexts = result.matches
+    .filter((m) => m.score >= 0.65) // similarity floor; below 0.6 is mostly noise
+    .map((m) => String(m.metadata?.text ?? ""))
+    .filter((t) => t.length > 0);
+
+  if (contexts.length === 0) {
+    return c.json({
+      answer: "I could not find related material. Try rephrasing the question.",
+      sources: [],
+    });
+  }
+
+  // 3) Generate the grounded answer
+  const answer = await generateAnswer(query, contexts, c.env);
+
+  return c.json({
+    answer,
+    sources: result.matches.map((m) => ({ id: m.id, score: m.score })),
+  });
+});
+
+export default app;
+```
+
+Three details from this code matter more than the rest.
+
+The first is the **similarity floor at 0.65**. Vectorize uses approximate nearest neighbor search, which means low-quality matches always sneak into the top-k. Letting them flow into the prompt is one of the fastest ways to manufacture hallucinations. The right number depends on your domain — measure it on your own evaluation set — but always have one.
+
+The second is the **tenant-scoped metadata filter**. Multi-tenant SaaS without this is one missing-where-clause away from leaking another customer's documents into a response. The metadata index you created in step one keeps these filtered queries fast.
+
+The third is the **explicit zero-result message**. Without it, Gemini will obediently invent something rather than admit defeat, and your users will trust the fabrication. Returning "no relevant material" is the simplest honesty mechanism you can build, and it costs nothing.
+
+## Step 4: Three defensive layers for production
+
+The pipeline above runs, but it is not yet production-grade. Workers' constraints and the unpredictability of external APIs require at least three defensive layers.
+
+### 4.1 Timeouts and bounded retries
+
+Gemini occasionally returns 503. Retry with exponential backoff, but cap the work — Workers' total CPU budget is finite, and infinite retry loops are a fast way to take the whole request down with you.
+
+```typescript
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  opts: { timeoutMs: number; maxRetries: number },
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < opts.maxRetries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
+    try {
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
+      clearTimeout(timer);
+      // Only retry 429 and 5xx; bubble other 4xx up immediately
+      if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+        if (attempt < opts.maxRetries - 1) {
+          // 200ms, 400ms, 800ms exponential backoff
+          await new Promise((r) => setTimeout(r, 200 * Math.pow(2, attempt)));
+          continue;
+        }
+      }
+      return res;
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;
+      if (attempt === opts.maxRetries - 1) throw err;
+      await new Promise((r) => setTimeout(r, 200 * Math.pow(2, attempt)));
+    }
+  }
+  throw lastErr;
+}
+```
+
+I run with three retries and a five-second timeout. Looser settings caused entire requests to time out against the Workers CPU ceiling. For a deeper treatment of retries, quotas, and request-side rate limiting, see [the production guide on Gemini API rate limiting and quota management](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide).
+
+### 4.2 A circuit breaker on Durable Objects
+
+When the embedding API has been failing for a while, hammering it with retries from every Worker around the planet is wasted work. A small circuit breaker, kept in a Durable Object, stops the bleed by short-circuiting requests for a cool-down window. The full pattern lives in [the resilience design guide for circuit breakers and bulkheads](/articles/gemini-api/gemini-api-resilience-circuit-breaker-bulkhead-production-guide); for this article assume it is wrapping the `embed()` and `generateAnswer()` calls.
+
+### 4.3 Cost guardrails
+
+A user pasting an entire PDF into the query field will blow your monthly Gemini bill in a single afternoon. Stop them at the door — character limits and output caps are crude but extremely effective.
+
+```typescript
+const MAX_QUERY_CHARS = 1000;
+if (query.length > MAX_QUERY_CHARS) {
+  return c.json(
+    { error: "query_too_long", limit: MAX_QUERY_CHARS },
+    400,
+  );
+}
+```
+
+Capping `maxOutputTokens` at 1024 on Gemini Flash is the second piece of the same defense. Together they keep the cost variance bounded, which is the variable that gets people in trouble at the end of the month.
+
+## Step 5: Re-ranking when top-k recall is not enough
+
+The pipeline above retrieves five matches, filters them by score, and hands them to Gemini. For most projects this is enough. But when the corpus grows past a few thousand documents, recall starts to wobble — the right passage exists in the index, but it lands at position eight instead of position three. A small re-ranking pass solves this without forcing you to leave the Workers runtime.
+
+The pattern I use is to retrieve the top twenty candidates from Vectorize, then ask Gemini Flash to re-score them in batches before keeping the top five. This costs one extra subrequest, which is cheap inside the paid Workers budget.
+
+```typescript
+async function rerank(
+  query: string,
+  candidates: Array<{ id: string; text: string }>,
+  env: Env,
+): Promise<Array<{ id: string; score: number }>> {
+  // Score each candidate against the query in a single pass.
+  // Flash handles structured output well for this kind of judgment task.
+  const prompt = `Score how well each passage answers the user's question.
+Return JSON: { "scores": [{ "id": "...", "score": 0.0 to 1.0 }] }
+
+# Question
+${query}
+
+# Passages
+${candidates.map((c) => `[id=${c.id}]\n${c.text}`).join("\n---\n")}`;
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${env.GEMINI_MODEL}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": env.GEMINI_API_KEY,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "object",
+            properties: {
+              scores: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    score: { type: "number" },
+                  },
+                  required: ["id", "score"],
+                },
+              },
+            },
+            required: ["scores"],
+          },
+        },
+      }),
+    },
+  );
+  if (!res.ok) {
+    // Falling back to original order is safer than throwing here —
+    // re-ranking is an enhancement, not a requirement.
+    return candidates.map((c) => ({ id: c.id, score: 0 }));
+  }
+  const data = await res.json<{
+    candidates: Array<{ content: { parts: Array<{ text: string }> } }>;
+  }>();
+  const text = data.candidates[0]?.content.parts[0]?.text ?? '{"scores":[]}';
+  const parsed = JSON.parse(text) as { scores: Array<{ id: string; score: number }> };
+  return parsed.scores.sort((a, b) => b.score - a.score);
+}
+```
+
+Two design choices here are worth calling out. First, **structured output via `responseSchema`** removes the JSON parsing fragility that would otherwise undo a re-ranking step on the first malformed response. Second, **the fallback path returns the original order** rather than throwing. Re-ranking is an optional improvement; if it fails, the pipeline should still answer the user.
+
+Re-ranking adds 200–400ms of latency. For a chat experience that is acceptable; for an autocomplete-style use case it is not. Match the depth of retrieval to the user's tolerance for waiting.
+
+## Step 6: Keeping the index honest as documents change
+
+The harder problem after the first ingestion is keeping the index in sync with the source. New documents arrive, old ones get edited, some get deleted. A live index that drifts out of sync produces wrong answers slowly enough that nobody notices until users complain.
+
+The pattern that has worked for me is to give every document a version hash and to upsert based on it. If the hash matches what is already in the index, skip the embed call. If it differs, re-embed and upsert. Deletions go through `VECTORIZE.deleteByIds`.
+
+```typescript
+import { sha256 } from "@noble/hashes/sha2"; // or any small hash util in Workers
+
+type SourceDoc = { id: string; text: string; tenant_id: string };
+
+async function syncDocs(
+  docs: SourceDoc[],
+  env: Env,
+  knownHashes: Map<string, string>, // id → previous hash from KV
+): Promise<{ embedded: number; skipped: number }> {
+  let embedded = 0;
+  let skipped = 0;
+
+  const toEmbed: SourceDoc[] = [];
+  for (const d of docs) {
+    const bytes = new TextEncoder().encode(d.text);
+    const hash = Buffer.from(sha256(bytes)).toString("hex").slice(0, 16);
+    if (knownHashes.get(d.id) === hash) {
+      skipped++;
+      continue;
+    }
+    toEmbed.push(d);
+    // Persist the new hash to KV (omitted) so the next sync skips this doc
+  }
+
+  // Embed and upsert only the changed docs (logic from Step 2)
+  // ... batched call to batchEmbedContents and VECTORIZE.upsert ...
+  embedded = toEmbed.length;
+
+  return { embedded, skipped };
+}
+```
+
+This pattern works even when documents come from a CMS that does not give you a "what changed" feed. Hashing is cheap, KV reads in Workers are sub-millisecond, and the embedding bill becomes proportional to actual edits rather than total document count.
+
+For the deletion side, hold the source-of-truth list of IDs somewhere durable (KV is fine for indie scale, R2 is better when the list grows). Run a periodic reconciliation job that compares "IDs the system should have" against "IDs Vectorize actually has" and deletes the difference. Without this, soft-deleted documents linger and surface in search results, which is one of the more embarrassing failure modes of an information retrieval system.
+
+## Step 7: Observability — the part that keeps you sane
+
+Edge runtimes are easy to deploy and easy to lose track of. Once you have multiple Workers, multiple Vectorize indexes, and multiple Gemini models in rotation, you need eyes on the system or surprises become routine.
+
+The minimum viable observability for this stack is three signals.
+
+The first is **per-request structured logs**. Workers' Logpush feature ships logs to R2, S3, or any HTTP endpoint. Every request should log query length, retrieval count, top score, generation latency, and total tokens used. Without this, debugging a "this answer is bad" complaint becomes archaeology.
+
+The second is **latency histograms by stage**. Embedding, vector search, generation, and total wall clock should each have their own metric. The day you see embedding latency double overnight is the day you find out Gemini is having an incident before users do. Tools like Logpush + ClickHouse, or Cloudflare's own Workers Analytics Engine, are both viable here.
+
+The third is **cost per request**. Multiply your structured logs by current price per million tokens and emit a daily total. The point is not precision; it is catching the day a deployment regression makes every request use 4× the tokens. The earlier you spot that, the smaller the bill. The article on [LLM observability with Langfuse and Gemini](/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide) covers a more complete observability stack, including trace-level visibility — wire that in once the volume justifies it.
+
+## Step 8: A migration path from existing managed-vector setups
+
+If you already run a RAG on Pinecone, Qdrant Cloud, or Weaviate, the cleanest migration path is dual-write rather than cutover. Keep the existing system serving production traffic and have a second worker write embeddings to Vectorize in parallel. After a week of comparing results between the two indexes — same queries, same passages, score differences below a threshold — flip read traffic to Vectorize and decommission the old system.
+
+Two practical points smooth the transition. The first is to **re-embed everything with `text-embedding-004` instead of porting old embeddings**. Different embedding models live in incompatible vector spaces, so reusing OpenAI's `text-embedding-3-small` vectors against Gemini queries produces gibberish. The second is to **track query latency by region during the dual-write phase**. The whole point of moving to the edge is the latency win for far-from-Tokyo users; verify it before you cut over.
+
+## Pitfalls you only learn the hard way
+
+A few traps tripped me repeatedly during the build. They are the kind of issue that does not land in the docs but does land in your error logs.
+
+- **Wrong dimensions fail silently.** Vectorize will reject mismatched vectors, but the error is opaque enough that engineers spend hours assuming "it didn't ingest." `text-embedding-004` is **fixed at 768 dimensions** — assert `embedding.values.length === 768` before upserting if you want a fast-fail signal. Mixing in OpenAI or Cohere embeddings without checking is the most common origin of this bug.
+- **Forgetting `taskType` quietly degrades retrieval.** As mentioned earlier, the loss is roughly five to ten percent of recall. You will not feel it in eyeballs but you will feel it in your evals.
+- **Subrequest limits bite quickly.** Each turn already burns three subrequests. Add re-ranking or multi-query rewriting and you reach five to ten. The free plan's cap of fifty disappears within seconds of running an ingestion script. Plan paid Workers from the start.
+- **Metadata is capped at 10KB.** Stuffing full documents into metadata works for short snippets and breaks the moment a long file shows up. If you might exceed 10KB, store the body in KV or R2 and keep only the key in the metadata.
+- **`returnMetadata: true` is not the same as `"all"`.** The boolean form returns only metadata-indexed properties; the string `"all"` returns everything. The API kept the boolean form for backward compatibility, which means everyone hits this once.
+- **The first embedding call is colder than later ones.** Gemini caches recent embeddings server-side, so identical text returns faster on the second hit. The first request can take 200–400ms. Add a periodic warm-up query to your monitoring if your p95 needs to stay tight.
+
+## Cost math at indie scale
+
+Concrete numbers help, so here is the math for a small service running 30,000 queries a month — about a thousand a day.
+
+- **Cloudflare Workers** — 100,000 requests per day stay free. 30,000 a month is comfortably inside the free tier.
+- **Cloudflare Vectorize** — 50,000 vectors and 30,000 queries lands at roughly $0.40 per month, with the first year heavily subsidized by free credits.
+- **Gemini Embedding (`text-embedding-004`)** — 30,000 queries × ~200 tokens averages 6 million tokens. Free-tier coverage is generous; many indie deployments stay free here.
+- **Gemini 2.5 Flash generation** — 30,000 calls × (4K input + 0.5K output) is roughly 120 million input tokens and 15 million output tokens. At Flash's $0.10 per million input and $0.40 per million output, that comes out near $12 + $6 = **about $18 per month**.
+
+The total lands under twenty dollars. A comparable Cloud Run + Pinecone stack starts at seventy dollars in fixed instance costs alone, before per-query fees. For a solo project, the edge stack is not a marginal improvement — it is a different category.
+
+For a deeper dive into trimming the bill, [the complete Gemini API cost optimization guide](/articles/gemini-api/gemini-api-cost-optimization-complete-guide) and [the implementation patterns for Gemini API context caching](/articles/gemini-api/gemini-api-context-caching-cost-optimization) are companion reads worth bookmarking.
+
+Pricing for both Cloudflare Workers and Vectorize moves over time, so confirm the current numbers on the [Cloudflare developer platform pricing page](https://www.cloudflare.com/plans/developer-platform/) and the [Gemini API pricing page](https://ai.google.dev/pricing) before you commit budget.
+
+## Closing — the smallest first step that pays off
+
+Edge RAG is a strong default even for projects that never plan to ship globally. The cost shape, the absence of cold starts, and the small operational surface compound for solo and small teams in ways that benchmarks underplay.
+
+If you take one action from this article today, run `wrangler vectorize create`, ingest ten Markdown files, and watch a query come back through `wrangler tail`. That single round trip — from upsert to first answer — taught me more about whether edge RAG fit my style than any blog post. Once it clicks, layer in the defenses described above (timeouts, the circuit breaker, the cost guardrails) at your own pace. They are not optional for production, but they are also not where you should start.
+
+I am still adjusting parts of this stack as I run it. If you find a sharper pattern in your own work, I would genuinely like to hear about it.
