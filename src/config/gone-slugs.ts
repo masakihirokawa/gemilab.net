@@ -415,4 +415,13 @@ export const GONE_ARTICLE_SLUGS: string[] = [
   "weekly-pickup-2026-0522",
   "weekly-pickup-2026-0526",
   "weekly-pickup-2026-0529",
+  // Broken chain sources added 2026-06-10
+  "ai-tools-directory-2026-part1",
+  "weekly-pickup-2026-0325",
+  "weekly-pickup-2026-0410",
+  "weekly-pickup-2026-0421",
+  "weekly-pickup-2026-0428",
+  "weekly-pickup-2026-0501",
+  "weekly-pickup-2026-0505",
+  "weekly-pickup-2026-0602",
 ];
