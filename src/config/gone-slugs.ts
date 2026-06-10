@@ -228,4 +228,13 @@ export const GONE_ARTICLE_SLUGS: string[] = [
   "ollama-gemma4-pull-manifest-error-fix-guide",
   "ollama-manifest-file-does-not-exist-diagnostic",
   "stitch-gemini-antigravity-integrated-design-pipeline",
-  "weekly-pickup-2026-0508",];
+  "weekly-pickup-2026-0508",
+// 2026-06-10 第2弾: WEAK剪定（薄い無料記事 ∩ 検索実績ゼロ(28日,日英合算) ∩ 公開45日超）
+  "embeddings-api-guide",
+  "gemini-image-generation-api",
+  "gemini-vibe-coding-ai-studio-practical",
+  "google-ai-studio-fullstack-vibe-coding",
+  "json-mode-structured-output",
+  "streaming-and-chat",
+  "video-understanding-guide",
+];

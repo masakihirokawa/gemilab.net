@@ -227,7 +227,6 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/gemini-dev/gemini-code-assist-outline-development-guide", to: "/articles/gemini-dev/gemini-code-assist-outline-practical-guide" },
   { from: "/articles/gemini-dev/gemini-code-assist-outline-guide", to: "/articles/gemini-dev/gemini-code-assist-outline-practical-guide" },
   { from: "/articles/gemini-dev/gemini-code-assist-outline-feature", to: "/articles/gemini-dev/gemini-code-assist-outline-practical-guide" },
-  { from: "/articles/gemini-dev/google-ai-studio-fullstack-vibe-coding", to: "/articles/gemini-dev/gemini-vibe-coding-ai-studio-practical" },
   { from: "/articles/gemini-dev/google-ai-studio-build-mode-practical-guide", to: "/articles/gemini-dev/google-ai-studio-build-mode-errors-troubleshooting" },
   { from: "/articles/gemini-dev/vertex-ai-quickstart", to: "/articles/gemini-dev/vertex-ai-gemini-production" },
   { from: "/articles/gemini-updates/weekly-pickup-2026-0512", to: "/articles/gemini-updates/weekly-pickup-2026-0508" },
