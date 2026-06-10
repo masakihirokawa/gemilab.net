@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GEMINI3.5PRO — I/Oで「6月GA」と表明されたGemini 3.5 Proは現在もVertexの限定プレビュー段階で広域提供は保留中。Deep Think推論・最大200万トークン対応",
-    "ENTERPRISE — Gemini Enterpriseで6/9付、3.5 Flashの機能管理トグルが廃止。全ユーザーでデフォルト有効・無効化不可に",
-    "IMAGE-DEPRECATION — 画像previewモデル（flash-image-preview/pro-image-preview）は6/25停止予定。GA版の3.1 Flash/Pro Imageへ移行を",
-    "FILE-SEARCH — File Searchがマルチモーダル検索（gemini-embedding-2）に対応。画像をネイティブに埋め込み・検索可能に",
-    "FLASH3.5-GA — Gemini 3.5 Flashはエージェント・コーディング向けにGA。検索・Maps・Code Execution・URL Context等の併用ツールに対応",
-    "WWDC — WWDC 2026で刷新版SiriがGeminiベースと確定。DMAによりEUではiOS 27時点で非提供",
+    "GEMINI3.5-FLASH — gemini-3.5-flashが一般提供（GA）開始。エージェント・コーディングタスクで持続的なフロンティア性能",
+    "MANAGED-AGENTS — Gemini APIのManaged Agentsが公開プレビュー。Googleホストの隔離Linuxサンドボックスで自律エージェントを構築・実行",
+    "INTERACTIONS-API — Interactions APIのスキーマがoutputsからstepsへ。6/8に旧スキーマ廃止のため移行が必要です",
+    "FILE-SEARCH — File Searchがマルチモーダル検索に対応。gemini-embedding-2で画像をネイティブに埋め込み・検索",
+    "WEBHOOKS — Gemini APIにイベント駆動のWebhooksを追加。Batch APIや長時間処理のポーリングを置き換え",
+    "DEEP-RESEARCH — Deep Researchエージェントが協調プランニング・可視化・MCPサーバ連携・File Searchに対応",
   ],
   en: [
-    "GEMINI3.5PRO — Announced for a June GA at I/O, Gemini 3.5 Pro is still in limited Vertex preview; broad rollout pending. Deep Think + up to 2M-token context",
-    "ENTERPRISE — As of Jun 9, Gemini Enterprise removed the 3.5 Flash toggle; it's on by default for all users and can't be disabled",
-    "IMAGE-DEPRECATION — Image preview models (flash-image-preview / pro-image-preview) retire Jun 25; migrate to GA 3.1 Flash/Pro Image",
-    "FILE-SEARCH — File Search now supports multimodal search via gemini-embedding-2, natively embedding and searching images",
-    "FLASH3.5-GA — Gemini 3.5 Flash is GA for agentic and coding work, with Search, Maps, Code Execution, URL Context, and combined tool use",
-    "WWDC — WWDC 2026 confirms the revamped Siri runs on Gemini; under the DMA it won't ship in the EU at iOS 27",
+    "GEMINI3.5-FLASH — gemini-3.5-flash reaches general availability, Google's most intelligent model for sustained agentic and coding performance",
+    "MANAGED-AGENTS — Managed Agents launch in public preview in the Gemini API, running autonomous stateful agents in Google-hosted Linux sandboxes",
+    "INTERACTIONS-API — The Interactions API schema moves from outputs to steps; the legacy schema was removed Jun 8, so migrate now",
+    "FILE-SEARCH — File Search now supports multimodal search, natively embedding and searching images via gemini-embedding-2",
+    "WEBHOOKS — The Gemini API adds event-driven Webhooks to replace polling for the Batch API and long-running operations",
+    "DEEP-RESEARCH — New Deep Research agents add collaborative planning, visualization, MCP server integration, and File Search",
   ],
 };
 
