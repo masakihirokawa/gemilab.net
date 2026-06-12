@@ -1,0 +1,241 @@
+---
+title: "Is Anyone Actually Using Your Gemini Feature? Measuring Acceptance, Regeneration, and Edit Distance"
+slug: "gemini-ai-feature-usage-metrics-design"
+category: "gemini-api"
+level: "intermediate"
+premium: true
+date: "2026-06-12T15:45"
+author: "Gemini Lab"
+description: "Token charts will not tell you whether users embrace a Gemini-powered feature. A practical design for measuring acceptance rate, regeneration rate, and edit distance with Swift and BigQuery, with two weeks of real numbers."
+tags: ["gemini-api", "product analytics", "instrumentation", "Firebase Analytics", "BigQuery", "indie development"]
+highlights:
+  - "A five-event taxonomy for the generation lifecycle, with a complete Swift instrumentation wrapper"
+  - "Working definitions for acceptance rate, regeneration rate, and normalized edit distance, plus weekly rollup SQL for the GA4 BigQuery export"
+  - "Two weeks of real numbers that raised acceptance from 41% to 63%, and a triage checklist for when the metrics stay low"
+---
+
+When the major Gemini API outage hit on June 11, I sat watching error-rate graphs, waiting for recovery. The next morning, with every chart back to normal, a different question crept in. Error rate: fine. Latency: fine. Token consumption: exactly as projected. But was the feature actually being used? I had not a single number that could answer that.
+
+One of the wellness apps I run as an indie developer has a small Gemini-powered feature that generates a short encouraging message when the app opens in the morning. For the two weeks after launch, everything I monitored lived on the API side. Whether users saved the output, immediately regenerated it, or quietly closed the screen — I was collecting none of it. This article is the design record of the product-side instrumentation I built after that realization.
+
+## Token Consumption Does Not Measure Value
+
+An API dashboard reports request counts, error rates, latency, and token consumption. All of these are essential for operational health, but every one of them is a supply-side number. None of them describe demand.
+
+In my app, generations held steady at roughly 1,900 per day, and from the supply side things looked healthy. Once the instrumentation described below went in, a different picture emerged: only 41% of generated messages were saved, and 28% were discarded through the regenerate button. Tokens were being consumed on schedule while nearly half the output was a miss for the person reading it. The supply-side charts stay clean while the demand side fails silently — that, I learned firsthand, is the uncomfortable property of AI features.
+
+LLM-ops practice has plenty to say about automated quality evaluation and cost monitoring, but user acceptance is a different layer. A response that scores perfectly on a quality rubric still gets discarded if it does not match the reader's mood. A product feature needs product measurement.
+
+## Break the Generation Lifecycle into Five Events
+
+I started by writing down, in chronological order, everything that happens between the user and a generated message, and collapsed it into five events.
+
+- **ai_shown** — the feature's entry point became visible (the generate button is on screen)
+- **ai_generated** — the first generation completed and the output was presented
+- **ai_regenerated** — the user tapped "try again" and replaced the output
+- **ai_accepted** — the user did something that counts as acceptance, such as saving or sharing
+- **ai_generation_failed** — the generation ended in an error
+
+There is deliberately no abandoned event. A silent exit means the user did nothing, and "nothing" is unreliable to emit from a client. Instead, abandonment is derived at query time: a session with ai_generated but neither ai_accepted nor ai_regenerated. Deriving it turned out to be the only way to count it without gaps.
+
+Every event carries the same four parameters.
+
+- **feature** — an identifier such as daily_message, so multiple AI features in one app can be compared on the same axis
+- **prompt_version** — a version string for the prompt; every improvement is evaluated by splitting on this
+- **model_id** — the model that served the call, so model migrations can be isolated from prompt changes
+- **latency_ms** — perceived wait time, measured from tap to render, not the API-side latency
+
+The discipline that matters most here is keeping the event count small. My first draft had twelve events; the rollup queries only ever touched five. The customer of your instrumentation is the future you writing SQL. An event that never appears in a query is nothing but transmission cost.
+
+## Swift Implementation — Wrap the Generation Call
+
+The implementation rule is simple: never separate the place that generates from the place that measures. When the two live apart, retries and regeneration paths eventually leak uncounted events.
+
+Here is what the code looked like before instrumentation — a perfectly ordinary call through Firebase AI Logic.
+
+```swift
+// Before: it generates, and nothing is recorded
+import FirebaseAI
+
+let model = FirebaseAI.firebaseAI(backend: .googleAI())
+    .generativeModel(modelName: "gemini-3.5-flash")
+
+func generateDailyMessage(context: DailyContext) async throws -> String {
+    let response = try await model.generateContent(buildPrompt(context))
+    return response.text ?? ""
+}
+```
+
+And here is the single wrapper that every generation now flows through.
+
+```swift
+// After: first runs, retries, failures, and acceptance all log from one place
+import FirebaseAI
+import FirebaseAnalytics
+
+struct GenerationResult {
+    let text: String
+    let latencyMs: Int
+    let attempt: Int
+}
+
+final class MeasuredGenerator {
+    static let feature = "daily_message"
+    static let promptVersion = "daily_message_v2"
+    static let modelId = "gemini-3.5-flash"
+
+    private let model = FirebaseAI.firebaseAI(backend: .googleAI())
+        .generativeModel(modelName: modelId)
+
+    // attempt: 1 = first generation, 2+ = the user tapped "try again"
+    func generate(context: DailyContext, attempt: Int) async throws -> GenerationResult {
+        let started = Date()
+        do {
+            let response = try await model.generateContent(buildPrompt(context))
+            let text = response.text ?? ""
+            let latencyMs = Int(Date().timeIntervalSince(started) * 1000)
+            Analytics.logEvent(attempt == 1 ? "ai_generated" : "ai_regenerated", parameters: [
+                "feature": Self.feature,
+                "prompt_version": Self.promptVersion,
+                "model_id": Self.modelId,
+                "latency_ms": latencyMs,
+                "output_chars": text.count,
+                "attempt": attempt,
+            ])
+            return GenerationResult(text: text, latencyMs: latencyMs, attempt: attempt)
+        } catch {
+            Analytics.logEvent("ai_generation_failed", parameters: [
+                "feature": Self.feature,
+                "prompt_version": Self.promptVersion,
+                "model_id": Self.modelId,
+                "error_domain": (error as NSError).domain,
+                "error_code": (error as NSError).code,
+            ])
+            throw error
+        }
+    }
+
+    // Call when the user saves or shares the message
+    func logAccepted(generated: String, saved: String) {
+        let distance = normalizedEditDistance(generated, saved)
+        Analytics.logEvent("ai_accepted", parameters: [
+            "feature": Self.feature,
+            "prompt_version": Self.promptVersion,
+            // GA4 parameters aggregate more cleanly as numbers,
+            // so the 0-1 distance is sent as an integer times 100
+            "edit_distance_x100": Int(distance * 100),
+        ])
+    }
+}
+```
+
+Three details are doing the real work. First, initial generations and regenerations travel the same code path, distinguished only by the attempt argument and the event name; split paths inevitably mean one of them loses instrumentation in a future refactor. Second, edit distance ships as an integer scaled by 100, because keeping GA4 parameters numeric makes the BigQuery side far less fiddly. Third, latency_ms measures tap-to-render, not the API round trip. Network and UI delays ride on top of model latency, and it is this perceived number — not the server-side one — that correlates with users giving up.
+
+## Edit Distance — Looking Inside "Saved"
+
+Acceptance rate alone has a blind spot. It cannot distinguish "saved without caring," "saved because they loved it," and "liked the direction but reworked it before saving."
+
+So ai_accepted carries the normalized edit distance between the generated text and the text that was finally saved — the Levenshtein distance divided by the longer string's length, giving a value from 0 to 1. A standard dynamic-programming implementation is plenty.
+
+```swift
+func normalizedEditDistance(_ a: String, _ b: String) -> Double {
+    let s = Array(a), t = Array(b)
+    if s.isEmpty || t.isEmpty {
+        return s.count == t.count ? 0 : 1
+    }
+    var prev = Array(0...t.count)
+    var curr = [Int](repeating: 0, count: t.count + 1)
+    for i in 1...s.count {
+        curr[0] = i
+        for j in 1...t.count {
+            let cost = s[i - 1] == t[j - 1] ? 0 : 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        }
+        swap(&prev, &curr)
+    }
+    return Double(prev[t.count]) / Double(max(s.count, t.count))
+}
+```
+
+In my feature the median came out at 0.03 — most people save untouched. But a consistent cluster sat above 0.3, and reading those revealed a pattern: users were rewriting only the closing phrase, bending it toward their own voice. That observation fed directly into the prompt revision described below. Edit distance tells you what users wish were different, which makes it a sharper instrument than acceptance rate alone.
+
+## A Weekly Rollup in BigQuery
+
+With the GA4 BigQuery export enabled, events land in daily tables under the events_ prefix. Once a week I run a rollup split by prompt_version.
+
+```sql
+WITH events AS (
+  SELECT
+    event_name,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'prompt_version') AS prompt_version,
+    (SELECT value.int_value    FROM UNNEST(event_params) WHERE key = 'latency_ms')         AS latency_ms,
+    (SELECT value.int_value    FROM UNNEST(event_params) WHERE key = 'edit_distance_x100') AS edit_x100
+  FROM `myapp.analytics_123456789.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20260601' AND '20260614'
+    AND (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'feature') = 'daily_message'
+)
+SELECT
+  prompt_version,
+  COUNTIF(event_name = 'ai_generated')   AS generated,
+  COUNTIF(event_name = 'ai_regenerated') AS regenerated,
+  COUNTIF(event_name = 'ai_accepted')    AS accepted,
+  SAFE_DIVIDE(
+    COUNTIF(event_name = 'ai_accepted'),
+    COUNTIF(event_name = 'ai_generated')
+  ) AS acceptance_rate,
+  SAFE_DIVIDE(
+    COUNTIF(event_name = 'ai_regenerated'),
+    COUNTIF(event_name = 'ai_generated') + COUNTIF(event_name = 'ai_regenerated')
+  ) AS regenerate_share,
+  APPROX_QUANTILES(latency_ms, 100)[OFFSET(95)] AS latency_p95_ms,
+  APPROX_QUANTILES(edit_x100, 100)[OFFSET(50)]  AS edit_distance_median_x100
+FROM events
+GROUP BY prompt_version
+ORDER BY prompt_version
+```
+
+My working definitions: acceptance rate is acceptances over first generations, and regeneration share is regenerations over all generations. Other denominators are defensible — what matters is freezing the definition and tracking it with the same query, because a definition change mid-stream makes improvements indistinguishable from accounting artifacts.
+
+One practical note: GA4's exploration UI requires registering custom dimensions before custom parameters become usable, but BigQuery has no such constraint. I push all of this analysis to BigQuery and never touch the GA4 admin screens for it. Writing one SQL file beats contorting an event design around a registration quota.
+
+## Two Weeks of Real Numbers
+
+The first two weeks of measurement produced these figures.
+
+- Entry views (ai_shown): 26,800
+- First generations (ai_generated): 19,400
+- Acceptance rate: 41%
+- Regeneration share: 28%
+- Median edit distance: 0.03
+- Perceived latency p95: 3.8 seconds
+
+The regeneration share was worse than I expected. Split by hour, one window stood out: between 6 and 8 a.m., regenerations spiked to 37%. Reading the morning outputs side by side made the problem obvious — they were long and overly introspective for something glanced at in the seconds before a commute.
+
+So prompt_version moved to v2 with three changes: a time-of-day context (morning, midday, evening) passed into the prompt, a hard 60-character cap on output, and a colloquial constraint on closing phrases — the exact thing the edit-distance cluster showed users rewriting. I also cut maxOutputTokens from 256 to 96, which shrank the response budget and brought perceived p95 latency down to 2.4 seconds.
+
+Over the following two weeks, acceptance reached 63%, regeneration share fell to 14%, and the morning window settled at 16%. Shorter outputs also meant a lower output-token bill, so quality and cost improved together. I will be honest that I cannot cleanly attribute the gain across the three changes — at indie scale, shipping a bundle and confirming with numbers is a trade-off I accept.
+
+There was a side benefit, too. Because latency_ms captured perceived time, a correlation surfaced: sessions where generation took longer than 3 seconds accepted at less than half the rate of faster ones. Knowing that number is what made the token-budget cut an easy decision rather than a gamble.
+
+## Triage When Acceptance Stays Low
+
+Once the numbers exist, the next question is what to suspect when they disappoint. My checklist, in order:
+
+1. **Split by latency first.** Compare acceptance above and below 3 seconds of perceived wait. A big gap means speed before content: try a lighter model, a smaller maxOutputTokens, or streaming the response — fixes that leave the prompt untouched
+2. **Split first-time users from returning users.** Low acceptance only on first use points to onboarding or presentation. Acceptance that decays with each return visit suggests staleness — not enough variety in the outputs
+3. **Read the edit-distance distribution.** Low acceptance with near-zero edit distance means people save without engaging; question the feature's placement and timing rather than the text. Higher distances mean directional mismatch; read what users rewrite and adjust the prompt accordingly
+4. **Check acceptance immediately after a regeneration.** If "regenerated, then accepted" is common, output variance is too wide. Lower the temperature or tighten constraints to narrow the distribution
+
+The ordering is deliberate: items near the top are cheaper to fix. Redirecting a prompt has blast radius that is hard to predict, so as long as speed or presentation can explain the number, I exhaust those first.
+
+## Connecting to Quality and Unit Economics
+
+Product-side acceptance measurement is not a complete practice on its own; I think of it as the layer between continuous output-quality monitoring and per-feature profitability. Whether the model's output stays reliable over time is the territory of the evaluation pipeline I described in [Designing a Continuous Quality Monitoring Pipeline for the Gemini API](/articles/gemini-api/gemini-api-quality-monitoring-golden-dataset-llm-judge), and whether the feature deserves its bill is the ledger from [Measuring the Economics of Each Gemini-Powered Feature — So You Can Keep It, Fix It, or Retire It](/articles/gemini-api/gemini-api-feature-unit-economics-sunset-decision-design).
+
+The three layers cut different cross-sections. Quality evaluation asks whether the model produced good text. Acceptance measurement asks whether anyone wanted it. Unit economics asks whether the whole exercise can continue. Adding the middle layer forced me to confront an inconvenient fact: outputs scoring near-perfect on quality rubrics were not moving acceptance at all, because good text and wanted text are different things. With all three in place, improving an AI feature stops being guesswork and becomes a matter of identifying which layer is failing before touching anything.
+
+## Start with Five Events
+
+Instrumentation design sounds heavyweight, but everything in this article amounts to five analytics events, one wrapper class around the generation call, and a single SQL query run weekly. No new dashboards, no additional vendors.
+
+If you already operate a Gemini-powered feature, try shipping just ai_generated and ai_accepted in your next release. The moment a single acceptance-rate number exists, your relationship with that feature changes. I spent two weeks reassured by a clean error-rate graph while half my feature's output was being thrown away — I would rather you skip that part. I hope this helps you find the numbers that are failing quietly in your own app.
