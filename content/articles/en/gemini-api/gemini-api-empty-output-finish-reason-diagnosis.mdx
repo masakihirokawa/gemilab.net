@@ -1,0 +1,286 @@
+---
+title: "Reverse-Engineering Empty Gemini API Responses with finish_reason — Triage, Retry Classification, and Monitoring"
+slug: "gemini-api-empty-output-finish-reason-diagnosis"
+category: "gemini-api"
+level: "intermediate"
+premium: true
+date: "2026-06-12T08:30"
+author: "Gemini Lab"
+description: "An empty response.text has three distinct failure layers — candidates, prompt_feedback, and finish_reason. Production code for detecting thinking-token starvation, classifying what is worth retrying, and monitoring your empty-response rate."
+tags: ["gemini-api", "finish-reason", "troubleshooting", "error-handling", "python", "typescript"]
+highlights:
+  - "A three-layer triage flow across candidates, prompt_feedback, and finish_reason, plus a lookup table covering nine values with their causes and retry verdicts"
+  - "Code that detects the 2.5-era failure where thinking tokens starve the output budget and silently erase your text, then repairs the config and recovers automatically"
+  - "A three-branch retry classifier that stops wasting quota on SAFETY and RECITATION, and a minimal logging setup that tracks your empty-response rate continuously"
+---
+Earlier this month, Gemini went through one of its largest outages to date. My own pipelines failed in waves that morning, and while reading back through the logs after recovery, one thing stood out.
+
+The calls that raised exceptions were easy to find. Alerts fired, stack traces landed where they should. What took far longer to notice were the calls sitting right next to them — HTTP 200, technically successful, with an empty `response.text`. An empty string slips through a pipeline quietly. Downstream steps run as if nothing happened, and the user ends up staring at a blank screen. In practice, this failure mode is worse than the loud one.
+
+An empty response is not the Gemini API breaking. The model always leaves a signal explaining why it stopped generating; the missing piece is code that actually reads it. This article walks through that reading in three stages — a triage flow, a retry classification, and monitoring — with Python (`google-genai`) as the primary SDK and Node/TypeScript (`@google/genai`) alongside.
+
+## An "empty response" has three distinct layers — where to look before response.text
+
+`response.text` is a convenience helper. Internally it just collects the text parts from `candidates[0].content.parts` and joins them. So when it comes back empty, the actual breakage lives in one of three different places:
+
+1. `candidates` itself is empty — your input was blocked before generation even started. Look at `prompt_feedback.block_reason`
+2. `candidates` exists but `parts` is empty — generation was cut off mid-flight. Look at `finish_reason`
+3. `parts` exists but carries no text — nothing is broken. The response contains non-text parts such as `function_call`, `inline_data`, or thought parts
+
+I run a small function that separates these three layers immediately after every production call.
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+def triage(resp) -> str:
+    """Identify which layer an empty response belongs to. The return value doubles as a log key."""
+    # Layer 1: no candidates -> the input was blocked upstream
+    if not resp.candidates:
+        block = getattr(resp.prompt_feedback, "block_reason", None)
+        return f"input_blocked:{block}"
+
+    cand = resp.candidates[0]
+    finish = str(getattr(cand, "finish_reason", "UNKNOWN"))
+
+    # Layer 2: no parts -> finish_reason holds the cutoff reason
+    parts = getattr(getattr(cand, "content", None), "parts", None) or []
+    if not parts:
+        return f"no_parts:{finish}"
+
+    # Layer 3: parts exist but no text -> a different kind of part came back
+    text = "".join((getattr(p, "text", "") or "") for p in parts)
+    if not text:
+        kinds = []
+        for p in parts:
+            if getattr(p, "function_call", None):
+                kinds.append("function_call")
+            elif getattr(p, "inline_data", None):
+                kinds.append("inline_data")
+            elif getattr(p, "thought", False):
+                kinds.append("thought")
+            else:
+                kinds.append("unknown")
+        return f"non_text_parts:{finish}:{'+'.join(kinds)}"
+
+    return "ok"
+```
+
+Streaming this return value into your logs means that the moment an "empty-looking" response arrives, you already know which layer failed. During the outage, having this one function in place was the difference between an hour of guesswork and reading a single log line.
+
+## A finish_reason lookup table — which values are worth retrying as-is
+
+When layer 2 is the culprit, `finish_reason` (`finishReason` in the Node SDK) tells you why generation stopped. The practical question is not what each value means in the abstract. It is a single yes-or-no: does retrying with no changes stand any chance of a different outcome? Hammering a value that always answers the same way burns quota and returns nothing.
+
+<table>
+  <thead>
+    <tr><th>Value</th><th>Typical cause</th><th>Retry as-is?</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>STOP</code></td><td>Normal completion. If empty, suspect non-text parts</td><td>No need (check layer 3)</td></tr>
+    <tr><td><code>MAX_TOKENS</code></td><td>Output budget exhausted, including by thinking tokens</td><td>Pointless (fix config first)</td></tr>
+    <tr><td><code>SAFETY</code></td><td>Output tripped the safety filter</td><td>Pointless (fix settings or input)</td></tr>
+    <tr><td><code>RECITATION</code></td><td>Excessive overlap with training data</td><td>Pointless (fix the prompt)</td></tr>
+    <tr><td><code>LANGUAGE</code></td><td>Unsupported language</td><td>Pointless</td></tr>
+    <tr><td><code>BLOCKLIST</code></td><td>Hit a forbidden-terms list</td><td>Pointless</td></tr>
+    <tr><td><code>PROHIBITED_CONTENT</code></td><td>Prohibited content detected</td><td>Pointless</td></tr>
+    <tr><td><code>SPII</code></td><td>Sensitive personal information detected</td><td>Pointless</td></tr>
+    <tr><td><code>MALFORMED_FUNCTION_CALL</code></td><td>Broken tool-call generation</td><td>Conditional (fix the schema)</td></tr>
+    <tr><td><code>OTHER</code> / <code>UNSPECIFIED</code></td><td>Internal or unclassified error</td><td>Yes (with backoff)</td></tr>
+  </tbody>
+</table>
+
+Scan the table and the pattern jumps out: the only family where a plain retry genuinely helps is `OTHER`. Everything else falls into either "repair the config or input, then come back" or "fail fast, because nothing will change." Those three groups become the skeleton of the retry classifier we will build below.
+
+One value that confuses people the first time: `STOP` with an empty text. Almost always this is layer 3 in disguise. When function calling is enabled and the model decides to invoke a tool, `parts` contains only a `function_call` and `text` is empty. That response is perfectly healthy.
+
+## Thinking tokens eating your output — why empty responses spiked after the 2.5 migration
+
+Gemini 2.0 Flash was retired on June 1, 2026, pushing a lot of code onto 2.5 Flash and newer. I migrated my own projects at the same time, and almost immediately the `MAX_TOKENS` flavor of empty response climbed from near zero to a few percent in one of my small batch jobs.
+
+The cause is thinking tokens. Models from the 2.5 generation onward "think" by default before answering, and those thinking tokens are spent out of the same output budget as your text. Keep `max_output_tokens` tuned to its old 2.0-era value and the entire budget can disappear into thought before the first visible character is written. You get `finish_reason=MAX_TOKENS` and an empty body from code that used to be perfectly correct.
+
+The telltale signature lives in `usage_metadata`.
+
+```python
+from google.genai import types
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=prompt,
+    config=types.GenerateContentConfig(
+        max_output_tokens=4096,
+        thinking_config=types.ThinkingConfig(thinking_budget=1024),
+    ),
+)
+
+usage = resp.usage_metadata
+print("thoughts:", getattr(usage, "thoughts_token_count", 0))
+print("candidates:", getattr(usage, "candidates_token_count", 0))
+```
+
+`finish_reason` says `MAX_TOKENS`, `thoughts_token_count` is large, `candidates_token_count` is at or near zero — that combination is a confirmed diagnosis of thinking-token starvation.
+
+The fix is to make both numbers explicit. Reserve roughly 1.5 to 2 times the tokens you actually want in the body as `max_output_tokens`, and manage `thinking_budget` as an explicit slice within it. On 2.5 Flash you can disable thinking entirely with `thinking_budget=0`; 2.5 Pro will not fully switch it off. The Gemini 3 generation moves to a `thinking_level` parameter that selects depth in steps, so when you migrate, review the parameter name itself, not just the value. My working rule: starve the thinking budget for mechanical work like labeling and summarization, and fund it generously for genuine design judgment. Matching the budget to the nature of the task pays off in both cost and stability.
+
+## When candidates is empty — what prompt_feedback is telling you
+
+Layer 1 — no `candidates` at all — has no `finish_reason` to inspect, because generation never started. The input itself was blocked, and the reason sits in `prompt_feedback.block_reason` with values like `SAFETY`, `BLOCKLIST`, `PROHIBITED_CONTENT`, or `OTHER`.
+
+The operational sting: this layer shows up most in apps that forward raw user input. You can test your own prompts before shipping. You cannot test what users will type.
+
+```python
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=user_input,
+)
+
+if not resp.candidates:
+    reason = getattr(resp.prompt_feedback, "block_reason", None)
+    # Retrying is futile -- ask the user to change the input instead
+    raise InputBlockedError(f"prompt blocked: {reason}")
+```
+
+There is one design decision here that matters more than the code. Telling the user "please try again later" for an input block is wrong. The same input will be blocked for the same reason every single time. The message should steer toward changing the input: "We couldn't process this content — please rephrase and try again." Before I separated these two messages, users would resubmit the identical text repeatedly and the block counter just kept climbing; after the change, the "it never works no matter how many times I try" support emails essentially stopped.
+
+## SAFETY and RECITATION — what settings can fix, and what only the input can fix
+
+`SAFETY` is the output-side filter firing. Even clearly benign requests can trip it in certain territories — news summarization, medical translation, competitor comparisons. Reading `candidate.safety_ratings` shows which HARM category crossed which probability band.
+
+You tune this with `safety_settings`, but loosening everything globally is sloppier than it needs to be. I split the policy in two based on how much I trust the input source.
+
+```python
+def safety_for(source: str):
+    # Trusted internal documents get a looser threshold; raw user input keeps the default
+    threshold = "BLOCK_ONLY_HIGH" if source == "internal" else "BLOCK_MEDIUM_AND_ABOVE"
+    return [
+        types.SafetySetting(category=c, threshold=threshold)
+        for c in (
+            "HARM_CATEGORY_HARASSMENT",
+            "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "HARM_CATEGORY_DANGEROUS_CONTENT",
+        )
+    ]
+```
+
+Pipelines that process my own content run at `BLOCK_ONLY_HIGH`; anything user-facing keeps the defaults. That split cuts false positives without giving up risk control where it matters.
+
+`RECITATION` is a different animal: it fires on excessive overlap with training data. Ask for song lyrics, a novel excerpt, or a press release "quoted verbatim" and you will see it almost every time. No setting fixes this one — only the input side does.
+
+In order of effectiveness, two things worked for me. First, an explicit paraphrasing constraint in the prompt, along the lines of "do not reuse more than three consecutive words from the source." Second, a two-stage pass that compresses long source text before the main call. After I started summarizing inputs down to roughly a third of their original length before passing them on, recitation stops went from a regular log entry to a rarity. Shorter input simply leaves less surface for an overlap to match.
+
+## A three-branch retry classifier — adding "fix, then retry" is what makes it stable
+
+Now we fold all of this into one implementation. Conventional retry logic has a single move: on failure, back off exponentially and try again. But as the lookup table showed, most empty-response causes make that move worthless. So we widen the branches to three: retry as-is, fix the config and then retry, or fail immediately.
+
+```python
+import random
+import time
+from dataclasses import dataclass, field
+
+FAIL_FAST = {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "LANGUAGE"}
+RETRY_AS_IS = {"OTHER", "FINISH_REASON_UNSPECIFIED", "UNKNOWN"}
+
+@dataclass
+class Plan:
+    action: str                     # "ok" / "retry" / "fix_and_retry" / "fail"
+    fix: dict = field(default_factory=dict)
+
+def classify(resp) -> Plan:
+    if not resp.candidates:
+        return Plan("fail")          # input blocks answer the same way every time
+    cand = resp.candidates[0]
+    finish = str(cand.finish_reason or "UNKNOWN").split(".")[-1]
+    parts = (cand.content.parts if cand.content else None) or []
+    text = "".join((getattr(p, "text", "") or "") for p in parts)
+    if text and finish == "STOP":
+        return Plan("ok")
+    if finish == "MAX_TOKENS":
+        # Double the output budget, squeeze thinking to push tokens into the body
+        return Plan("fix_and_retry", fix={"grow_output": 2.0, "thinking_budget": 512})
+    if finish in FAIL_FAST:
+        return Plan("fail")
+    return Plan("retry")             # only the OTHER family earns a plain retry
+
+def generate(prompt: str, model: str = "gemini-2.5-flash", max_attempts: int = 3) -> str:
+    max_out = 2048
+    thinking = 1024
+    for attempt in range(max_attempts):
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=max_out,
+                thinking_config=types.ThinkingConfig(thinking_budget=thinking),
+            ),
+        )
+        plan = classify(resp)
+        if plan.action == "ok":
+            return resp.text
+        if plan.action == "fail":
+            raise RuntimeError(f"non-retryable: {triage(resp)}")
+        if plan.action == "fix_and_retry":
+            max_out = int(max_out * plan.fix["grow_output"])
+            thinking = plan.fix["thinking_budget"]
+        time.sleep((2 ** attempt) + random.random())   # exponential backoff with jitter
+    raise TimeoutError(f"retries exhausted for model={model}")
+```
+
+The branch that earns its keep is `MAX_TOKENS`. Retrying it unchanged cuts off in the same place, the same way, every time. Double the output budget, squeeze the thinking slice, and come back — adding that single "repair before retrying" path transforms the retry success rate.
+
+The other lesson this month's outage drove home was model fallback. When the `OTHER` family keeps repeating, switching models often recovers faster than hammering the same one — run 3.5 Flash as the primary and drop to `generate(prompt, model="gemini-2.5-flash")` once retries are exhausted. The one pipeline I had wired with that extra rung was the only one that kept publishing through the outage morning. For the network-layer half of this strategy — 429s and 5xx — see [Gemini API in production — error handling and rate-limit patterns that absorb 429, 500, and 503 quietly](/articles/gemini-dev/gemini-api-error-handling-rate-limit-production-patterns), which pairs naturally with this classifier.
+
+## Streaming and Structured Output change the shape of "empty"
+
+Everything so far assumed unary generation. Streaming shifts the rules slightly: `finish_reason` only arrives on the final chunk, so instead of judging each chunk as it lands, drain the stream first and judge afterward.
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const stream = await ai.models.generateContentStream({
+  model: "gemini-2.5-flash",
+  contents: prompt,
+});
+
+let text = "";
+let finish: string | undefined;
+
+for await (const chunk of stream) {
+  text += chunk.text ?? "";
+  finish = chunk.candidates?.[0]?.finishReason ?? finish;
+}
+
+if (!text) {
+  console.error(`empty stream: finishReason=${finish ?? "never_arrived"}`);
+}
+```
+
+The case to guard is a stream that ends without ever carrying a single character of body text. If your UI hides the spinner when "the first chunk arrives," an empty stream leaves that spinner spinning forever. I always branch to a regular error state when the stream closes with `text` still empty.
+
+Structured Output hides the inverse trap. With a JSON `response_mime_type`, the JSON arrives as text inside `parts`, which looks healthy — but an overly complex schema can derail generation into `MALFORMED_FUNCTION_CALL` or truncated JSON. I keep the schema-side debugging separate in [Why Gemini API JSON and structured output comes back wrong — causes and fixes](/articles/gemini-api/gemini-api-json-structured-output-errors-fix). For the triage flow in this article, the rule of thumb is: a `function_call` part at layer 3 means the model chose to invoke a tool; broken JSON text means go rework the schema.
+
+## Measuring your empty-response rate — three log lines and one alert
+
+Finally, monitoring. What makes empty responses genuinely dangerous is that they never appear on an error-rate graph. The HTTP layer reports 200 after 200 while your users see nothing. So give the phenomenon its own metric.
+
+```python
+logger.info(
+    "gemini.response",
+    extra={
+        "triage": triage(resp),                     # ok / input_blocked:* / no_parts:* / non_text_parts:*
+        "model": model,
+        "thoughts_tokens": getattr(resp.usage_metadata, "thoughts_token_count", 0),
+        "candidates_tokens": getattr(resp.usage_metadata, "candidates_token_count", 0),
+    },
+)
+```
+
+Aggregate the `triage` field and watch the share of anything other than `ok` over a five-minute window — that is your empty-response rate. As an indie developer running several API-dependent pipelines, my baseline sits comfortably under 0.1%, and the alert fires at 0.3%. On the morning of this month's outage, the first signal to fire was not the 5xx error rate. It was this one. Outages, it turns out, can begin as a phase where calls do not fail — they just stop carrying anything. That is not something I would have guessed without running the metric.
+
+One habit completes the setup: re-baseline the empty-response rate before every release. Model generation changes and prompt edits move the baseline quietly. On the latency side, [Designing request hedging for the Gemini API to tame p99 tail latency](/articles/gemini-api/gemini-api-request-hedging-p99-latency-design) complements this nicely.
+
+The next step is concrete: drop `triage()` into your production path right after each call and collect a week of logs. See which layer, which value, and how often — then tune thresholds and retry design from evidence. Resisting the urge to fix before measuring feels slower and is, in my experience, the fastest route. If you are staring down the same blank responses, I hope this saves you the morning it cost me.

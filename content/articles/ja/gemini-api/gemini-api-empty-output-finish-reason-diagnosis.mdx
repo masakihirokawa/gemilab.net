@@ -1,0 +1,286 @@
+---
+title: "Gemini API の空応答を finish_reason から逆引きする — 診断フロー・再試行分類・監視の実務"
+slug: "gemini-api-empty-output-finish-reason-diagnosis"
+category: "gemini-api"
+level: "intermediate"
+premium: true
+date: "2026-06-12T08:30"
+author: "Gemini Lab"
+description: "response.text が空になる問題は candidates・prompt_feedback・finish_reason の3層で診断できます。思考トークンによる出力枯渇の検出、再試行可否の分類器、空応答率の監視まで、本番で運用している実装をまとめました。"
+tags: ["gemini-api", "finish-reason", "troubleshooting", "error-handling", "python", "typescript"]
+highlights:
+  - "candidates・prompt_feedback・finish_reason を順に見る3層診断フローと、主要9値の原因・再試行可否をまとめた逆引き表"
+  - "思考トークンが出力予算を使い切って本文が消える 2.5 系特有の事故を usage_metadata から検出し、設定を直して自動復帰するコード"
+  - "SAFETY や RECITATION を無駄に再試行しない3分岐リトライ分類器と、空応答率を常時監視する最小ログ構成"
+---
+今月上旬、Gemini が大規模な障害に見舞われた朝のことです。私のパイプラインでも呼び出しが立て続けに失敗し、復旧後にログを読み返していて、ひとつ気づいたことがありました。
+
+例外で落ちた呼び出しはすぐに分かります。アラートが鳴り、スタックトレースが残るからです。検知が遅れたのは、その隣にいた「HTTP 200 で成功したのに `response.text` が空」という呼び出しのほうでした。空文字は静かにパイプラインを通り抜けます。後続の処理は何事もなかったように走り、ユーザーには白い画面だけが届く。例外より、こちらのほうが質が悪いのです。
+
+空応答は Gemini API の故障ではありません。モデルが「なぜそこで生成を止めたか」を必ずシグナルとして残しており、読み落としているのは受け取る側です。その読み方を、診断フロー・再試行の分類・監視の3段階に分けて整理します。コードは Python（`google-genai`）を中心に、Node/TypeScript（`@google/genai`）も併記します。
+
+## 「空応答」には3つの層がある — response.text の前に見る場所
+
+`response.text` は便利なヘルパーですが、内部では `candidates[0].content.parts` からテキストパーツを拾って連結しているだけです。だから「空」と一口に言っても、実際には壊れている場所が3つに分かれます。
+
+1. `candidates` 自体が空 — 生成が始まる前に、入力がブロックされています。見るべきは `prompt_feedback.block_reason` です
+2. `candidates` はあるが `parts` が空 — 生成が途中で打ち切られています。見るべきは `finish_reason` です
+3. `parts` はあるがテキストがない — 実は壊れていません。`function_call` や `inline_data`、思考パーツなど、テキスト以外のパーツが返っています
+
+この3層を順に見分ける関数を、私は本番のすべての呼び出し直後に挟んでいます。
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+def triage(resp) -> str:
+    """空応答の層を特定する。戻り値は後段の分岐とログのキーになる。"""
+    # 層1: candidates がない → 入力段階でブロック済み
+    if not resp.candidates:
+        block = getattr(resp.prompt_feedback, "block_reason", None)
+        return f"input_blocked:{block}"
+
+    cand = resp.candidates[0]
+    finish = str(getattr(cand, "finish_reason", "UNKNOWN"))
+
+    # 層2: parts が空 → finish_reason が打ち切り理由を持っている
+    parts = getattr(getattr(cand, "content", None), "parts", None) or []
+    if not parts:
+        return f"no_parts:{finish}"
+
+    # 層3: parts はあるがテキストがない → 別種のパーツが返っている
+    text = "".join((getattr(p, "text", "") or "") for p in parts)
+    if not text:
+        kinds = []
+        for p in parts:
+            if getattr(p, "function_call", None):
+                kinds.append("function_call")
+            elif getattr(p, "inline_data", None):
+                kinds.append("inline_data")
+            elif getattr(p, "thought", False):
+                kinds.append("thought")
+            else:
+                kinds.append("unknown")
+        return f"non_text_parts:{finish}:{'+'.join(kinds)}"
+
+    return "ok"
+```
+
+`response.text` に触る前にこの戻り値をログへ流すだけで、「空に見える応答」が届いた瞬間に原因の層が割れます。障害対応の最中、この1関数があるかないかで調査時間は大きく変わりました。切り分けに迷っていた時間が、ログを1行読む時間になるからです。
+
+## finish_reason 逆引き表 — そのまま再試行してよい値・無駄な値
+
+層2に該当した場合、`finish_reason`（Node SDK では `finishReason`)の値が打ち切りの理由を教えてくれます。実務で重要なのは意味の暗記ではなく、「その値はそのまま再試行して意味があるか」という1点です。再試行しても同じ結果になる値を叩き続けると、クォータを消費するだけで何も得られません。
+
+<table>
+  <thead>
+    <tr><th>値</th><th>主な原因</th><th>そのまま再試行</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>STOP</code></td><td>正常終了。空ならテキスト以外のパーツを疑う</td><td>不要（層3を確認）</td></tr>
+    <tr><td><code>MAX_TOKENS</code></td><td>出力上限に到達。思考トークンの枯渇含む</td><td>無意味（設定を直してから）</td></tr>
+    <tr><td><code>SAFETY</code></td><td>出力がセーフティフィルターに接触</td><td>無意味（設定か入力を直す)</td></tr>
+    <tr><td><code>RECITATION</code></td><td>学習データとの過度な一致</td><td>無意味（プロンプトを直す）</td></tr>
+    <tr><td><code>LANGUAGE</code></td><td>非対応言語の入出力</td><td>無意味</td></tr>
+    <tr><td><code>BLOCKLIST</code></td><td>禁止語リストに接触</td><td>無意味</td></tr>
+    <tr><td><code>PROHIBITED_CONTENT</code></td><td>禁止コンテンツ判定</td><td>無意味</td></tr>
+    <tr><td><code>SPII</code></td><td>機微な個人情報の検出</td><td>無意味</td></tr>
+    <tr><td><code>MALFORMED_FUNCTION_CALL</code></td><td>ツール呼び出しの生成不全</td><td>条件付き（スキーマを直す）</td></tr>
+    <tr><td><code>OTHER</code> / <code>UNSPECIFIED</code></td><td>内部エラー・未分類</td><td>有効（バックオフ付きで）</td></tr>
+  </tbody>
+</table>
+
+眺めると分かるとおり、再試行が素直に効くのは実質 `OTHER` 系だけです。残りは「設定か入力を直してから出直す」グループと「直しても無駄なので即座に失敗させる」グループに分かれます。この3分類が、後半で実装する再試行分類器の骨格になります。
+
+ちなみに `STOP` なのに空、というケースを初めて見ると戸惑いますが、ほとんどは層3の取り違えです。Function Calling を有効にした呼び出しでモデルがツール実行を選ぶと、`parts` には `function_call` だけが入り、`text` は空になります。これは正常な応答です。
+
+## 思考トークンが本文を食い潰す — 2.5 系移行後に空応答が増えた理由
+
+2026年6月1日に Gemini 2.0 Flash が廃止され、多くのコードが 2.5 Flash 以降へ移行しました。私自身もこのタイミングで移行を済ませたのですが、直後から `MAX_TOKENS` 起因の空応答が目に見えて増えました。個人開発の小さなバッチ処理で、移行前はほぼゼロだった空応答が数%まで跳ねたのです。
+
+原因は思考トークンです。2.5 系以降のモデルは既定で「考えて」から答えます。そして思考に使ったトークンも出力予算の中から消費されます。`max_output_tokens` を 2.0 Flash 時代の感覚のまま小さく絞っていると、予算のすべてが思考に使われ、本文を書く前に上限へ到達します。結果は `finish_reason=MAX_TOKENS`、本文は空。コードは何も間違っていないのに、です。
+
+見分け方は `usage_metadata` にあります。
+
+```python
+from google.genai import types
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=prompt,
+    config=types.GenerateContentConfig(
+        max_output_tokens=4096,
+        thinking_config=types.ThinkingConfig(thinking_budget=1024),
+    ),
+)
+
+usage = resp.usage_metadata
+print("thoughts:", getattr(usage, "thoughts_token_count", 0))
+print("candidates:", getattr(usage, "candidates_token_count", 0))
+```
+
+`finish_reason` が `MAX_TOKENS`、`thoughts_token_count` が大きく、`candidates_token_count` がほぼゼロ。この組み合わせが揃ったら、確定で「思考が予算を食い潰した」事故です。
+
+対処は2つの値を明示することに尽きます。本文に欲しいトークン数の1.5〜2倍を `max_output_tokens` に確保し、`thinking_budget` をその内数として明示的に管理します。2.5 Flash は `thinking_budget=0` で思考を切れますが、2.5 Pro は完全には無効化できません。Gemini 3 系では `thinking_level` で深さを段階指定する方式に変わっているため、移行時はパラメータ名ごと見直すのが安全です。要約やラベリングのような「考えなくていい仕事」では思考を絞り、設計判断を伴う仕事では予算を厚くする。仕事の性質で予算を変えるのが、コストと安定性の両面で効きます。
+
+## candidates が空のとき — prompt_feedback が教えてくれること
+
+層1、つまり `candidates` 自体が返ってこないケースは、`finish_reason` を探しても見つかりません。生成が始まる前に入力側でブロックされているからで、理由は `prompt_feedback.block_reason` に入っています。値は `SAFETY`・`BLOCKLIST`・`PROHIBITED_CONTENT`・`OTHER` などです。
+
+このケースの実務上の急所は、ユーザー入力をそのまま流しているアプリで起きやすいことです。自分の書いたプロンプトは事前にテストできますが、ユーザーが何を入力してくるかは制御できません。
+
+```python
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=user_input,
+)
+
+if not resp.candidates:
+    reason = getattr(resp.prompt_feedback, "block_reason", None)
+    # 再試行しても結果は同じ。ユーザーに「入力を変えてほしい」と伝える
+    raise InputBlockedError(f"prompt blocked: {reason}")
+```
+
+大事な設計判断がひとつあります。入力ブロックを「時間をおいて再試行してください」と案内するのは誤りです。同じ入力は何度送っても同じ理由でブロックされます。ユーザーへのメッセージは「この内容は処理できませんでした。表現を変えてお試しください」のように、入力の変更を促す文面にします。エラーの正体を区別せずに汎用メッセージを返すと、ユーザーは同じ入力を連打し、ブロック数だけが積み上がります。私はこの区別を入れてから、サポートへの「何度やっても動かない」という問い合わせがほぼ消えました。
+
+## SAFETY と RECITATION — 設定で直すケース・入力で直すケース
+
+`SAFETY` は出力側のフィルター接触です。明らかに無害な依頼でも、ニュース要約・医療系の翻訳・競合製品の比較といった領域では誤検知に近い形で止まることがあります。`candidate.safety_ratings` を読むと、どの HARM カテゴリがどの確度で引っかかったかが分かります。
+
+閾値調整は `safety_settings` で行いますが、一律に緩めるのは雑すぎます。私は入力の信頼度で2段階に分けています。
+
+```python
+def safety_for(source: str):
+    # 社内文書など信頼できる入力は緩く、生のユーザー入力は標準のまま
+    threshold = "BLOCK_ONLY_HIGH" if source == "internal" else "BLOCK_MEDIUM_AND_ABOVE"
+    return [
+        types.SafetySetting(category=c, threshold=threshold)
+        for c in (
+            "HARM_CATEGORY_HARASSMENT",
+            "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "HARM_CATEGORY_DANGEROUS_CONTENT",
+        )
+    ]
+```
+
+自前のコンテンツを処理するパイプラインで `BLOCK_ONLY_HIGH`、ユーザー入力を扱う面では既定値のまま。この分け方なら、誤検知の削減とリスク管理を両立できます。
+
+`RECITATION` は毛色が違い、学習データとの過度な一致で止まります。歌詞・小説の一節・プレスリリース原文を「そのまま引用して」と頼むと高確率で発火します。こちらは設定では直せません。直すのは入力側です。
+
+効果があった順に並べると、第一に「原文の表現を3語以上連続して使わない」のような言い換え制約をプロンプトに明示すること。第二に、長い原文を先に短く要約してから本処理に渡す二段階方式です。入力を元の3割程度まで要約してから渡すようにしたところ、発火頻度は体感で激減し、ログ上もほぼ見なくなりました。原文が短くなるほど「一致」の余地が減る、という素直な理屈です。
+
+## 3分岐リトライ分類器 — 「直してから再試行」を入れると安定する
+
+ここまでの観察を1つの実装に束ねます。一般的なリトライは「失敗したら指数バックオフで再試行」の一本槍ですが、逆引き表で見たとおり Gemini の空応答には再試行が無意味な値が多い。そこで分岐を3つに増やします。そのまま再試行する・設定を直してから再試行する・即座に失敗させる、の3つです。
+
+```python
+import random
+import time
+from dataclasses import dataclass, field
+
+FAIL_FAST = {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "LANGUAGE"}
+RETRY_AS_IS = {"OTHER", "FINISH_REASON_UNSPECIFIED", "UNKNOWN"}
+
+@dataclass
+class Plan:
+    action: str                     # "ok" / "retry" / "fix_and_retry" / "fail"
+    fix: dict = field(default_factory=dict)
+
+def classify(resp) -> Plan:
+    if not resp.candidates:
+        return Plan("fail")          # 入力ブロックは何度送っても同じ
+    cand = resp.candidates[0]
+    finish = str(cand.finish_reason or "UNKNOWN").split(".")[-1]
+    parts = (cand.content.parts if cand.content else None) or []
+    text = "".join((getattr(p, "text", "") or "") for p in parts)
+    if text and finish == "STOP":
+        return Plan("ok")
+    if finish == "MAX_TOKENS":
+        # 出力予算を倍にし、思考予算は絞って本文へ回す
+        return Plan("fix_and_retry", fix={"grow_output": 2.0, "thinking_budget": 512})
+    if finish in FAIL_FAST:
+        return Plan("fail")
+    return Plan("retry")             # OTHER 系のみ素直に再試行
+
+def generate(prompt: str, model: str = "gemini-2.5-flash", max_attempts: int = 3) -> str:
+    max_out = 2048
+    thinking = 1024
+    for attempt in range(max_attempts):
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=max_out,
+                thinking_config=types.ThinkingConfig(thinking_budget=thinking),
+            ),
+        )
+        plan = classify(resp)
+        if plan.action == "ok":
+            return resp.text
+        if plan.action == "fail":
+            raise RuntimeError(f"non-retryable: {triage(resp)}")
+        if plan.action == "fix_and_retry":
+            max_out = int(max_out * plan.fix["grow_output"])
+            thinking = plan.fix["thinking_budget"]
+        time.sleep((2 ** attempt) + random.random())   # ジッター付き指数バックオフ
+    raise TimeoutError(f"retries exhausted for model={model}")
+```
+
+ポイントは `MAX_TOKENS` の扱いです。同じ設定のまま再試行しても、同じ場所で同じように打ち切られるだけです。出力予算を倍に広げ、思考予算を絞って本文側へ回す。この「設定を直してから出直す」分岐を入れた途端、再試行の成功率が別物になります。
+
+もうひとつ、今月の障害で価値を実感したのがモデルフォールバックです。`OTHER` 系が連続する局面では、同じモデルを叩き続けるより `generate(prompt, model="gemini-2.5-flash")` のように別モデルへ切り替えるほうが復帰が早いことがあります。3.5 Flash を主力にしつつ、再試行が尽きたら 2.5 Flash へ落とす。この一段を入れていたパイプラインだけが、障害の朝も止まりませんでした。429 や 5xx を含むネットワーク層の戦略は[Gemini API 本番運用ノート — 429・500・503 に静かに耐えるエラーハンドリングとレート制限の設計](/articles/gemini-dev/gemini-api-error-handling-rate-limit-production-patterns)で扱っているので、本稿の分類器と組み合わせて使ってください。
+
+## ストリーミングと Structured Output では「空」の形が変わる
+
+ここまでは一括生成の話でした。ストリーミングでは事情が少し変わります。`finish_reason` は最後のチャンクにしか入らないため、チャンクを受けるたびに判定するのではなく、ストリームを全部受け切ってから判定します。
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const stream = await ai.models.generateContentStream({
+  model: "gemini-2.5-flash",
+  contents: prompt,
+});
+
+let text = "";
+let finish: string | undefined;
+
+for await (const chunk of stream) {
+  text += chunk.text ?? "";
+  finish = chunk.candidates?.[0]?.finishReason ?? finish;
+}
+
+if (!text) {
+  console.error(`empty stream: finishReason=${finish ?? "never_arrived"}`);
+}
+```
+
+注意したいのは、ストリームが1チャンクも本文を運ばずに終わるケースです。UI 側が「最初のチャンクが来たらスピナーを消す」設計だと、空ストリームでスピナーが永遠に回ります。私はストリーム終了時に `text` が空なら通常のエラー表示へ落とす分岐を必ず入れています。
+
+Structured Output では逆の罠があります。`response_mime_type` を JSON にした応答は `parts` のテキストとして JSON 文字列が入るため一見正常ですが、スキーマが複雑すぎると生成が乱れて `MALFORMED_FUNCTION_CALL` や途中で切れた JSON が返ることがあります。スキーマ起因の不全は[Gemini APIのJSON出力・構造化出力が正しく返らない原因と対処法](/articles/gemini-api/gemini-api-json-structured-output-errors-fix)に切り分けをまとめています。空応答の診断フローとしては、層3で `function_call` パーツを見つけたら「ツール実行の選択」、壊れた JSON テキストなら「スキーマの見直し」へ進む、と覚えておけば迷いません。
+
+## 空応答率を測る — ログ3行とアラート1本から
+
+最後に監視の話です。空応答の厄介さは、エラー率のグラフに乗らないことに尽きます。HTTP 的には 200 で成功しているので、5xx を監視していても何も見えません。だから専用の指標を1本立てます。
+
+```python
+logger.info(
+    "gemini.response",
+    extra={
+        "triage": triage(resp),                     # ok / input_blocked:* / no_parts:* / non_text_parts:*
+        "model": model,
+        "thoughts_tokens": getattr(resp.usage_metadata, "thoughts_token_count", 0),
+        "candidates_tokens": getattr(resp.usage_metadata, "candidates_token_count", 0),
+    },
+)
+```
+
+この `triage` フィールドを集計し、`ok` 以外の比率を「空応答率」として5分窓で眺めます。私の運用では平常時 0.1% を下回る水準で安定しており、アラートは 0.3% 超過に置いています。今月の障害の朝、最初に異常を知らせたのは 5xx のエラー率ではなく、この空応答率のほうでした。障害の初期は「失敗はしないが中身が返らない」状態から始まることがある、というのは運用してみて初めて分かったことです。
+
+仕上げとして、リリース前に空応答率の基準値を必ず取り直すようにしています。モデルの世代交代やプロンプトの変更で基準値は静かに動くからです。レイテンシ側の監視設計は[Gemini API のリクエスト Hedging で p99 レイテンシのテールを抑える設計](/articles/gemini-api/gemini-api-request-hedging-p99-latency-design)が補完になります。
+
+次の一歩は明確です。まず `triage()` を本番の呼び出し直後に挟み、1週間ぶんのログを取ってください。どの層で・どの値で・どれくらい空応答が起きているかが見えてから、閾値や再試行の設計を直す。順番を逆にしないことが、遠回りに見えて最短です。同じ空応答と向き合っている方の助けになれば嬉しいです。
