@@ -1,0 +1,165 @@
+---
+title: "深夜のポーリングをやめる — Gemini Batch API を Webhook 駆動に作り替えた設計記録"
+slug: "gemini-batch-webhook-polling-to-event-driven-redesign"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-12T13:00"
+author: "Gemini Lab"
+description: "Gemini Batch API の完了監視を 60 秒間隔のポーリングから Webhook 駆動へ移行した実作業の記録です。static/dynamic の使い分け、署名検証、実測値をまとめました。"
+tags: ["Gemini API", "Batch API", "Webhook", "イベント駆動", "運用設計", "Python"]
+highlights:
+  - "一晩あたり約 1,080 回あった status 確認の GET をゼロにした移行手順と、移行後も薄いフォールバックポーリングを残した判断基準"
+  - "static webhook と dynamic webhook をジョブの性質でどう使い分けるか — 私の環境で固まった具体的な振り分けルール"
+  - "standardwebhooks ライブラリによる署名検証・5 分の replay 対策・webhook-id での重複排除まで含めた、そのまま動く Flask レシーバーの実装"
+---
+
+明け方 4 時のサーバーログを眺めていて、手が止まりました。
+
+夜間に流している Gemini Batch API のジョブはとっくに終わっているのに、結果の取り込みが始まったのは 58 秒後。理由は単純で、完了確認のポーリングが 60 秒間隔だったからです。
+
+ログの大半は「まだ終わっていません」という応答の記録でした。一晩分をざっと数えると、status 確認の GET だけで 1,000 回を超えています。仕事をしていない通信が、ログの約 90% を占めている状態。
+
+2026 年 5 月に Gemini API へ [Webhooks](https://ai.google.dev/gemini-api/docs/webhooks) が正式に入ったのを機に、この監視層を作り替えることにしました。本稿はその実作業の記録です。
+
+## ポーリング監視の実測コスト
+
+作り替えの前に、現状を数字で押さえておきます。私の夜間パイプラインは、個人開発しているアプリの App Store・Google Play 向け説明文と、アプリ内テキストの多言語ローカライズ文言を Batch API でまとめて生成するもので、毎晩 3 ジョブを流しております。
+
+- ポーリング間隔: 60 秒
+- 1 ジョブの平均所要時間: 約 2 時間（Batch API はベストエフォートのため夜によって大きく揺れます）
+- 一晩の GET 回数: 約 120 回 × 3 ジョブ × リトライ込みで **約 1,080 回**
+- 完了から検知までの遅延: 平均 30 秒、最悪 60 秒
+
+GET 自体は無料に近いとはいえ、cron とポーリングスクリプトという「動き続ける部品」を一つ抱えることになります。実際、過去にはポーリング側の例外処理の不備で監視だけが静かに死んでいた朝がありました。ジョブは成功しているのに結果が取り込まれていない。あの空振りの感覚は、いまも指先に残っております。
+
+## static と dynamic、どちらで受けるか
+
+Gemini API の Webhook には 2 種類あります。最初にここの設計判断を誤ると後で作り直しになるため、丁寧に整理します。
+
+**static webhook** はプロジェクト単位の登録です。`webhooks.create` で一度エンドポイントを登録すると、購読したイベント（`batch.succeeded` や `batch.failed` など）がプロジェクト全体から飛んできます。署名は対称鍵（signing secret）の HMAC 方式。
+
+**dynamic webhook** はジョブ単位の指定です。`batches.create` の `webhook_config` に URI を渡すと、そのジョブの完了通知だけが届きます。署名は JWKS による非対称鍵方式で、`user_metadata` に任意のルーティング情報を載せられます。
+
+私の環境では次のルールに落ち着きました。
+
+1. **定常の夜間バッチ → static**。エンドポイントが固定で、Slack 通知やデータベース更新のような「全ジョブ共通の後処理」に繋がるため
+2. **臨時・実験ジョブ → dynamic**。`user_metadata` に `{"job_group": "experiment"}` のような目印を載せ、本番の後処理に混ざらないよう専用エンドポイントで受けるため
+
+逆にしないことが肝心だと感じております。臨時ジョブのために static の購読を増やすと、レシーバー側の分岐が際限なく育ちます。
+
+## static webhook の登録
+
+登録は数行です。ただし一点だけ、最初の落とし穴になりやすい、取り返しのつかない箇所があります。
+
+```python
+from google import genai
+
+client = genai.Client()
+
+webhook = client.webhooks.create(
+    name="NightlyBatchWebhook",
+    subscribed_events=["batch.succeeded", "batch.failed", "batch.expired"],
+    uri="https://my-api.example.com/gemini-callback",
+)
+
+# signing secret はこのレスポンスでしか取得できない
+print(webhook.new_signing_secret)
+```
+
+`new_signing_secret` は **作成時の一度しか返ってきません**。私自身、最初これを控え忘れ、`rotate_signing_secret` でローテーションする羽目になりました。ローテーション時は旧シークレットを即時失効させるか 24 時間の猶予を持たせるか選べますので、本番運用では `REVOKE_PREVIOUS_SECRETS_AFTER_H24` を指定して新旧並行期間を作る対処が安全です。
+
+購読イベントに `batch.expired` を入れている点は意図的です。Batch API は 24 時間以内に処理されなかったジョブを期限切れにします。ポーリング時代はこの検知が翌朝まで遅れていました。期限切れも「完了の一種」として同じ経路で受け取れるのは、運用上の大きな前進です。
+
+## レシーバーの実装 — 署名検証を省かない
+
+受け口は Flask で書きました。Gemini の Webhook は [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks) 仕様に準拠しているため、検証は `standardwebhooks` ライブラリに任せられます。
+
+```python
+# pip install flask standardwebhooks
+import os
+import queue
+import threading
+from flask import Flask, request, jsonify
+from standardwebhooks.webhooks import Webhook, WebhookVerificationError
+
+app = Flask(__name__)
+SIGNING_SECRET = os.environ["WEBHOOK_SIGNING_SECRET"]
+
+# 後処理は別スレッドに逃がし、レスポンスは即返す
+work_queue: "queue.Queue[dict]" = queue.Queue()
+seen_ids: set[str] = set()  # webhook-id による重複排除（実運用は TTL 付きストアに）
+
+@app.route("/gemini-callback", methods=["POST"])
+def gemini_callback():
+    payload = request.get_data(as_text=True)
+    try:
+        wh = Webhook(SIGNING_SECRET)
+        event = wh.verify(payload, request.headers)
+    except WebhookVerificationError:
+        return jsonify({"error": "invalid signature"}), 400
+
+    delivery_id = request.headers.get("webhook-id", "")
+    if delivery_id in seen_ids:
+        return jsonify({"status": "duplicate"}), 200
+    seen_ids.add(delivery_id)
+
+    work_queue.put(event)  # パースとダウンロードはワーカーへ
+    return jsonify({"status": "received"}), 200
+
+def worker():
+    while True:
+        event = work_queue.get()
+        if event.get("type") == "batch.succeeded":
+            uri = event["data"]["output_file_uri"]
+            download_and_ingest(uri)  # 結果ファイルの取り込み
+        elif event.get("type") in ("batch.failed", "batch.expired"):
+            notify_failure(event["data"])
+
+threading.Thread(target=worker, daemon=True).start()
+```
+
+このコードで押さえている運用要件は 3 つです。
+
+1. **署名検証を最初に行う**。`webhook-signature` / `webhook-id` / `webhook-timestamp` ヘッダーを `standardwebhooks` が一括検証します。タイムスタンプが 5 分より古い配送は replay 攻撃の可能性があるため弾かれます
+2. **2xx を即返す**。レスポンスが遅れると Gemini 側はリトライ周期に入ります。重い処理をハンドラー内でやってはいけません
+3. **webhook-id で重複排除する**。配送保証は at-least-once です。同じ通知が二度届く前提で、取り込み処理を冪等にしておきます
+
+## 公式ドキュメントに書かれていない運用知見
+
+ここからは、実際に 3 週間ほど運用して気づいた点です。
+
+**ペイロードは薄い**。通知には `output_file_uri` と件数程度しか入っておらず、結果本体は入っていません。つまり Webhook 化しても「結果を取りに行くコード」は丸ごと残ります。消せるのはポーリングループだけ、と最初から見積もっておくと設計がぶれません。
+
+**ローカル開発の検証が地味に大変**。署名検証込みで動作確認するには、開発機にトンネル（cloudflared 等）を張って実イベントを受けるのが結局いちばん確実でした。署名ヘッダーを手で偽造してテストするより、検証用の static webhook をもう一本登録して dev 環境へ向ける回避策の方が早いです。
+
+**フォールバックポーリングは捨てませんでした**。Webhook は at-least-once とはいえ、受け側のダウンや DNS 障害まで面倒は見てくれません。私は「ジョブ投入から 6 時間経っても通知が来ていなければ 1 回だけ GET で確認する」という保険を残しました。一晩 1,080 回が、最悪ケースでも 3 回。これなら保険のコストとして許容できます。
+
+障害時の振る舞い全般については、[Gemini API の障害下で夜間バッチを守った話](/articles/gemini-api/gemini-api-outage-resilient-nightly-batch) で別途まとめております。
+
+## 移行手順のチェックリスト
+
+私が実際に踏んだ順序です。一気に切り替えず、並行期間を置きます。
+
+1. レシーバーを実装し、署名検証・重複排除・即時 2xx の 3 点をテストする
+2. static webhook を `batch.succeeded` / `batch.failed` / `batch.expired` で登録し、シークレットを環境変数へ保管する
+3. **ポーリングを残したまま** Webhook を 1 週間並走させ、検知の一致を突き合わせる
+4. ポーリング間隔を 60 秒 → 6 時間の保険水準へ落とす
+5. 並走ログで取りこぼしゼロを確認してから、cron の監視ジョブを削除する
+
+並走期間に一度だけ、レシーバーの再起動中に通知を逃した夜がありました。Gemini 側が指数バックオフで 24 時間リトライしてくれたため実害はゼロでしたが、保険のポーリングを残す判断はこの夜に固まりました。
+
+## 移行後の実測値
+
+- status 確認の GET: 約 1,080 回/晩 → **平常時 0 回**（保険ポーリング最大 3 回・通信量にして 99% 超の削減）
+- 完了から取り込み開始までの遅延: 平均 30 秒 → **数秒以内**
+- 監視まわりのコード行数: 約 180 行 → 約 110 行（ポーリングループとバックオフ制御が消えた分）
+- 監視が静かに死ぬ系の障害: 並走 3 週間でゼロ
+
+数字以上に効いているのは、「いま動いているか」を cron の生死で考えなくてよくなったことです。通知が来なければ保険が拾う。構造が単純になった分、夜の安心感が違います。
+
+## 次の一歩
+
+まずは臨時ジョブ 1 本に dynamic webhook を付け、`user_metadata` でルーティングする小さな実験から始めることをお勧めします。static の登録はプロジェクト全体に影響しますから、挙動を体で覚えてからでも遅くありません。
+
+同じように夜間バッチを抱えている方の参考になれば幸いです。

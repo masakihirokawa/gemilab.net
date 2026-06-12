@@ -1,0 +1,165 @@
+---
+title: "Retiring the Midnight Polling Loop — Rebuilding My Gemini Batch Monitoring Around Webhooks"
+slug: "gemini-batch-webhook-polling-to-event-driven-redesign"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-12T13:00"
+author: "Gemini Lab"
+description: "A working log of migrating Gemini Batch API completion monitoring from 60-second polling to event-driven webhooks: static vs dynamic, signature verification, and real numbers."
+tags: ["Gemini API", "Batch API", "Webhook", "Event-driven", "Operations", "Python"]
+highlights:
+  - "How I took roughly 1,080 status-check GETs per night down to zero, and why I still kept a thin fallback poll as insurance"
+  - "A concrete rule for splitting jobs between static and dynamic webhooks that survived three weeks of production use"
+  - "A Flask receiver you can run as-is, covering standardwebhooks signature verification, the 5-minute replay window, and webhook-id deduplication"
+---
+
+Around 4 a.m. I was scrolling through server logs and stopped cold.
+
+My nightly Gemini Batch API job had finished long ago, but ingestion of the results didn't start until 58 seconds later. The reason was mundane: my completion check polled once every 60 seconds.
+
+Most of the log was a record of "not done yet" responses. Counting one night's worth, the status-check GETs alone exceeded a thousand. Nine tenths of the traffic was doing no work at all.
+
+When the Gemini API shipped [Webhooks](https://ai.google.dev/gemini-api/docs/webhooks) in May 2026, I took it as the cue to rebuild this monitoring layer. This is the working log.
+
+## Measuring what polling actually cost
+
+Before rebuilding anything, I wanted the current state in numbers. As an indie developer I run everything myself, and this nightly pipeline generates App Store and Google Play descriptions plus localized in-app text for my apps in bulk through the Batch API — three jobs per night.
+
+- Polling interval: 60 seconds
+- Average job duration: about 2 hours (Batch API is best-effort, so this swings widely night to night)
+- GETs per night: roughly 120 × 3 jobs, plus retries — **about 1,080 calls**
+- Detection lag after completion: 30 seconds on average, 60 seconds worst case
+
+The GETs themselves cost next to nothing. The real cost is owning one more always-running component: a cron entry and a polling script. I have been burned before — an unhandled exception once killed the watcher silently while the jobs themselves succeeded. Results sat there, uningested, all morning. That hollow feeling stays with you.
+
+## Static or dynamic — deciding where events land
+
+Gemini API webhooks come in two flavors, and getting this decision wrong means a rebuild later, so it deserves care.
+
+**Static webhooks** are project-level. Register an endpoint once with `webhooks.create` and every subscribed event in the project (`batch.succeeded`, `batch.failed`, and so on) arrives there. Signatures use a symmetric signing secret (HMAC).
+
+**Dynamic webhooks** are per-job. Pass a `webhook_config` when calling `batches.create` and only that job's notifications go to the given URI. Signatures are asymmetric via JWKS, and you can attach routing hints in `user_metadata`.
+
+My setup settled into two rules.
+
+1. **Recurring nightly batches → static.** The endpoint is fixed and feeds shared post-processing — database updates, a Slack ping — common to every job
+2. **Ad-hoc and experimental jobs → dynamic.** I tag them with `user_metadata` like `{"job_group": "experiment"}` and point them at a separate endpoint so they never leak into production post-processing
+
+Resisting the inverse matters. If you keep widening the static subscription to absorb one-off jobs, the receiver's branching logic grows without bound.
+
+## Registering the static webhook
+
+Registration is a few lines — with one irreversible detail.
+
+```python
+from google import genai
+
+client = genai.Client()
+
+webhook = client.webhooks.create(
+    name="NightlyBatchWebhook",
+    subscribed_events=["batch.succeeded", "batch.failed", "batch.expired"],
+    uri="https://my-api.example.com/gemini-callback",
+)
+
+# The signing secret is returned only in this response
+print(webhook.new_signing_secret)
+```
+
+`new_signing_secret` is returned **exactly once, at creation time**. I failed to save it on my first attempt and had to call `rotate_signing_secret`. Rotation lets you choose between revoking old secrets immediately or after a 24-hour grace period; in production, `REVOKE_PREVIOUS_SECRETS_AFTER_H24` gives you a safe overlap window.
+
+Subscribing to `batch.expired` is deliberate. The Batch API expires jobs that aren't processed within 24 hours, and in the polling era I often didn't notice until the next morning. Having expiry arrive through the same pipe as success — just another kind of completion — is a real operational win.
+
+## The receiver — don't skip signature verification
+
+I wrote the receiver in Flask. Gemini webhooks follow the [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks) specification, so verification can be delegated to the `standardwebhooks` library.
+
+```python
+# pip install flask standardwebhooks
+import os
+import queue
+import threading
+from flask import Flask, request, jsonify
+from standardwebhooks.webhooks import Webhook, WebhookVerificationError
+
+app = Flask(__name__)
+SIGNING_SECRET = os.environ["WEBHOOK_SIGNING_SECRET"]
+
+# Push heavy work to a worker thread; respond immediately
+work_queue: "queue.Queue[dict]" = queue.Queue()
+seen_ids: set[str] = set()  # webhook-id dedup (use a TTL store in production)
+
+@app.route("/gemini-callback", methods=["POST"])
+def gemini_callback():
+    payload = request.get_data(as_text=True)
+    try:
+        wh = Webhook(SIGNING_SECRET)
+        event = wh.verify(payload, request.headers)
+    except WebhookVerificationError:
+        return jsonify({"error": "invalid signature"}), 400
+
+    delivery_id = request.headers.get("webhook-id", "")
+    if delivery_id in seen_ids:
+        return jsonify({"status": "duplicate"}), 200
+    seen_ids.add(delivery_id)
+
+    work_queue.put(event)  # parsing and downloads happen in the worker
+    return jsonify({"status": "received"}), 200
+
+def worker():
+    while True:
+        event = work_queue.get()
+        if event.get("type") == "batch.succeeded":
+            uri = event["data"]["output_file_uri"]
+            download_and_ingest(uri)  # fetch and ingest the results file
+        elif event.get("type") in ("batch.failed", "batch.expired"):
+            notify_failure(event["data"])
+
+threading.Thread(target=worker, daemon=True).start()
+```
+
+Three operational requirements are baked into this code.
+
+1. **Verify the signature first.** The `webhook-signature`, `webhook-id`, and `webhook-timestamp` headers are checked together by `standardwebhooks`. Deliveries with timestamps older than 5 minutes are rejected as potential replays
+2. **Return 2xx immediately.** A slow response pushes Gemini into its retry cycle. Never do heavy work inside the handler
+3. **Deduplicate on webhook-id.** Delivery is at-least-once. Assume every notification can arrive twice and keep ingestion idempotent
+
+## Things the documentation doesn't tell you
+
+What follows comes from roughly three weeks of running this in production.
+
+**The payload is thin.** A notification carries `output_file_uri` and counts — not the results themselves. Going event-driven removes the polling loop and nothing else; all the code that fetches and parses results stays. Budgeting for that from the start keeps the design honest.
+
+**Local development is quietly painful.** To test with real signatures, the most reliable path was tunneling into my dev machine (cloudflared or similar) and receiving live events. Registering a second static webhook pointed at the dev environment beat hand-forging signature headers every time.
+
+**I kept a fallback poll.** At-least-once delivery doesn't cover your receiver being down or DNS misbehaving. My insurance: if no notification has arrived 6 hours after submission, do a single GET. Worst case that's 3 calls a night instead of 1,080 — an acceptable premium.
+
+For the broader question of surviving API outages, I've written separately about [keeping a nightly batch alive through a Gemini API outage](/articles/gemini-api/gemini-api-outage-resilient-nightly-batch).
+
+## The migration checklist
+
+The order I actually followed. The point is the overlap period — never cut over in one move.
+
+1. Implement the receiver and test the three essentials: signature verification, deduplication, immediate 2xx
+2. Register the static webhook for `batch.succeeded` / `batch.failed` / `batch.expired` and store the secret in environment variables
+3. Run webhooks **in parallel with polling** for one week, cross-checking that both detect the same completions
+4. Relax the polling interval from 60 seconds to the 6-hour insurance level
+5. Only after the overlap log shows zero misses, delete the cron watcher
+
+During the overlap, one notification arrived while my receiver was mid-restart. Gemini's exponential backoff retried for up to 24 hours, so nothing was lost — but that night is what convinced me to keep the fallback poll permanently.
+
+## Results, measured
+
+- Status-check GETs: ~1,080/night → **0 in normal operation** (at most 3 from the fallback)
+- Lag from completion to ingestion start: ~30 seconds average → **a few seconds**
+- Monitoring code: ~180 lines → ~110 lines (the polling loop and backoff control simply vanished)
+- Silent watcher deaths: zero across three weeks of parallel running
+
+The number that matters least is the one I feel most: I no longer reason about whether a cron process is alive. If the event doesn't come, the insurance catches it. A simpler structure sleeps better at night — and so do I.
+
+## A first step
+
+Start small: attach a dynamic webhook to a single ad-hoc job and route it with `user_metadata`. Static registration affects the whole project, so there is no harm in building intuition on a throwaway job first.
+
+If you run nightly batches of your own, I hope this record saves you an early morning or two.
