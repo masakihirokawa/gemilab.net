@@ -1,0 +1,170 @@
+---
+title: "Gemini Interactions API: Fixing What Broke When the Legacy outputs Schema Was Removed on June 6"
+slug: "gemini-interactions-api-outputs-to-steps-migration-fix"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-06-12T10:15"
+author: "Gemini Lab"
+description: "Google removed the Gemini Interactions API legacy outputs schema on June 6, 2026. A symptom-based walkthrough of migrating to steps and the new response_format."
+tags: ["gemini-api", "interactions-api", "breaking-changes", "migration", "steps-schema", "response-format"]
+---
+
+On June 6, the legacy response schema of the Gemini Interactions API — the one that returned an `outputs` array — was removed for good. Through May you could pin the old behavior with an `Api-Revision` header, but that header is now ignored. There is no longer a "roll back and think about it later" option: code that broke can only be fixed by moving forward to the new `steps` schema.
+
+I went through this migration in late May, in between shipping updates for four of my iOS wallpaper apps. The tool I migrated is a small personal utility that summarizes App Store reviews every morning and posts them to Slack — less than a hundred lines of code. Even at that size, I hit two moments of "I changed exactly what the docs said, so why is the final output empty?" As an indie developer I have accumulated a pile of small automations that fall into the "it works, don't touch it" category, and I suspect many of those only got noticed when this removal deadline arrived and quietly broke them.
+
+So rather than restating the documentation, I have organized the migration the way I actually debugged it: by failure symptom. We will walk through unary calls, streaming, structured output, and client-managed conversation history, with before-and-after code for each.
+
+## What changed, in three stages
+
+According to the [official migration guide (Interactions API: Breaking changes migration guide)](https://ai.google.dev/gemini-api/docs/interactions-breaking-changes-may-2026), the cutover happened in three phases.
+
+- **May 6 (opt-in)**: New SDK releases supporting the new schema became available, and REST users could opt in by sending the `Api-Revision: 2026-05-20` header
+- **May 20 (default flip)**: Requests without the header started receiving the new schema. Sending `Api-Revision: 2026-05-06` temporarily restored the legacy shape
+- **June 6 (sunset)**: The legacy schema was removed entirely, and the `Api-Revision` header is now ignored
+
+Two pillars of the change matter for your code. First, the flat `outputs` array was replaced by a `steps` array whose entries carry type discriminators. Second, `response_mime_type` was removed, and all output format controls were consolidated into a polymorphic `response_format` field.
+
+One thing that genuinely confused me while reading the guide: the body text says upgrading to Python ≥1.76.0 / JavaScript ≥1.53.0 opts you into the new schema automatically, while the timeline table refers to new major versions (Python ≥2.0.0 / JS ≥2.0.0). The version requirements are stated inconsistently on the same page. I decided not to overthink it and jumped straight to the latest stable release. Once your reading code assumes the new shape, the safest setup is an SDK version that can only return that shape — mixing eras is where the subtle bugs live.
+
+The guide also notes that features shipped after May 7 only ever appear in `steps` responses, so staying on the legacy schema had stopped paying off well before the deadline. This episode reinforced a habit I wrote about in [Stopping Config Drift in the Gemini API — Detecting Environment Differences by Codifying Model IDs and Safety Settings](/articles/gemini-api/gemini-api-config-drift-detection-as-code-production): pin deliberate choices like API revisions in code, so removals like this surface as a diff instead of a surprise.
+
+## Triage by symptom — the silent empty output is worse than the crash
+
+How your code fails tells you where to fix it. I saw three distinct failure modes.
+
+- **Unary calls raise**: In Python you get `AttributeError: 'Interaction' object has no attribute 'outputs'`; with raw REST, the response JSON simply has no `outputs` key. This is the easy case — it fails loudly
+- **Streaming goes quiet**: Event names changed from `content.delta` to `step.delta`, so handlers filtering on the old names match nothing and pass through silently. On top of that, the discriminator field itself was renamed from `event_type` to `type`, so old checks miss twice. In batch pipelines this shows up as jobs that "succeed" while producing empty artifacts. My review summarizer hit exactly this in staging — I only noticed when three days of empty Slack digests had piled up
+- **Client-managed history gets rejected**: Code that re-sends the previous turn's `outputs` array in the next `input` either sends an empty history (the key no longer exists) or gets a 400 for a shape mismatch
+
+The quiet failures are operationally nastier than the crashes. If you are debugging empty responses in general, note that there is an unrelated cause with similar symptoms, which I covered in [Why Gemini 2.5/3 Returns an Empty Body with finish_reason MAX_TOKENS — and How to Fix It](/articles/gemini-api/gemini-thinking-model-empty-output-max-tokens-budget-fix) — worth ruling out while you are in there.
+
+## The core rewrite — from outputs[0].text to the model_output step
+
+Here is the minimal unary fix. The legacy read looked like this:
+
+```python
+# Before: the legacy read that worked until June 5
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+interaction = client.interactions.create(
+    model="gemini-3-flash-preview",
+    input="Summarize this app review in one line: ...",
+)
+
+print(interaction.outputs[0].text)  # June 6 onward: AttributeError
+```
+
+In the new schema the response is a `steps` array where thoughts, tool calls, and model output appear as a structured timeline.
+
+```python
+# After: reading the new steps schema
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+interaction = client.interactions.create(
+    model="gemini-3-flash-preview",
+    input="Summarize this app review in one line: ...",
+)
+
+# steps can mix thought / function_call / model_output entries.
+# If you just want the text, filtering on model_output is the safe read.
+final_text = ""
+for step in interaction.steps:
+    if step.type == "model_output":
+        final_text = step.content[0].text
+
+print(final_text)
+# Expected output (example):
+# One-star reviews center on a white screen in dark mode; two users ask for a fix.
+```
+
+The official samples read `interaction.steps[-1].content[0].text`, but I settled on filtering by `step.type == "model_output"` for two reasons. First, when thinking is included in responses, a `thought` step can sit at the front of the array, so `steps[0]` grabs something that is not your answer — this is where I tripped first. Second, with function calling, an interaction in `requires_action` status ends with a `function_call` step, so even the last element is not guaranteed to be text.
+
+There is one more subtle asymmetry worth knowing. `POST /interactions` returns only the output steps, but `GET /interactions/{id}` returns the full timeline including the initial `user_input` step. Index-based code can work right after the POST and then be off by one when re-fetching. Filtering by type makes the same code correct for both responses.
+
+## Streaming: a full event-name swap
+
+The streaming migration is mechanical once you see the mapping.
+
+- `interaction.start` → `interaction.created`
+- `content.start` → `step.start`
+- `content.delta` → `step.delta`
+- `content.stop` → `step.stop`
+- `interaction.complete` → `interaction.status_update` (with `status: "completed"`)
+- `error` → `interaction.status_update` (with `status: "error"`)
+
+Remember the discriminator field is now `type`, not `event_type`. The minimal rewritten consumer looks like this:
+
+```python
+# After: consuming the new streaming events
+for event in client.interactions.create(
+    model="gemini-3-flash-preview",
+    input="Explain last night's crash report trends in three lines.",
+    stream=True,
+):
+    # Legacy check was: chunk.event_type == "content.delta"
+    if event.type == "step.delta":
+        if event.delta.type == "text":
+            print(event.delta.text, end="", flush=True)
+```
+
+If you stream function calls, there is an extra change: the `step.start` event carries the function name, and the arguments arrive across `step.delta` events as partial JSON strings in `arguments_delta`, which you must accumulate before parsing. Unary calls hand you the complete `function_call` object at once, so this difference is easy to miss — it is mentioned in the guide, but quietly.
+
+One caution about stream termination. The guide's deprecation list says `interaction.complete` is replaced by `interaction.status_update`, yet the new-schema SSE example on the same page still ends with an `interaction.complete` event. While the documentation disagrees with itself, I would not couple your shutdown logic to a single event name. My handler closes the stream on either signal and logs which one fired, so I can tighten it later once the behavior settles.
+
+## response_mime_type is gone — structured output moves into response_format
+
+If you use structured output (JSON mode), the request side needs rewriting too.
+
+```python
+# Before: response_mime_type plus a bare JSON schema
+interaction = client.interactions.create(
+    model="gemini-3-flash-preview",
+    input="Classify this review: Crashes right after launch. One star.",
+    response_mime_type="application/json",
+    response_format={
+        "type": "object",
+        "properties": {"sentiment": {"type": "string"}},
+    },
+)
+```
+
+```python
+# After: a discriminated response_format that wraps mime_type and schema
+interaction = client.interactions.create(
+    model="gemini-3-flash-preview",
+    input="Classify this review: Crashes right after launch. One star.",
+    response_format={
+        "type": "text",
+        "mime_type": "application/json",
+        "schema": {
+            "type": "object",
+            "properties": {"sentiment": {"type": "string"}},
+        },
+    },
+)
+
+print(interaction.steps[-1].content[0].text)
+# Expected output (example): {"sentiment": "negative"}
+```
+
+The catch: the JSON schema you used to pass directly as `response_format` now nests one level deeper under a `schema` key. A mechanical rename will not save you here. Image settings made the same move — `image_config` (aspect ratio, size) left `generation_config` and now lives in a `response_format` entry with `"type": "image"`. To request multiple modalities at once, pass an array of format entries instead of a single object.
+
+## Client-managed history, and three details that are easy to miss
+
+Finally, three smaller items I almost forgot to fix.
+
+- **History plumbing**: In stateless setups, you used to collect `outputs` from each response and feed it back as the next `input`. Now you pass the `steps` array through and append your new user turn as a `user_input` step
+- **Annotation format**: Citations on text now come as discriminated `url_citation` entries with a `title` field. If you render grounded citations yourself, the rendering code needs updating along with the parsing
+- **Search result field rename**: A `google_search_result` step exposes its payload under `result.search_suggestions` rather than `result.rendered_content`. If you persist grounding results to a database, the schema mismatch will accumulate quietly until you fix the writer
+
+Rather than fixing everything in one pass, working through whichever path was actually failing proved more reliable for me. And if you are migrating model generations at the same time (3.1 to 3.2, say), I would keep the schema migration and the model migration in separate commits — the production checkpoints in [Gemini 3.2 API Implementation Guide — Correct Model IDs, Migrating from 3.1, and Production Checkpoints](/articles/gemini-api/gemini-3-2-api-developer-guide) pair well with that split, and reverting one without the other stays possible.
+
+## Where to start — inventory .outputs before you edit anything
+
+The single next step I would recommend: before changing a line, run `grep -rn "\.outputs" --include="*.py"` across your repository (for JavaScript, search both `.outputs` and `content.delta`), and list every hit. Then sort each file into one of the three symptom buckets from this article — crashing unary reads, silently empty streams, and rejected history payloads — and fix them in that order. For small tools the rewrite took me about thirty minutes each. Having grown a collection of these operational scripts since 2014, I keep relearning the same lesson: the cheapest time to do the inventory is the same day you notice the breakage. If your June 6 surprise was a stack of quietly empty outputs, I hope this saves you the three days of blank Slack digests it cost me.
