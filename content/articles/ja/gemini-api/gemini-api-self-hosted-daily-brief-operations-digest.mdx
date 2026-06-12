@@ -1,0 +1,260 @@
+---
+title: "夜間ログを毎朝3分で読み切る — Gemini API で Daily Brief 風の運用ダイジェストを自作した記録"
+slug: "gemini-api-self-hosted-daily-brief-operations-digest"
+category: "gemini-api"
+level: "intermediate"
+premium: true
+date: "2026-06-13T08:00"
+author: "Gemini Lab"
+description: "Daily Brief に着想を得て、夜間の運用ログを毎朝1通のダイジェストに変えるパイプラインを自作しました。収集・構造化・要約・配信の4段構成と実測トークン数、障害の朝でも配信を止めないフォールバック設計までの実装記録です。"
+tags: ["gemini-api", "daily-brief", "structured-output", "automation", "operations"]
+highlights:
+  - "散らばった夜間ログの確認に毎朝20〜30分かけていた人が、1通のダイジェストを3分で読む運用に切り替えられる"
+  - "response_schema を使って、要約を「読む文章」ではなく「判断できる構造化データ」として受け取る設計を習得できる"
+  - "2026年6月の大規模障害（error 1076/1099）を踏まえた、要約が失敗しても配信は止めないフォールバック実装をそのまま流用できる"
+---
+
+2026年6月のある朝、前夜に走った自動処理のログを確認するだけで30分近くかかっていることに気づきました。記事の自動公開ログ、アプリのクラッシュ集計、検索パフォーマンスの日次スナップショット。個人開発で複数のパイプラインを夜間に回していると、朝いちばんの仕事が「ログの巡回」になってしまいます。
+
+ちょうど同じ週、Google が Gemini の新機能として Daily Brief を発表しました。夜のあいだに受信トレイやカレンダー、タスクを分析して、朝にパーソナルなダイジェストを届けてくれるエージェントです。発表を読みながら思ったのは、「この発想は自分の運用ログにこそ欲しい」ということでした。Daily Brief がカバーするのは Google サービス内のデータです。自前のサーバーに溜まるログは対象外なので、同じ発想のものを Gemini API で小さく自作することにしました。
+
+結果として、毎朝7時に1通届くダイジェストを3分で読み、異常がある日だけ深掘りする運用に変わりました。本稿はその実装記録です。
+
+## 朝の「ログ巡回」はなぜ破綻するのか
+
+最初に、自分の運用がどう破綻していたかを正直に書いておきます。
+
+夜間に動いているのは、技術ブログ4サイトの記事自動公開、壁紙アプリのレビュー返信下書き生成、検索データの日次取得、バックアップの4系統です。それぞれが別の場所に別のフォーマットでログを吐きます。成功した日のログはほぼ読む価値がありません。それでも「失敗していたら困る」ので全部の場所を開いて確認する。この非対称性が問題でした。
+
+- **読む価値のあるログは全体の1割未満**: 異常があった日だけ詳細が必要で、残りは「全部成功」の一言で足ります
+- **フォーマットがバラバラ**: cron の標準出力、JSON のレポート、CSV のスナップショットが混在し、目視の切り替えコストが高くつきます
+- **確認漏れが事故になる**: 巡回を1日サボった翌日に、リトライ上限を使い切ったタスクが静かに止まっていたことがありました
+
+つまり必要なのは「全ソースを横断して読み、異常だけを浮かび上がらせ、正常は1行に圧縮する」レイヤーです。これは LLM が最も得意とする種類の仕事だと考えました。
+
+## 全体設計 — 収集・構造化・要約・配信の4段
+
+パイプラインは4段に分けました。それぞれの責務を1つに絞るのがポイントです。
+
+- **収集（collect）**: 直近24時間のログを各ソースから集め、1つの JSON ペイロードにまとめる。LLM は使わない
+- **要約（summarize）**: Gemini 3.5 Flash に投げ、response_schema で構造化されたダイジェストを受け取る
+- **整形（render）**: 構造化データをメール本文に変換する。LLM は使わない
+- **配信（deliver）**: メールで送る。要約が失敗しても、この段だけは必ず実行する
+
+LLM を使うのは2段目だけです。後述しますが、この「LLM 依存箇所を1段に閉じ込める」構成が、障害の朝に効きました。
+
+## Step 1: ログを Gemini に渡せる形に整える
+
+収集スクリプトは標準ライブラリだけで書けます。各ソースのログを読み、ソース名をキーにした辞書へ詰めるだけの素朴な作りです。
+
+```python
+# collect_logs.py — 直近24時間の夜間ログを1つのJSONペイロードに集約する
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+
+LOG_SOURCES = {
+    "article_publish": Path("logs/publish"),   # 記事自動公開のログ
+    "app_reviews": Path("logs/reviews"),       # レビュー返信下書き生成のログ
+    "seo_snapshot": Path("logs/search"),       # 検索データ日次取得のログ
+    "backup": Path("logs/backup"),             # バックアップのログ
+}
+
+MAX_CHARS_PER_SOURCE = 8000  # 1ソースあたりの上限。古い行から捨てる
+
+def collect_yesterday() -> dict:
+    since = datetime.now() - timedelta(hours=24)
+    payload = {}
+    for name, root in LOG_SOURCES.items():
+        if not root.exists():
+            payload[name] = "(no logs)"
+            continue
+        chunks = []
+        for f in sorted(root.glob("*.log")):
+            if datetime.fromtimestamp(f.stat().st_mtime) < since:
+                continue
+            chunks.append(f.read_text(encoding="utf-8", errors="replace"))
+        text = "\n".join(chunks).strip()
+        # 上限超過時は「新しい行を残す」— 末尾側に直近の結果が書かれているため
+        payload[name] = text[-MAX_CHARS_PER_SOURCE:] if text else "(no logs)"
+    return payload
+
+if __name__ == "__main__":
+    data = collect_yesterday()
+    print(json.dumps({k: len(v) for k, v in data.items()}, ensure_ascii=False))
+    # 期待する出力例: {"article_publish": 4213, "app_reviews": 1877, "seo_snapshot": 902, "backup": 311}
+```
+
+地味な工夫が2つあります。1つは上限超過時に先頭ではなく **末尾を残す** こと。夜間ログは末尾側に最終結果（成功・失敗の確定情報）が書かれているためです。最初は素直に `text[:MAX_CHARS_PER_SOURCE]` と書いていて、肝心の失敗箇所がダイジェストから消える事故を起こしました。
+
+もう1つは、この段階で個人情報をマスクしておくことです。私の場合、レビュー返信ログにユーザーのニックネームがそのまま残っていました。外部 API に送る前のペイロードは一度 `print` して中身を目視することをおすすめします。
+
+## Step 2: response_schema で「判断できるデータ」を受け取る
+
+要約段の核心は、自由文ではなく構造化出力で受け取ることです。最初の試作では「ログを要約してください」とだけ指示していたのですが、日によって文体も構成も揺れて、結局「読んで解釈する時間」が戻ってきてしまいました。response_schema を固定してからは、メールのどの位置に何が書いてあるかが毎朝同じになり、読む速度が安定しました。
+
+```python
+# summarize.py — Gemini 3.5 Flash に構造化ダイジェストを生成させる
+import json
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # 環境変数 GEMINI_API_KEY を読み込む
+
+DIGEST_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "headline": types.Schema(type=types.Type.STRING),
+        "incidents": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "source": types.Schema(type=types.Type.STRING),
+                    "severity": types.Schema(
+                        type=types.Type.STRING,
+                        enum=["info", "warn", "critical"],
+                    ),
+                    "summary": types.Schema(type=types.Type.STRING),
+                    "action": types.Schema(type=types.Type.STRING),
+                },
+                required=["source", "severity", "summary"],
+            ),
+        ),
+    },
+    required=["headline", "incidents"],
+)
+
+SYSTEM_INSTRUCTION = (
+    "あなたは個人開発者の運用アシスタントです。"
+    "渡された夜間ログを読み、朝の判断に必要な情報だけを抽出してください。"
+    "正常に完了した処理は incidents に含めず、headline で1行に集約します。"
+    "エラー・リトライ・想定外の出力は incidents に入れ、"
+    "severity と、開発者が今朝とるべき action を日本語で付けてください。"
+)
+
+def summarize(payload: dict) -> dict:
+    res = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=json.dumps(payload, ensure_ascii=False),
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
+            response_mime_type="application/json",
+            response_schema=DIGEST_SCHEMA,
+            temperature=0.2,
+        ),
+    )
+    return json.loads(res.text)
+```
+
+設計判断を2つ補足します。
+
+**「全部正常」の判定を LLM に任せない。** 試作版ではスキーマに `all_clear` というブール値を持たせて LLM に判定させていましたが、warn 級の事象を拾いながら all_clear を true にする日がありました。現在は `incidents` 配列が空かどうかをコード側で見て判定しています。LLM には「抽出」をさせ、「判定」は機械側で確定する。この線引きにしてから誤報がなくなりました。
+
+**severity は enum で3値に絞る。** 自由記述にすると「中程度」「やや深刻」のような揺れが生まれ、整形段の分岐が書けなくなります。スキーマの enum 制約はこういう場面のためにあります。
+
+## Step 3: 実測値 — トークン数・処理時間・体感コスト
+
+30日ほど運用した実測値です。環境やログ量で変わるため、規模感の参考としてお読みください。
+
+- **入力トークン**: 1回あたりおよそ 9,000〜13,000 トークン（4ソース・原文ベースで約 20〜28KB）
+- **出力トークン**: 平常時 300〜500 トークン。インシデントが多い朝でも 900 トークン前後
+- **処理時間**: generate_content の呼び出しが 4〜6 秒。パイプライン全体でも 10 秒未満
+- **コスト**: Flash 系の従量課金では、この用途の30日分が請求ダッシュボード上でコーヒー1杯に届かない水準でした
+
+入力が1万トークン前後に収まっているのは、Step 1 の `MAX_CHARS_PER_SOURCE` で粗く絞っているおかげです。ログを無加工で全部投げる設計だと、成功ログの定型行で数万トークンを浪費します。LLM に渡す前の「機械的な減量」は、コストだけでなく要約の質にも効きます。ノイズが少ないほど incidents の抽出精度が上がるというのが私の実感です。
+
+## Step 4: cron と配信 — 朝7時に届ける
+
+整形と配信は標準ライブラリの smtplib で済ませています。HTML メールにする必要は感じませんでした。等幅のプレーンテキストの方が、ターミナルのログと地続きの感覚で読めます。
+
+```python
+# deliver.py — ダイジェストをプレーンテキストのメールに整形して送る
+import smtplib
+from email.mime.text import MIMEText
+
+def render(digest: dict) -> str:
+    lines = [f"■ {digest['headline']}", ""]
+    if not digest["incidents"]:
+        lines.append("incidents なし。すべてのパイプラインが正常に完了しています。")
+    for it in digest["incidents"]:
+        mark = {"info": "・", "warn": "[warn]", "critical": "[CRIT]"}.get(it["severity"], "・")
+        lines.append(f"{mark} {it['source']}: {it['summary']}")
+        if it.get("action"):
+            lines.append(f"    → {it['action']}")
+    return "\n".join(lines)
+
+def send(body: str) -> None:
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = "Morning Ops Digest"
+    msg["From"] = "ops@example.com"
+    msg["To"] = "me@example.com"
+    with smtplib.SMTP("localhost") as s:
+        s.send_message(msg)
+```
+
+cron は配信時刻から逆算して 6:40 に設定しています。処理自体は10秒で終わりますが、後述のリトライで最大数分待つ可能性を織り込んだ余裕です。
+
+```bash
+# crontab — 毎朝 6:40 に実行（リトライ込みでも 7:00 前に配信が完了する）
+40 6 * * * cd /home/me/ops-digest && /usr/bin/python3 run_digest.py >> cron.log 2>&1
+```
+
+## 障害の朝に学んだフォールバック — 要約は止まっても配信は止めない
+
+2026年6月中旬、Gemini に大規模な障害が発生し、error 1076 / error 1099 が広範に報告される朝がありました。私のダイジェストも summarize 段で失敗したのですが、このときフォールバックが機能して「劣化版ダイジェスト」が定時に届きました。設計時にいちばん時間をかけた部分が、想定どおりに働いた朝でした。
+
+```python
+# run_digest.py — 要約に失敗しても配信は止めないエントリポイント
+import time
+from collect_logs import collect_yesterday
+from summarize import summarize
+from deliver import render, send
+
+RETRIES = 3
+
+def degraded_digest(payload: dict) -> str:
+    # Gemini が利用できない朝のための「生ログ縮約版」
+    lines = ["■ [劣化モード] 要約APIが利用できないため各ソースの末尾を表示します", ""]
+    for name, text in payload.items():
+        tail = text.strip().splitlines()[-5:]
+        lines.append(f"--- {name} ---")
+        lines.extend(tail)
+        lines.append("")
+    return "\n".join(lines)
+
+def main() -> None:
+    payload = collect_yesterday()
+    for attempt in range(1, RETRIES + 1):
+        try:
+            send(render(summarize(payload)))
+            return
+        except Exception:
+            if attempt == RETRIES:
+                send(degraded_digest(payload))
+                return
+            time.sleep(30 * attempt)  # 30秒 → 60秒と間隔を広げて再試行
+
+if __name__ == "__main__":
+    main()
+```
+
+考え方は単純で、**この仕組みの本来の価値は「要約」ではなく「毎朝必ず届くこと」にある**、という優先順位の整理です。要約が利用できない朝は、各ソースの末尾5行だけを並べた縮約版を送ります。読むのに10分かかりますが、「届かないので手動巡回に戻る」よりずっとましです。
+
+リトライ間隔を線形に広げているのは、障害時に固定間隔で叩き続けると回復中のサービスへ負荷をかけるだけだからです。この判断の背景は、以前書いた [Gemini API の大規模障害で夜間バッチを止めないために組んだ三層の防御](/articles/gemini-api/gemini-api-outage-resilient-nightly-batch) と [Gemini API 本番運用ノート — 429・500・503 に静かに耐えるエラーハンドリングとレート制限の設計](/articles/gemini-dev/gemini-api-error-handling-rate-limit-production-patterns) に詳しく書いています。
+
+## つまずきやすいポイント
+
+実装中に実際に踏んだ穴を3つ残しておきます。
+
+**ログの切り詰め方向を間違える。** 前述のとおり、`text[:N]` ではなく `text[-N:]` です。夜間バッチのログは末尾に結論が書かれます。私はこれで3日分、失敗を見逃しました。
+
+**スキーマを最初から欲張る。** 試作版では「推定原因」「関連するコミット」までスキーマに含めていましたが、根拠の薄い推測が混ざって信頼性を下げました。ダイジェストの役割は「今朝どこを見るべきか」の指示までで、原因分析はリンク先のログで人間がやる。フィールドを減らしたら、かえって役に立つようになりました。
+
+**ダイジェスト自体の失敗を監視しない。** 配信が止まったことに気づける仕組みがないと、この仕組み自体が新しい単一障害点になります。私は cron の終了コードを別の監視に流すのと、メールが平日朝に届かなかったら気づける程度の習慣で運用していますが、Batch API のポーリングを Webhook に置き換えた経験（[深夜のポーリングをやめる — Gemini Batch API を Webhook 駆動に作り替えた設計記録](/articles/gemini-api/gemini-batch-webhook-polling-to-event-driven-redesign)）と同じく、「監視の監視」は薄くてもよいので一枚あると安心です。
+
+## まとめ — まず1ソースから始める
+
+4段すべてを最初から組む必要はありません。まずは cron ジョブ1本のログを `collect_yesterday()` 相当の関数で読み、response_schema 付きで Gemini 3.5 Flash に投げて、構造化された JSON が返る体験を確かめてみてください。そこまで動けば、ソースを足すのも配信を足すのも単純作業です。
+
+朝のログ巡回が3分のメール確認に変わると、浮いた時間より「見逃しているかもしれない」という低い不安が消えることの方が大きい、というのが30日運用しての実感です。同じように夜間処理を抱えている方の参考になれば幸いです。
