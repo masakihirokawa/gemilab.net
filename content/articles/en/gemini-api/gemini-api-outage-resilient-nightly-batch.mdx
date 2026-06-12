@@ -1,0 +1,119 @@
+---
+title: "Designing a Nightly Batch That Survives a Gemini API Outage — Three Layers of Defense"
+slug: "gemini-api-outage-resilient-nightly-batch"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-06-12T01:50"
+author: "Gemini Lab"
+description: "This week's widespread Gemini outage cost my nightly batch three hours of work. Here is how I rebuilt it with three layers of defense: classified retries, a model fallback chain, graceful degradation, plus idempotency keys and a catch-up queue."
+tags: ["Gemini API", "reliability", "retry", "fallback", "batch processing"]
+---
+
+This week's widespread Gemini API outage caught my nightly aggregation batch mid-run, and it dropped three hours of work. Unfamiliar error numbers kept coming back, every retry failed in exactly the same way, and one look at the dashboard the next morning told me this was the kind of incident nothing on my side could fix. But that was not the real problem. The real problem surfaced after recovery: I had no safe way to replay the three hours of items the batch had dropped.
+
+The damage turned out to be minor. Still, an indie developer's services keep running while their only operator sleeps, and that asymmetry deserves more respect than I had given it. I spent the aftermath rebuilding the batch around three layers of defense, and this is a record of the design decisions and the code. The examples use Node.js with the official SDK, but the ideas carry over to any stack.
+
+## Start by sorting failures into four kinds
+
+Before writing any recovery code, I classified what "failure" actually means here. Feeding everything into one retry loop is the most dangerous default.
+
+- **Transient failures**: 429 rate limits, 503s, and wide outages like this week's. Time genuinely heals these
+- **Permanent failures**: 400-class input errors and auth problems. Resending changes nothing
+- **Network-layer failures**: timeouts and dropped connections. The nasty part is not knowing whether the request arrived
+- **Quality failures**: a clean 200 status wrapping output too broken for the next stage to use
+
+The point of the taxonomy: only the first and third kinds deserve mechanical retries. Resending a 400 burns quota for nothing, and retrying a quality failure through the same network-style loop mostly hands you the same broken output again. Quality failures want a retry with changed conditions — lower temperature, a reworded prompt — which is a different mechanism entirely.
+
+## Layer one: retry only what deserves retrying
+
+Once the classification exists, the retry logic stays short.
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+type FailureKind = "transient" | "permanent" | "network";
+
+function classifyError(err: unknown): FailureKind {
+  const status = (err as { status?: number }).status;
+  if (status === 429 || (status !== undefined && status >= 500)) return "transient";
+  if (status !== undefined && status >= 400) return "permanent";
+  return "network"; // timeouts and fetch failures carry no status
+}
+
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (classifyError(err) === "permanent") throw err; // resending will not help
+      const base = 1000 * 2 ** attempt;
+      const jitter = Math.random() * base * 0.5;
+      await new Promise((resolve) => setTimeout(resolve, base + jitter));
+    }
+  }
+  throw lastError;
+}
+```
+
+Two details matter more than the rest. Keep the jitter: if every client resends at the same instant the moment service recovers, the recovery itself triggers a second incident. And cap the attempts low — four is plenty. A regional outage lasts somewhere between thirty minutes and several hours, so fighting it in a hot loop is pointless. Park the work in a queue, walk away, and let the next scheduled run absorb it.
+
+## Layer two: a model fallback chain
+
+When retries cannot save a call, the next move is switching models. I run gemini-3.5-flash as the primary and drop to gemini-3.1-flash on failure.
+
+```typescript
+const MODEL_CHAIN = ["gemini-3.5-flash", "gemini-3.1-flash"];
+
+async function generateWithFallback(
+  prompt: string
+): Promise<{ text: string; degraded: boolean }> {
+  for (const [index, model] of MODEL_CHAIN.entries()) {
+    try {
+      const res = await withRetry(() =>
+        ai.models.generateContent({ model, contents: prompt })
+      );
+      return { text: res.text ?? "", degraded: index > 0 };
+    } catch {
+      // fall through to the next model in the chain
+    }
+  }
+  throw new Error("all models in chain failed");
+}
+```
+
+The discipline that makes this layer trustworthy is rehearsal. Discovering mid-outage that the fallback model's output fails your downstream parser is the worst possible timing, so once a month I deliberately disable the primary and run the chain end to end. The `degraded` flag in the result also narrows down which outputs deserve a quality check afterward.
+
+Honesty requires a caveat: during this week's incident there were stretches where the fallback model failed alongside the primary. Detouring within the same vendor helps far less when the shared infrastructure is what failed. That reality was harsher than my design assumed — and it is exactly why a third layer exists.
+
+## Layer three: graceful degradation — staying up beats being smart
+
+The last layer is making sure nothing breaks when AI is simply unavailable. In my batch, Gemini handles summarization and classification; the underlying data renders fine without either. So when the whole chain fails, the system now reuses the previous run's results and shows a small notice that the latest analysis is temporarily paused.
+
+The exercise that unlocked this layer was listing, feature by feature, what the screen needs to remain coherent when something is missing. Written out, the list of truly indispensable processing was shorter than I expected. In most places AI output is enrichment, not foundation — and an outage in a non-foundation layer should never take the whole service down with it. Obvious in hindsight; fuzzy in my head until I wrote it down.
+
+## Detecting the outage — where to set the alert threshold
+
+With the three layers in place, the remaining question was detection. Alerting on every single failure buries you in notifications from ordinary, scattered 503s, and alert fatigue guarantees you will skim past the one notification that matters. I know because I have done exactly that once before.
+
+I settled on a two-part trigger: five consecutive failures, or a failure rate above fifty percent within a five-minute window. Since switching to those thresholds, quiet days produce zero false alarms, and during this week's incident the alert arrived within minutes of the first errors.
+
+One more observation worth passing on: my own error-classification counters moved faster than the official status page. Status pages update on a delay; by the time they acknowledged the incident, my transient counter had been climbing for a while. So the monitoring now treats my own metrics as the primary signal and the status page as confirmation, not the other way around.
+
+## Without idempotency, retries become accidents
+
+Less glamorous than any of the three layers, and the real lesson of the week. I considered myself fluent in retry logic, yet I had postponed making the write side idempotent — and that order is backwards.
+
+A timed-out call is not necessarily an unsent call. It may have arrived, been processed, and lost only its response. So every write in the batch now carries an idempotency key — date plus item ID — and lands as an upsert. With that single change, "processed the same item twice and wrote it twice" becomes structurally impossible rather than merely unlikely. If you are adding retry machinery to a pipeline, make the writes idempotent first. The retries can wait a day; the duplicate writes cannot be unwritten.
+
+## Catch-up after recovery, and what actually mattered
+
+Recovery needs design too. My failure this time: the only record of dropped items lived inside the error log, and fishing work items back out of log lines is an experience I do not intend to repeat.
+
+In the rebuilt pipeline, failed items go into a pending_retry table, and every batch run begins by draining whatever is waiting there. After an outage, the next scheduled run becomes the catch-up run automatically — no dedicated recovery script, no manual morning surgery.
+
+Looking back, what actually carried the week was not sophisticated machinery but three plain things: a failure taxonomy, idempotency keys, and a leftover queue. If your nightly batch leans on the Gemini API, check one thing before the next incident arrives — where, exactly, a failed item gets recorded. If the answer is "in the logs," that is the first thing worth fixing, and your post-outage morning will thank you for it.
