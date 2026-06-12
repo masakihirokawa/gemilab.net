@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "OUTAGE — Geminiが過去最大級の障害（error 1076/1099）から回復へ。エンジニアリングチームの緩和策で影響は縮小中",
-    "DAILY-BRIEF — 新エージェント「Daily Brief」が登場。夜間にinbox・カレンダー・タスクを分析し、朝のパーソナルダイジェストを生成",
-    "GEMINI-OMNI — Geminiと生成メディアモデルを統合した動画AI「Gemini Omni」。プロンプトから一貫性のある高品質動画を生成",
-    "ENTERPRISE — Gemini Enterpriseで3.5 Flashが6/8からデフォルト固定に。機能管理トグルは廃止され全ユーザーで有効",
-    "DEPRECATION — 画像previewモデル（3.1-flash-image/3-pro-image）は6/25に停止。GA版への移行はお早めに",
-    "FILE-SEARCH — File Searchがマルチモーダル検索に対応。gemini-embedding-2で画像をネイティブに埋め込み・検索",
+    "CHROME — Gemini in ChromeがAndroidに6月下旬展開。Nano Bananaとauto browseを同梱し、RAM 4GB以上・en-USの端末から段階提供",
+    "OMNI-FLASH — Gemini Omni FlashがAI Plus/Pro/Ultraの全サブスクライバーへロールアウト。YouTube Shorts RemixとCreateでは18歳以上に無料開放",
+    "DEADLINE — 画像previewモデル（gemini-3.1-flash / 3-pro image-preview）の停止まで残り12日（6/25）。GA版への移行はお早めに",
+    "SCHEMA — Interactions APIの旧スキーマは6/8に削除済み。steps配列と新response_formatへの移行が完了しているか要確認です",
+    "FLASH-GA — Gemini 3.5 Flashが一般提供。Antigravity・Gemini API・AI Studio・Android Studioから利用できます",
+    "SUITE — Deep Think・Deep Research・Gemini Live・Gemini Omniが出揃い、「考える→調べる→話す→作る」が一つの流れに",
   ],
   en: [
-    "OUTAGE — Gemini recovers from one of its biggest outages (errors 1076/1099) as engineering mitigations take effect",
-    "DAILY-BRIEF — The new Daily Brief agent works overnight, analyzing your inbox, calendar, and tasks into a personalized morning digest",
-    "GEMINI-OMNI — Gemini Omni combines Gemini with Google's generative media models to produce consistent, high-quality video from a single prompt",
-    "ENTERPRISE — Gemini 3.5 Flash is enabled by default in Gemini Enterprise as of Jun 8 and can no longer be turned off",
-    "DEPRECATION — Image preview models (3.1-flash-image / 3-pro-image) shut down Jun 25; migrate to the GA versions now",
-    "FILE-SEARCH — File Search now supports multimodal search, natively embedding and searching images via gemini-embedding-2",
+    "CHROME — Gemini in Chrome lands on Android in late June with Nano Banana and auto browse, rolling out first to 4GB+ RAM devices set to en-US",
+    "OMNI-FLASH — Gemini Omni Flash rolls out to all AI Plus, Pro, and Ultra subscribers, and is free for adults in YouTube Shorts Remix and YouTube Create",
+    "DEADLINE — 12 days until the image preview models shut down on Jun 25 — migrate gemini-3.1-flash and 3-pro image-preview workloads to GA versions now",
+    "SCHEMA — The legacy Interactions API schema was removed on Jun 8; double-check your migration to the steps array and the new response_format",
+    "FLASH-GA — Gemini 3.5 Flash is generally available via Antigravity, the Gemini API, AI Studio, and Android Studio",
+    "SUITE — Deep Think, Deep Research, Gemini Live, and Gemini Omni now form one flow: reason, research, talk, and create",
   ],
 };
 
