@@ -131,6 +131,17 @@ const nextConfig: NextConfig = {
   async redirects() {
     return [
       ...buildAuditRedirects(),
+      // Slug rename (2026-06-12): de-templated slug for premium upgrade, old -guide slug 301s to new
+      {
+        source: "/articles/gemini-api/gemini-api-cost-optimization-complete-guide",
+        destination: "/articles/gemini-api/gemini-api-cost-cut-caching-model-routing-batch-record",
+        permanent: true,
+      },
+      {
+        source: "/:locale(ja|en)/articles/gemini-api/gemini-api-cost-optimization-complete-guide",
+        destination: "/:locale/articles/gemini-api/gemini-api-cost-cut-caching-model-routing-batch-record",
+        permanent: true,
+      },
       // Legacy/orphan URL surfaced in GSC (2026-04-25): non-existent article slug, redirect to closest match
       {
         source: "/articles/gemini-api/gemini-api-multimodal-guide",

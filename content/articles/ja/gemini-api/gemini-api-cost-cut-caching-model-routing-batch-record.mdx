@@ -1,0 +1,271 @@
+---
+title: "Gemini API の月額5万円を8,400円まで下げた運用設計 — キャッシュ・モデル使い分け・Batch API の組み合わせ方"
+slug: "gemini-api-cost-cut-caching-model-routing-batch-record"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-02T14:00"
+author: "Gemini Lab"
+description: "Gemini API の月額費用を52,000円から8,400円まで下げた実装と運用の記録です。暗黙・明示キャッシュの使い分け、Flash/Pro の自動ルーティング、Batch API への移行、usage_metadata による実測まで、本番で動かしているコードとともに整理します。"
+tags: ["Gemini API", "コスト削減", "Context Caching", "Batch API", "運用設計"]
+highlights:
+  - "暗黙キャッシュと明示キャッシュの使い分け基準。明示キャッシュが逆に高くつく境界条件の見極め方"
+  - "Flash と Pro を自動で使い分けるルーティング実装と、品質を落とさないための判定ルールの作り方"
+  - "Batch API への移行手順と、usage_metadata ベースで費用を実測するロギング実装のコード"
+---
+## 請求額を見て手が止まった4月のこと
+
+2026年4月、Gemini API の月次請求が 52,000円に達していました。
+
+個人開発で運営しているサイト群の記事生成補助、要約パイプライン、アプリ内コンテンツのメタデータ生成。一つひとつは小さな処理です。それが積み重なった結果の数字でした。
+
+売上に対して原価が重すぎる。そう判断して、2ヶ月かけて呼び出し設計を全面的に見直しました。結果として、同じ機能を維持したまま月額は 8,400円まで下がっています。
+
+この記事は、その過程で実際に効いた施策を、効いた順番とコードつきで記録したものです。なお、トークン単価は改定されることがあるため、最新の数字は [Gemini API の料金ページ](https://ai.google.dev/gemini-api/docs/pricing)で確認いただければと思います。本文では「何が何割安くなるか」という構造の方を中心に書きます。
+
+## どこで費用が膨らむのか — 請求を分解して見えた3つの偏り
+
+最初にやったのは、削減策を調べることではなく、自分の請求を分解することでした。1週間分の呼び出しログを集計して分かったのは、次の3つの偏りです。
+
+1. **入力トークンの大半が「毎回同じ前置き」だった**。執筆ガイドラインや参照資料など、リクエストごとに同じ数万トークンを送り続けていました。全入力の約7割がこの固定部分でした
+2. **全リクエストの9割が Pro 系モデルに流れていた**。タグ付けや短文要約のような軽いタスクまで、「品質が心配だから」という理由で高いモデルに投げていました
+3. **リアルタイム性が不要な処理が6割以上あった**。夜間に終わっていればよい集計・要約まで、すべて同期 API で即時実行していました
+
+この3つがそのまま、後述する施策の優先順位になりました。逆に言えば、自分の請求を分解しないまま一般論のテクニックを足しても、効果の大きい順に手を打てません。最初の半日はログ集計に使うことをおすすめします。
+
+## 暗黙キャッシュと明示キャッシュをどう使い分けるか
+
+Gemini API のキャッシュには2つの層があります。
+
+- **暗黙キャッシュ（implicit caching）**: リクエスト先頭が直近のリクエストと共通していれば、API 側が自動で割引を適用してくれる仕組み。コード変更は不要です
+- **明示キャッシュ（explicit caching）**: `caches.create` で参照コンテンツを事前登録し、TTL の間それを使い回す仕組み。割引は確実に効きますが、キャッシュの保持自体に時間課金が発生します
+
+まず効いたのは、暗黙キャッシュが効くように **プロンプトの並び順を直す** ことでした。固定の前置き（ガイドライン・参照資料）を必ず先頭に置き、毎回変わる部分（その日の題材）を末尾に置く。これだけで `usage_metadata` の `cached_content_token_count` が立ち上がり、固定部分の課金が目に見えて減りました。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # GEMINI_API_KEY は環境変数から読み込まれます
+
+with open("style_guide.md", encoding="utf-8") as fh:
+    style_guide = fh.read()  # 約3万トークンの固定リファレンス
+
+def summarize(daily_input: str) -> str:
+    response = client.models.generate_content(
+        model="gemini-3.5-flash",
+        # 固定部分を先頭、可変部分を末尾に。この順序が暗黙キャッシュの鍵です
+        contents=[style_guide, daily_input],
+    )
+    meta = response.usage_metadata
+    print(
+        f"input={meta.prompt_token_count} "
+        f"cached={meta.cached_content_token_count} "
+        f"output={meta.candidates_token_count}"
+    )
+    return response.text
+```
+
+アクセス頻度が高い参照資料は、明示キャッシュに昇格させます。
+
+```python
+cache = client.caches.create(
+    model="gemini-3.5-flash",
+    config=types.CreateCachedContentConfig(
+        display_name="site-reference-corpus",
+        system_instruction="あなたは技術記事の編集を支援するアシスタントです。",
+        contents=[style_guide],
+        ttl="3600s",  # 1時間。処理をこの窓に集約して使い切ります
+    ),
+)
+
+response = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents="この題材を当サイトの文体方針に沿って要約してください。\n\n" + daily_input,
+    config=types.GenerateContentConfig(cached_content=cache.name),
+)
+```
+
+### 運用して分かったこと：明示キャッシュが逆に高くつく境界
+
+公式ドキュメントを読むだけでは気づけなかった点がここです。明示キャッシュは **保持時間に対して課金される** ため、アクセス頻度が低いと割引よりストレージ費の方が大きくなります。
+
+私の場合、1時間あたり数回しか参照しない資料を24時間 TTL で置いていた時期があり、その週はキャッシュ関連の費用がむしろ増えました。いまは次のルールで運用しています。
+
+- 同じ資料への参照が **1時間に10回を超える** 処理だけ明示キャッシュにする
+- TTL は処理バッチの実行窓に合わせて最短にする（私の場合は 3600s）
+- それ以下の頻度のものは、並び順の工夫による暗黙キャッシュに任せる
+
+キャッシュ設計だけをさらに深掘りした記録は、[Gemini API のキャッシュ戦略で月3万円を6,000円にした：Context Caching・Implicit Caching の本番設計](/articles/gemini-api/gemini-api-caching-80percent-cost-reduction-production)にまとめています。
+
+## Flash と Pro の使い分けを「ルール」に落とす
+
+2つ目の偏り、「9割が Pro 系」への対処です。
+
+判定をその都度人間の感覚でやると、結局すべて高いモデルに寄っていきます。そこで、タスクの性質からモデルを機械的に決める小さなルーター関数を入れました。
+
+```python
+ROUTING_RULES = {
+    # タスク種別: (モデル, 根拠)
+    "tagging":        ("gemini-3.5-flash", "分類はFlashで品質差が出なかった"),
+    "short_summary":  ("gemini-3.5-flash", "300字以内の要約はFlashで十分"),
+    "long_analysis":  ("gemini-3.1-pro",   "複数文書の突き合わせはProが安定"),
+    "code_review":    ("gemini-3.1-pro",   "誤検出の手戻りがFlashだと高くつく"),
+}
+
+def pick_model(task_type: str) -> str:
+    model, _reason = ROUTING_RULES.get(task_type, ("gemini-3.5-flash", "既定"))
+    return model
+
+def run_task(task_type: str, prompt: str):
+    return client.models.generate_content(
+        model=pick_model(task_type),
+        contents=prompt,
+    )
+```
+
+ポイントは、キーワードマッチで「質問の難しさ」を推定するのではなく、**呼び出し側のタスク種別で静的に決める** ことです。私も最初は本文の語句から複雑度を推定する方式を試しましたが、判定がぶれて品質事故の原因になりました。バッチパイプラインなら、どの処理がどの程度の推論を要するかは設計時点で分かっています。動的推定より静的ルールの方が、安くて事故も少ないというのが結論です。
+
+切り替え後の品質確認は、移行前の出力50件と移行後の出力50件を並べて目視比較しました。タグ付けと短文要約では差を見つけられず、長文分析だけは Flash で取りこぼしが出たため Pro に残しています。現在の比率はおおよそ Flash 7 : Pro 3 です。
+
+推論の深さ自体を制御してコストを下げる方法は、[Gemini 2.5 Pro の thinking_budget を制御する — コストを3分の1にしながら推論品質を守る実装パターン](/articles/gemini-api/gemini-25-pro-thinking-budget-cost-control-guide)で扱っています。
+
+## 急がない処理は Batch API に寄せる
+
+3つ目の偏りへの対処です。Batch API は同期 API の半額で実行できる代わりに、完了までの時間が保証されません。
+
+私の処理のうち「翌朝までに終わっていればよいもの」を洗い出すと、全体の6割がこちらに移せました。日次の集計要約、AdMob 収益レポートの朝向けダイジェスト生成、アーカイブ記事のメタデータ再生成、画像キャプションの一括付与などです。
+
+```python
+import json
+
+# JSONL でリクエストを並べる
+requests = [
+    {
+        "key": f"summary-{i}",
+        "request": {
+            "contents": [{"parts": [{"text": text}], "role": "user"}],
+        },
+    }
+    for i, text in enumerate(daily_texts)
+]
+
+with open("batch_input.jsonl", "w", encoding="utf-8") as fh:
+    for r in requests:
+        fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+uploaded = client.files.upload(
+    file="batch_input.jsonl",
+    config=types.UploadFileConfig(mime_type="jsonl"),
+)
+
+job = client.batches.create(
+    model="gemini-3.5-flash",
+    src=uploaded.name,
+    config={"display_name": "nightly-summaries"},
+)
+print(job.name, job.state)
+```
+
+導入当初は10秒間隔のポーリングで完了を待っていましたが、2026年6月に Batch API がイベント駆動の Webhooks に対応したため、現在は完了通知を受けて後続処理を起動する形に移行済みです。ポーリングのための常駐プロセスが消え、運用がひとつ静かになりました。
+
+ひとつ注意点があります。Batch API は「混雑時は遅くなる」前提で設計するものです。私の実測では深夜帯の投入はほぼ1時間以内に返ってきますが、日中は数時間かかることがありました。締切のある処理を移すなら、締切から逆算して投入時刻に余裕を持たせてください。
+
+## トークンを減らす小さな工夫 — 構造化出力とシステム指示
+
+派手さはないものの、確実に効く部分です。
+
+出力側は、自由文で受けて後からパースするのをやめ、`response_schema` で構造化出力を強制しました。出力トークンが減るうえ、パース失敗による再実行（=二重課金）がなくなる効果の方がむしろ大きかったです。
+
+```python
+from pydantic import BaseModel
+
+class ArticleMeta(BaseModel):
+    issue: str
+    sentiment: str
+    priority: str
+
+response = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents=mail_body,
+    config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=ArticleMeta,
+    ),
+)
+meta = ArticleMeta.model_validate_json(response.text)
+```
+
+入力側のシステム指示は、長文の自然文を箇条書きの規則に書き直して約4割短くしました。ただし、削りすぎて品質が落ちた経験もあります。「短くする」より「曖昧な文を規則の形に直す」と捉えた方が、トークンと品質の両方にとって安全です。
+
+同種の質問が繰り返し来る対話系の機能であれば、埋め込みベースの回答キャッシュも併用できます。設計は[Gemini API のセマンティックキャッシュ設計 — 埋め込みベース回答キャッシュで API コストを実用的に下げる](/articles/gemini-api/gemini-api-semantic-answer-cache-embedding-cost-reduction)に書きました。
+
+## usage_metadata で費用を見える化する
+
+すべての施策の土台になったのが、呼び出しごとの実測ログです。レスポンスの `usage_metadata` を JSONL に落とすだけの薄い実装ですが、これがないと「どの施策が効いたか」を語れません。
+
+```python
+import json
+import time
+from pathlib import Path
+
+LOG_PATH = Path("logs/gemini_usage.jsonl")
+LOG_PATH.parent.mkdir(exist_ok=True)
+
+def generate_logged(model: str, task: str, **kwargs):
+    started = time.time()
+    response = client.models.generate_content(model=model, **kwargs)
+    meta = response.usage_metadata
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "model": model,
+        "task": task,
+        "input_tokens": meta.prompt_token_count,
+        "cached_tokens": meta.cached_content_token_count or 0,
+        "output_tokens": meta.candidates_token_count,
+        "latency_sec": round(time.time() - started, 2),
+    }
+    with LOG_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return response
+
+def weekly_report():
+    totals: dict[str, dict[str, int]] = {}
+    with LOG_PATH.open(encoding="utf-8") as fh:
+        for line in fh:
+            r = json.loads(line)
+            t = totals.setdefault(r["model"], {"calls": 0, "in": 0, "cached": 0, "out": 0})
+            t["calls"] += 1
+            t["in"] += r["input_tokens"]
+            t["cached"] += r["cached_tokens"]
+            t["out"] += r["output_tokens"]
+    for model, t in totals.items():
+        hit = t["cached"] / t["in"] * 100 if t["in"] else 0
+        print(f"{model}: {t['calls']}回 入力{t['in']:,} (キャッシュ率{hit:.0f}%) 出力{t['out']:,}")
+```
+
+週次でこのレポートを眺める習慣ができてから、設計変更の判断が早くなりました。トークン数は請求と直結するので、単価を掛ければそのまま費用予測になります。私はキャッシュ率が 50% を切った週に原因を調べる、という閾値運用にしています。
+
+## 月額推移の実測値と、効いた順番
+
+施策を入れた順に、月額がどう動いたかの記録です（いずれも私の構成での実測で、処理量はほぼ一定です）。
+
+1. **モデルルーティング導入**: 52,000円 → 36,000円前後。最も工数が小さく、最も効きました
+2. **暗黙キャッシュ向けのプロンプト並び替え**: 36,000円 → 26,000円前後。コード変更は数行でした
+3. **明示キャッシュの導入と TTL 調整**: 26,000円 → 19,000円前後。前述の失敗で一度増えてから下がっています
+4. **夜間処理の Batch API 移行**: 19,000円 → 10,500円前後。対象の洗い出しに一番時間がかかりました
+5. **構造化出力と再実行削減**: 10,500円 → 8,400円。再実行率の低下が効いた印象です
+
+振り返って意外だったのは、技術的に最も地味な「ルーティング」が最大の削減幅だったことです。高度な仕組みから着手したくなりますが、効果は偏りの大きさで決まります。だからこそ最初の請求分解が大切でした。
+
+## つまずいた点 — 私の場合の3つの失敗
+
+- **明示キャッシュの TTL を長くしすぎた**。前述の通り、参照頻度が低い資料の長時間保持は逆効果でした。頻度を測ってから昇格させるべきでした
+- **ルーティングを語句ベースの動的判定にした**。判定のぶれで品質事故が起き、結局タスク種別の静的ルールに落ち着きました
+- **Batch API に締切のある処理を混ぜた**。日中投入で数時間返らず、後続処理が詰まりました。締切あり・なしの仕分けはコードではなく運用設計の問題です
+
+## まとめ — 最初の1週間でやること
+
+施策を網羅するより、順序を守る方が結果につながると感じています。これから着手される方は、まず1週間、`usage_metadata` のログだけ仕込んで自分の請求を分解してみてください。固定前置きの比率・モデルの偏り・即時性が不要な処理の割合。この3つの数字が出れば、どの施策から打つべきかは自ずと決まります。
+
+同じように API 費用と向き合っている個人開発の方の参考になれば幸いです。

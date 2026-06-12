@@ -1,0 +1,272 @@
+---
+title: "How I Cut My Gemini API Bill from ¥52,000 to ¥8,400 a Month — Caching, Model Routing, and the Batch API"
+slug: "gemini-api-cost-cut-caching-model-routing-batch-record"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-04-02T14:00"
+author: "Gemini Lab"
+description: "A working record of cutting my Gemini API bill from ¥52,000 to ¥8,400 a month. Covers implicit vs. explicit caching, Flash/Pro routing rules, migrating to the Batch API, and a usage_metadata logging setup — with the production code I actually run."
+tags: ["Gemini API", "cost optimization", "Context Caching", "Batch API", "operations"]
+highlights:
+  - "When implicit caching is enough and where explicit caching quietly costs you more — with the threshold I use in production"
+  - "A static model-routing approach for Flash and Pro that avoids quality incidents, and how I verified the switch"
+  - "Batch API migration steps plus a usage_metadata logging implementation that turns token counts into a cost forecast"
+---
+## The April Invoice That Made Me Stop
+
+In April 2026, my monthly Gemini API invoice reached ¥52,000.
+
+As an indie developer I run article-summarization pipelines, content-metadata generation for my apps, and a handful of editorial helpers for the sites I maintain. Each job is small. The invoice was what those small jobs added up to.
+
+The unit economics no longer made sense, so I spent two months rebuilding how every call is made. The same features now run at ¥8,400 a month.
+
+This article is a record of what actually worked, in the order it worked, with the code I run in production. One caveat before we start: token prices change, so please check the [official Gemini API pricing page](https://ai.google.dev/gemini-api/docs/pricing) for current numbers. I will focus on the structure — what gets cheaper, and by roughly how much — rather than on unit prices that may go stale.
+
+## Where the Money Was Actually Going
+
+My first step was not researching optimization techniques. It was decomposing my own bill. Aggregating one week of call logs surfaced three imbalances:
+
+1. **Most input tokens were the same preamble, every time.** Style guides and reference material — tens of thousands of identical tokens sent with each request. Roughly 70% of all input tokens were this fixed prefix
+2. **Nine out of ten requests went to Pro-class models.** Even light tasks like tagging and short summaries were routed to the expensive model "to be safe"
+3. **Over 60% of the workload had no real-time requirement.** Nightly aggregations and archive jobs were all running through the synchronous API anyway
+
+These three numbers became my priority list. Without that decomposition, you end up applying generic tips in random order instead of attacking your own largest imbalance first. I would budget half a day for log analysis before touching anything else.
+
+## Implicit vs. Explicit Caching: Choosing the Right Layer
+
+Gemini API caching works at two layers:
+
+- **Implicit caching** applies a discount automatically when the beginning of your request matches a recent one. No code changes required
+- **Explicit caching** registers reference content via `caches.create` and reuses it for the duration of a TTL. The discount is guaranteed, but you pay for cache storage by the hour
+
+The first win was simply **reordering prompts** so implicit caching could fire: fixed preamble (guidelines, reference docs) always first, variable content (the day's input) always last. After that change, `cached_content_token_count` in `usage_metadata` started climbing and the cost of the fixed prefix visibly dropped.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # reads GEMINI_API_KEY from the environment
+
+with open("style_guide.md", encoding="utf-8") as fh:
+    style_guide = fh.read()  # a fixed reference of ~30K tokens
+
+def summarize(daily_input: str) -> str:
+    response = client.models.generate_content(
+        model="gemini-3.5-flash",
+        # Fixed part first, variable part last — this ordering is what
+        # makes implicit caching effective.
+        contents=[style_guide, daily_input],
+    )
+    meta = response.usage_metadata
+    print(
+        f"input={meta.prompt_token_count} "
+        f"cached={meta.cached_content_token_count} "
+        f"output={meta.candidates_token_count}"
+    )
+    return response.text
+```
+
+High-frequency reference material gets promoted to an explicit cache:
+
+```python
+cache = client.caches.create(
+    model="gemini-3.5-flash",
+    config=types.CreateCachedContentConfig(
+        display_name="site-reference-corpus",
+        system_instruction="You are an assistant that supports technical editing.",
+        contents=[style_guide],
+        ttl="3600s",  # one hour; I concentrate the workload into this window
+    ),
+)
+
+response = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents="Summarize this material following our style policy.\n\n" + daily_input,
+    config=types.GenerateContentConfig(cached_content=cache.name),
+)
+```
+
+### What Production Taught Me: The Break-Even Point of Explicit Caching
+
+Here is the part I could not learn from documentation alone. Explicit caching **bills you for storage time**, so at low access frequency the storage cost outgrows the discount.
+
+For a while I kept a document on a 24-hour TTL that was only referenced a few times per hour — and my cache-related spend went *up* that week. My current rules:
+
+- Promote to explicit caching only when the same material is referenced **more than ten times per hour**
+- Set the TTL to the actual execution window of the batch, as short as possible (3600s in my case)
+- Everything below that frequency relies on prompt ordering and implicit caching
+
+For a deeper dive into the caching side alone, see [my production caching write-up for the Gemini API](/articles/gemini-api/gemini-api-caching-80percent-cost-reduction-production).
+
+## Turning Model Choice into a Rule, Not a Feeling
+
+Next, the second imbalance: 90% of traffic on Pro-class models.
+
+If model choice is left to in-the-moment judgment, everything drifts toward the expensive model. So I added a small router that decides the model statically, from the task type:
+
+```python
+ROUTING_RULES = {
+    # task type: (model, rationale)
+    "tagging":        ("gemini-3.5-flash", "no measurable quality gap on classification"),
+    "short_summary":  ("gemini-3.5-flash", "summaries under 300 chars are fine on Flash"),
+    "long_analysis":  ("gemini-3.1-pro",   "cross-document work is more stable on Pro"),
+    "code_review":    ("gemini-3.1-pro",   "false positives on Flash cost more in rework"),
+}
+
+def pick_model(task_type: str) -> str:
+    model, _reason = ROUTING_RULES.get(task_type, ("gemini-3.5-flash", "default"))
+    return model
+
+def run_task(task_type: str, prompt: str):
+    return client.models.generate_content(
+        model=pick_model(task_type),
+        contents=prompt,
+    )
+```
+
+The key decision: **route by the caller's task type, not by guessing query complexity from keywords.** I tried keyword-based complexity detection first, and its unpredictable judgments caused quality incidents. In a batch pipeline you already know at design time how much reasoning each job needs. Static rules turned out to be both cheaper and safer than dynamic guessing.
+
+To validate the switch, I compared 50 outputs before and after for each task type. Tagging and short summaries showed no detectable difference on Flash; long-form analysis did regress, so it stays on Pro. My current traffic split is roughly Flash 7 : Pro 3.
+
+If you want to control reasoning depth itself as a cost lever, I cover that in [my thinking_budget control patterns for Gemini 2.5 Pro](/articles/gemini-api/gemini-25-pro-thinking-budget-cost-control-guide).
+
+## Moving Non-Urgent Work to the Batch API
+
+The third imbalance. The Batch API runs at half the price of the synchronous API, in exchange for no completion-time guarantee.
+
+Listing every job that merely needed to be "done by morning" moved 60% of my workload over: daily digest summaries, morning digests of AdMob revenue reports, metadata regeneration for archived articles, and bulk image captioning.
+
+```python
+import json
+
+# Assemble requests as JSONL
+requests = [
+    {
+        "key": f"summary-{i}",
+        "request": {
+            "contents": [{"parts": [{"text": text}], "role": "user"}],
+        },
+    }
+    for i, text in enumerate(daily_texts)
+]
+
+with open("batch_input.jsonl", "w", encoding="utf-8") as fh:
+    for r in requests:
+        fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+uploaded = client.files.upload(
+    file="batch_input.jsonl",
+    config=types.UploadFileConfig(mime_type="jsonl"),
+)
+
+job = client.batches.create(
+    model="gemini-3.5-flash",
+    src=uploaded.name,
+    config={"display_name": "nightly-summaries"},
+)
+print(job.name, job.state)
+```
+
+I started with 10-second polling to wait for completion. Since the Batch API gained event-driven webhooks in June 2026, I have switched to a completion callback that triggers downstream processing — one less resident polling process to babysit.
+
+One honest warning: design for the Batch API as if it *will* be slow at peak times. In my measurements, jobs submitted late at night usually return within an hour, while daytime submissions can take several hours. If a job has a deadline, work backwards from it and leave generous margin on the submission time.
+
+## Smaller Wins: Structured Output and Leaner System Instructions
+
+Unglamorous, but reliable.
+
+On the output side, I stopped accepting free-form text and parsing it afterwards. Forcing structured output via `response_schema` reduced output tokens — but the bigger win was eliminating re-runs (double billing) caused by parse failures.
+
+```python
+from pydantic import BaseModel
+
+class ArticleMeta(BaseModel):
+    issue: str
+    sentiment: str
+    priority: str
+
+response = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents=mail_body,
+    config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=ArticleMeta,
+    ),
+)
+meta = ArticleMeta.model_validate_json(response.text)
+```
+
+On the input side, I rewrote long prose system instructions as terse bullet rules, about 40% shorter. I have also over-trimmed and paid for it in quality, so my framing now is "convert vague sentences into rules" rather than "make it shorter" — that protects both tokens and output quality.
+
+If your workload includes repeated, similar user questions, an embedding-based answer cache stacks well on top of all this; the design is in [my semantic answer cache write-up](/articles/gemini-api/gemini-api-semantic-answer-cache-embedding-cost-reduction).
+
+## Making Costs Visible with usage_metadata
+
+Underneath every decision above was one thin piece of infrastructure: per-call logging of `usage_metadata` to JSONL. Without it, you cannot say which change actually worked.
+
+```python
+import json
+import time
+from pathlib import Path
+
+LOG_PATH = Path("logs/gemini_usage.jsonl")
+LOG_PATH.parent.mkdir(exist_ok=True)
+
+def generate_logged(model: str, task: str, **kwargs):
+    started = time.time()
+    response = client.models.generate_content(model=model, **kwargs)
+    meta = response.usage_metadata
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "model": model,
+        "task": task,
+        "input_tokens": meta.prompt_token_count,
+        "cached_tokens": meta.cached_content_token_count or 0,
+        "output_tokens": meta.candidates_token_count,
+        "latency_sec": round(time.time() - started, 2),
+    }
+    with LOG_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return response
+
+def weekly_report():
+    totals: dict[str, dict[str, int]] = {}
+    with LOG_PATH.open(encoding="utf-8") as fh:
+        for line in fh:
+            r = json.loads(line)
+            t = totals.setdefault(r["model"], {"calls": 0, "in": 0, "cached": 0, "out": 0})
+            t["calls"] += 1
+            t["in"] += r["input_tokens"]
+            t["cached"] += r["cached_tokens"]
+            t["out"] += r["output_tokens"]
+    for model, t in totals.items():
+        hit = t["cached"] / t["in"] * 100 if t["in"] else 0
+        print(f"{model}: {t['calls']} calls, in {t['in']:,} (cache {hit:.0f}%), out {t['out']:,}")
+```
+
+Reviewing this weekly made design decisions faster. Token counts map directly to billing, so multiplying by unit prices gives you a cost forecast for free. My operational threshold: if the cache-hit ratio drops below 50% in a given week, I investigate.
+
+## The Actual Monthly Numbers, in the Order Things Worked
+
+How the bill moved as each measure landed (my setup, near-constant workload):
+
+1. **Model routing**: ¥52,000 → about ¥36,000. The least engineering effort, the largest single cut
+2. **Prompt reordering for implicit caching**: → about ¥26,000. A few lines of code
+3. **Explicit caching with tuned TTLs**: → about ¥19,000. It briefly went up first, thanks to my TTL mistake
+4. **Batch API migration for nightly work**: → about ¥10,500. The audit of "what can wait until morning" took the most time
+5. **Structured output and fewer re-runs**: → ¥8,400. The drop in retry rate mattered more than the shorter outputs
+
+The surprise, in hindsight: the most technically boring change — routing — delivered the biggest cut. It is tempting to start with the sophisticated machinery, but impact follows the size of the imbalance, which is why the initial bill decomposition mattered so much.
+
+## Three Mistakes I Made Along the Way
+
+- **TTLs that were too long on explicit caches.** Low-frequency material held for hours costs more than it saves. Measure the access frequency before promoting anything
+- **Keyword-based dynamic routing.** Unstable judgments, quality incidents, eventually replaced by static task-type rules
+- **Putting deadline-bound jobs into the Batch API.** A daytime submission took hours and blocked downstream work. Separating deadline-bound from deadline-free jobs is an operations question, not a code question
+
+## Where to Start: Your First Week
+
+Rather than implementing everything, protect the order of operations. Spend one week doing nothing but logging `usage_metadata` and decomposing your own bill. Three numbers — the share of fixed preamble tokens, the model distribution, and the fraction of deadline-free work — will tell you exactly which lever to pull first.
+
+If you are wrestling with the same line item on your own invoice, I hope this record saves you a few of the detours it cost me.
