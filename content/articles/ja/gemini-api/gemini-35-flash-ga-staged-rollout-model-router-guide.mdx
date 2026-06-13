@@ -1,0 +1,215 @@
+---
+title: "Gemini 3.5 Flash GA をどこから差し替えるか — ワークロード別の置き換え判定とモデルルーターによる段階導入の記録"
+slug: "gemini-35-flash-ga-staged-rollout-model-router-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-13T19:45"
+author: "Gemini Lab"
+description: "Gemini 3.5 Flash GA への移行をモデル名の書き換え1行で済ませず、評価ハーネスでワークロード別に実測してから段階導入した記録です。判定基準・比較コード・環境変数ルーター・ロールバック設計をまとめます。"
+tags: ["gemini", "gemini-api", "gemini-3-5-flash", "model-migration", "production"]
+highlights:
+  - "「モデル名を書き換えたら品質が落ちた」という移行失敗を避け、手元のワークロードごとに 3.5 Flash の採否を判定できるようになる"
+  - "レイテンシ・トークン消費・出力形式の安定性を自前タスクで実測する評価ハーネスを、コピペで動く Python コードとして入手できる"
+  - "環境変数 1 つで旧モデルに即時ロールバックできるモデルルーター構成を、障害時フォールバックと共通の仕組みとして構築できる"
+---
+
+6月8日に Gemini Enterprise で 3.5 Flash の機能管理トグルが廃止され、全ユーザーでデフォルト有効・無効化不可になったというニュースを見て、ふと自分の API 側の構成を確認しました。アプリ向けの分類バッチも記事メタデータ生成も、まだ `gemini-2.5-flash` のままです。Enterprise 側では「もう選べない」段階まで来ているのに、API 側の自分の判断だけが止まっている。この非対称が気になって、週末に移行の棚卸しをすることにしました。
+
+結論から書くと、私は 4 本のパイプラインのうち 3 本を `gemini-3.5-flash` に切り替え、1 本を意図的に旧モデルに残しました。「全部まとめて書き換える」のでも「様子見で何もしない」のでもなく、ワークロード単位で実測して判定する。その過程で書いた評価ハーネスとモデルルーターの実装を、判断の根拠ごと残しておきます。
+
+## 「Flash が主力」前提でモデル構成を見直す
+
+Google I/O 2026 で GA になった Gemini 3.5 Flash は、従来の「Flash = 軽量・廉価版」という位置づけを崩しました。公称ではエージェント・コーディング系ベンチマークで Gemini 3.1 Pro を上回りつつ、速度は他のフロンティアモデル比で約 4 倍とされています。一方で Gemini 3.5 Pro は I/O で「6月 GA」と表明されたまま、現時点では Vertex の一部エンタープライズ向け限定プレビューにとどまっています。
+
+つまり 2026 年 6 月時点の現実的な選択肢はこうなります。
+
+- **gemini-3.5-flash**: GA。エージェント・コーディング用途の事実上の主力
+- **gemini-3.1-pro**: 引き続き利用可能だが、ベンチマーク上は 3.5 Flash に抜かれた領域がある
+- **gemini-2.5-flash**: 安定稼働中の既存パイプラインが多く残る世代
+- **gemini-3.1-flash-lite**: 5月7日 GA。コスト最優先の単純タスク向け
+
+この構図で悩ましいのは、「新しい方が良いに決まっている」と言い切れないことです。モデルが変わると出力の癖が変わり、後段のパーサーや品質チェックが静かに壊れます。私は過去に画像生成モデルの移行で、コード差分自体は数行なのに検証に丸一日かかった経験があります（そのときの記録は [Gemini の画像生成 preview モデルが 6月25日に停止します — GA 版への移行で確認したコード差分と検証手順](/articles/gemini-api/gemini-image-preview-models-625-shutdown-ga-migration) に書きました）。テキスト系でも同じことが起きる前提で進めます。
+
+## ワークロード別の置き換え判定 — 4 本のパイプラインをどう振り分けたか
+
+個人開発で運営している壁紙アプリ群とブログ運営の裏側では、Gemini API を使う処理が大きく 4 種類動いています。それぞれ要求特性が違うので、一括移行ではなく個別判定にしました。
+
+- **画像メタデータの分類バッチ（夜間）**: 出力は固定スキーマの JSON。求めるのは形式の安定と単価。レイテンシはほぼ無関係
+- **記事メタデータ生成（description・タグ候補）**: 日本語の自然さと文字数制約の遵守が重要。形式逸脱は後段で検知できる
+- **App Store・Google Play レビューへの返信下書き**: トーンの一貫性が最優先。モデルが変わると「声」が変わるリスクが最も高い
+- **エージェント的な多段タスク（リサーチ→整形→検証）**: ツール呼び出しの判断精度と速度が効く。3.5 Flash の得意領域のはず
+
+判定の軸は 3 つに絞りました。第一に、出力形式の安定性が後段の機械処理に直結するか。第二に、モデルの「声」の変化がユーザーに見えるか。第三に、速度・精度の改善が体感できる規模か。この 3 軸で見ると、レビュー返信だけは「ユーザーに声が見える」かつ「改善の体感が小さい」ので、移行を急ぐ理由がないと判断できます。
+
+## 評価ハーネスを書く — 本番の代表タスクで実測する
+
+公称ベンチマークは自分のタスクの代理にはなりません。本番パイプラインから代表ケースを抜き出して、新旧モデルに同じ入力を流すハーネスを書きます。何を解決するコードかと言うと、「移行判断に必要な実測値（レイテンシ・トークン・形式合格率）を 1 コマンドで取る」ためのものです。
+
+```python
+# compare_models.py — 本番の代表タスクで新旧モデルを実測比較する
+import json
+import os
+import statistics
+import time
+
+from google import genai
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+MODELS = ["gemini-2.5-flash", "gemini-3.5-flash"]
+
+# 本番パイプラインから抜き出した代表タスク
+# 各ケースは {"prompt": "...", "required_keys": ["title", "tags"]} の形式
+with open("eval_cases.json", encoding="utf-8") as f:
+    CASES = json.load(f)
+
+
+def run_case(model: str, case: dict) -> dict:
+    started = time.perf_counter()
+    response = client.models.generate_content(
+        model=model,
+        contents=case["prompt"],
+        config={
+            "response_mime_type": "application/json",
+            "temperature": 0.2,
+        },
+    )
+    elapsed = time.perf_counter() - started
+    usage = response.usage_metadata
+    return {
+        "latency": elapsed,
+        "input_tokens": usage.prompt_token_count,
+        "output_tokens": usage.candidates_token_count,
+        "text": response.text,
+    }
+
+
+def is_valid(case: dict, text: str) -> bool:
+    # 後段パーサーが要求する形式を、そのまま合否条件にする
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return all(key in data for key in case["required_keys"])
+
+
+for model in MODELS:
+    latencies = []
+    valid = 0
+    in_tokens = 0
+    out_tokens = 0
+    for case in CASES:
+        result = run_case(model, case)
+        latencies.append(result["latency"])
+        in_tokens += result["input_tokens"]
+        out_tokens += result["output_tokens"]
+        if is_valid(case, result["text"]):
+            valid += 1
+    print(
+        f"{model}: p50={statistics.median(latencies):.2f}s "
+        f"valid={valid}/{len(CASES)} "
+        f"tokens(in/out)={in_tokens}/{out_tokens}"
+    )
+```
+
+ポイントは `is_valid` を「後段パーサーの要求そのもの」にしていることです。汎用的な品質スコアではなく、自分のシステムが実際に落ちる条件で合否を取る。ここを抽象化すると、実測の意味が薄れます。
+
+実行すると、次のような出力になります（ケース数 60 の例）。
+
+```
+gemini-2.5-flash: p50=1.82s valid=57/60 tokens(in/out)=48210/15890
+gemini-3.5-flash: p50=1.41s valid=58/60 tokens(in/out)=48210/17820
+```
+
+## 実測結果の読み方 — 速さより先に「形式の安定」を見る
+
+私の環境での実測（分類バッチ 60 ケース、メタデータ生成 40 ケース）から読み取れたことを、数字の解釈ごと書きます。なお値は実行時間帯やプロンプトに依存するので、絶対値より傾向を見てください。
+
+まずレイテンシは、p50 で 2 割前後の短縮が一貫して観測できました。公称の「4 倍速い」はベンチマーク条件での話で、JSON 強制つきの実タスクではこの程度に落ち着きます。それでも夜間バッチの総実行時間は目に見えて縮みました。
+
+次に意外だったのが出力トークンの増加です。3.5 Flash は同じ指示に対してやや饒舌で、私のケースでは出力トークンが 1 割強増えました。単価が同じなら、速くなっても請求額は微増し得るということです。description 生成のように長さ上限がある処理では、`max_output_tokens` とプロンプト側の文字数指定を締め直して相殺しました。
+
+形式合格率は両者ほぼ同等でしたが、失敗の質が違いました。2.5 Flash の失敗は「キー欠落」、3.5 Flash の失敗は「余計なキーの追加」に寄ります。後段が未知キーを無視する設計なら実害はありませんが、厳格スキーマ検証をしているなら移行時に落ち方が変わる点は知っておくべきです。
+
+エージェント的な多段タスクだけは、合格率そのものが明確に改善しました（私の検証では 7 〜 8 割 → 9 割前後）。ツール選択の迷いが減り、リトライ回数が落ちたのが効いています。この領域は公称どおり 3.5 Flash の得意分野だと感じます。
+
+## モデルルーターで段階導入する — 1 行で戻せる構成
+
+実測で方針が決まったら、コード中のモデル名を直接書き換えるのではなく、ワークロード名からモデル ID を引くルーターを 1 枚挟みます。これを解決したい問題は「切り替えと切り戻しを、デプロイなしで・即時に・ワークロード単位で」行えるようにすることです。
+
+```python
+# model_router.py — 環境変数で即時ロールバックできるモデルルーター
+import os
+import random
+
+DEFAULT_ROUTES = {
+    "categorize": "gemini-3.5-flash",    # 分類バッチ: 移行済み
+    "metadata": "gemini-3.5-flash",      # メタデータ生成: カナリア 50% で試験中
+    "review_reply": "gemini-2.5-flash",  # レビュー返信: 意図的に保留
+    "agentic": "gemini-3.5-flash",       # 多段タスク: 移行済み
+}
+
+# 一部のトラフィックだけ新モデルへ流す比率(未指定は 100%)
+CANARY_RATIO = {
+    "metadata": 0.5,
+}
+
+FALLBACK_MODEL = "gemini-2.5-flash"
+
+
+def resolve_model(workload: str) -> str:
+    # 環境変数 MODEL_OVERRIDE_<WORKLOAD> が最優先(緊急ロールバック用)
+    override = os.environ.get(f"MODEL_OVERRIDE_{workload.upper()}")
+    if override:
+        return override
+    model = DEFAULT_ROUTES.get(workload, FALLBACK_MODEL)
+    ratio = CANARY_RATIO.get(workload)
+    if ratio is not None and random.random() >= ratio:
+        return FALLBACK_MODEL
+    return model
+```
+
+この構成にしておくと、問題が起きたときの対応は `MODEL_OVERRIDE_METADATA=gemini-2.5-flash` を環境変数に足して再起動するだけです。コードに触らないので、深夜にスマートフォンからでも戻せます。カナリア比率はメタデータ生成のような「形式逸脱を後段で検知できる」ワークロードにだけ使い、検知手段のない処理は 0 か 100 かで切り替える方針にしています。中途半端に混ざると、不具合報告の再現条件が追えなくなるためです。
+
+出力差分を本番トラフィックで継続的に観測したい場合は、ルーターの先にシャドウ実行を足す設計もあります。その実装パターンは [Gemini API のシャドウトラフィックで新モデル移行を安全に進める — 出力差分を本番で測る実装パターン](/articles/gemini-advanced/gemini-api-shadow-traffic-model-migration-production) が詳しいので、ここでは省きます。
+
+## 障害時のフォールバックも同じルーターに載せる
+
+6月12日に Gemini が過去最大級と報じられた障害（error 1076 / 1099 が広範発生）から回復したばかりということもあり、移行と同時にフォールバック経路も見直しました。モデル移行用のルーターがあると、障害時の退避も同じ仕組みに載せられます。
+
+```python
+# generate_with_fallback — 主モデル失敗時に旧世代へ自動退避する
+from model_router import FALLBACK_MODEL, resolve_model
+
+
+def generate_with_fallback(client, workload, contents, config):
+    primary = resolve_model(workload)
+    last_error = None
+    for model in (primary, FALLBACK_MODEL):
+        try:
+            return client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as err:  # 本番では google.genai.errors の型で個別に捕捉する
+            last_error = err
+    raise last_error
+```
+
+注意点が 2 つあります。第一に、新旧モデルが同一の障害で同時に落ちるケースはあるので、これは保険であって冗長化ではありません。最終的に失敗したジョブを翌朝リカバリできるキュー設計の方が本質です。第二に、フォールバック発動をログに残さないと「いつの間にか旧モデルで動き続けていた」事故が起きます。私は発動時に Slack 通知を 1 本飛ばすようにしました。
+
+## つまずいた点 — エイリアス・クォータ・出力ドリフト
+
+移行作業で実際に手が止まった箇所を 3 つ残します。
+
+**エイリアス ID を踏みかけた**。検証中に `-latest` 系のエイリアスでモデルを指定しかけて、固定 ID に書き直しました。エイリアスは中身が予告なく入れ替わるため、実測した結果と本番で動くモデルがずれる可能性があります。評価ハーネスとルーターには GA の固定 ID だけを書く、を原則にしています。
+
+**クォータがモデルごとに別管理だった**。新モデルに切り替えた直後の夜間バッチで 429 が散発しました。旧モデルで実績のある同時実行数でも、新モデル側のレート制限枠は別カウントです。移行初日は同時実行を半分に絞り、429 が出ないことを確認してから戻しました。
+
+**thinking 系の既定値の違いでレイテンシが振れた**。3.5 Flash は推論の使い方が世代で変わっており、config を明示しないとタスクによってレイテンシの分散が大きくなりました。比較測定では温度や推論設定を両モデルで揃えて明示することをおすすめします。推論コストの制御自体は [Gemini 2.5 Pro の thinking_budget を制御する — コストを3分の1にしながら推論品質を守る実装パターン](/articles/gemini-api/gemini-25-pro-thinking-budget-cost-control-guide) で書いた考え方がそのまま使えます。
+
+## 最初の一本を選んで実測するところから
+
+移行の全体像は「実測 → ワークロード別判定 → ルーター経由で段階切り替え → 監視とロールバック手段の常備」という流れに尽きます。Enterprise 側がデフォルト固定に踏み切ったように、この切り替えはいずれ外側からもやってきます。私自身、今回の棚卸しを終えるまで「いつでも移れる」とどこかで思い込んでいました。自分のタイミングで移れるうちに、判断材料を手元に持っておく方が良いと考えています。
+
+次の一歩としては、本番パイプラインの中で「出力形式の検証が機械的にできる処理」を 1 本だけ選び、上の評価ハーネスに 20 ケースほど流してみてください。p50 レイテンシと形式合格率の 2 つの数字が出た時点で、移行判断は感覚の問題ではなくなります。同じ作業をされる方の参考になれば幸いです。

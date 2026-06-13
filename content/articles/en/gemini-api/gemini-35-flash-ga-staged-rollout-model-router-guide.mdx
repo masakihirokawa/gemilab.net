@@ -1,0 +1,215 @@
+---
+title: "Where to Adopt Gemini 3.5 Flash GA First — Per-Workload Evaluation and a Staged Rollout with a Model Router"
+slug: "gemini-35-flash-ga-staged-rollout-model-router-guide"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-13T19:45"
+author: "Gemini Lab"
+description: "How I migrated production workloads to Gemini 3.5 Flash GA in stages: a per-workload evaluation harness, measured results, an env-based model router, and rollback design."
+tags: ["gemini", "gemini-api", "gemini-3-5-flash", "model-migration", "production"]
+highlights:
+  - "Avoid the classic 'I swapped the model name and quality dropped' failure by deciding 3.5 Flash adoption per workload, based on your own measurements"
+  - "Get a copy-paste evaluation harness in Python that measures latency, token consumption, and output-format pass rates on your real production tasks"
+  - "Build a model router that rolls back to the previous model with a single environment variable, doubling as your outage fallback path"
+---
+
+On June 8, Gemini Enterprise removed the feature-management toggle for 3.5 Flash — it is now enabled by default for every user, with no way to turn it off. Reading that news made me check my own API-side configuration. My classification batches and metadata generation jobs were still running on `gemini-2.5-flash`. The Enterprise side had moved past the point of choice while my own decision was simply sitting idle. That asymmetry bothered me enough to spend a weekend on a proper migration audit.
+
+The outcome: of my four production pipelines, I switched three to `gemini-3.5-flash` and deliberately kept one on the older model. Not a blanket rewrite, not indefinite wait-and-see — a per-workload decision backed by measurements. This article documents the evaluation harness and the model router I built along the way, together with the reasoning behind each call.
+
+## Rethinking the Lineup Now That Flash Is the Flagship
+
+Gemini 3.5 Flash, which reached general availability around Google I/O 2026, broke the old assumption that "Flash" means the lightweight budget tier. Google's positioning has it outperforming Gemini 3.1 Pro on agentic and coding benchmarks while running roughly four times faster than comparable frontier models. Meanwhile, Gemini 3.5 Pro — announced at I/O with a June GA target — remains a limited enterprise preview on Vertex at the time of writing.
+
+So the realistic menu in June 2026 looks like this:
+
+- **gemini-3.5-flash**: GA. The de facto workhorse for agentic and coding workloads
+- **gemini-3.1-pro**: still available, but now outscored by 3.5 Flash in several areas
+- **gemini-2.5-flash**: the generation many stable production pipelines still run on
+- **gemini-3.1-flash-lite**: GA since May 7, for cost-first simple tasks
+
+The tricky part is that "newer is better" is not a safe assumption. When the model changes, its output habits change, and downstream parsers and quality checks break quietly. I learned this the hard way migrating image-generation models, where the code diff was a few lines but validation ate an entire day — I wrote that up in [Gemini's image preview models shut down on June 25 — the code diffs and verification steps for moving to GA](/articles/gemini-api/gemini-image-preview-models-625-shutdown-ga-migration). I went into this migration assuming text models would behave the same way.
+
+## Per-Workload Triage — How I Sorted Four Pipelines
+
+As an indie developer I run a set of wallpaper apps and several blogs, and behind them four distinct kinds of Gemini API workloads. Their requirements differ, so I judged each one separately rather than migrating in bulk.
+
+- **Nightly image-metadata classification**: output is fixed-schema JSON. What matters is format stability and unit cost. Latency is almost irrelevant
+- **Article metadata generation (descriptions, tag candidates)**: natural Japanese and strict length limits matter. Format violations are caught downstream
+- **Store-review reply drafts**: tone consistency is the top priority. A model change altering the "voice" is the biggest risk here
+- **Agentic multi-step tasks (research → shape → verify)**: tool-selection accuracy and speed dominate. Supposedly 3.5 Flash's home turf
+
+I narrowed the decision to three questions. First, does output-format stability feed directly into machine processing? Second, is the model's voice visible to end users? Third, is the speed or accuracy gain large enough to feel? Through that lens, review replies stood out as the one workload where the voice is user-visible and the expected gain is small — no reason to rush.
+
+## Writing the Evaluation Harness — Measure on Your Real Tasks
+
+Published benchmarks are not a proxy for your tasks. The harness below pulls representative cases out of the production pipeline and feeds identical inputs to old and new models. The problem it solves: getting the numbers a migration decision actually needs — latency, tokens, and format pass rate — from a single command.
+
+```python
+# compare_models.py — measure old vs. new models on real production tasks
+import json
+import os
+import statistics
+import time
+
+from google import genai
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+MODELS = ["gemini-2.5-flash", "gemini-3.5-flash"]
+
+# Representative cases extracted from the production pipeline.
+# Each case: {"prompt": "...", "required_keys": ["title", "tags"]}
+with open("eval_cases.json", encoding="utf-8") as f:
+    CASES = json.load(f)
+
+
+def run_case(model: str, case: dict) -> dict:
+    started = time.perf_counter()
+    response = client.models.generate_content(
+        model=model,
+        contents=case["prompt"],
+        config={
+            "response_mime_type": "application/json",
+            "temperature": 0.2,
+        },
+    )
+    elapsed = time.perf_counter() - started
+    usage = response.usage_metadata
+    return {
+        "latency": elapsed,
+        "input_tokens": usage.prompt_token_count,
+        "output_tokens": usage.candidates_token_count,
+        "text": response.text,
+    }
+
+
+def is_valid(case: dict, text: str) -> bool:
+    # Use the downstream parser's actual requirements as the pass condition
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return all(key in data for key in case["required_keys"])
+
+
+for model in MODELS:
+    latencies = []
+    valid = 0
+    in_tokens = 0
+    out_tokens = 0
+    for case in CASES:
+        result = run_case(model, case)
+        latencies.append(result["latency"])
+        in_tokens += result["input_tokens"]
+        out_tokens += result["output_tokens"]
+        if is_valid(case, result["text"]):
+            valid += 1
+    print(
+        f"{model}: p50={statistics.median(latencies):.2f}s "
+        f"valid={valid}/{len(CASES)} "
+        f"tokens(in/out)={in_tokens}/{out_tokens}"
+    )
+```
+
+The key design choice is that `is_valid` encodes the downstream parser's exact requirements, not a generic quality score. Measure against the conditions under which your system actually breaks; abstract that away and the measurement loses its meaning.
+
+A run looks like this (60-case example):
+
+```
+gemini-2.5-flash: p50=1.82s valid=57/60 tokens(in/out)=48210/15890
+gemini-3.5-flash: p50=1.41s valid=58/60 tokens(in/out)=48210/17820
+```
+
+## Reading the Results — Check Format Stability Before Speed
+
+Here is what my measurements (60 classification cases, 40 metadata cases) showed, with interpretation. The values depend on time of day and prompts, so read them as trends rather than absolutes.
+
+Latency improved consistently, around 20 percent at p50. The headline "four times faster" claim applies to benchmark conditions; with forced JSON output on real tasks, the gain settles around this level. Even so, the total runtime of my nightly batches shrank noticeably.
+
+The surprise was output token growth. Given the same instructions, 3.5 Flash is slightly more verbose — my output tokens rose a bit over 10 percent. At equal unit pricing, a faster model can still nudge your bill upward. For length-capped jobs like description generation, I tightened `max_output_tokens` and the character limits in the prompt to offset it.
+
+Format pass rates were roughly equal between the two, but the failures differed in kind. When 2.5 Flash failed, it tended to drop required keys; when 3.5 Flash failed, it tended to add extra keys. If your downstream code ignores unknown keys, no harm done — but if you validate against a strict schema, be aware that the failure mode shifts with the migration.
+
+The one workload with a clear accuracy win was agentic multi-step tasks: pass rates went from the 70–80 percent range to around 90 percent in my testing. Less hesitation in tool selection meant fewer retries. This is exactly the territory where 3.5 Flash earns its billing.
+
+## Staged Rollout with a Model Router — Reversible in One Line
+
+Once the measurements settle the policy, don't rewrite model names scattered through your code. Put a single router in front that maps workload names to model IDs. The problem this solves: switching and reverting per workload, instantly, without a deploy.
+
+```python
+# model_router.py — a model router with instant env-based rollback
+import os
+import random
+
+DEFAULT_ROUTES = {
+    "categorize": "gemini-3.5-flash",    # classification batch: migrated
+    "metadata": "gemini-3.5-flash",      # metadata generation: 50% canary
+    "review_reply": "gemini-2.5-flash",  # review replies: deliberately held back
+    "agentic": "gemini-3.5-flash",       # multi-step tasks: migrated
+}
+
+# Fraction of traffic routed to the new model (unspecified = 100%)
+CANARY_RATIO = {
+    "metadata": 0.5,
+}
+
+FALLBACK_MODEL = "gemini-2.5-flash"
+
+
+def resolve_model(workload: str) -> str:
+    # MODEL_OVERRIDE_<WORKLOAD> wins over everything (emergency rollback)
+    override = os.environ.get(f"MODEL_OVERRIDE_{workload.upper()}")
+    if override:
+        return override
+    model = DEFAULT_ROUTES.get(workload, FALLBACK_MODEL)
+    ratio = CANARY_RATIO.get(workload)
+    if ratio is not None and random.random() >= ratio:
+        return FALLBACK_MODEL
+    return model
+```
+
+With this in place, incident response is just adding `MODEL_OVERRIDE_METADATA=gemini-2.5-flash` to the environment and restarting. No code changes, which means you can revert from a phone at midnight. I only use canary ratios on workloads where format violations are detectable downstream, like metadata generation; anything without a detection mechanism gets switched all-or-nothing. Half-mixed traffic makes bug reports impossible to reproduce.
+
+If you want continuous output-diff observation on live traffic, you can attach shadow execution behind the router. I covered that pattern in [Shadow traffic for safe Gemini model migrations — measuring output diffs in production](/articles/gemini-advanced/gemini-api-shadow-traffic-model-migration-production), so I'll skip it here.
+
+## Put Outage Fallback on the Same Router
+
+With Gemini just recovering from what was reported as its largest outage to date (the June 12 incident with widespread error 1076 / 1099), I reviewed my fallback paths during the same migration. Once a model router exists, outage evacuation rides on the same mechanism.
+
+```python
+# generate_with_fallback — auto-evacuate to the previous generation on failure
+from model_router import FALLBACK_MODEL, resolve_model
+
+
+def generate_with_fallback(client, workload, contents, config):
+    primary = resolve_model(workload)
+    last_error = None
+    for model in (primary, FALLBACK_MODEL):
+        try:
+            return client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as err:  # in production, catch google.genai.errors types
+            last_error = err
+    raise last_error
+```
+
+Two caveats. First, old and new models can go down in the same incident — this is insurance, not redundancy. A queue design that lets failed jobs recover the next morning matters more. Second, log every fallback activation; otherwise you get the "it silently ran on the old model for a week" accident. I send a single Slack notification whenever it triggers.
+
+## Where I Got Stuck — Aliases, Quotas, and Output Drift
+
+Three places where the migration actually stopped my hands.
+
+**I almost shipped an alias ID.** During testing I nearly specified a `-latest` style alias before correcting to the pinned ID. Aliases swap their contents without notice, so the model you measured and the model running in production can silently diverge. My rule: only pinned GA IDs go into the harness and the router.
+
+**Quotas are tracked per model.** The first nightly batch after switching threw scattered 429s. Concurrency levels proven safe on the old model count against a separate rate-limit bucket on the new one. I halved concurrency on day one, confirmed zero 429s, then restored it.
+
+**Different thinking defaults made latency jitter.** The 3.5 generation handles reasoning differently, and without explicit config the latency variance grew on some tasks. For comparative measurement, pin temperature and reasoning settings identically on both models. The cost-control mindset from [Controlling thinking_budget on Gemini 2.5 Pro — cutting costs to a third while protecting reasoning quality](/articles/gemini-api/gemini-25-pro-thinking-budget-cost-control-guide) carries over directly.
+
+## Start by Picking One Pipeline and Measuring It
+
+The whole migration reduces to: measure, decide per workload, switch in stages through a router, and keep monitoring plus a rollback lever within reach. As the Enterprise default-lock shows, this switch will eventually arrive from the outside whether you choose it or not. I'd rather hold the decision data in my own hands while the timing is still mine.
+
+As a next step, pick one pipeline whose output format can be verified mechanically, and run about 20 cases through the harness above. Once you have two numbers — p50 latency and format pass rate — the migration stops being a matter of intuition. I hope this record is useful to anyone doing the same work.
