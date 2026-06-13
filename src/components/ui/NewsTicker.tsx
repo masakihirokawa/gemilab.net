@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CHROME — Gemini in ChromeがAndroidに6月下旬展開。Nano Bananaとauto browseを同梱し、RAM 4GB以上・en-USの端末から段階提供",
-    "OMNI-FLASH — Gemini Omni FlashがAI Plus/Pro/Ultraの全サブスクライバーへロールアウト。YouTube Shorts RemixとCreateでは18歳以上に無料開放",
-    "DEADLINE — 画像previewモデル（gemini-3.1-flash / 3-pro image-preview）の停止まで残り12日（6/25）。GA版への移行はお早めに",
-    "SCHEMA — Interactions APIの旧スキーマは6/8に削除済み。steps配列と新response_formatへの移行が完了しているか要確認です",
-    "FLASH-GA — Gemini 3.5 Flashが一般提供。Antigravity・Gemini API・AI Studio・Android Studioから利用できます",
-    "SUITE — Deep Think・Deep Research・Gemini Live・Gemini Omniが出揃い、「考える→調べる→話す→作る」が一つの流れに",
+    "FLASH35 — Gemini 3.5 FlashがGemini Enterpriseアプリで既定モデルに（6/8〜）。無効化はできません",
+    "APP — I/O 2026でGeminiアプリを刷新。1日の要点をまとめる「Daily Brief」、新UI、動画モデル「Gemini Omni」を追加",
+    "SPARK — パーソナルAIエージェント「Gemini Spark」が登場。チャットボットから連携作業システムへの転換が鮮明に",
+    "CHROME — Gemini in Chrome on Android（Nano Banana・auto browse）が6月下旬から。メモリ4GB以上・English-US設定の端末から順次",
+    "DEEPTHINK — Gemini 3 Deep ThinkがAPI経由でも一部の研究者・企業に開放。科学・研究向けの高度推論モードです",
+    "MODELS — Gemini 3世代を軸に3.1 Pro / 3.1 Flash-Lite / 3.5 Flashを展開。速度・推論深度・コストで使い分けます",
   ],
   en: [
-    "CHROME — Gemini in Chrome lands on Android in late June with Nano Banana and auto browse, rolling out first to 4GB+ RAM devices set to en-US",
-    "OMNI-FLASH — Gemini Omni Flash rolls out to all AI Plus, Pro, and Ultra subscribers, and is free for adults in YouTube Shorts Remix and YouTube Create",
-    "DEADLINE — 12 days until the image preview models shut down on Jun 25 — migrate gemini-3.1-flash and 3-pro image-preview workloads to GA versions now",
-    "SCHEMA — The legacy Interactions API schema was removed on Jun 8; double-check your migration to the steps array and the new response_format",
-    "FLASH-GA — Gemini 3.5 Flash is generally available via Antigravity, the Gemini API, AI Studio, and Android Studio",
-    "SUITE — Deep Think, Deep Research, Gemini Live, and Gemini Omni now form one flow: reason, research, talk, and create",
+    "FLASH35 — Gemini 3.5 Flash is the default model in the Gemini Enterprise app (since Jun 8) and cannot be turned off",
+    "APP — At I/O 2026 the Gemini app gains a Daily Brief, a redesigned UI, and a new video model called Gemini Omni",
+    "SPARK — Gemini Spark, a personal AI agent, debuts as Google turns Gemini from a chatbot into a connected work system",
+    "CHROME — Gemini in Chrome on Android (Nano Banana, auto browse) rolls out in late June, starting on 4GB+ devices set to English-US",
+    "DEEPTHINK — Gemini 3 Deep Think reaches the Gemini API for select researchers and enterprises — advanced reasoning for science and research",
+    "MODELS — Across the Gemini 3 generation, 3.1 Pro, 3.1 Flash-Lite, and 3.5 Flash trade off speed, reasoning depth, and cost",
   ],
 };
 
