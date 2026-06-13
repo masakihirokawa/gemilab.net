@@ -1,0 +1,244 @@
+---
+title: "画像生成モデルを乗り換えると品質は静かに落ちる — 人手レビューなしで検知する自動ゲートの設計"
+slug: "gemini-image-model-migration-auto-quality-gate-embedding-judge"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-14T10:45"
+author: "Gemini Lab"
+description: "preview から GA への画像モデル移行で、出力品質が落ちていないかを目視に頼らず検証する3層ゲートの実装です。決定的プロパティ検査・マルチモーダル埋め込み類似度・Gemini によるブリーフ遵守スコアを Python のコードでつなぎ、しきい値とカットオーバー手順まで整理しました。"
+tags: ["gemini", "image-generation", "model-migration", "embedding", "llm-as-judge", "Python"]
+highlights:
+  - "画像モデルの切り替えで品質が落ちていないか不安だった人が、目視レビューを増やさずに劣化を機械で検知する仕組みを今日組める"
+  - "生成画像には使えない画素比較の代わりに、マルチモーダル埋め込み類似度と Gemini 判定を組み合わせた3層ゲートのコードを入手できる"
+  - "baseline の取り方としきい値の決め方が分かり、preview 停止前に安全なカットオーバー判断を自分で下せるようになる"
+---
+
+画像生成モデルを `preview` 系から GA 版へ切り替えたとき、API は何ごともなく 200 を返し続けます。例外も出ません。けれども数日後にアプリの新着壁紙を眺めると、なんとなく彩度が浅い、構図の余白の取り方が変わった、という違和感に気づきます。テキスト生成のように「壊れたら例外で止まる」わけではないので、品質の劣化は静かに進行します。
+
+私は個人開発で壁紙アプリを運営していて、生成パイプラインは毎日まとまった枚数を吐き出します。6月25日に `gemini-3.1-flash-image-preview` と `gemini-3-pro-image-preview` が停止する以上、GA 版への移行は避けられません。問題は「切り替えた後、品質が落ちていないことをどうやって確かめるか」でした。1枚ずつ目で見るのは枚数的に無理がありますし、私自身の主観に頼ると日によってぶれます。そこで、出力品質を機械で見張るゲートを移行前に組みました。本稿はその設計と、実際に動かしているコードの記録です。
+
+移行作業そのもの（モデルID の確認やコード差分）は[6月25日停止する画像 preview モデルの GA 移行手順](/articles/gemini-api/gemini-image-preview-models-625-shutdown-ga-migration)に整理しています。本稿はその次の工程、つまり「移行が品質を壊していないかを検証する」部分に絞ります。
+
+## なぜ生成画像では画素比較（SSIM）が破綻するのか
+
+最初に試して失敗したのが、移行前後で同じプロンプトを投げ、出力画像を SSIM や画素差分で比べる方法でした。テキストやスクリーンショットの回帰テストでは定番の手段です。
+
+ところが生成画像では、同じプロンプト・同じシードでもモデルが変われば構図そのものが変わります。GA 版は preview 版と重みが違うので、SSIM はほぼゼロに張り付きます。「全部が変わっている」としか言えず、肝心の「品質が下がったのか、ただ違う絵になっただけなのか」を区別できません。
+
+つまり生成画像の品質ゲートに必要なのは「ピクセルがどれだけ一致するか」ではなく、次の3つの問いに別々に答える仕組みです。
+
+- その画像は仕様（解像度・アスペクト比・ファイル健全性・安全性）を満たしているか
+- 出力は「依頼したブリーフ」からどれだけ逸脱したか（内容の意味的な距離）
+- 人が見たときの完成度・ブリーフ遵守度はどれくらいか
+
+この3問にそれぞれ別の層で答えるのが、本稿の3層ゲートです。
+
+## 3層ゲートの全体像
+
+層を分けるのは、安いチェックで早く弾き、高いチェックを最後に回すためです。
+
+- **層1: 決定的プロパティ検査** — API 呼び出しゼロ。解像度・アスペクト比・デコード可否・極端な単色画像を検出します。ここで落ちるものは下流に流しません。
+- **層2: マルチモーダル埋め込み類似度** — `gemini-embedding-2` でブリーフ文と生成画像をそれぞれ埋め込み、コサイン類似度で「依頼からの逸脱度」を数値化します。preview 時代の baseline 分布と比べて外れ値を検出します。
+- **層3: Gemini によるブリーフ遵守スコア** — 構造化出力で 0〜100 のスコアと理由を返させます。最も高コストなので、層1・層2 を通った画像にだけ適用します。
+
+最終判定は3層のスコアを合成し、baseline から決めたしきい値で `pass` / `fail` を出します。
+
+## 層1: 決定的プロパティ検査（API を使わない最初の砦）
+
+まずは無料で速い検査から始めます。GA 版に切り替えた直後にいちばん起きやすいのが「アスペクト比が微妙にずれる」「稀に真っ黒・真っ白の画像が混ざる」という事故です。これらは埋め込みや LLM に渡す前に弾けます。
+
+```python
+import io
+from dataclasses import dataclass
+from PIL import Image
+
+
+@dataclass
+class PropertyResult:
+    ok: bool
+    reasons: list
+
+
+def check_image_properties(image_bytes, target_w, target_h, tolerance=0.01):
+    """解像度・アスペクト比・デコード可否・単色つぶれを検査する。"""
+    reasons = []
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+    except Exception as exc:
+        return PropertyResult(False, [f"decode_failed: {exc}"])
+
+    w, h = img.size
+    target_ratio = target_w / target_h
+    actual_ratio = w / h
+    if abs(actual_ratio - target_ratio) / target_ratio > tolerance:
+        reasons.append(f"aspect_mismatch: {actual_ratio:.4f} vs {target_ratio:.4f}")
+
+    # 極端な単色（生成失敗で真っ黒・真っ白になるケース）を分散で検出
+    gray = img.convert("L")
+    pixels = list(gray.getdata())
+    mean = sum(pixels) / len(pixels)
+    variance = sum((p - mean) ** 2 for p in pixels) / len(pixels)
+    if variance < 25.0:
+        reasons.append(f"low_variance: {variance:.1f} (flat image)")
+
+    return PropertyResult(len(reasons) == 0, reasons)
+
+
+result = check_image_properties(open("sample.png", "rb").read(), 1206, 2622)
+print(result.ok, result.reasons)
+# 期待出力例: True []  /  失敗例: False ['low_variance: 3.2 (flat image)']
+```
+
+分散による単色検出は素朴ですが効きます。preview から GA に切り替えた最初の週、私のパイプラインでは 600 枚に 2〜3 枚の割合で真っ黒画像が混ざりました。層1 だけでこの種の事故は止まります。
+
+## 層2: マルチモーダル埋め込みで「ブリーフからの逸脱」を測る
+
+`gemini-embedding-2` はテキストと画像を同じベクトル空間に埋め込めるようになりました。これを使うと「依頼したブリーフ文」と「実際に生成された画像」のコサイン類似度を取れます。値が低いほど、依頼から内容が外れていることを意味します。
+
+```python
+import os
+import numpy as np
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+
+def embed(content_parts):
+    resp = client.models.embed_content(
+        model="gemini-embedding-2",
+        contents=content_parts,
+        config=types.EmbedContentConfig(output_dimensionality=1024),
+    )
+    return np.array(resp.embeddings[0].values, dtype=np.float32)
+
+
+def cosine(a, b):
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+def brief_adherence(image_bytes, brief_text):
+    """ブリーフ文と生成画像の意味的な近さを 0〜1 で返す。"""
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+    text_vec = embed([brief_text])
+    image_vec = embed([image_part])
+    return cosine(text_vec, image_vec)
+
+
+brief = "霧のかかった杉林、朝の斜光、静かで余白の多い構図、彩度は控えめ"
+score = brief_adherence(open("sample.png", "rb").read(), brief)
+print(round(score, 4))
+# 期待出力例: 0.31 前後（このスコアは絶対値ではなく baseline との相対で読む）
+```
+
+ここで大事なのは、コサイン類似度の**絶対値に意味を持たせない**ことです。テキストと画像のクロスモーダル類似度は 0.3 前後に出ることが多く、「0.3 は低い」と早合点すると判断を誤ります。後述の baseline 分布と比べて初めて意味を持ちます。埋め込みの距離設計そのものは[埋め込みモデルをダウンタイムなしで移行する設計](/articles/gemini-advanced/gemini-embedding-model-migration-zero-downtime-reindex)でも触れています。
+
+## 層3: Gemini を判定者にしてブリーフ遵守度をスコアリング
+
+最後に、人の目に近い判定を Gemini にさせます。ポイントは自由文で感想を書かせないことです。構造化出力（`response_schema`）で数値スコアと短い理由だけを返させ、後段で機械的に扱えるようにします。
+
+```python
+import os
+import json
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "adherence": {"type": "integer"},
+        "aesthetic": {"type": "integer"},
+        "artifacts": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["adherence", "aesthetic", "artifacts", "reason"],
+}
+
+
+def judge_image(image_bytes, brief_text):
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+    instruction = (
+        "あなたは壁紙の品質審査員です。次のブリーフに対する画像を評価してください。"
+        "adherence と aesthetic は 0〜100 の整数、"
+        "artifacts は崩れ・不自然な反復があれば true。"
+        "reason は 40 字以内の日本語で簡潔に。\n\nブリーフ: " + brief_text
+    )
+    resp = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=[instruction, image_part],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=JUDGE_SCHEMA,
+            temperature=0.0,
+        ),
+    )
+    return json.loads(resp.text)
+
+
+verdict = judge_image(open("sample.png", "rb").read(), "霧のかかった杉林、朝の斜光、静かな構図")
+print(verdict)
+# 期待出力例: {'adherence': 88, 'aesthetic': 82, 'artifacts': False, 'reason': '構図・光ともブリーフに忠実'}
+```
+
+`temperature=0.0` にして判定のぶれを抑えます。それでも 1 回の判定は揺れるので、重要な baseline 計測では同じ画像を 3 回判定して中央値を取ると安定します。判定者としての Gemini の使い方は[LLM-as-judge を本番運用する設計](/articles/gemini-api/gemini-llm-as-judge-evaluation-production-guide)に詳しくまとめています。
+
+## 3層を束ねて pass / fail を出す
+
+各層の結果を1つの関数で合成します。層1 で落ちたら即 fail、層2・層3 は baseline から決めたしきい値で判定します。
+
+```python
+def quality_gate(image_bytes, brief_text, target_w, target_h, thresholds):
+    prop = check_image_properties(image_bytes, target_w, target_h)
+    if not prop.ok:
+        return {"verdict": "fail", "stage": "properties", "detail": prop.reasons}
+
+    sim = brief_adherence(image_bytes, brief_text)
+    if sim < thresholds["min_similarity"]:
+        return {"verdict": "fail", "stage": "embedding", "detail": round(sim, 4)}
+
+    j = judge_image(image_bytes, brief_text)
+    if j["artifacts"] or j["adherence"] < thresholds["min_adherence"]:
+        return {"verdict": "fail", "stage": "judge", "detail": j}
+
+    return {"verdict": "pass", "similarity": round(sim, 4), "judge": j}
+
+
+thresholds = {"min_similarity": 0.22, "min_adherence": 70}
+out = quality_gate(open("sample.png", "rb").read(), "霧の杉林、朝の斜光", 1206, 2622, thresholds)
+print(out["verdict"], out.get("stage", "ok"))
+# 期待出力例: pass ok
+```
+
+この順序にしているのは、層1 が無料・即時、層2 が安い埋め込み 2 回、層3 が最も高い生成 1 回だからです。落とせるものを早い層で落とすほど、全体のコストとレイテンシが下がります。リクエストの段取りで品質を守る考え方は[シャドートラフィックでモデル移行を検証する本番設計](/articles/gemini-advanced/gemini-api-shadow-traffic-model-migration-production)とも共通します。
+
+## しきい値の決め方とカットオーバー手順
+
+しきい値は勘で決めません。preview がまだ動いているうちに baseline を取るのが肝心です。preview が止まってからでは比較対象が消えてしまいます。
+
+手順はこうしています。
+
+1. preview 版で、本番と同じブリーフ集合から 100〜200 枚を生成する
+2. その全枚数に層2・層3 を回し、`similarity` と `adherence` の分布を記録する
+3. しきい値を「baseline 分布の下位 5 パーセンタイル」あたりに置く。私は `min_similarity` を下位 5%、`min_adherence` を 70 に設定しました
+4. GA 版で同じブリーフ集合を生成し、同じゲートに通す。GA の合格率が baseline と同等なら、品質は維持できていると判断してカットオーバーする
+5. 合格率が明確に下がっていれば、プロンプト側を GA 向けに調整してから再計測する
+
+ここで GA の合格率が下がった場合、それは「移行してはいけない」という意味ではなく、「GA 版に合わせてブリーフを書き直す余地がある」というサインであることが多いです。実際、私のパイプラインでは GA 版で彩度の指示語を1つ足しただけで合格率が baseline 水準に戻りました。
+
+## つまずいた点
+
+**埋め込みの絶対値で足切りした失敗。** 最初、コサイン類似度 0.5 未満を fail にしたら全滅しました。クロスモーダル類似度の典型値を知らなかったためです。baseline 分布を取るまで、しきい値を固定値で決めてはいけません。
+
+**判定者モデルを画像生成と同じ系統にした失敗。** 生成も判定も同じ画像モデル系に寄せると、モデル特有の癖を「良し」と判定しがちです。判定は生成と独立した汎用モデル（私は `gemini-3.5-flash`）に任せ、生成側と切り離すほうが素直でした。
+
+**baseline を GA 切り替え後に取ろうとした失敗。** これは設計ミスそのものです。比較の基準は、消える側（preview）が生きているうちにしか取れません。移行前に baseline を凍結保存しておくことを強くおすすめします。
+
+## まとめ
+
+まず、preview がまだ生きている今のうちに、本番ブリーフ 100 枚分の `similarity` と `adherence` の baseline を取って JSON で保存してください。それが移行判断の唯一の物差しになります。
+
+生成 AI の品質は「壊れたら例外」では教えてくれません。静かに下がるものを数値で見張る仕組みを持てるかどうかが、個人開発で生成パイプラインを長く回し続けられるかの分かれ目だと感じています。お読みいただきありがとうございました。同じ移行に取り組んでいる方の役に立てば嬉しいです。

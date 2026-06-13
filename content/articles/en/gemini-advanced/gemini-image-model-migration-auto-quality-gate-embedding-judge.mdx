@@ -1,0 +1,244 @@
+---
+title: "Switching Image Models Quietly Degrades Quality — A Gate That Catches It Without Manual Review"
+slug: "gemini-image-model-migration-auto-quality-gate-embedding-judge"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-14T10:45"
+author: "Gemini Lab"
+description: "When you move image generation from preview to GA models, the API keeps returning 200 and quality slips silently. This is the three-layer gate I built to detect that drift without staring at every image: deterministic property checks, multimodal embedding similarity, and a Gemini judge, wired together in Python with thresholds and a cutover procedure."
+tags: ["gemini", "image-generation", "model-migration", "embedding", "llm-as-judge", "Python"]
+highlights:
+  - "If you were nervous that switching image models might degrade output, you can now build a machine that catches the drift without adding manual review"
+  - "Instead of pixel comparison (which breaks for generated images), you get working code for a three-layer gate combining multimodal embedding similarity and a Gemini judge"
+  - "You'll learn how to capture a baseline and set thresholds, so you can make a safe cutover decision yourself before the preview models shut down"
+---
+
+When you swap an image generation model from a `preview` variant to its GA version, the API keeps returning 200 as if nothing happened. No exceptions are raised. Yet a few days later you glance at the fresh wallpapers your app shipped and notice something off — saturation feels shallower, the negative space in the composition has shifted. Unlike text generation, where a break tends to surface as an exception, quality degradation creeps in quietly.
+
+I run wallpaper apps as a solo developer, and my generation pipeline produces a sizable batch every day. With `gemini-3.1-flash-image-preview` and `gemini-3-pro-image-preview` shutting down on June 25, migrating to the GA versions isn't optional. The real question was: after I switch, how do I confirm that quality hasn't dropped? Reviewing every image by hand doesn't scale at that volume, and relying on my own eye introduces day-to-day bias. So before the migration I built a gate that watches output quality mechanically. This is the design, with the code I actually run.
+
+The migration mechanics themselves — checking model IDs and code diffs — are covered in [the GA migration steps for the image preview models shutting down on June 25](/articles/gemini-api/gemini-image-preview-models-625-shutdown-ga-migration). This piece focuses on the next stage: verifying that the migration hasn't broken quality.
+
+## Why pixel comparison (SSIM) breaks for generated images
+
+The first thing I tried — and abandoned — was sending the same prompt before and after migration and comparing outputs with SSIM or pixel diffs. That's the standard move for regression testing text or screenshots.
+
+But with generated images, even the same prompt and seed produce a different composition once the model's weights change. The GA model differs from preview, so SSIM pins to nearly zero. All it can tell you is "everything changed," which is useless for the question that matters: did quality drop, or did you simply get a different valid image?
+
+A quality gate for generated images therefore needs to answer three separate questions, not "how many pixels match":
+
+- Does the image meet spec (resolution, aspect ratio, file integrity, safety)?
+- How far did the output drift from the brief you requested (semantic distance)?
+- How complete and on-brief does it look to a human eye?
+
+Each question gets its own layer. That's the three-layer gate.
+
+## The three-layer gate at a glance
+
+Layers exist so cheap checks reject early and expensive checks run last.
+
+- **Layer 1: deterministic property checks** — zero API calls. Catches resolution, aspect ratio, decode failures, and degenerate flat images. Anything that fails here never reaches downstream layers.
+- **Layer 2: multimodal embedding similarity** — embed both the brief text and the generated image with `gemini-embedding-2`, then use cosine similarity to quantify drift from the request. Compare against the baseline distribution from the preview era to spot outliers.
+- **Layer 3: a Gemini judge** — return a 0–100 score and a short reason via structured output. This is the most expensive layer, so it only runs on images that already passed layers 1 and 2.
+
+The final verdict combines all three scores and applies thresholds derived from the baseline to emit `pass` or `fail`.
+
+## Layer 1: deterministic property checks (the free first wall)
+
+Start with the cheap, fast checks. The most common accident right after switching to a GA model is a slightly off aspect ratio, or the occasional all-black or all-white frame. You can reject these before spending anything on embeddings or an LLM.
+
+```python
+import io
+from dataclasses import dataclass
+from PIL import Image
+
+
+@dataclass
+class PropertyResult:
+    ok: bool
+    reasons: list
+
+
+def check_image_properties(image_bytes, target_w, target_h, tolerance=0.01):
+    """Check resolution, aspect ratio, decodability, and flatness."""
+    reasons = []
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+    except Exception as exc:
+        return PropertyResult(False, [f"decode_failed: {exc}"])
+
+    w, h = img.size
+    target_ratio = target_w / target_h
+    actual_ratio = w / h
+    if abs(actual_ratio - target_ratio) / target_ratio > tolerance:
+        reasons.append(f"aspect_mismatch: {actual_ratio:.4f} vs {target_ratio:.4f}")
+
+    # Detect degenerate flat images (failed generations going all-black/white) via variance
+    gray = img.convert("L")
+    pixels = list(gray.getdata())
+    mean = sum(pixels) / len(pixels)
+    variance = sum((p - mean) ** 2 for p in pixels) / len(pixels)
+    if variance < 25.0:
+        reasons.append(f"low_variance: {variance:.1f} (flat image)")
+
+    return PropertyResult(len(reasons) == 0, reasons)
+
+
+result = check_image_properties(open("sample.png", "rb").read(), 1206, 2622)
+print(result.ok, result.reasons)
+# Example: True []  /  failure: False ['low_variance: 3.2 (flat image)']
+```
+
+Variance-based flatness detection is crude but effective. In the first week after moving from preview to GA, my pipeline produced an all-black frame roughly 2–3 times per 600 images. Layer 1 alone stops that class of accident.
+
+## Layer 2: measuring drift from the brief with multimodal embeddings
+
+`gemini-embedding-2` can now embed text and images into the same vector space. That lets you take the cosine similarity between the brief you requested and the image you actually generated. The lower the value, the further the content drifted from the request.
+
+```python
+import os
+import numpy as np
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+
+def embed(content_parts):
+    resp = client.models.embed_content(
+        model="gemini-embedding-2",
+        contents=content_parts,
+        config=types.EmbedContentConfig(output_dimensionality=1024),
+    )
+    return np.array(resp.embeddings[0].values, dtype=np.float32)
+
+
+def cosine(a, b):
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+def brief_adherence(image_bytes, brief_text):
+    """Return semantic closeness between the brief and the image, 0 to 1."""
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+    text_vec = embed([brief_text])
+    image_vec = embed([image_part])
+    return cosine(text_vec, image_vec)
+
+
+brief = "misty cedar forest, low morning light, calm composition with generous negative space, muted saturation"
+score = brief_adherence(open("sample.png", "rb").read(), brief)
+print(round(score, 4))
+# Example: around 0.31 (read this relative to a baseline, not as an absolute)
+```
+
+The crucial part is to **not assign meaning to the absolute cosine value**. Cross-modal text-to-image similarity often lands around 0.3, so jumping to "0.3 is low" leads you astray. It only becomes meaningful against the baseline distribution described later. The distance design behind embeddings is also discussed in [migrating an embedding model with zero downtime](/articles/gemini-advanced/gemini-embedding-model-migration-zero-downtime-reindex).
+
+## Layer 3: a Gemini judge scoring brief adherence
+
+Finally, get a verdict closer to a human's by letting Gemini judge. The key is to forbid free-form prose. Use structured output (`response_schema`) so it returns only a numeric score and a short reason that downstream code can handle mechanically.
+
+```python
+import os
+import json
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "adherence": {"type": "integer"},
+        "aesthetic": {"type": "integer"},
+        "artifacts": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["adherence", "aesthetic", "artifacts", "reason"],
+}
+
+
+def judge_image(image_bytes, brief_text):
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+    instruction = (
+        "You are a wallpaper quality reviewer. Evaluate the image against this brief. "
+        "adherence and aesthetic are integers 0-100. "
+        "Set artifacts to true if there is distortion or unnatural repetition. "
+        "Keep reason under 12 words.\n\nBrief: " + brief_text
+    )
+    resp = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=[instruction, image_part],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=JUDGE_SCHEMA,
+            temperature=0.0,
+        ),
+    )
+    return json.loads(resp.text)
+
+
+verdict = judge_image(open("sample.png", "rb").read(), "misty cedar forest, low morning light, calm composition")
+print(verdict)
+# Example: {'adherence': 88, 'aesthetic': 82, 'artifacts': False, 'reason': 'composition and light faithful to brief'}
+```
+
+Set `temperature=0.0` to reduce judgment variance. Even so, a single verdict wobbles, so for important baseline measurements I judge the same image three times and take the median. A deeper treatment of running Gemini as a judge in production is in [operating LLM-as-judge in production](/articles/gemini-api/gemini-llm-as-judge-evaluation-production-guide).
+
+## Wiring the three layers into a pass / fail
+
+Combine each layer's result in one function. Fail immediately if layer 1 fails; judge layers 2 and 3 against thresholds derived from the baseline.
+
+```python
+def quality_gate(image_bytes, brief_text, target_w, target_h, thresholds):
+    prop = check_image_properties(image_bytes, target_w, target_h)
+    if not prop.ok:
+        return {"verdict": "fail", "stage": "properties", "detail": prop.reasons}
+
+    sim = brief_adherence(image_bytes, brief_text)
+    if sim < thresholds["min_similarity"]:
+        return {"verdict": "fail", "stage": "embedding", "detail": round(sim, 4)}
+
+    j = judge_image(image_bytes, brief_text)
+    if j["artifacts"] or j["adherence"] < thresholds["min_adherence"]:
+        return {"verdict": "fail", "stage": "judge", "detail": j}
+
+    return {"verdict": "pass", "similarity": round(sim, 4), "judge": j}
+
+
+thresholds = {"min_similarity": 0.22, "min_adherence": 70}
+out = quality_gate(open("sample.png", "rb").read(), "misty cedar forest, morning light", 1206, 2622, thresholds)
+print(out["verdict"], out.get("stage", "ok"))
+# Example: pass ok
+```
+
+This ordering exists because layer 1 is free and instant, layer 2 is two cheap embeddings, and layer 3 is the most expensive single generation. The earlier you drop a failing image, the lower your overall cost and latency. This same idea of protecting quality through request sequencing appears in [validating a model migration with shadow traffic](/articles/gemini-advanced/gemini-api-shadow-traffic-model-migration-production).
+
+## Setting thresholds and the cutover procedure
+
+Don't pick thresholds by intuition. Capture the baseline while preview is still alive — once it shuts down, the comparison target is gone.
+
+Here's the procedure I follow.
+
+1. With the preview model, generate 100–200 images from the same brief set you use in production.
+2. Run layers 2 and 3 over all of them and record the distribution of `similarity` and `adherence`.
+3. Set thresholds near the 5th percentile of the baseline distribution. I put `min_similarity` at the bottom 5% and `min_adherence` at 70.
+4. Generate the same brief set with the GA model and run it through the same gate. If GA's pass rate matches the baseline, quality is being maintained and you can cut over.
+5. If the pass rate clearly drops, tune the prompts for GA, then re-measure.
+
+When GA's pass rate falls, it usually doesn't mean "don't migrate" — it means there's room to rewrite the brief for the GA model. In my pipeline, adding a single saturation cue for the GA model brought the pass rate back to baseline level.
+
+## Where I stumbled
+
+**Cutting off on the absolute embedding value.** At first I failed anything below cosine 0.5, and everything got rejected — because I didn't know the typical range of cross-modal similarity. Never fix thresholds to a constant before you've captured the baseline distribution.
+
+**Using the same model family for judging as for generation.** When generation and judgment lean on the same image-model family, the judge tends to rate that model's quirks as "good." Letting an independent general model judge (I use `gemini-3.5-flash`), decoupled from generation, behaved more honestly.
+
+**Trying to capture the baseline after the GA switch.** That's a design mistake outright. The reference point can only be captured while the side that's disappearing (preview) is still alive. I strongly recommend freezing and saving the baseline before migrating.
+
+## Wrapping up
+
+Right now, while preview is still alive, capture the `similarity` and `adherence` baseline over 100 production briefs and save it as JSON. That file becomes the one and only yardstick for your migration decision.
+
+Generative AI won't tell you about quality through exceptions. Whether you can keep a generation pipeline running over the long haul as a solo developer comes down, I think, to whether you have a mechanism that watches — in numbers — for the things that slip quietly. Thank you for reading, and I hope it helps anyone tackling the same migration.
