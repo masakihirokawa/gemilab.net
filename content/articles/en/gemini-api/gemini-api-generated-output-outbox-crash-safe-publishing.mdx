@@ -1,0 +1,194 @@
+---
+title: "The Morning Gemini Generated Fine but the Publish Crashed — A 'Generation Outbox' So Expensive Output Is Never Lost"
+slug: "gemini-api-generated-output-outbox-crash-safe-publishing"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-13T13:30"
+author: "Gemini Lab"
+description: "Generation succeeds, then the process dies right before publishing. The expensive output is gone, and you pay for the same generation again. Here is a 'generation outbox' that persists the output first and turns publishing into an idempotent follow-up, plus what it did for me during the June outage."
+tags: ["gemini-api", "outbox", "reliability", "automation", "production"]
+highlights:
+  - "Prevent the most wasteful failure mode — 'generation succeeded, publish failed' — with a single table that durably stores the output first, shown in complete SQLite and Python code"
+  - "Pass the fingerprint to the publisher as an idempotency key so retries never double-post, with a walk-through of exactly what happens at each crash point"
+  - "Using real measurements — about 11,000 input and 3,500 output tokens per article — see how three retries triple your generation cost, and how much the outbox claws back"
+---
+
+It was the morning of that big June 2026 outage (error 1076 / 1099). As an indie developer I run automated publishing pipelines across four sites, and when I read the logs I froze. Gemini's generation itself was going through fine — but the publish step right after it (a git push) was dying along with the network.
+
+The job exited with an error, and the scheduler dutifully retried. A retry starts over from generation. So it threw away the output I had already paid for and was holding in memory, and called Gemini again with the same prompt. During the outage, that happened three times.
+
+I wrote about preventing duplicate *generations* earlier, in [Idempotency Key Design for the Gemini API](/articles/gemini-api/gemini-api-idempotency-key-design-multisite-production). Today is about the failure hiding behind it: generation succeeds, but you lose the result before you can publish it. Even in a small indie pipeline, this quietly and reliably burns money.
+
+## Why "generated but not published" is the costliest failure
+
+Think of the pipeline as two stages — generate, then publish. There are three ways it can fail.
+
+It crashes before generation. Nothing is lost; a retry simply starts over cleanly.
+
+Both generation and publish succeed. That is the happy path.
+
+The problem is the third case: generation succeeds and the crash lands before publishing. You have already been charged by Gemini. The most valuable intermediate artifact — the output — is sitting in memory, and if you never persisted it, it vanishes when the process exits. The retry regenerates, so you buy the same tokens again.
+
+The longer the input prompt, the more this hurts. My article-generation job carries reference data and prior-article context, so input averages around 11,000 tokens and output around 3,500. If only the publish keeps failing and you retry three times, generation cost roughly triples. Small for one article, but across six sites every day, a few hours of outage adds up fast.
+
+## The shift — put the output in an "outbox" before sending
+
+The fix borrows the outbox pattern that backend systems have used for a long time.
+
+Instead of writing an email and sending it immediately, you save it to a drafts folder first, then hand it to the sending process. If sending fails, the draft is still there — you never rewrite the body.
+
+Apply that to the Gemini pipeline. The moment generation succeeds, write the output itself to a durable store *before* publishing. Publishing becomes a separate, independent step that only pulls items out of the box and ships them.
+
+Now the roles are cleanly split. The generation phase's job ends at "safely place the expensive output into the box." The publish phase's job is "ship each item exactly once." Wherever a crash lands, output that made it into the box is never bought twice.
+
+## A single outbox table
+
+The store can be anything. Since I run this solo, I started with SQLite, which lives in one file. On Cloudflare Workers you can swap in D1 or KV.
+
+```sql
+CREATE TABLE IF NOT EXISTS outbox (
+  fingerprint   TEXT PRIMARY KEY,   -- fingerprint of the generation request (idempotency key)
+  target        TEXT NOT NULL,      -- where to publish (article slug, site name, ...)
+  payload       TEXT NOT NULL,      -- the Gemini output itself
+  tokens        INTEGER,            -- measured token count (for cost tracking)
+  status        TEXT NOT NULL DEFAULT 'pending',  -- pending / published
+  created_at    REAL,
+  published_at  REAL
+);
+```
+
+The key point is making `fingerprint` the primary key. As we will see, it is the single axis that suppresses both duplicate generation and duplicate publishing. The `payload` holds the output verbatim. The instant it lands there, the output becomes an asset you never need to buy again.
+
+## Generation phase — the job ends once output is in the box
+
+Here is the generation side. It computes the fingerprint, skips generation if the box already has it, and otherwise calls Gemini and writes the result.
+
+```python
+import hashlib
+import json
+import time
+import sqlite3
+from google import genai
+
+client = genai.Client()
+db = sqlite3.connect("outbox.db")
+
+
+def fingerprint(model: str, prompt: str, config: dict) -> str:
+    """Hash with sorted keys so identical inputs map to the same fingerprint."""
+    payload = json.dumps(
+        {"model": model, "prompt": prompt, "config": config},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def generate_into_outbox(model: str, prompt: str, config: dict, target: str) -> str:
+    fp = fingerprint(model, prompt, config)
+
+    row = db.execute(
+        "SELECT status FROM outbox WHERE fingerprint = ?", (fp,)
+    ).fetchone()
+    if row is not None:
+        # Already generated. Skip regeneration; hand off to the publish phase.
+        return fp
+
+    resp = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=config,
+    )
+
+    db.execute(
+        "INSERT INTO outbox "
+        "(fingerprint, target, payload, tokens, status, created_at) "
+        "VALUES (?, ?, ?, ?, 'pending', ?)",
+        (
+            fp,
+            target,
+            resp.text,
+            resp.usage_metadata.total_token_count,
+            time.time(),
+        ),
+    )
+    db.commit()
+    return fp
+```
+
+Once `commit()` returns, the output is on disk. If the process dies after this line, there is no need to call Gemini again. The generation phase can safely let go here.
+
+## Publish phase — an independent drain that empties the box
+
+Publishing runs as a separate drain process, on its own schedule. It pulls `pending` rows, publishes them, and flips them to `published` on success.
+
+```python
+def drain_outbox(publish_fn) -> int:
+    """Publish pending output. Safe to call any number of times."""
+    rows = db.execute(
+        "SELECT fingerprint, target, payload FROM outbox "
+        "WHERE status = 'pending'"
+    ).fetchall()
+
+    done = 0
+    for fp, target, payload in rows:
+        # Pass fingerprint to the publisher as the idempotency key.
+        # If the same key arrives twice, the publisher collapses it to one.
+        ok = publish_fn(target=target, body=payload, idempotency_key=fp)
+        if not ok:
+            # Could not publish this time. Leave it pending for the next run.
+            continue
+        db.execute(
+            "UPDATE outbox SET status = 'published', published_at = ? "
+            "WHERE fingerprint = ?",
+            (time.time(), fp),
+        )
+        db.commit()
+        done += 1
+    return done
+```
+
+`publish_fn` can be a git push, a CMS posting API, or a webhook. What matters is that it always accepts an `idempotency_key` and rejects duplicates on the receiving side. Many posting APIs offer an idempotency-key header; for a homegrown target, a single "have I already published this key?" check is enough.
+
+## Verify it survives a crash at every point
+
+Whether the design is correct becomes clear when you walk each crash point one by one.
+
+Crash before generation. The box is empty. The retry simply regenerates. Zero loss.
+
+Crash right after `generate_content` but before `commit()`. The output was still only in memory. This is the one window where re-paying is unavoidable — which is exactly why you keep this window as short as possible and write immediately after generation.
+
+Crash after `commit()` but before publishing. This is the exact point I hit during the June outage. The output is sitting in the box as `pending`. The next drain picks it up and publishes it, so generation cost does not rise at all.
+
+Crash after publishing but before flipping to `published`. The next drain tries to publish the same row again, but thanks to the `idempotency_key` the target rejects the second attempt. Readers never see a double post.
+
+Across these four points, "regenerate the expensive output" is confined to the tiny second window. That confinement is what the outbox buys you.
+
+## A bonus that mattered during the outage
+
+What I felt during the June incident is that splitting generation from publishing also raises resilience to the outage itself.
+
+Even when the publish target (GitHub) was flaky, as long as Gemini responded I could keep generating, and every output piled up in the box. Once the target recovered, a single drain flushed all the accumulated `pending` rows at once. Conversely, during the hours Gemini was returning error 1076, I gave up only on generation and calmly kept publishing whatever was already in the box.
+
+The outage-recovery design itself is covered in [Building a Nightly Batch That Does Not Stop](/articles/gemini-api/gemini-api-outage-resilient-nightly-batch), but the outbox is its foundation. When one side falls over, the other keeps moving through the box. That separation kept the whole pipeline alive that day.
+
+## Pitfalls I hit in practice
+
+After running it for a while, a few things stood out.
+
+The scariest pitfall is `pending` rows piling up unnoticed. If the target stays unhealthy, the box keeps filling. I recommend folding "count of `pending` rows older than N hours by `created_at`" into your morning ops digest, with a threshold that surfaces it.
+
+The fingerprint must include every setting that affects the output. Not just the model and prompt, but `temperature` and `response_schema` too — otherwise a regeneration with only the config changed gets misread as "the same thing" and skipped. I settled on hashing the entire config.
+
+Decide when to delete published rows. Because I want `tokens` for cost tracking, a separate job only sweeps rows that have been `published` for more than 30 days.
+
+## Choosing by scale
+
+To start small, one SQLite file is plenty. My own solo setup drove the "generated but not published" loss to zero with exactly this.
+
+On edge runtimes like Cloudflare Workers, swap the store for D1 and the backlog monitoring for Workers Analytics, and you get the same design without owning a server.
+
+If you add more publish targets and want stronger delivery guarantees, leaning on a dedicated durable-workflow platform is an option; I lay out that decision in [Durable Workflows with the Gemini API](/articles/gemini-api/gemini-api-inngest-durable-workflow-production-guide). But before reaching for a big machine, plug the costliest failure with a one-table outbox first. For indie work, that is where I find the cost-to-benefit ratio is highest.
+
+Thanks for reading. Once you have paid for a generation, you want to see that output through to a single, reliable publish. Since I started thinking that way, my pipeline has been a little quieter even on the morning of an outage.

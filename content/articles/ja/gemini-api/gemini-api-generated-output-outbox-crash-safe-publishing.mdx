@@ -1,0 +1,194 @@
+---
+title: "Gemini の生成は通ったのに公開が落ちた朝 — 高価な出力を取りこぼさない『生成アウトボックス』の設計"
+slug: "gemini-api-generated-output-outbox-crash-safe-publishing"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-13T13:30"
+author: "Gemini Lab"
+description: "生成は成功したのに、公開処理の直前でプロセスが落ちる。すると高価な出力が消え、もう一度同じ生成に課金することになります。生成結果を先に永続化し、公開を冪等な後続処理に分離する『生成アウトボックス』の実装と、6月の障害下での運用記録をまとめました。"
+tags: ["gemini-api", "outbox", "reliability", "automation", "production"]
+highlights:
+  - "「生成は成功・公開は失敗」という最も損な落ち方を、生成結果を先に永続化する1テーブルで防ぐ設計を、SQLite と Python の完全なコードで示します"
+  - "公開側に fingerprint を冪等キーとして渡し、リトライしても二重投稿にならない drain 処理の実装と、各クラッシュ地点での挙動を1つずつ追えます"
+  - "1記事あたり入力約11,000・出力約3,500トークンという実測値をもとに、3回リトライで生成コストが約3倍に膨らむ構造と、アウトボックス導入後の削減幅を共有します"
+---
+
+2026年6月のあの大規模障害（error 1076 / 1099）が出ていた朝のことです。私自身、Dolice Labs として4サイトの自動投稿パイプラインを動かしているのですが、ログを見て手が止まりました。Gemini の生成自体は通っているのに、その直後の公開処理（git への push）がネットワークごと落ちていたのです。
+
+ジョブはエラーで終了し、スケジューラが律儀にリトライします。リトライすればまた生成から始まる。つまり、すでに課金を終えて手元にあったはずの出力を捨てて、同じプロンプトでもう一度 Gemini を呼ぶ。それが障害のあいだ、3回繰り返されていました。
+
+重複生成を防ぐ話は以前 [Gemini API の冪等性キー設計](/articles/gemini-api/gemini-api-idempotency-key-design-multisite-production) に書きました。今日扱うのは、その裏側にある別の失敗です。生成が成功したのに、その成果を公開できずに失う落ち方。これは個人開発の小さなパイプラインでも、静かに、しかし確実にお金を溶かします。
+
+## なぜ「生成成功・公開失敗」が一番損なのか
+
+パイプラインを「生成 → 公開」の2段だと考えると、起こりうる落ち方は3通りです。
+
+生成の前に落ちる場合。これは何も失っていません。リトライすれば素直にやり直せます。
+
+生成と公開の両方が成功する場合。これが正常系です。
+
+問題は3つ目、生成が成功して公開の前に落ちる場合です。Gemini への課金はすでに発生しています。出力という最も価値のある中間生成物がメモリ上にあるのに、それを永続化していなければ、プロセスの終了とともに消えます。リトライは生成からやり直すので、同じトークンをもう一度買うことになります。
+
+入力が長いプロンプトほど、この損は大きくなります。私の記事生成ジョブは、参照データや過去記事の文脈を含めて入力が平均で約11,000トークン、出力が約3,500トークンほどです。公開だけが落ちて3回リトライすれば、生成コストはおおよそ3倍。1件では小さくても、6サイトを毎日回していると、障害の数時間で無視できない額になります。
+
+## 発想の転換 — 生成結果を「送信前の箱」に入れる
+
+解決の鍵は、バックエンド設計で古くから使われてきたアウトボックス（送信箱）の考え方です。
+
+メールを書いてすぐ送るのではなく、いったん下書きフォルダに保存してから送信処理に回す。送信が失敗しても下書きは残っているので、本文をもう一度書く必要はありません。
+
+これを Gemini のパイプラインに当てはめます。生成が成功したら、公開する前に、出力そのものを永続ストアへ書き込んでおく。公開は、その箱から取り出して送り出すだけの、独立した後続処理にします。
+
+こうすると役割がはっきり分かれます。生成フェーズの仕事は「高価な出力を安全に箱へ入れる」ところまで。公開フェーズの仕事は「箱の中身を確実に1回だけ送り出す」こと。どこで落ちても、箱に入った出力は二度と買い直さずに済みます。
+
+## アウトボックステーブルを1枚用意する
+
+ストアは何でも構いません。私は個人運用なので、まずは1ファイルで完結する SQLite から始めました。Cloudflare Workers 上なら D1 や KV に置き換えられます。
+
+```sql
+CREATE TABLE IF NOT EXISTS outbox (
+  fingerprint   TEXT PRIMARY KEY,   -- 生成リクエストの指紋（冪等キー）
+  target        TEXT NOT NULL,      -- 公開先（記事スラッグ・サイト名など）
+  payload       TEXT NOT NULL,      -- Gemini の出力そのもの
+  tokens        INTEGER,            -- 実測トークン数（コスト追跡用）
+  status        TEXT NOT NULL DEFAULT 'pending',  -- pending / published
+  created_at    REAL,
+  published_at  REAL
+);
+```
+
+ポイントは `fingerprint` を主キーにすることです。後述しますが、これが生成の重複も公開の重複も同時に抑える軸になります。`payload` には出力をそのまま入れます。ここに入った瞬間、出力は「買い直し不要な資産」に変わります。
+
+## 生成フェーズ — 出力を箱に入れるまでが仕事
+
+生成側のコードです。指紋を計算し、すでに箱にあれば生成をスキップし、なければ Gemini を呼んで結果を書き込みます。
+
+```python
+import hashlib
+import json
+import time
+import sqlite3
+from google import genai
+
+client = genai.Client()
+db = sqlite3.connect("outbox.db")
+
+
+def fingerprint(model: str, prompt: str, config: dict) -> str:
+    """同じ入力なら同じ指紋になるよう、キーをソートしてハッシュ化する。"""
+    payload = json.dumps(
+        {"model": model, "prompt": prompt, "config": config},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def generate_into_outbox(model: str, prompt: str, config: dict, target: str) -> str:
+    fp = fingerprint(model, prompt, config)
+
+    row = db.execute(
+        "SELECT status FROM outbox WHERE fingerprint = ?", (fp,)
+    ).fetchone()
+    if row is not None:
+        # すでに生成済み。再生成せず、公開フェーズに引き継ぐ
+        return fp
+
+    resp = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=config,
+    )
+
+    db.execute(
+        "INSERT INTO outbox "
+        "(fingerprint, target, payload, tokens, status, created_at) "
+        "VALUES (?, ?, ?, ?, 'pending', ?)",
+        (
+            fp,
+            target,
+            resp.text,
+            resp.usage_metadata.total_token_count,
+            time.time(),
+        ),
+    )
+    db.commit()
+    return fp
+```
+
+`commit()` が返った時点で、出力はディスク上にあります。この行を越えた後にプロセスが落ちても、もう Gemini を呼び直す必要はありません。生成フェーズは、ここで安心して手を離せます。
+
+## 公開フェーズ — 箱を空にする独立した処理
+
+公開は、生成とは別のプロセス、別のタイミングで動かせる drain（汲み出し）処理にします。`pending` の行を取り出し、公開し、成功したら `published` に更新するだけです。
+
+```python
+def drain_outbox(publish_fn) -> int:
+    """pending の出力を公開する。何度呼んでも安全。"""
+    rows = db.execute(
+        "SELECT fingerprint, target, payload FROM outbox "
+        "WHERE status = 'pending'"
+    ).fetchall()
+
+    done = 0
+    for fp, target, payload in rows:
+        # 公開側に fingerprint を冪等キーとして渡す。
+        # 同じキーの公開が二度来ても、公開側で1回に畳む。
+        ok = publish_fn(target=target, body=payload, idempotency_key=fp)
+        if not ok:
+            # 今回は公開できなかった。pending のまま次回に持ち越す
+            continue
+        db.execute(
+            "UPDATE outbox SET status = 'published', published_at = ? "
+            "WHERE fingerprint = ?",
+            (time.time(), fp),
+        )
+        db.commit()
+        done += 1
+    return done
+```
+
+`publish_fn` は、git push でも、CMS への投稿 API でも、Webhook 送信でも構いません。大切なのは `idempotency_key` を必ず受け取り、公開先で重複を弾くことです。多くの投稿 API は冪等キーのヘッダーを持っていますし、自前の公開先なら「このキーで公開済みか」を1行確認するだけで足ります。
+
+## どこで落ちても壊れないことを、地点ごとに確かめる
+
+設計が正しいかどうかは、クラッシュ地点を1つずつ歩いて確かめると腑に落ちます。
+
+生成の前で落ちた場合。箱には何も入っていません。リトライは普通に生成からやり直します。損失ゼロです。
+
+`generate_content` の直後、`commit()` の前で落ちた場合。出力はまだメモリにしかありませんでした。ここは唯一、買い直しが避けられない区間です。だからこそ、この区間をできるだけ短く保ち、生成の直後に間髪入れず書き込むのが肝心になります。
+
+`commit()` の後、公開の前で落ちた場合。これがまさに6月の障害で私が遭遇した地点です。出力は箱に `pending` で残っています。次回 drain が拾って公開するので、生成コストは一切増えません。
+
+公開はしたが `published` への更新前に落ちた場合。次回の drain が同じ行をもう一度公開しようとしますが、`idempotency_key` のおかげで公開先が2回目を弾きます。読者から見れば二重投稿は起きません。
+
+この4地点を通して、「高価な生成をやり直すケース」は2番目の極小区間だけに閉じ込められます。これがアウトボックスの効きどころです。
+
+## 障害の最中に効いた、もう一つの副産物
+
+6月の障害対応で実感したのは、生成と公開を切り離すと、障害そのものへの耐性も上がるということです。
+
+公開先（GitHub）が不安定でも、Gemini が応答している限り生成は進められ、出力はすべて箱に溜まります。公開先が回復してから drain を走らせれば、溜まっていた `pending` がまとめて流れていきます。逆に Gemini 側が error 1076 を返している時間帯は、生成だけを諦めて、すでに箱にある分の公開は淡々と続けられました。
+
+障害時の自動リカバリ設計そのものは [Gemini API で止まらない夜間バッチを組む](/articles/gemini-api/gemini-api-outage-resilient-nightly-batch) に詳しく書きましたが、アウトボックスはその土台になります。片方が倒れても、もう片方は箱を介して進める。この分離が、当日のパイプライン全体を生かしてくれました。
+
+## 運用で見えた落とし穴
+
+実際に回してみて、いくつか注意点がありました。
+
+`pending` が滞留したまま気づかないのが一番怖い落とし穴です。公開先がずっと不調だと箱に溜まり続けます。`created_at` から一定時間を超えた `pending` の件数を毎朝の運用ダイジェストに混ぜておき、閾値を超えたら気づける状態にしておくことをお勧めします。
+
+指紋の材料には、出力を左右する設定をすべて含めるべきです。モデル名やプロンプトだけでなく、`temperature` や `response_schema` まで入れないと、設定だけ変えた再生成を「同じもの」と誤認してスキップしてしまいます。私は config を丸ごとハッシュに入れる方針に落ち着きました。
+
+公開済みの行をいつ消すかも決めておきます。私はコスト追跡のために `tokens` を残したいので、`published` から30日経った行だけを別ジョブで掃除しています。
+
+## 規模に応じた採り方
+
+小さく始めるなら、SQLite 1ファイルで十分です。私の個人運用も、まずはこれで「生成成功・公開失敗」の損失をゼロにできました。
+
+Cloudflare Workers のようなエッジ実行なら、ストアを D1 に、滞留監視を Workers Analytics に置き換えると、サーバーを持たずに同じ設計が組めます。
+
+さらに公開先が増えて配送の保証を厚くしたいなら、専用の耐久ワークフロー基盤に寄せる選択もあります。その判断軸は [Gemini API と耐久ワークフローの実装](/articles/gemini-api/gemini-api-inngest-durable-workflow-production-guide) にまとめてあります。ただ、いきなり大きな仕組みに行く前に、まずは1テーブルのアウトボックスで「最も損な落ち方」を塞ぐ。そこから始めるのが、個人開発では一番費用対効果が高いと感じています。
+
+お読みいただきありがとうございました。生成にお金を払った以上、その出力は一度きりの公開まで責任を持って届けたい。そう考えるようになってから、私のパイプラインは障害の朝にも少しだけ静かになりました。
