@@ -1,0 +1,167 @@
+---
+title: "Rebuilding a Three-Layer RAG Cache After Migrating to Gemini 3.5 Flash"
+slug: "gemini-35-flash-rag-three-layer-cache-redesign"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-13T20:30"
+author: "Gemini Lab"
+description: "When Gemini 2.0 Flash was retired, I rebuilt my RAG caching stack around 3.5 Flash. Here are the working implementations for response, semantic, and embedding caches, measured hit rates from production, and how self-managed caching divides the work with the API's Context Caching."
+tags: ["gemini-3-5-flash", "rag", "cost-optimization", "caching", "gemini-embedding-2"]
+highlights:
+  - "Working three-layer cache code (response, semantic, embedding) built on the google-genai SDK and Redis"
+  - "The verification process behind a 0.92 similarity threshold, plus invalidation design against false hits, tenant bleed, and stale answers"
+  - "How to divide responsibilities between the API's Context Caching and your own layers, with per-layer hit-rate instrumentation and an investment rule for L2"
+---
+
+When Gemini 2.0 Flash was retired on June 1, my RAG pipeline — an indie developer project running on a solo budget — moved to 3.5 Flash. I would have loved for the migration to end with swapping a model ID and running the test suite. In practice, that was where the real work started: once pricing and token-handling assumptions change, a cache design that used to be optimal quietly stops being so.
+
+So while I was in there, I peeled off every cache layer and rebuilt the stack from scratch. The punchline: I ended up with the same three-layer structure as before. What changed was the priority of each layer and how the work is divided with the API's own Context Caching. This article walks through the rebuilt design with working code and production numbers.
+
+## Cut your caches along the cost boundaries
+
+A single RAG request spends money in exactly three places.
+
+1. **Query embedding** — the API call that vectorizes the question
+2. **Vector search** — the database query (billed per search on managed services)
+3. **Answer generation** — sending context plus question to the model
+
+Items 2 and 3 dominate the invoice. That is why I find it cleanest to organize caches by *which cost point each one eliminates*:
+
+- **L1 (response cache)**: stores answers to identical questions; a hit skips all three steps
+- **L2 (semantic cache)**: reuses retrieval results for semantically similar past queries; skips step 2
+- **L3 (embedding cache)**: never recomputes the embedding of an identical string; skips step 1
+
+The higher the layer, the bigger the saving on a hit. That hierarchy survived the migration intact. What shifted was my judgment about how much to keep self-managed — more on that below.
+
+## L1: the response cache is still the first thing to install
+
+User questions repeat far more than you expect. In FAQ-shaped workloads, exact matches alone catch around a third of traffic. In my production data for the past week, L1 hit 34% — one in three generation calls evaporates before it ever reaches the API.
+
+```python
+import hashlib
+import json
+import redis
+
+from google import genai
+
+client = genai.Client()  # reads GEMINI_API_KEY from the environment
+r = redis.Redis(decode_responses=True)
+RESP_TTL = 60 * 60 * 24 * 7  # 7 days
+
+def response_cache_key(tenant: str, query: str, filters: dict) -> str:
+    """Build a deterministic key from tenant, normalized query, and filters."""
+    payload = json.dumps(
+        {"t": tenant, "q": " ".join(query.lower().split()), "f": filters},
+        sort_keys=True,
+    )
+    return "rag:l1:" + hashlib.sha256(payload.encode()).hexdigest()
+
+def answer_with_l1(tenant: str, query: str, filters: dict) -> dict:
+    key = response_cache_key(tenant, query, filters)
+    if (hit := r.get(key)) is not None:
+        return json.loads(hit)
+    result = run_rag_pipeline(tenant, query, filters)  # includes L2/L3
+    r.setex(key, RESP_TTL, json.dumps(result))
+    return result
+```
+
+Three deliberate choices here. First, normalization via `lower().split()` collapses case and whitespace variants into one key. Second, **the tenant ID goes into the key, always** — I once came within a code review of shipping a version without it, which would have served one tenant's answers to another. Permission boundaries belong in the cache key itself. Third, the TTL: keep serving yesterday's answer after a document update and user trust erodes quietly.
+
+For invalidation I don't rely on TTL alone. Each cached answer carries the IDs of the documents it cites, and a document-update event purges every answer referencing it. At weekly update cadence, that mechanism alone has kept stale-answer incidents at zero.
+
+## L2: pick the similarity threshold from your own logs
+
+L1 only fires on exact matches. "How to write type hints" and "adding type annotations" hash to different keys. L2 closes that gap: embed the query, look for a semantically close past query, and if it is close enough, **reuse its retrieval results**.
+
+```python
+import uuid
+from typing import Optional
+
+SIM_THRESHOLD = 0.92  # measured on my domain (technical Q&A)
+
+def l2_lookup(tenant: str, qvec) -> Optional[list]:
+    res = query_index.query(
+        vector=qvec, top_k=1,
+        filter={"tenant": tenant, "emb_model": "gemini-embedding-2"},
+    )
+    if not res.matches or res.matches[0].score < SIM_THRESHOLD:
+        return None
+    return res.matches[0].metadata["docs"]
+
+def retrieve_with_l2(tenant: str, query: str, filters: dict) -> list:
+    qvec = embed_cached(query)  # goes through L3
+    if (docs := l2_lookup(tenant, qvec)) is not None:
+        return docs
+    docs = vector_search(qvec, filters)
+    query_index.upsert([(
+        str(uuid.uuid4()), qvec,
+        {"tenant": tenant, "emb_model": "gemini-embedding-2", "docs": docs},
+    )])
+    return docs
+```
+
+The 0.92 was not a guess. I pulled 500 recent queries from production logs, computed pairwise similarities, then manually reviewed 50 pairs at each candidate threshold — 0.85, 0.90, 0.92, 0.95. At 0.85, questions like "the price difference between Flash and Pro" and "the Flash price revision" — similar wording, different intent — were being merged. At 0.95, almost nothing but exact duplicates survived. On my data, 0.92 was the lowest setting with zero false merges. Your domain will differ; this is the one calibration I would not skip.
+
+L2 catches 18% of the requests that get past L1. On a managed vector database billed per query, that 18% translates directly into search-cost savings.
+
+## L3: the lightest layer, and the easiest one to break during migration
+
+L3 simply avoids re-embedding identical strings.
+
+```python
+import numpy as np
+
+EMB_TTL = 60 * 60 * 24 * 30  # 30 days
+EMB_MODEL = "gemini-embedding-2"
+
+def embed_cached(query: str) -> np.ndarray:
+    normalized = " ".join(query.lower().split())
+    key = f"rag:l3:{EMB_MODEL}:" + hashlib.sha256(normalized.encode()).hexdigest()
+    if (hit := r.get(key)) is not None:
+        return np.frombuffer(bytes.fromhex(hit), dtype=np.float32)
+    res = client.models.embed_content(model=EMB_MODEL, contents=normalized)
+    vec = np.array(res.embeddings[0].values, dtype=np.float32)
+    r.setex(key, EMB_TTL, vec.tobytes().hex())
+    return vec
+```
+
+Notice that **the embedding model name is baked into the cache key**. This is where I lost the most time during the rebuild. When I switched to gemini-embedding-2, vectors from the old model lingered in L3 and in the L2 index, mixing with new-model vectors — and cosine similarity between vectors from different embedding spaces is meaningless whether it comes out high or low.
+
+The fix is boring and reliable: stamp the model name into both the L3 keys and the L2 metadata, and let old-model entries age out via TTL once nothing references them. A runbook that says "manually purge all caches on every model migration" will eventually be forgotten. A key schema that makes mixing impossible cannot be.
+
+L3 saves the least money of the three layers, but its hit rate is the highest — 42% of requests that reach it — and there is no reason not to have it.
+
+## Dividing the work with the API's Context Caching
+
+This is where my judgment changed after the migration. The Gemini API offers Context Caching, which discounts tokens in a repeated prefix. In RAG, the system prompt and fixed instructions repeat on every call, so that part belongs to the API.
+
+What my own L1 does is different in kind: not a discount, but **the disappearance of the call itself**. They are not alternatives. My division of labor:
+
+- **System prompt, output-format instructions, fixed few-shots**: leave to Context Caching — and structure the prompt as "stable part first, variable part last" so the prefix actually stays stable
+- **Exact repeat questions**: kill with L1 before they reach the API
+- **Search and embeddings**: the API does not cache these at all, so L2 and L3 stay self-managed
+
+The corollary: injecting dynamic values (timestamps, user names) at the top of the prompt breaks the prefix match. Push every variable element toward the end. The highest-ROI change in the whole rebuild was not a cache at all — it was reordering the prompt.
+
+## Instrument hit rates per layer
+
+A cache earns its keep only once you start measuring it. I record hits and misses per layer and review weekly.
+
+```python
+import time
+
+def record(layer: str, hit: bool) -> None:
+    day = time.strftime("%Y-%m-%d")
+    r.hincrby(f"rag:stats:{day}", f"{layer}:{'hit' if hit else 'miss'}", 1)
+```
+
+A daily Redis hash is unsophisticated and entirely sufficient. Last week's numbers: L1 at 34%, L2 at 18% of L1 misses, L3 at 42% of what reaches it. Working backwards, generation calls run at roughly 66% of raw volume, and searches at about 82% of that.
+
+One decision rule the metrics taught me: **whether L2 deserves investment depends on whether L1 has plateaued**. If L1 sits above 30% and stops climbing while your logs show paraphrased duplicates, L2 will pay off. If L1 hovers in the teens — exploratory-question workloads, typically — your time is better spent on retrieval quality than on tuning a similarity threshold.
+
+## After the migration
+
+A model generation change is a natural moment to re-examine cache design. New pricing shifts which layer matters most, and an embedding-model switch will expose every weakness in your key schema at once.
+
+Start with L1 alone for one week and measure the hit rate. That single number tells you precisely how much optimization headroom your application is sitting on. The L2, L3, and Context Caching decisions can comfortably wait for it.

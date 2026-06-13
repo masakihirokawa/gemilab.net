@@ -1,0 +1,167 @@
+---
+title: "Gemini 3.5 Flash 移行で組み直した RAG の3層キャッシュ — レスポンス・検索・埋め込みを段階的に節約する"
+slug: "gemini-35-flash-rag-three-layer-cache-redesign"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-13T20:30"
+author: "Gemini Lab"
+description: "Gemini 2.0 Flash の廃止を機に、RAG のキャッシュ設計を 3.5 Flash 前提で組み直しました。レスポンス・セマンティック・埋め込みの3層それぞれの実装コードと実測ヒット率、API 側 Context Caching との役割分担までを整理します。"
+tags: ["gemini-3-5-flash", "rag", "cost-optimization", "caching", "gemini-embedding-2"]
+highlights:
+  - "google-genai SDK と Redis で組む3層キャッシュ（レスポンス・セマンティック・埋め込み）の動作する実装コード"
+  - "類似度閾値を 0.92 に決めるまでの検証手順と、誤ヒット・テナント混線・古い回答の固定化を防ぐ無効化設計"
+  - "API 側 Context Caching と自前キャッシュの役割分担、層別ヒット率の観測コードと L2 投資判断の基準"
+---
+
+6月1日に Gemini 2.0 Flash が廃止され、個人開発で運用している私の RAG パイプラインも 3.5 Flash への移行を済ませました。モデル ID を書き換えて動作確認をして終わり、にできればよかったのですが、実際にはここからが本番でした。単価とトークン処理の前提が変わると、以前のキャッシュ設計が「最適」ではなくなるからです。
+
+移行作業のついでに、キャッシュ層を一度すべて剥がして組み直しました。私自身、剥がす前は構成が大きく変わるだろうと予想していたのですが、結論から言うと、最終的には以前と同じ「3層」に落ち着きました。ただし各層の優先度と、API 側の Context Caching との役割分担は移行前と変わっています。以下、組み直し後の設計を実装コードと実測値つきで共有します。
+
+## コストの発生点ごとにキャッシュを切る
+
+RAG の1リクエストがお金を使う場所は、分解すると3箇所です。
+
+1. **クエリの埋め込み計算** — 質問文をベクトル化する API コール
+2. **ベクトル検索** — ベクトル DB への問い合わせ（マネージドなら検索回数課金）
+3. **回答生成** — 文脈と質問を生成モデルに渡す呼び出し
+
+請求書の大半は 2 と 3 が占めます。だからこそ、キャッシュは「どの発生点を消すか」で層を分けるのが筋がよいと考えています。
+
+- **L1（レスポンスキャッシュ）**: 同じ質問への回答を保存し、ヒットすれば 1〜3 を全部スキップする
+- **L2（セマンティックキャッシュ）**: 意味的に近い過去クエリの検索結果を再利用し、2 をスキップする
+- **L3（埋め込みキャッシュ）**: 同一文字列の埋め込み再計算をやめ、1 をスキップする
+
+上の層でヒットするほど節約幅が大きい。この段階構造は 3.5 Flash になっても変わりませんでした。変わったのは「どこまで自前で持つか」の判断です。後述します。
+
+## L1: レスポンスキャッシュ — 移行後も最初に入れるべき層
+
+ユーザーの質問は驚くほど重複します。FAQ 寄りの使われ方をするアプリなら、完全一致だけでも3割前後がヒットします。私の運用データ（直近1週間）では L1 のヒット率は 34% でした。つまり生成呼び出しの3分の1が、API に到達する前に消えています。
+
+```python
+import hashlib
+import json
+import redis
+
+from google import genai
+
+client = genai.Client()  # API キーは環境変数 GEMINI_API_KEY から
+r = redis.Redis(decode_responses=True)
+RESP_TTL = 60 * 60 * 24 * 7  # 7日
+
+def response_cache_key(tenant: str, query: str, filters: dict) -> str:
+    """テナント・正規化済みクエリ・フィルタから決定的にキーを生成します。"""
+    payload = json.dumps(
+        {"t": tenant, "q": " ".join(query.lower().split()), "f": filters},
+        sort_keys=True, ensure_ascii=False,
+    )
+    return "rag:l1:" + hashlib.sha256(payload.encode()).hexdigest()
+
+def answer_with_l1(tenant: str, query: str, filters: dict) -> dict:
+    key = response_cache_key(tenant, query, filters)
+    if (hit := r.get(key)) is not None:
+        return json.loads(hit)
+    result = run_rag_pipeline(tenant, query, filters)  # L2/L3 を含む本体
+    r.setex(key, RESP_TTL, json.dumps(result, ensure_ascii=False))
+    return result
+```
+
+このコードで意図しているのは3点です。まず、正規化を `lower().split()` の組み合わせにして、大文字小文字と空白揺れを同一視すること。次に、**テナント ID をキーの先頭要素に必ず入れる**こと。私は以前、これを忘れかけて別テナントの回答が混ざる寸前までいったことがあります。権限境界はキャッシュキーの段階で切るのが一番確実です。最後に TTL。ドキュメントを更新したのに古い回答が返り続けると、ユーザーからの信頼は静かに削れていきます。
+
+なお、ドキュメント更新時の無効化は TTL 任せにせず、回答キャッシュのメタデータに参照ドキュメント ID を持たせ、更新イベントで該当キーをまとめて破棄する作りにしています。週次更新程度の頻度なら、この仕組みだけで「古い回答事故」はほぼ起きません。
+
+## L2: セマンティックキャッシュ — 閾値は実測で決める
+
+L1 は完全一致でしか効きません。「型ヒントの書き方」と「type hints のつけ方」は別キーです。そこで、クエリの埋め込みベクトルで「意味的に近い過去クエリ」を探し、十分近ければ**検索結果（取得済み文脈）を再利用**します。
+
+```python
+import uuid
+from typing import Optional
+
+SIM_THRESHOLD = 0.92  # 私のドメイン（技術 Q&A）での実測値
+
+def l2_lookup(tenant: str, qvec) -> Optional[list]:
+    res = query_index.query(
+        vector=qvec, top_k=1,
+        filter={"tenant": tenant, "emb_model": "gemini-embedding-2"},
+    )
+    if not res.matches or res.matches[0].score < SIM_THRESHOLD:
+        return None
+    return res.matches[0].metadata["docs"]
+
+def retrieve_with_l2(tenant: str, query: str, filters: dict) -> list:
+    qvec = embed_cached(query)  # L3 を通す
+    if (docs := l2_lookup(tenant, qvec)) is not None:
+        return docs
+    docs = vector_search(qvec, filters)
+    query_index.upsert([(
+        str(uuid.uuid4()), qvec,
+        {"tenant": tenant, "emb_model": "gemini-embedding-2", "docs": docs},
+    )])
+    return docs
+```
+
+閾値 0.92 は最初から決め打ちしたわけではありません。実際の手順はこうでした。まず本番ログから直近のクエリ 500 件を抜き、全ペアの類似度を計算します。次に 0.85 / 0.90 / 0.92 / 0.95 の各閾値で「同一視されるペア」を目視で 50 組ずつ確認しました。0.85 では「Flash と Pro の料金差」と「Flash の料金改定」のような**似て非なる質問**が同一視され、0.95 ではほぼ完全一致しか拾えません。私のデータでは 0.92 が誤ヒットゼロを保てる下限でした。ドメインが違えば最適値も違うので、この検証だけは自分のログでやることをおすすめします。
+
+L2 のヒット率は「L1 を抜けたリクエストのうち 18%」。検索回数課金のマネージドベクトル DB を使っている場合、この 18% はそのまま検索費用の節約になります。
+
+## L3: 埋め込みキャッシュ — 軽いが、移行時に一番事故りやすい層
+
+L3 は同一文字列の埋め込みを再計算しないだけの単純な層です。
+
+```python
+import numpy as np
+
+EMB_TTL = 60 * 60 * 24 * 30  # 30日
+EMB_MODEL = "gemini-embedding-2"
+
+def embed_cached(query: str) -> np.ndarray:
+    normalized = " ".join(query.lower().split())
+    key = f"rag:l3:{EMB_MODEL}:" + hashlib.sha256(normalized.encode()).hexdigest()
+    if (hit := r.get(key)) is not None:
+        return np.frombuffer(bytes.fromhex(hit), dtype=np.float32)
+    res = client.models.embed_content(model=EMB_MODEL, contents=normalized)
+    vec = np.array(res.embeddings[0].values, dtype=np.float32)
+    r.setex(key, EMB_TTL, vec.tobytes().hex())
+    return vec
+```
+
+注目していただきたいのは、キャッシュキーに**埋め込みモデル名を含めている**点です。今回の組み直しで一番時間を使ったのが、実はここでした。埋め込みモデルを gemini-embedding-2 に切り替えた際、旧モデルのベクトルが L3 と L2 のインデックスに残ったまま新モデルのベクトルと混在し、L2 の類似度スコアが意味を失ったのです。ベクトル空間が違うモデル同士のコサイン類似度は、高く出ても低く出ても信用できません。
+
+対処はシンプルで、L3 のキーと L2 のメタデータの両方にモデル名を焼き込み、旧モデル分は参照されなくなった時点で TTL 失効に任せる。モデル移行のたびに全キャッシュを手動破棄する運用は、いつか忘れます。キーに焼き込んでおけば、忘れても事故になりません。
+
+L3 単体の節約額は3層で最小ですが、ヒット率は 42%（L2 まで到達したリクエスト中）と最も高く、入れない理由がない層です。
+
+## API 側の Context Caching とどう棲み分けるか
+
+ここが移行後に判断を変えた部分です。Gemini API には Context Caching があり、同一プレフィックスのトークンには割引が効きます。RAG ではシステムプロンプトと固定の指示文がプレフィックスとして毎回繰り返されるので、ここは API 側に任せるのが合理的です。
+
+一方で、自前の L1 がやっているのは割引ではなく**呼び出し自体の消滅**です。性質が違うので、どちらかを選ぶ話ではありません。私の整理はこうです。
+
+- **システムプロンプト・出力形式の指示・固定 few-shot**: API 側の Context Caching に任せる（プレフィックスが安定するようプロンプト構造を「固定部 → 可変部」の順に並べる）
+- **完全一致の再質問**: 自前 L1 で API 到達前に消す
+- **検索と埋め込み**: API 側ではそもそもキャッシュされないので、L2 / L3 で自前管理する
+
+逆に言うと、プロンプトの先頭に動的な値（日時やユーザー名）を差し込むと Context Caching のプレフィックス一致が壊れます。可変要素は必ずプロンプト末尾側に寄せる。移行後のコード整理で一番費用対効果が高かった変更は、キャッシュ実装ではなくこのプロンプトの並び替えでした。
+
+## 層別ヒット率を観測する
+
+キャッシュは入れた瞬間より、観測を始めてからが本番です。層ごとにヒット・ミスを記録し、週次で眺めています。
+
+```python
+import time
+
+def record(layer: str, hit: bool) -> None:
+    day = time.strftime("%Y-%m-%d")
+    r.hincrby(f"rag:stats:{day}", f"{layer}:{'hit' if hit else 'miss'}", 1)
+```
+
+Redis のハッシュに日付単位で積むだけの素朴な作りですが、判断には十分です。直近1週間の実測は L1: 34%、L2: 18%（L1 ミス中）、L3: 42%（L2 到達分中）。この数字から逆算すると、生成 API の呼び出しは素の状態の約 66%、検索はさらにその 82% まで減っています。
+
+観測していて分かった判断基準をひとつ。**L2 に投資すべきかどうかは、L1 のヒット率が頭打ちになったかで決まります**。L1 が 30% を超えてなお伸びない、かつログに「言い換えただけの質問」が目立つなら L2 が効きます。逆に L1 が 10% 台のアプリ（探索的な質問が多い場合など）では、L2 の閾値チューニングに時間を使うより、そもそものリトリーバル品質に投資した方が回収が早いはずです。
+
+## 移行を終えて
+
+モデルの世代交代は、キャッシュ設計を見直す自然なタイミングです。単価が変わればどの層が一番効くかも変わりますし、埋め込みモデルの切り替えはキャッシュキーの設計ミスを一斉にあぶり出します。
+
+まずは L1 だけを1週間入れて、ヒット率を測ってみてください。その数字が、あなたのアプリにどれだけ最適化の余地が眠っているかを正確に教えてくれます。L2・L3 と Context Caching の整理は、その実測値が出てからで十分間に合います。
