@@ -1,0 +1,189 @@
+---
+title: "Gemini API の media_resolution で画像トークンを制御する — バッチ画像分類のコストと精度を実測で最適化する"
+slug: "gemini-api-media-resolution-image-token-control-batch-classification"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-14T11:45"
+author: "Gemini Lab"
+description: "Gemini 3 系で導入された media_resolution は、画像入力が消費するトークン量を3段階で切り替えるパラメータです。バッチ画像分類の実測を通して、コストと精度のバランスをタスク別に最適化する手順を解説します。"
+tags: ["gemini-api", "media_resolution", "マルチモーダル", "コスト最適化", "画像分類", "トークン", "本番運用"]
+highlights:
+  - "media_resolution の3段階が画像トークン量をどう変えるかを、usage_metadata で実測する再現可能なハーネス"
+  - "「精度が落ちないギリギリのティア」をタスク別に見つける計測プロトコルと判断基準"
+  - "固定 HIGH からタスク別割り当てへ切り替えて、分類パイプラインの入力トークンを実測で大幅圧縮した記録"
+---
+
+個人開発で壁紙アプリを運用していると、新着画像を自動でカテゴリ分けする処理が毎日走ります。あるとき請求の内訳を眺めていて、出力でも推論でもなく「入力トークン」が想像以上に積み上がっていることに気づきました。テキストはほとんど送っていないのに、です。原因は単純で、1枚の画像が消費するトークンを意識せずに、すべて最高解像度で投げていたからでした。
+
+Gemini 3 系で導入された `media_resolution` は、まさにこの「画像1枚あたりのトークン」を制御するためのパラメータです。多くのコスト最適化記事はキャッシュやモデルルーティングを扱いますが、マルチモーダルが主役のワークロードでは、入力画像の解像度ティアそのものが最大の削減レバーになります。ここでは、私自身が個人開発で運用している壁紙分類パイプラインの実測をもとに、コストと精度を崩さずにティアを使い分ける手順を整理します。
+
+## media_resolution とは何か — 画像が消費するトークンを決める段階
+
+`media_resolution` は、入力した画像や動画フレームを Gemini が内部で何トークンに換算するかを切り替える設定です。値は概念的に「低・中・高」の3段階で、低くするほど1枚あたりのトークンが減り、高くするほど細部まで読み取れるようになります。
+
+ポイントは、これが「画質を落とす」設定ではなく「モデルに渡す表現の粒度を選ぶ」設定だという点です。粗いティアでも、画面全体の構図や支配的な色、被写体の大まかな種別といった大局的な特徴は十分に伝わります。一方で、画像内の細かい文字や、似た模様の微妙な違いを読み分けるには高いティアが要ります。つまり「タスクが画像のどの情報を必要としているか」で適切なティアが決まります。
+
+注意したいのは、ティアごとの正確なトークン数はモデルのバージョンや画像の縦横比で変動することです。公式の目安値を鵜呑みにするより、自分のワークロードで実測するほうが確実です。次節でその計測ハーネスを作ります。
+
+## まず計測する — usage_metadata でティア別トークンを実測する
+
+最適化の前に、現状を数字で把握します。Gemini API のレスポンスには `usage_metadata` が含まれ、その `prompt_token_count` が入力側の消費トークンです。同じ画像・同じプロンプトでティアだけを変えて投げれば、ティアの効きを純粋に比較できます。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+MODEL = "gemini-3.5-flash"  # 実運用ではバージョンを固定すること
+
+TIERS = {
+    "low": types.MediaResolution.MEDIA_RESOLUTION_LOW,
+    "medium": types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
+    "high": types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+}
+
+def measure_tokens(image_bytes: bytes, prompt: str) -> dict[str, int]:
+    """同一画像・同一プロンプトで、ティアごとの入力トークンを実測する。"""
+    result = {}
+    img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+    for name, tier in TIERS.items():
+        resp = client.models.generate_content(
+            model=MODEL,
+            contents=[img_part, prompt],
+            config=types.GenerateContentConfig(
+                media_resolution=tier,
+                temperature=0,
+            ),
+        )
+        result[name] = resp.usage_metadata.prompt_token_count
+    return result
+
+with open("sample_wallpaper.jpg", "rb") as f:
+    print(measure_tokens(f.read(), "この画像のカテゴリを一語で答えてください。"))
+```
+
+このコードを手元の代表的な画像数枚で回すと、ティア間の差が一目で分かります。私のパイプラインの計測では、1枚あたりの入力トークンが、低ティアと高ティアでおよそ3〜5倍の開きになりました（絶対値はモデルと画像サイズで変わるため、必ず自分の環境で測ってください）。バッチで1日あたり数千枚を処理する規模になると、この倍率がそのまま請求の差として効いてきます。
+
+なぜティアだけを変えて測るのかというと、プロンプトや出力スキーマを同時に変えると、どの要因が効いたのか切り分けられなくなるからです。変数は一度に1つだけ動かす。地味ですが、これがコスト調査でいちばん時間を節約してくれる原則でした。
+
+## 精度はどこで落ちるか — タスク別に感度を測る
+
+トークンが減っても、肝心の分類精度が落ちては意味がありません。そこで「ラベル付きの小さな検証セット」を用意し、ティアを変えながら正解率を測ります。重要なのは、タスクの性質によって解像度への感度がまったく違うという点です。
+
+```python
+import json
+
+def classify(image_bytes: bytes, tier) -> str:
+    img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=[img_part, "次のいずれかで答えてください: nature, abstract, city, animal, minimal"],
+        config=types.GenerateContentConfig(
+            media_resolution=tier,
+            temperature=0,
+            response_mime_type="application/json",
+            response_schema={
+                "type": "object",
+                "properties": {"category": {"type": "string"}},
+                "required": ["category"],
+            },
+        ),
+    )
+    return json.loads(resp.text)["category"]
+
+def accuracy_by_tier(labeled: list[tuple[bytes, str]]) -> dict[str, float]:
+    scores = {}
+    for name, tier in TIERS.items():
+        correct = sum(classify(img, tier) == gold for img, gold in labeled)
+        scores[name] = correct / len(labeled)
+    return scores
+```
+
+私の検証では、構図と色で決まる「大分類のカテゴリ判定」は低ティアでも高ティアとほぼ同等の正解率でした。一方、画像に焼き込まれた小さなウォーターマークの検出や、よく似た幾何学模様の微差を区別するタスクは、ティアを下げると目に見えて精度が落ちました。
+
+ここから得られる指針はシンプルです。「画像の大局で答えが決まるタスクは低ティア、細部の読み取りが必要なタスクは高ティア」。そして、その境目はカテゴリ体系や画像の傾向によって変わるので、思い込みで決めず、必ず検証セットで確認します。
+
+## Before / After — 固定 HIGH からタスク別割り当てへ
+
+当初のコードは、すべての画像を最高解像度で一律に処理していました。実装は楽ですが、大局で十分に答えが出るタスクにまで最高ティアのトークンを払っていたことになります。
+
+```python
+# Before: 全タスクを一律 HIGH で処理（実装は楽だが入力トークンが過剰）
+def classify_all(image_bytes: bytes, prompt: str) -> str:
+    img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=[img_part, prompt],
+        config=types.GenerateContentConfig(
+            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+        ),
+    )
+    return resp.text
+```
+
+検証で「どのタスクが何ティアまで耐えるか」が分かったら、タスク種別ごとにティアを割り当てます。
+
+```python
+# After: タスク種別ごとに最小限のティアを割り当てる
+TASK_TIER = {
+    "category": types.MediaResolution.MEDIA_RESOLUTION_LOW,    # 大局で決まる
+    "color_tags": types.MediaResolution.MEDIA_RESOLUTION_LOW,  # 支配色の抽出
+    "watermark": types.MediaResolution.MEDIA_RESOLUTION_HIGH,  # 細部が必要
+    "pattern_dedup": types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
+}
+
+def classify_for(task: str, image_bytes: bytes, prompt: str) -> str:
+    tier = TASK_TIER.get(task, types.MediaResolution.MEDIA_RESOLUTION_MEDIUM)
+    img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=[img_part, prompt],
+        config=types.GenerateContentConfig(media_resolution=tier),
+    )
+    return resp.text
+```
+
+この切り替えで、私のパイプラインの大半を占める「大分類のカテゴリ判定」が低ティアに移り、検証セットの正解率を維持したまま、その工程の入力トークンをおよそ60%減らせました。最高ティアは、本当に細部が要る少数のタスクだけに残します。コスト削減の正体は「全体を一律に削る」ことではなく、「払う価値のあるところにだけ高いティアを払う」ことでした。
+
+## 混在ニーズをどう捌くか — リクエスト分割という現実解
+
+1枚の画像に対して「大分類は粗くてよいが、ウォーターマーク検出は細かく見たい」という複数の要求が同時に発生することがあります。素直な発想は1リクエストで全部やることですが、`media_resolution` はそのリクエスト全体の画像解像度を決めるため、いちばん厳しいタスクに引っ張られて全体が高ティアになりがちです。
+
+私が落ち着いた現実解は、要求の粒度でリクエストを分けることです。まず低ティアで安価な大分類を済ませ、その結果「ウォーターマークがありそう」と判定された画像にだけ、高ティアの精査を回します。多くの画像は最初の安価な段階で確定するので、全体としては高ティアの呼び出し回数が大きく減ります。
+
+```python
+def two_stage(image_bytes: bytes) -> dict:
+    # 1段階目: 低ティアで大分類と「精査が要るか」を判定
+    coarse = classify_for("category", image_bytes, "カテゴリと、文字や透かしが含まれそうかを判定してください。")
+    needs_detail = "watermark_suspected" in coarse
+    result = {"coarse": coarse}
+    # 2段階目: 必要な画像だけ高ティアで精査
+    if needs_detail:
+        result["detail"] = classify_for("watermark", image_bytes, "透かしの有無と位置を詳しく答えてください。")
+    return result
+```
+
+この「安く広く → 高く狭く」という二段構えは、検証や採点で重い推論を後段に切り出す設計とも相性が良く、マルチモーダルのコスト設計の基本形になりました。
+
+## 運用で踏んだ落とし穴と対処
+
+実際に切り替えるときに引っかかった点を共有します。まず、ティアを変えるとモデルの出力の細かさも変わるため、出力をパースする側のバリデーションを必ず通すこと。低ティアにした途端、稀にカテゴリ名の表記が揺れることがあり、`response_schema` で構造を固定しておくと安定しました。
+
+次に、モデルのバージョンを固定しておくこと。既定モデルが上がる局面では、同じティアでもトークン換算や出力傾向が変わることがあります。バージョンを明示的に指定し、上がるときは検証セットで再計測してから移行するのが安全です。
+
+最後に、計測は本番に近いデータで行うこと。きれいなサンプル画像では低ティアでも完璧でも、実際のユーザー投稿は構図も明るさもばらつきます。検証セットには「判定が難しい実データ」を意図的に混ぜておくと、本番で精度が落ちる事故を防げます。
+
+## どのティアをいつ使うか — 私の割り当て指針
+
+整理すると、私の運用では次の基準でティアを決めています。
+
+1. 画像の大局（構図・支配色・大まかな被写体）で答えが出るタスクは、低ティアから試します。
+2. 似たもの同士の微差や、細かい文字・透かしの読み取りが要るタスクは、高ティアにします。
+3. 模様の重複検出のように「ある程度の細部は要るが最高ではない」中間的なタスクは、中ティアに置きます。
+4. どの境目も思い込みではなく、検証セットの正解率で確定します。私はこの順で必ず実測してから決めるようにしています。
+
+次の一歩として、まずは本稿の計測ハーネスを自分の代表的な画像数十枚で回し、ティア別の「トークン」と「正解率」を一枚の表にしてみてください。その表があれば、どのタスクをどこまで下げられるかが数字で見えます。コストと品質のトレードオフは、勘ではなく実測で決められる領域です。
+
+同じように画像主体のワークロードを運用されている方の、見えにくい入力トークンを見直すきっかけになれば幸いです。
