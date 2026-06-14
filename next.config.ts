@@ -6,49 +6,16 @@ const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 // 削除済み記事の 301 redirect（2026-05-09 品質監査により撤去 — _documents/_quality_audit/cross_site/2026-05-09_cross_site_report.md 参照）
 // localePrefix: "as-needed" のため、ja は prefix なし、en は /en/ prefix
 const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
-  { from: "/articles/gemini-api/premium-showcase-multimodal-app-development", to: "/articles/gemini-api" },
-  { from: "/articles/gemini-api/google-document-ai-gemini-intelligent-document-processing-guide", to: "/articles/gemini-api" },
-  { from: "/articles/gemini-api/vertex-ai-search-gemini-enterprise-rag-production-guide", to: "/articles/gemini-api" },
-  { from: "/articles/gemini-api/gemini-api-cloud-run-usage-based-saas-complete-guide", to: "/articles/gemini-api" },
-  { from: "/articles/gemini-api/gemini-structured-output-advanced", to: "/articles/gemini-api" },
-  { from: "/articles/gemini-api/gemini-live-api-realtime-voice-app-guide", to: "/articles/gemini-api" },
-  { from: "/articles/gemini-api/gemini-api-saas-monetization", to: "/articles/gemini-api" },
-  { from: "/articles/gemini-dev/firebase-ai-logic-swiftui-ios-production-app-guide-2026", to: "/articles/gemini-dev" },
   // 2026-05-09 Tax content removal (backed up to _backup/tax_content_2026-05-09/, migrated to note.com)
-  { from: "/blog/ai-tax-filing-and-fighting-injustice", to: "/blog" },
-  { from: "/blog/gemini-workspace-tax-records-legal-documents", to: "/blog" },
-  { from: "/blog/tax-battle-complete-chronicle", to: "/blog" },
-  { from: "/blog/toyama-darkness-uozu-tax-office-kura-ai-reform", to: "/blog" },
-  { from: "/blog/toyama-tax-office-darkness-systemic-injustice", to: "/blog" },
-  { from: "/blog/toyama-tax-office-kura-recording-refusal-health-crisis", to: "/blog" },
-  { from: "/blog/uozu-tax-office-update-fighting-systemic-injustice", to: "/blog" },
-  { from: "/blog/why-ai-should-replace-tax-officials", to: "/blog" },
   // ===== 品質整理 2026-05-15: 低品質記事削除（完全ガイド系/徹底解説系 183本）=====
-  { from: "/articles/gemini-api/veo3-video-generation-api", to: "/articles/gemini-api" },
-  { from: "/articles/gemini-api/context-caching-guide", to: "/articles/gemini-api" },
-  { from: "/articles/gemini-basics/gemini-rsfc-structured-prompt-complete-guide", to: "/articles/gemini-basics" },
-  { from: "/articles/gemini-basics/gemini-troubleshooting-common-errors-2026", to: "/articles/gemini-basics" },
-  { from: "/articles/gemini-basics/gemini-gems-custom-ai-guide", to: "/articles/gemini-basics" },
-  { from: "/articles/gemini-basics/what-is-gemini", to: "/articles/gemini-basics" },
-  { from: "/articles/gemini-basics/gemini-3-pro-guide", to: "/articles/gemini-basics" },
-  { from: "/articles/gemini-dev/gemini-3-2-duckdb-streamlit-data-agent-production-guide", to: "/articles/gemini-dev" },
-  { from: "/articles/gemini-updates/gemma-4-complete-guide", to: "/articles/gemini-updates" },
   // 2026-05-15 Tax-related article removal (YMYL compliance for GSC崩壊 recovery)
-  { from: "/articles/gemini-dev/gemini-2-5-pro-niche-vertical-saas-150k-monthly", to: "/articles/gemini-dev" },
 
   // 2026-05-15 GSC崩壊対応: TMPL_TITLE違反+他違反の記事を一括削除（Helpful Content System対応）
-  { from: "/articles/gemini-advanced/gemini-2-5-pro-deep-research-guide", to: "/articles/gemini-advanced" },
-  { from: "/articles/gemini-basics/what-is-gemma-4", to: "/articles/gemini-basics" },
-  { from: "/articles/gemini-dev/gemini-code-assist-outline-feature-guide", to: "/articles/gemini-dev" },
-  { from: "/articles/gemini-workspace/google-workspace-gemini-practical-daily-workflow", to: "/articles/gemini-workspace" },
 
   // 2026-05-15 GSC崩壊対応 Phase 3: 4+違反の重度低品質記事を削除
   // 2026-05-25 YMYL (tax) removal
-  { from: "/articles/gemini-basics/gemini-gems-monetization-guide", to: "/articles/gemini-basics" },
   // 2026-05-25 YMYL (tax) removal
-  { from: "/articles/gemini-updates/weekly-pickup-2026-0417", to: "/articles/gemini-updates" },
   // 2026-05-25 YMYL (tax) removal
-  { from: "/articles/gemini-updates/weekly-pickup-2026-0424", to: "/articles/gemini-updates" },
   // 2026-05-25 cross-site duplicate slug rename
   { from: "/articles/gemini-basics/ai-tools-directory-2026-part2", to: "/articles/gemini-basics/gemini-ai-tools-directory-2026-part2" },
   // 2026-05-25 cross-site duplicate slug rename
