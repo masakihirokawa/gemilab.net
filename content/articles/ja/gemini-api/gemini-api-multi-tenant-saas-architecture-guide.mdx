@@ -3,16 +3,20 @@ title: "マルチテナント SaaS で Gemini API を安全に提供する設計
 slug: "gemini-api-multi-tenant-saas-architecture-guide"
 category: "gemini-api"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-04-26T04:30"
 author: "Gemini Lab"
 description: "Gemini API を複数テナントに販売する SaaS で、APIキー漏洩・無限ループによる暴走・他テナントの巻き添え障害を防ぐための実装パターンを、Python のコード付きでまとめました。"
 tags: ["Gemini API", "マルチテナント", "SaaS", "本番運用", "課金", "アーキテクチャ"]
+highlights:
+  - "テナント別トークンバケットと月予算ガードを組み合わせ、1社の暴走が全テナントに波及しない分離設計を実装できます"
+  - "request_id を背骨に、usage_records テーブルとマテリアライズドビューでリクエスト粒度の課金計測と監査を構築できます"
+  - "FastAPI への組み込み例・偽 Gemini クライアントによるテスト・サブテナント/PII 対応まで、本番運用の落とし穴を回避できます"
 
 ---
-Gemini API をバックエンドに使った SaaS を作っていて、最初に冷や汗をかいたのは「ある1社が無限ループで自分のテナントを叩き続けた結果、その日のうちに私の Cloud Billing が4桁ドルに到達した」夜のことでした。
+個人開発で Gemini API をバックエンドに使った SaaS を運用していて、最初に冷や汗をかいたのは「ある1社が無限ループで自分のテナントを叩き続けた結果、その日のうちに私の Cloud Billing が4桁ドルに到達した」夜のことでした。
 
-幸い検知できたのは、Cloud Billing アラートではなく、Slack に流していた1リクエストごとのコストログでした。アラートは翌朝届きました。本記事は、あの夜の自分に渡したかったマルチテナント設計の地図です。
+幸い検知できたのは、Cloud Billing アラートではなく、Slack に流していた1リクエストごとのコストログでした。アラートは翌朝届きました。本記事は、個人開発でこの規模の運用に一人で向き合ってきた私自身が、あの夜の自分に渡したかったマルチテナント設計の地図です。
 
 シングルテナント（1社1インスタンス、1社1APIキー）の運用とは、考えるべきことが大きく変わります。「テナントを跨いだ巻き添え障害を起こさない」「テナントごとの利用量を、月末の請求と紐づくレベルで正確に取る」「想定外のトラフィックでコストが指数関数的に膨らんだ瞬間に止める」——この3点をどう設計するかが、SaaS としての耐久力を決めます。
 
@@ -388,6 +392,160 @@ C プラン（BYOK）に進化させたとき、テナントから預かった A
 - **予算アラート発火履歴**: 80%/100%通過したテナントの一覧と時刻
 
 私は Grafana + PostgreSQL でこれを組んでいますが、Looker Studio + BigQuery でも同じことが可能です。スプレッドシートでも構いません。**「何を見れば異常がわかるか」を最初に決めて、最低限のグラフだけ作る**のが現実的な始め方です。
+
+## FastAPI で全パーツを1つに束ねる
+
+ここまでの部品（認証・レート制限・課金計測・予算ガード）が、実際のサーバーでどう噛み合うのかを、最小の FastAPI サービスとして示します。チャットエンドポイントを1本だけ持つ構成です。
+
+```python
+# app.py
+from fastapi import FastAPI, Depends, HTTPException, Request
+from contextvars import ContextVar
+import uuid
+
+from tenant_context import TenantContext
+from tenant_rate_limiter import TenantRateLimiter
+from usage_recorder import GeminiClientWithMetering
+from budget_guard import TenantBudgetGuard
+
+# 実運用では起動時に1度だけ構築します
+limiter: TenantRateLimiter
+gemini: GeminiClientWithMetering
+guard: TenantBudgetGuard
+
+# ログ付与のため、リクエストごとにテナントコンテキストを束ねます
+current_ctx: ContextVar[TenantContext | None] = ContextVar("current_ctx", default=None)
+
+async def get_tenant_context(request: Request) -> TenantContext:
+    api_key = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not api_key:
+        raise HTTPException(401, "missing bearer token")
+
+    # 自前のテナントテーブルを引きます。この前に Gemini を呼んではいけません
+    row = await app.state.db.fetchrow(
+        "SELECT tenant_id, user_id, plan FROM api_keys WHERE token_hash = $1",
+        sha256_hex(api_key),
+    )
+    if row is None:
+        raise HTTPException(401, "invalid token")
+
+    ctx = TenantContext(
+        tenant_id=row["tenant_id"],
+        user_id=row["user_id"],
+        plan=row["plan"],
+        monthly_token_budget=10**9,  # 概算。実際の上限は予算ガードが強制します
+        request_id=str(uuid.uuid4()),
+    )
+    current_ctx.set(ctx)
+    return ctx
+
+app = FastAPI()
+
+@app.post("/v1/chat")
+async def chat(payload: dict, ctx: TenantContext = Depends(get_tenant_context)):
+    if not await limiter.try_acquire(ctx, cost=1):
+        # 行儀の良いクライアントが正しくバックオフできるようヒントを返します
+        raise HTTPException(429, "tenant rate limit exceeded", headers={"Retry-After": "1"})
+
+    try:
+        text = await gemini.generate(ctx, model=payload["model"], prompt=payload["prompt"])
+    except PermissionError as e:
+        raise HTTPException(402, str(e))  # 予算超過は 402 Payment Required で返す
+
+    return {"text": text, "request_id": ctx.request_id}
+```
+
+この接着コードで強調したい点が3つあります。
+
+`Depends(get_tenant_context)` を入口に置くと、新しいエンドポイントを書く人が「テナントの特定を忘れる」ことが構造的にできなくなります。依存を受け取るか、明示的に認証をスキップすると宣言するか、どちらかを強制されるためです。
+
+`current_ctx` の `ContextVar` は、ロギングフィルタが `tenant_id` を自動付与するための土台になります。
+
+そして予算超過時に 429 ではなく **402 Payment Required** を返すこと。これでクライアント側が「レート制限で絞られた」のか「予算が尽きた」のかをエラーコードだけで区別できます。ダッシュボードで両者を別系列として可視化したいときに効いてきます。
+
+## 本物の Gemini クレジットを消費せずにマルチテナントを検証する
+
+マルチテナントのコードには、競合状態でしか表面化しない厄介なバグが潜みます。私が助けられたテストパターンを2つ紹介します。
+
+1つ目は、決定的なトークン数を返す偽の `genai.Client` です。これがあると、実際の課金を発生させずにレート制限と予算のアサーションを書けます。
+
+```python
+# tests/fakes.py
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+@dataclass
+class FakeUsage:
+    prompt_token_count: int
+    candidates_token_count: int
+    total_token_count: int
+
+class FakeGeminiAio:
+    def __init__(self, prompt_tokens=100, output_tokens=200):
+        self.prompt_tokens = prompt_tokens
+        self.output_tokens = output_tokens
+        self.calls = 0
+
+    @property
+    def models(self):
+        outer = self
+
+        class _Models:
+            async def generate_content(self, model, contents):
+                outer.calls += 1
+                return SimpleNamespace(
+                    text="ok",
+                    usage_metadata=FakeUsage(
+                        outer.prompt_tokens,
+                        outer.output_tokens,
+                        outer.prompt_tokens + outer.output_tokens,
+                    ),
+                )
+
+        return _Models()
+
+class FakeGeminiClient:
+    def __init__(self):
+        self.aio = FakeGeminiAio()
+```
+
+テストで `FakeGeminiClient()` を `GeminiClientWithMetering` に差し込めば、「100回呼んだ後のテナントAの記録コストは 100 × 1回あたり単価に等しい」ことを、Google に一切触れずに検証できます。
+
+2つ目は、敵対的なワークロードを再生する `pytest` フィクスチャです。「良いテナント」が秒間1リクエストを送る一方で、「悪いテナント」が秒間100リクエストを撃ち込む状況を作ります。テストでは、良いテナントの成功率が100%を保ちつつ、悪いテナントだけが綺麗に絞られることをアサートします。コピーしてきた Lua スクリプトに微妙なオフバイワンがあること、あるいはトークンバケットの容量が想定バーストを吸収しきれないことに気づくのは、たいていこの種のテストです。
+
+## エッジケース: サブテナントとチーム
+
+規模の大きい顧客は、いずれ自社テナントをチームやプロジェクトに細分化し、それぞれの利用額を個別に見たいと言ってきます。幸い、ここまでの設計は素直にスケールします。`usage_records` に `team_id` 列を1つ足せば、同じマテリアライズドビューが `(tenant_id, team_id)` 単位で集計してくれます。レート制限はテナント単位のまま据え置けます（守っているのは単一プロジェクトに乗った Gemini クオータだからです）。課金の可視性だけをより細かくします。
+
+厄介になるのは、チームが親テナントとは**別の**予算上限を持ちたいときです。2つの設計が考えられます。
+
+- **階層型**: チームごとに予算を持たせ、親テナントのハードキャップがチーム上限を上書きする。概念は綺麗ですが、予算ガードで DB 読み取りが1回増えます
+- **フラット＋ハードキャップ**: 予算を持つのはテナントだけ。チームはダッシュボードで自分の利用分を見られますが、独自の上限は強制できません。実装が容易で、多くの顧客はこれで満足します
+
+まずはフラット型から始めてください。実際の顧客がエスカレーションしてきたときに、初めて階層型へ移ればよいのです。
+
+## PII を Gemini に届く前に処理する
+
+ユーザー入力をそのまま Gemini に渡すマルチテナント SaaS は、いずれ必ず「責任を持って扱ってくれるはず」と顧客が信じた個人情報を含むリクエストを受け取ります。安全側の既定値は、**どのプロンプトにも PII が含まれていると仮定して動く**ことです。
+
+私が運用で持ちこたえている軽量なやり方は、高信頼度の PII パターン（メールアドレス・電話番号・クレジットカード番号・地域別の公的 ID）を検出する高速な前段フィルタを走らせ、その場でマスキングするか、明確なエラーで拒否するかのどちらかを選ぶことです。マスキングのほうが顧客に優しい挙動です。プロンプトを転送する前に `john@example.com` を `[email]` に置換し、置換した「件数」だけを利用記録に残します（元の値は決して残しません）。
+
+規制下のプラン（医療・金融）のテナントには、前段フィルタのモードをプラン定義の一部にします。`enterprise` プランは `pii_mode = "block"` を設定して PII を検出したプロンプトを拒否でき、`pro` プランは既定で `pii_mode = "redact"` とする、といった具合です。これを `tenant_config` に永続化しておくと、全エンドポイントで一貫した挙動を保てます。
+
+見落としがちな PII リスクは、**応答側**にもあります。テナントがチャットボットを作って LLM 出力をエンドユーザーへストリーミングする場合、LLM はときに、もっともらしい名前・メール・住所を幻覚で生成します。同じパターンを応答からも除去するオプトインの出力フィルタを用意してください。わずかなレイテンシと引き換えに、大きな法的安心が得られます。
+
+## request_id に独立した節を割く理由
+
+この設計に登場するすべての ID のなかで、`request_id` こそがシステムをデバッグ可能にするかどうかを静かに決めています。あらゆる層がこれをログに残し、あらゆるリトライがこれを再利用し、あらゆる保存行がこれを参照する必要があります。
+
+私は `request_id` を、ビジネスロジックが走る前に API ゲートウェイ（あるいは前述の FastAPI ミドルウェア）で ULID として発行します。そこから先は次のように流れます。
+
+- Gemini 呼び出しラッパーが `usage_records.request_id` に書き込む
+- 構造化ロガーが `contextvars` 経由で全行に `request_id=...` を出力する
+- 429／402 のエラー応答が本文にこれを含めるので、サポート窓口は ID を1つ貼るだけで関連ログ行をすべて辿れる
+- 冪等性を意識したリトライが同じ `request_id` を再利用するので、`usage_records` の UNIQUE 制約が自動的に重複を排除する
+
+`request_id` が可視性の背骨になると、障害後の解析時間が数時間から数分に縮みます。この ID で初めて1件の障害を綺麗に辿れたとき、コールスタックに通すために費やした手間は十分に報われます。
 
 ## 移行ロードマップ — どの順序で組み込むか
 
