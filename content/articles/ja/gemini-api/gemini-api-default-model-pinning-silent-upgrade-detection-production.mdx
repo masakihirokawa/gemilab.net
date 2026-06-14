@@ -1,0 +1,156 @@
+---
+title: "Gemini APIの『デフォルトモデルが上がる』を事故にしない — モデルIDの固定と既定変更の検知設計"
+slug: "gemini-api-default-model-pinning-silent-upgrade-detection-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-14T13:00"
+author: "Gemini Lab"
+description: "既定モデルが静かに上がると、同じコードのまま出力長・推論挙動・コストが変わります。モデルIDを単一の真実の源で固定し、レスポンスの実効モデルを検証して既定変更を検知する設計を、実装レベルで解説します。"
+tags: ["Gemini API", "本番運用", "モデル管理", "個人開発者", "信頼性"]
+highlights:
+  - "レスポンスの model_version を使って『実際に応答したモデル』を起動時に検証するガードの実装"
+  - "エイリアス指定が事故になる仕組みと、固定すべき5項目をコード化する単一の真実の源"
+  - "既定変更を検知してアラートを上げ、移行を7日で安全に完了させる本番プレイブック"
+---
+
+朝、いつもどおり夜間バッチのログを眺めていて、出力が普段より2割ほど短いことに気づきました。コードは1行も変えていません。料金グラフだけが前日比で少し上振れている。原因を追っていくと、モデルを明示せずエイリアスで呼んでいた経路だけ、応答していたモデルが変わっていました。既定モデルが静かに切り替わったのです。
+
+2026年6月8日、Gemini Enterprise では既定モデルが 3.5 Flash に固定され、無効化トグルも廃止されました。API 側でも同様に、エイリアスや「指定なし」に依存している自動処理は、ある日を境に応答するモデルが変わり得ます。問題はモデルの良し悪しではありません。**自分が知らないうちに挙動が変わること**そのものが、運用上の事故です。
+
+ここでは、複数アプリで Gemini API を併用してきた個人開発の現場で実際に効いた、既定変更を「事故」にしないための設計をまとめます。私自身が深夜に原因を追ったあの一件を、二度と繰り返さないための仕組みです。
+
+## エイリアス指定がなぜ静かな事故になるのか
+
+`gemini-flash-latest` のようなエイリアスや、SDK の既定に任せた呼び出しは、書いた時点では便利です。最新が自動で使われるからです。しかしこの「自動で上がる」性質は、本番では二つの顔を持ちます。
+
+一つ目は**出力挙動の変化**です。世代が変わると、同じプロンプトでも出力長・整形・thinking の深さが変わります。後段で正規表現や JSON スキーマに通している処理は、ここで静かに壊れます。
+
+二つ目は**コストの変化**です。応答するモデルが変われば単価が変わります。1日10万回呼び出すバッチであれば、単価が数十パーセント動くだけで月のコストは大きく振れます。
+
+固定すべきは、最低でも次の5項目です。モデルID、生成パラメータ（temperature・max_output_tokens）、thinking 設定、安全設定、そして「想定しているモデル世代」です。最後の一つは検証用のメタ情報で、後述するガードの基準になります。
+
+## レスポンスの model_version で実効モデルを検証する
+
+ここが本記事の核心です。Gemini API のレスポンスには、実際に応答したモデルを示す `model_version` が含まれます。リクエストで何を指定したかではなく、**サーバーが何で応答したか**を直接確認できます。これを起動時の smoke コールで照合すれば、既定変更を即座に捕まえられます。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+# 単一の真実の源（環境ごとにここだけを切り替える）
+EXPECTED_MODEL = "gemini-2.5-pro"          # エイリアスではなく明示ID
+EXPECTED_VERSION_PREFIX = "gemini-2.5-pro" # model_version の期待プレフィックス
+
+def assert_pinned_model() -> str:
+    """起動時に1回だけ呼ぶ。実効モデルが想定と違えば即座に落とす。"""
+    resp = client.models.generate_content(
+        model=EXPECTED_MODEL,
+        contents="ping",
+        config=types.GenerateContentConfig(max_output_tokens=8),
+    )
+    actual = resp.model_version or ""
+    if not actual.startswith(EXPECTED_VERSION_PREFIX):
+        raise RuntimeError(
+            f"model drift detected: expected '{EXPECTED_VERSION_PREFIX}*', "
+            f"got '{actual}'. デプロイを中止してください。"
+        )
+    return actual
+
+if __name__ == "__main__":
+    print("pinned model OK:", assert_pinned_model())
+```
+
+この `assert_pinned_model()` をアプリ起動時やバッチの先頭で呼ぶだけで、「想定外のモデルに応答された状態のまま本番が走り続ける」事故を防げます。エラーで落ちることが目的です。静かに動き続けるより、はっきり止まるほうが安全だからです。
+
+## ランタイムで毎回照合し、ズレたらアラートを上げる
+
+起動時の検証に加えて、本番の各応答でも `model_version` を記録しておくと、移行や障害の事後分析が一気に楽になります。すべての応答にモデルの実効値が紐づくため、「いつから挙動が変わったか」を後から正確に言えます。
+
+```python
+import logging
+
+logger = logging.getLogger("gemini.model_guard")
+
+def generate_with_guard(prompt: str):
+    resp = client.models.generate_content(
+        model=EXPECTED_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.4,
+            max_output_tokens=2048,
+        ),
+    )
+    actual = resp.model_version or "unknown"
+    um = resp.usage_metadata
+    logger.info(
+        "model=%s in_tok=%s out_tok=%s",
+        actual,
+        getattr(um, "prompt_token_count", None),
+        getattr(um, "candidates_token_count", None),
+    )
+    if not actual.startswith(EXPECTED_VERSION_PREFIX):
+        # 落とすほどではないが、必ず気づける経路に流す
+        logger.error("MODEL DRIFT at runtime: got %s", actual)
+        notify_ops(f"Gemini model drift: {actual}")  # Slack 等へ
+    return resp
+```
+
+トークン数を一緒に残しておくのが実務上のコツです。モデルが変わるとトークン消費の傾向も変わるため、`model_version` の変化と消費量の変化を突き合わせれば、コスト上振れの原因をその場で説明できます。
+
+## CIでモデルレジストリをスナップショットして差分を止める
+
+人手の確認は必ず抜けます。そこで、固定しているモデル設定を1ファイルにまとめ、CI で差分をゲートします。意図しない変更（誰かが急いでエイリアスに戻した、など）をマージ前に止めるためです。
+
+手順は次のとおりです。
+
+1. `model_registry.json` に環境ごとのモデルID・パラメータを書き出す（単一の真実の源）。
+2. アプリは起動時にこのレジストリを読み、`-latest` などのエイリアスが含まれていたら起動を拒否する。
+3. CI で「エイリアス禁止」「期待プレフィックスとの一致」を検査するテストを実行する。
+4. 変更があれば必ずレビューを通す。差分が出ること自体を可視化する。
+
+```python
+import json, re, sys
+
+FORBIDDEN = re.compile(r"(latest|preview|exp)$")
+
+def check_registry(path="model_registry.json") -> int:
+    reg = json.load(open(path, encoding="utf-8"))
+    errors = []
+    for env, cfg in reg.items():
+        model = cfg.get("model", "")
+        if FORBIDDEN.search(model):
+            errors.append(f"{env}: エイリアス禁止 -> {model}")
+        if "expected_version_prefix" not in cfg:
+            errors.append(f"{env}: expected_version_prefix が未定義")
+    for e in errors:
+        print("NG:", e)
+    return 1 if errors else 0
+
+if __name__ == "__main__":
+    sys.exit(check_registry())
+```
+
+このゲートは小さなテストですが、効果は大きいです。本番のモデル指定がコードレビューの対象になる、という状態を作れるからです。
+
+## 既定変更を「採用」に変える7日プレイブック
+
+既定変更を検知して止めるのは守りです。新しい既定が実際に良い場合は、攻めに転じて計画的に採用します。私はこの順序で進めることを推奨します。
+
+1日目から2日目は、新モデルを本番と同じプロンプトでオフライン評価します。代表的な100件ほどの入力で、出力長・JSON 妥当性・所要時間を旧モデルと並べます。3日目は、ゴールデンデータセットに対する回帰テストを通し、後段の正規表現やスキーマが壊れないかを確認します。4日目から5日目は、トラフィックの5%程度を新モデルに振り分け、`model_version` 別にエラー率とトークン消費を観測します。6日目に問題がなければ、レジストリの `model` と `expected_version_prefix` を新IDへ更新し、CI ゲートを通します。7日目に全面切り替えとし、旧モデルへ即時ロールバックできる状態を24時間維持します。
+
+ここで効いてくるのが、これまで仕込んできた `model_version` のログです。切り替え前後の同一指標を、推測ではなく実データで比較できます。「なんとなく良くなった気がする」ではなく、「出力長の中央値が18%短くなり、JSON 妥当率は99.6%で変化なし」と言えること。これが本番運用の安心につながります。
+
+## 落とし穴とその回避
+
+実際にやってみると、いくつか引っかかる点があります。
+
+`model_version` が指定IDと完全一致するとは限りません。マイナーなサフィックスが付くことがあるため、ガードは完全一致ではなく**プレフィックス一致**で書くのが安全です。完全一致にすると、無害なパッチ更新でも本番が落ちてしまいます。
+
+エイリアスを「開発では便利だから」と残したくなりますが、開発と本番で実効モデルが食い違うと、本番だけで再現する不具合の温床になります。開発でも本番と同じ明示IDを使い、新モデルの試用は別の検証用フラグで切り替えるのが、結果的に安全でした。
+
+それから、検証用の smoke コールにも当然コストがかかります。`max_output_tokens` を最小にし、頻度を起動時のみに絞れば、無視できる水準に収まります。安全のための数円を惜しんで、静かな事故を見逃すほうがはるかに高くつきます。
+
+既定が上がること自体は、止められない流れです。止められないものに身構えるのではなく、**上がったことに必ず気づける状態**を先に作っておく。その小さな準備が、深夜の原因究明を一度きりで終わらせてくれます。同じ課題に取り組んでいる方の参考になれば幸いです。
