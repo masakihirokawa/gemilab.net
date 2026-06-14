@@ -1,0 +1,121 @@
+---
+title: "When Gemini API Cuts Your Response Off Mid-Sentence — Detecting finish_reason: MAX_TOKENS and Stitching the Continuation"
+slug: "gemini-api-max-tokens-truncation-continuation-recovery"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-06-14T10:15"
+author: "Gemini Lab"
+description: "Long-form generation that ends mid-sentence is usually finish_reason: MAX_TOKENS. This failure arrives as a quiet HTTP 200, no exception. Here is how to detect it, stitch a continuation to recover the full text, and avoid the thinking-token trap that makes it worse on 3.x models."
+tags: ["gemini-api", "finish-reason", "max-tokens", "troubleshooting", "python", "typescript"]
+---
+Late one evening I was reading a draft that my article pipeline had just produced, and something felt off. The prose was fine, but the final paragraph ended on "and so the next thing to consider is" — and then nothing. No continuation. The logs held no clue: HTTP 200, zero exceptions. Yet the body had stopped, cleanly, in the middle of a sentence.
+
+This is not a Gemini bug. The model had clearly reported that it stopped because it hit the output ceiling. The fault was on my side: I had taken the truncated text and passed it downstream without reading that signal. If an empty response is the failure where nothing arrives, this is the failure where something plausible-but-cut-off arrives — and that is harder to catch, not easier.
+
+This article walks through detecting `finish_reason: MAX_TOKENS` truncation reliably and stitching a continuation to recover the full output. Code is primarily Python (`google-genai`), with Node/TypeScript (`@google/genai`) alongside.
+
+## Why a "successful 200" still hands you a cut-off body
+
+`response.text` is a convenient helper: it concatenates the text from `candidates[0].content.parts` and hands it back. The problem is that this helper tells you nothing about whether generation actually finished. If the model is cut off partway, whatever it produced up to that point comes back normally. From the caller's side, it looks like success.
+
+The real verdict lives elsewhere: `candidates[0].finish_reason`. If it is `STOP`, the model ended generation on its own terms — complete. If it is `MAX_TOKENS`, it was force-stopped at the `max_output_tokens` ceiling — truncated. Reading that one field is the difference between the full text and a cut-off one.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+resp = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents="Write a detailed retrospective of this quarter's solo dev work, with headings.",
+    config=types.GenerateContentConfig(max_output_tokens=512),
+)
+
+reason = resp.candidates[0].finish_reason
+text = resp.text or ""
+print(reason, len(text))  # MAX_TOKENS, ~512 worth ← the tell that it was cut off
+```
+
+The line to hold: when `finish_reason` is `MAX_TOKENS`, do not trust `resp.text` as a finished product.
+
+## Thinking tokens quietly eat the output budget — the trap that grew on 3.x
+
+Here is a trap that has become much easier to fall into recently. On Gemini 3-generation thinking models, the tokens the model spends "thinking" internally are drawn from the same output budget. So even with `max_output_tokens` set to 512, if 400 of those go to thinking, only 112 tokens of actual body reach the user. The body is not short — the budget was consumed by reasoning before the text could finish.
+
+`usage_metadata` makes the distinction obvious at a glance.
+
+```python
+um = resp.usage_metadata
+print("prompt     :", um.prompt_token_count)
+print("candidates :", um.candidates_token_count)   # what reached the user
+print("thoughts   :", getattr(um, "thoughts_token_count", 0))  # spent on thinking
+```
+
+If `thoughts_token_count` is large and `candidates_token_count` is pinned near `max_output_tokens`, the cause is not "the body is long" but "thinking exhausted the budget." Two fixes apply. For calls whose whole point is long output, set `max_output_tokens` generously against real demand, padding for the thinking portion. For summarize-or-extract calls that need no deep reasoning, dial the thinking depth down so the budget goes to the body instead. As an indie developer watching the token bill, I keep separate settings for "write me something long" calls and "answer me briefly" calls, and never reuse the same ceiling across both.
+
+## When it cuts off, stitch the continuation — a safe resume request
+
+Even after raising the ceiling, some inputs will hit it again. A "resume and merge" mechanism makes this robust. The idea is simple: feed the text you have back into the conversation as the model's own turn (assistant role), then ask it to keep going from there without repeating itself.
+
+```python
+def generate_complete(client, model, prompt, max_rounds=4, per_call_tokens=2048):
+    contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
+    full = ""
+    for _ in range(max_rounds):
+        resp = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(max_output_tokens=per_call_tokens),
+        )
+        chunk = resp.text or ""
+        full += chunk
+        reason = resp.candidates[0].finish_reason
+        if reason != types.FinishReason.MAX_TOKENS:
+            break  # STOP (complete) -> exit
+        # Put what we have back as history and ask to continue
+        contents.append(types.Content(role="model", parts=[types.Part(text=chunk)]))
+        contents.append(types.Content(
+            role="user",
+            parts=[types.Part(text="Continue exactly from where the previous output stopped, without repeating it.")],
+        ))
+    return full, reason
+```
+
+Two details earn their keep in production. First, always include a stop condition. Without an upper bound like `max_rounds`, a model that keeps returning `MAX_TOKENS` will loop forever and inflate cost with nothing to show. Second, watch the seam. Continuations tend to repeat a few words at the boundary, so detect and trim the overlap when merging.
+
+```python
+def stitch(a: str, b: str, max_overlap: int = 80) -> str:
+    for n in range(min(max_overlap, len(a), len(b)), 0, -1):
+        if a[-n:] == b[:n]:
+            return a + b[n:]
+    return a + b
+```
+
+## The check is identical in Node/TypeScript
+
+The SDK changes, but the field to read stays `finishReason`.
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({});
+const resp = await ai.models.generateContent({
+  model: "gemini-3.5-flash",
+  contents: "Write a detailed quarterly retrospective with headings.",
+  config: { maxOutputTokens: 512 },
+});
+
+const reason = resp.candidates?.[0]?.finishReason;
+if (reason === "MAX_TOKENS") {
+  // Branch into resume logic. Do not treat resp.text as the finished product.
+  console.warn("Output was cut off mid-stream; a continuation is needed.");
+}
+```
+
+Streaming is no different. Chunks flow to the end normally, so the screen looks fine. Whether it was truncated only becomes clear once you read the `finishReason` carried on the final chunk. After the receive loop exits, always confirm that last `finishReason`.
+
+## One next step
+
+Start by adding a single `finish_reason` column to your pipeline's output logs. You will quickly see how often `MAX_TOKENS` is slipping in. From there, raise the ceiling only on the calls meant to produce long output, and apply the continuation logic to the few that still cut off — in that order, you close the gap without burning extra tokens. Once the silently truncated outputs become visible, the confidence you have in your generations changes noticeably. Thanks for reading.

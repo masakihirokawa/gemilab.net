@@ -1,0 +1,121 @@
+---
+title: "Gemini API の本文が途中で切れる — finish_reason: MAX_TOKENS を検知して続きを継ぎ直す実装メモ"
+slug: "gemini-api-max-tokens-truncation-continuation-recovery"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-06-14T10:15"
+author: "Gemini Lab"
+description: "長文生成で末尾が文の途中でぷつりと切れる。原因の多くは finish_reason: MAX_TOKENS です。例外も 200 のまま静かに混入するこの事故を検知し、続きを継ぎ足して全文を取り戻す実装を、思考トークンの落とし穴とあわせてまとめました。"
+tags: ["gemini-api", "finish-reason", "max-tokens", "troubleshooting", "python", "typescript"]
+---
+記事の自動生成パイプラインを回していたある晩、出力された下書きを読んでいて妙な感覚に襲われました。文章は自然なのに、最後の段落が「したがって、次に検討すべきは」で終わっている。続きがない。エラーログには何も残っていません。HTTP ステータスは 200、例外もゼロ。それでも本文は、文の途中でぷつりと切れていました。
+
+これは Gemini の不具合ではありません。モデルは「出力の上限に達したのでここで止めました」ときちんと申告しています。受け取る側がそのシグナルを読まずに、切れたテキストをそのまま下流へ流してしまっただけなのです。空応答が「何も来ない」事故なら、こちらは「もっともらしく切れたものが来る」事故で、見つけにくさはむしろ上です。
+
+個人開発のパイプラインでは、この途中切れに何度か足をすくわれてきました。ここでは `finish_reason: MAX_TOKENS` による途中切れを確実に検知し、続きを継ぎ足して全文を復元するまでの実装を整理します。コードは Python（`google-genai`）を主に、Node/TypeScript（`@google/genai`）も併記します。
+
+## なぜ「200 で成功」なのに本文が切れるのか
+
+`response.text` は便利なヘルパーで、`candidates[0].content.parts` のテキストを連結して返してくれます。問題は、このヘルパーが「生成が正常に最後まで終わったか」をいっさい教えてくれないことです。途中で打ち切られても、それまでに生成されたぶんのテキストは普通に返ってきます。だから呼び出し側からは成功に見えます。
+
+判定材料は別の場所にあります。`candidates[0].finish_reason` です。これが `STOP` であれば、モデルは自分の意思で生成を終えています（＝完結）。`MAX_TOKENS` であれば、`max_output_tokens` の上限に当たって強制終了されています（＝途中切れ）。この一語を読むかどうかが、全文と尻切れの分かれ目になります。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+resp = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents="この四半期の個人開発の振り返りを、見出し付きで詳しくまとめてください。",
+    config=types.GenerateContentConfig(max_output_tokens=512),
+)
+
+reason = resp.candidates[0].finish_reason
+text = resp.text or ""
+print(reason, len(text))  # MAX_TOKENS 512相当 ← 切れている合図
+```
+
+`finish_reason` が `MAX_TOKENS` のときに `resp.text` を信用してそのまま使ってはいけない、というのがまず守るべき一線です。
+
+## 思考トークンが出力予算を静かに食う — 3.x 系で増えた落とし穴
+
+ここで、最近とくに踏みやすくなった罠に触れておきます。Gemini 3 世代の思考（thinking）対応モデルでは、モデルが内部で「考える」ために使うトークンも、出力側の予算から消費されます。つまり `max_output_tokens` を 512 に設定していても、そのうち 400 が思考に使われれば、実際にユーザーへ届く本文は残り 112 トークンぶんしかありません。本文が短いのではなく、予算が思考に食われて途中で切れているのです。
+
+この区別は `usage_metadata` を見ると一目でわかります。
+
+```python
+um = resp.usage_metadata
+print("prompt     :", um.prompt_token_count)
+print("candidates :", um.candidates_token_count)   # ユーザーに届いた本文ぶん
+print("thoughts   :", getattr(um, "thoughts_token_count", 0))  # 思考に使われたぶん
+```
+
+`thoughts_token_count` が大きく、`candidates_token_count` が `max_output_tokens` 近くで頭打ちになっているなら、原因は「本文の長さ」ではなく「思考が予算を食い切ったこと」です。対処は二択です。長文出力が主目的の呼び出しでは `max_output_tokens` を実需に対して十分大きく取る（思考ぶんを上乗せして見積もる）。あるいは要約・抽出のように深い推論が要らない処理では、思考の深さを抑える設定を選んで予算を本文に回す。私自身は、長文を書かせる呼び出しと短く答えさせる呼び出しでこの設定を分け、同じ上限値を使い回さないようにしています。
+
+## 切れたら続きを継ぎ足す — 安全な継続リクエスト
+
+上限を上げても、入力次第では再び上限に達することがあります。そこで「切れたら続きを依頼して、結合する」継続の仕組みを用意しておくと安定します。考え方はシンプルで、これまでに得られた本文をモデル自身の発話（assistant ロール）として会話履歴に戻し、「直前の続きから、繰り返さずに書いてください」と頼むだけです。
+
+```python
+def generate_complete(client, model, prompt, max_rounds=4, per_call_tokens=2048):
+    contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
+    full = ""
+    for _ in range(max_rounds):
+        resp = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(max_output_tokens=per_call_tokens),
+        )
+        chunk = resp.text or ""
+        full += chunk
+        reason = resp.candidates[0].finish_reason
+        if reason != types.FinishReason.MAX_TOKENS:
+            break  # STOP（完結）なら抜ける
+        # これまでの出力を履歴に戻し、続きを依頼する
+        contents.append(types.Content(role="model", parts=[types.Part(text=chunk)]))
+        contents.append(types.Content(
+            role="user",
+            parts=[types.Part(text="直前の出力の続きを、重複させずにそのまま書き続けてください。")],
+        ))
+    return full, reason
+```
+
+実運用で効いてくる細部が二つあります。ひとつは終了条件を必ず入れること。`max_rounds` のような上限がないと、モデルがいつまでも `MAX_TOKENS` を返し続けたときに呼び出しが止まらず、コストだけが膨らみます。もうひとつは結合部の重複です。継続では境目で同じ語句を繰り返しがちなので、結合後に直近数十文字の重なりを検出して削る処理を入れておくと、文章がきれいにつながります。
+
+```python
+def stitch(a: str, b: str, max_overlap: int = 80) -> str:
+    for n in range(min(max_overlap, len(a), len(b)), 0, -1):
+        if a[-n:] == b[:n]:
+            return a + b[n:]
+    return a + b
+```
+
+## Node/TypeScript でも判定は同じ
+
+SDK が変わっても、見るべき場所は `finishReason` で一貫しています。
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({});
+const resp = await ai.models.generateContent({
+  model: "gemini-3.5-flash",
+  contents: "四半期の振り返りを見出し付きで詳しくまとめてください。",
+  config: { maxOutputTokens: 512 },
+});
+
+const reason = resp.candidates?.[0]?.finishReason;
+if (reason === "MAX_TOKENS") {
+  // 続きを依頼するロジックへ。resp.text をそのまま完成品として扱わない
+  console.warn("出力が途中で切れています。継続が必要です。");
+}
+```
+
+ストリーミングでも事情は同じです。チャンクは最後まで普通に流れてくるため、画面上は自然に見えます。途中切れかどうかは、ストリームの最終チャンクに載る `finishReason` を読むまで分かりません。受信ループを抜けたあとに必ず最後の `finishReason` を確認する、という一手を忘れないでください。
+
+## 次の一歩
+
+まずは自分のパイプラインの出力ログに、`finish_reason` を一列足してみてください。`MAX_TOKENS` がどのくらいの頻度で混ざっているかが見えるはずです。そのうえで、長文を書かせる呼び出しだけ上限を引き上げ、それでも切れるものに継続ロジックを当てる——この順で入れていくと、無駄なトークンを増やさずに尻切れを潰せます。静かに混入していた途中切れが見えるようになると、出力の信頼感がはっきり変わります。お読みいただきありがとうございました。
