@@ -1,0 +1,123 @@
+---
+title: "Flash で生成し、迷ったときだけ Deep Think に検証させる二段パイプライン"
+slug: "gemini-deep-think-second-pass-grader-cheap-flash-pipeline"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-06-14T15:48"
+author: "Gemini Lab"
+description: "Deep Think の API 開放を機に、全リクエストを重いモデルに通すのではなく、Flash の出力が怪しいときだけ Deep Think に検証させる二段構成を、コストの考え方と動くコードで整理します。"
+tags: ["Gemini API", "Deep Think", "Flash", "コスト最適化", "品質ゲート"]
+---
+
+Deep Think が API でも一部開放されたと聞いて最初に思ったのは、「全部これに通せば品質は上がるが、料金が現実的でなくなる」でした。重い推論モデルは精度が高い代わりに、トークン単価も応答時間も Flash とは桁が違います。個人開発で自動化パイプラインを毎日回していると、この差は月末の請求に直接効いてきます。
+
+そこで取った設計が、生成は安い Flash に任せ、出力が怪しいときだけ Deep Think に検証させる二段構成です。重い推論を「常時」ではなく「必要なときだけ」呼ぶことで、精度の底上げとコストの両立を狙いました。
+
+## 全リクエストを重いモデルに通さない理由
+
+実運用のリクエストは、難易度が一様ではありません。大半は Flash で十分に正しい答えが返り、一部だけが判断に迷う難問です。それなのに全件を Deep Think に通すと、簡単な9割のためにも高い単価を払うことになります。
+
+二段構成の発想は「安いモデルでまず答え、自信が持てないものだけ高いモデルに回す」です。重要なのは、Flash 自身に「自信があるか」を申告させ、その申告を機械的な振り分けの根拠にすることです。エスカレーションの判断を人間が見なくても回るようにして初めて、自動パイプラインとして成立します。
+
+## 一段目：Flash に答えと自信度を同時に出させる
+
+ポイントは、Flash の応答に「答え」だけでなく「自信度」と「迷った理由」を構造化して含めさせることです。JSON で受け取れば、後段の振り分けが文字列パースなしで書けます。
+
+```javascript
+// stage1-flash.mjs
+import { GoogleGenerativeAI } from "@google/generative-ai";
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+const flash = genAI.getGenerativeModel({
+  model: "gemini-3.5-flash",
+  generationConfig: { responseMimeType: "application/json" },
+});
+
+export async function draftWithConfidence(question) {
+  const prompt = `次の問いに答え、JSON のみを返してください。
+形式: {"answer": string, "confidence": number(0-1), "uncertain_reason": string}
+confidence は自分の答えへの確信度。曖昧・前提不足・計算が絡む場合は低めに申告してください。
+問い: ${question}`;
+
+  const res = await flash.generateContent(prompt);
+  return JSON.parse(res.response.text());
+}
+```
+
+`responseMimeType: "application/json"` を指定すると、Flash が JSON 以外の前置きを混ぜにくくなります。自信度を自己申告させる手法は万能ではありませんが、「計算が絡む」「前提が足りない」といった構造的に難しいケースを Flash 自身がそこそこ正直に低く申告してくれます。完璧な指標ではなく、振り分けの一次フィルタとして使うのが現実的です。
+
+## 振り分け：自信度としきい値でエスカレーションを決める
+
+二段目を呼ぶかどうかは、自信度のしきい値で機械的に決めます。しきい値は運用の中で調整する前提で、定数に出しておきます。
+
+```javascript
+// router.mjs
+const ESCALATE_BELOW = 0.7;   // この自信度を下回ったら Deep Think に回す
+
+export function needsDeepThink(draft) {
+  if (draft.confidence < ESCALATE_BELOW) return true;
+  // 自信度が高くても、理由欄に危険信号があれば回す
+  const risky = ["不確実", "前提", "推測", "計算", "最新"];
+  return risky.some(w => (draft.uncertain_reason || "").includes(w));
+}
+```
+
+しきい値だけに頼らず、`uncertain_reason` のキーワードも併用しているのは、自信度が高めに出てしまう「自信過剰な誤答」を拾うためです。私の運用では、自信度0.7という単純なしきい値だけだと全体の約2割がエスカレーション対象になり、計算や最新情報が絡む問いがそこに集中していました。
+
+## 二段目：Deep Think には「検証」だけ依頼する
+
+二段目で大事なのは、Deep Think にゼロから答え直させるのではなく、Flash の答えの当否を検証させることです。検証タスクに絞ると、出力が短くなりトークンを節約できますし、判断の根拠も得られます。
+
+```javascript
+// stage2-deepthink.mjs
+import { GoogleGenerativeAI } from "@google/generative-ai";
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+const deep = genAI.getGenerativeModel({ model: "gemini-3-deep-think" });
+
+export async function verify(question, draft) {
+  const prompt = `問い: ${question}
+一次回答: ${draft.answer}
+この一次回答が正しいか検証し、JSON で返してください。
+形式: {"verdict":"ok"|"fix","final":string,"why":string}
+誤りがあれば final に訂正後の答えを入れてください。`;
+
+  const res = await deep.generateContent(prompt);
+  return JSON.parse(res.response.text());
+}
+```
+
+## 二段をつなぐ：迷ったものだけ高いモデルが触る
+
+最後に全体をつなぎます。Flash がまず答え、振り分けで必要と判定されたものだけが Deep Think に渡ります。
+
+```javascript
+// pipeline.mjs
+import { draftWithConfidence } from "./stage1-flash.mjs";
+import { needsDeepThink } from "./router.mjs";
+import { verify } from "./stage2-deepthink.mjs";
+
+export async function answer(question) {
+  const draft = await draftWithConfidence(question);
+  if (!needsDeepThink(draft)) {
+    return { answer: draft.answer, path: "flash-only" };
+  }
+  const checked = await verify(question, draft);
+  return {
+    answer: checked.verdict === "fix" ? checked.final : draft.answer,
+    path: "escalated",
+    note: checked.why,
+  };
+}
+```
+
+`path` を結果に残しているのは、あとで「何割がエスカレーションされたか」を集計するためです。この比率が想定より高ければしきい値が厳しすぎ、低すぎれば誤答を取りこぼしている疑いがあります。コストと品質のバランスは、この一つの数字で監視できます。
+
+## しきい値の決め方と運用の勘所
+
+最初のしきい値は、難しめの問いを20〜30件用意して手で正解をつけ、エスカレーション率と正答率の両方を見ながら決めるのが確実でした。いきなり本番のトラフィックで調整すると、コストか品質のどちらかを犠牲にした状態が長引きます。
+
+私自身、Dolice Labs の自動投稿で運用していて効いたのは、Deep Think の検証結果を記録し、Flash が間違えやすい問いの傾向を後から分析したことです。特定のカテゴリで `verdict: "fix"` が偏って出るなら、そこは一段目のプロンプトを補強するか、最初から二段目に回す方が結局は安く済みます。二段構成は固定ではなく、振り分けの精度を継続的に上げていく土台だと考えています。
+
+まずは自信度のしきい値0.7と、危険信号キーワードだけの最小構成で動かしてみてください。全件を重いモデルに通す前に、この二段でどれだけコストを抑えられるかを実測すると、Deep Think を「ここぞ」で使う感覚が掴めます。実装の参考になれば幸いです。
