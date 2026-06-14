@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH35 — Gemini 3.5 FlashがGemini Enterpriseアプリで既定モデルに（6/8〜）。無効化はできません",
-    "APP — I/O 2026でGeminiアプリを刷新。1日の要点をまとめる「Daily Brief」、新UI、動画モデル「Gemini Omni」を追加",
-    "SPARK — パーソナルAIエージェント「Gemini Spark」が登場。チャットボットから連携作業システムへの転換が鮮明に",
-    "CHROME — Gemini in Chrome on Android（Nano Banana・auto browse）が6月下旬から。メモリ4GB以上・English-US設定の端末から順次",
-    "DEEPTHINK — Gemini 3 Deep ThinkがAPI経由でも一部の研究者・企業に開放。科学・研究向けの高度推論モードです",
-    "MODELS — Gemini 3世代を軸に3.1 Pro / 3.1 Flash-Lite / 3.5 Flashを展開。速度・推論深度・コストで使い分けます",
+    "FLASH GA — Gemini 3.5 Flashが一般提供（GA）に。エージェント・コーディングで持続的なフロンティア性能を発揮する最も賢いモデルと位置づけられています",
+    "TOGGLE — Global・US・EUマルチリージョンでは6/16以降、Gemini 3.5 Flashの機能管理トグルが廃止されます。設定を参照している場合は確認が必要です",
+    "AGENTS — Managed Agentsが公開プレビューで登場。Googleホストの隔離Linuxサンドボックス内で動く自律的・ステートフルなエージェントを構築・デプロイできます",
+    "IMAGE — 画像プレビュー2モデル（gemini-3.1-flash-image-preview・gemini-3-pro-image-preview）が6/25に廃止。後継モデルへの移行が必要です",
+    "SEARCH — File Searchがマルチモーダル対応。gemini-embedding-2により画像をネイティブに埋め込み・検索できるようになりました",
+    "CLI — Gemini CLIとCode Assistが6/18で個人向け提供終了。無料ユーザーとAI Pro/Ultra加入者はAntigravity CLIへ誘導されます",
   ],
   en: [
-    "FLASH35 — Gemini 3.5 Flash is the default model in the Gemini Enterprise app (since Jun 8) and cannot be turned off",
-    "APP — At I/O 2026 the Gemini app gains a Daily Brief, a redesigned UI, and a new video model called Gemini Omni",
-    "SPARK — Gemini Spark, a personal AI agent, debuts as Google turns Gemini from a chatbot into a connected work system",
-    "CHROME — Gemini in Chrome on Android (Nano Banana, auto browse) rolls out in late June, starting on 4GB+ devices set to English-US",
-    "DEEPTHINK — Gemini 3 Deep Think reaches the Gemini API for select researchers and enterprises — advanced reasoning for science and research",
-    "MODELS — Across the Gemini 3 generation, 3.1 Pro, 3.1 Flash-Lite, and 3.5 Flash trade off speed, reasoning depth, and cost",
+    "FLASH GA — Gemini 3.5 Flash is now generally available, billed as the most intelligent model for sustained frontier performance on agentic and coding tasks",
+    "TOGGLE — From Jun 16 the Gemini 3.5 Flash feature toggle is removed in the Global, US, and EU multi-regions, so check any configs that depend on it",
+    "AGENTS — Managed Agents launched in public preview, letting developers build and deploy autonomous, stateful agents inside Google-hosted isolated Linux sandboxes",
+    "IMAGE — The image preview models gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down Jun 25; migrate to their successors",
+    "SEARCH — File Search now supports multimodal search, natively embedding and searching images via the gemini-embedding-2 model",
+    "CLI — Gemini CLI and Code Assist end individual access on Jun 18; free users and AI Pro/Ultra subscribers are directed to the Antigravity CLI",
   ],
 };
 
