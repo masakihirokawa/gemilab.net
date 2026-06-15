@@ -1,0 +1,180 @@
+---
+title: "Permission-Aware RAG — Designing Gemini Search That Only Cites What the User Is Allowed to See"
+slug: "gemini-api-permission-aware-rag-access-control-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-15T04:45"
+author: "Gemini Lab"
+description: "The day you add RAG to internal search, drafts and finance memos nobody should see start leaking into answers. This is a production design — metadata filtering, defense in depth, and audit logging — for letting Gemini search while respecting permissions, with working code."
+tags: ["gemini-api", "rag", "security", "access-control", "production"]
+highlights:
+  - "If you froze up at the thought of internal search leaking other people's drafts or financials into answers, you'll leave with a production architecture that treats permissions as a first-class part of retrieval."
+  - "You'll get copy/paste-ready defense in depth: ACL labels on every chunk, a hard pre-filter by the user's principal set at query time, and a re-check against the source of truth right before answering."
+  - "You'll close the 'stale ACL' gap and the subtler leaks through citations and chat history, and design an audit log that records who answered what, and on what basis."
+---
+I still remember the first day I wired Gemini-powered RAG into an internal knowledge search. The demo was flawless. Ask "how did ad revenue trend last month?" and it pulled the right-looking numbers and answered cleanly. The problem surfaced the moment I asked that same question signed in as a part-timer's account.
+
+A finance memo I'd only ever shared with leadership quietly showed up as the basis for the answer.
+
+The document body never rendered. But Gemini happily said "last month was up versus the prior month" — summarizing numbers that account should never have touched. Vector search returns "chunks that are semantically close," and asks nothing whatsoever about "is this person allowed to see it."
+
+Permission-aware RAG is not a feature you bolt on later. You have to weave permissions into the retrieval design itself. Here I'll walk through the failures I hit personally as an indie developer building cross-service knowledge search across the Dolice Labs properties, and how I fixed them — with runnable code.
+
+## Why ordinary RAG leaks silently
+
+A typical RAG pipeline has three stages. Split documents into chunks, embed them, store them in a vector store. When a question arrives, run nearest-neighbor search for the top k, and hand those to Gemini as context.
+
+Nowhere in that design does the word "permission" appear. The index is "one giant bag where everyone's documents are mixed together," and nearest-neighbor search simply pulls semantically close items out of that bag. If an executives-only finance memo is in the bag, it'll match a part-timer's question too.
+
+The first fix people reach for is "post-filtering": let Gemini answer, then check the cited documents and drop the ones the user can't access. This is wrong twice over. First, by the time you drop them, Gemini has already read and summarized the secret. Second, if the top k fill up with documents the user can't see, the documents they *should* see get pushed out of range, and answer quality drops too.
+
+The correct order is reversed: **filter by permission, then search.** This is called pre-filtering, or security trimming.
+
+## The core design — making permission a first-class part of retrieval
+
+The idea is simple. Give every single chunk an ACL (access control list): "the set of principals allowed to see this chunk." A principal is a user ID or a group ID.
+
+At query time, expand the asking user into their set of principals, and only consider "chunks whose ACL intersects one of those principals." The vector-similarity computation happens only within that narrowed set.
+
+The key is to enforce the ACL as a **metadata filter** in the vector store. Most vector stores (Pinecone, Qdrant, pgvector, sqlite-vec, and others) can apply a nearest-neighbor search and a metadata condition simultaneously. That gets you the top k that are "semantically close *and* allowed" in a single query.
+
+First, the indexing side. When you store a chunk, always attach `allowed_principals` alongside the embedding.
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def embed(text: str) -> list[float]:
+    res = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text,
+    )
+    return res.embeddings[0].values
+
+def index_chunk(store, doc_id: str, chunk_text: str, allowed_principals: list[str]):
+    """Store one chunk with its ACL.
+    allowed_principals lists the user/group IDs allowed to see this chunk.
+    e.g. ["user:masaki", "group:executives"]
+    """
+    if not allowed_principals:
+        # An empty ACL means "nobody can see it," NOT "everyone can."
+        # Get this backwards and any unlabeled document leaks to everyone.
+        raise ValueError(f"doc={doc_id} has no allowed_principals (rejecting to prevent accidental public exposure)")
+    store.upsert(
+        id=f"{doc_id}",
+        vector=embed(chunk_text),
+        metadata={
+            "text": chunk_text,
+            "doc_id": doc_id,
+            "allowed_principals": allowed_principals,
+        },
+    )
+```
+
+Throwing on an empty `allowed_principals` looks minor but is the single most important line. The implementations that fail are the ones that silently treat "empty ACL = unrestricted = public." **The safe default is not "visible to all" but "visible to none" (deny by default).** A document someone forgot to label should disappear from search, not leak.
+
+## The query side — expand principals and hard-filter
+
+When a user asks something, first re-derive their memberships from the **source of truth** (the authoritative permission data) to build the principal set. Do not use stale membership baked into the index. The reason is the "stale ACL problem" below.
+
+```python
+def resolve_principals(user_id: str, directory) -> set[str]:
+    """Look up the user's memberships from the authoritative source and
+    expand them into a principal set: the user plus their groups
+    (recursively expanding nested groups).
+    """
+    principals = {f"user:{user_id}"}
+    for group in directory.groups_of(user_id):           # e.g. ["executives", "marketing"]
+        principals.add(f"group:{group}")
+        for parent in directory.ancestor_groups(group):  # nesting: marketing -> all-staff
+            principals.add(f"group:{parent}")
+    return principals
+
+def secure_retrieve(store, query: str, user_id: str, directory, k: int = 6):
+    principals = resolve_principals(user_id, directory)
+    hits = store.query(
+        vector=embed(query),
+        top_k=k,
+        # Apply the vector neighborhood and the metadata condition together.
+        # Only chunks whose allowed_principals intersect `principals` are candidates.
+        metadata_filter={"allowed_principals": {"$in": list(principals)}},
+    )
+    return hits
+```
+
+The big win of the metadata filter is that the narrowing happens **inside the same query** as the vector search. Documents the user can't access are never even compared as candidate vectors, so the "read the secret, then drop it" failure of post-filtering is structurally impossible. The top k are, from the start, "the best k among documents the user is allowed to see."
+
+## The stale ACL problem — the index is not the source of truth
+
+This was my most painful operational lesson. The `allowed_principals` in your vector store is just a snapshot of permissions at the moment you indexed. "The person who transferred out of marketing," "the document whose sharing was revoked" — the vectors know none of it.
+
+Right after a part-timer left, in the few hours before re-indexing ran, their token was still alive and the stale ACL would have made documents visible. That's not theoretical — it's a moment that genuinely made my stomach drop.
+
+The countermeasure is two layers. First, always re-derive `resolve_principals` from the source of truth (a directory or IAM) on every request; never trust memberships from the index. Second, **right before assembling the answer, re-check the retrieved chunks' permissions against the source of truth.** Defense in depth.
+
+```python
+def verify_access(hits, user_id: str, authz) -> list:
+    """Re-check the retrieved chunks against the source of truth, right
+    before they're used in an answer. Even if the index's ACL is stale,
+    this is the final place to drop them.
+    """
+    verified = []
+    for h in hits:
+        # authz judges permission "as of right now" from the source of truth.
+        if authz.can_read(user_id=user_id, doc_id=h.metadata["doc_id"]):
+            verified.append(h)
+    return verified
+```
+
+Checking twice looks redundant, but the two checks play different roles. The metadata filter buys you both efficiency and safety: "don't let Gemini read documents the user can't access." The pre-answer `verify_access` is insurance: "don't leak in the end, even when the index has gone stale." With only the former, stale ACLs leak; with only the latter, you've already handed secret-bearing context to Gemini.
+
+## Closing the leaks through citations and chat history
+
+Even with retrieval narrowed, two gaps remain.
+
+One is **citations.** If your answer prints "Source: May 2026 finance memo" — a filename or path — then even without showing the body, the mere fact that "such a document exists" is itself information. Limit citations to the displayable metadata (a title, a public URL) of chunks that passed `verify_access`.
+
+The other is **chat history.** In a multi-turn conversation, a summary of a document the user could once see lingers in the history, and the model references it on a later turn after access was lost. Chat history tends to become a cache of "what was once visible." As a countermeasure, don't keep sensitive answers in history verbatim, and re-evaluate permission on every turn.
+
+```python
+def answer(client, store, user_id, directory, authz, query, history=None):
+    hits = secure_retrieve(store, query, user_id, directory, k=6)
+    allowed = verify_access(hits, user_id, authz)
+    if not allowed:
+        # Zero candidates is honestly returned as "no match."
+        # Answering from history here would leak under stale permissions.
+        return {"text": "I couldn't find anything matching within the scope you can access.", "citations": []}
+
+    context = "\n\n".join(f"[{i}] {h.metadata['text']}" for i, h in enumerate(allowed))
+    system = (
+        "You are an internal knowledge assistant. "
+        "Answer strictly based on the provided context. "
+        "Do not guess about anything not in the context; say you don't know."
+    )
+    res = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=f"{system}\n\n# Context\n{context}\n\n# Question\n{query}",
+    )
+    citations = [{"doc_id": h.metadata["doc_id"]} for h in allowed]
+    return {"text": res.text, "citations": citations}
+```
+
+## Audit logging — who answered what, on what basis
+
+The moment you handle permissions, you need to be able to explain "nothing leaked" after the fact. On every question I record a structured log: the user, the expanded principals, the doc_ids retrieved, the doc_ids dropped by `verify_access`, and the doc_ids ultimately used as the basis.
+
+Recording the dropped count pays off. If the number `verify_access` drops spikes above normal, that's a signal that "the index has gone stale" or "re-indexing is jammed." In practice, watching this drop rate daily let me trigger a re-index before a stale ACL lingered. In my setup the drop rate sits below 1% normally, and the days it climbed to a few percent were always days the batch re-index had failed.
+
+## Before you ship to production
+
+Finally, here are the checks I learned the hard way.
+
+First, **always have an integration test that asks the same question from two accounts with different permissions.** The executive account gets numbers; the part-timer account gets "no match." Just having this symmetry test catches almost every case where a retrieval refactor lets permission slip through.
+
+Second, put a guard in CI that makes it impossible to index with an empty `allowed_principals`. A missing label should be "rejected at index time," not "leaked," and you guarantee that with code rather than human attention.
+
+Third, understand the performance characteristics of your metadata filter. Some vector stores get slow on `$in` filters once the principal set exceeds a few hundred. In that case, structure groups hierarchically and collapse into broad principals like "all-staff" to keep the `$in` cardinality down.
+
+Permission-aware RAG is not a flashy feature. But upholding the obvious — that what should not be seen is not seen — is the single greatest source of trust when you're trying to put AI to work inside an organization. I'm still learning as I operate this, but I hope it helps anyone facing the safety of internal search the same way.
