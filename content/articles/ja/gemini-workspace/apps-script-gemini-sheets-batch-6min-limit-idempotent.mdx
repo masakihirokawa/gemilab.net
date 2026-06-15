@@ -1,0 +1,234 @@
+---
+title: "Apps Script から Gemini でスプレッドシート数千行を処理する — 6分の実行上限を越える分割と冪等性の設計"
+slug: "apps-script-gemini-sheets-batch-6min-limit-idempotent"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-06-16T10:45"
+author: "Gemini Lab"
+description: "Apps Script の6分実行上限でスプレッドシートのバッチ処理が途中で止まる問題を、トリガー継続・ステータス列による冪等処理・指数バックオフで最後まで流し切る設計と実装をまとめます。"
+tags: ["gemini-workspace", "apps-script", "gemini-api", "automation", "batch-processing", "google-sheets"]
+highlights:
+  - "Apps Script の6分実行上限で途中停止していたバッチを、トリガー継続で数千行を最後まで流せるようになる"
+  - "再実行のたびに同じ行を二重処理して API コストを溶かしていた構成を、ステータス列ベースの冪等処理に切り替えられる"
+  - "429 や一時エラーで止まりがちな行単位の Gemini 呼び出しに、指数バックオフと失敗行の隔離をコピーして組み込める"
+---
+
+スプレッドシートに溜まった2,000行のアプリレビューを Gemini で一気に分類・要約しようとして、実行が6分でぷつりと打ち切られたことがあります。個人開発で複数のアプリを運営していると、レビュー返信の下書きや多言語のストアメタデータの整備を、つい慣れた Google スプレッドシート上でまとめて回したくなります。ところが Apps Script で素直に書くと、行数が増えた瞬間に「処理を完了できませんでした」で止まる。しかも止まった位置が分からないので、再実行すると先頭から二重に処理してしまい、API コストだけが二重にかかる——この二つの壁を同時に外す設計を、実際に運用しているコードに沿って整理します。
+
+## 6分で打ち切られる、というのが最初の壁です
+
+Apps Script の1回の実行時間には上限があります。無料の Google アカウントで約6分、Google Workspace アカウントでも約30分です。ループの中で1行ごとに Gemini を呼ぶと、1行あたり1〜3秒かかるため、無料アカウントでは150〜300行あたりで上限に達します。
+
+ここで多くの人がやりがちなのが「`Utilities.sleep()` を削ってとにかく速くする」という対処です。私自身も最初はそうしましたが、これは筋が悪いと感じています。速くしても上限が消えるわけではなく、行数が2倍になればまた止まるからです。本質的な解決は「1回の実行で全部やろうとしない」ことです。実行を時間予算内で自分から打ち切り、続きを次の実行に引き継ぐ。Apps Script にはそのための時間ベースのトリガーが用意されています。
+
+つまり設計の方針はこうなります。
+
+1. シートに「処理状態」を持つ列を用意し、どの行まで終わったかをデータ自身に記録する
+2. 1回の実行は「残り時間が尽きる前」に自分で安全に停止する
+3. 停止する直前に、数十秒後に同じ関数をもう一度呼ぶトリガーを仕掛けてバトンを渡す
+
+この3点が噛み合うと、行数が何千行になっても、複数回の実行に分割されながら最後まで流れていきます。
+
+## 設計の起点は「1行ずつ冪等にする」ことです
+
+分割実行で最も怖いのは、再開時の二重処理です。途中で止まった実行と、次に立ち上がる実行のあいだで「どこまで終わったか」の認識がずれると、同じ行に二度 Gemini を呼んでしまいます。これを防ぐ一番確実な方法は、進捗をスクリプト側の変数ではなく**シートのセルそのものに書く**ことです。
+
+具体的には、出力列の隣に `status` 列を1つ足します。値は `done` か `error` か空欄の3状態だけです。処理対象を選ぶときは「status が空欄の行」に限定します。こうすると、どのタイミングで実行が落ちても、次の実行は自然に「まだ手をつけていない行」から再開します。スクリプトの記憶に頼らないので、トリガーが二重に発火しても、片方が `done` を書いた行はもう片方の対象から外れます。
+
+```javascript
+// 設定: 自分のシートに合わせて変更する
+const CFG = {
+  SHEET: 'reviews',     // 対象シート名
+  COL_INPUT: 1,         // 入力テキストの列（A=1）
+  COL_OUTPUT: 2,        // Gemini の結果を書く列（B=2）
+  COL_STATUS: 3,        // 処理状態の列（C=3）
+  HEADER_ROWS: 1,       // ヘッダー行数
+  TIME_BUDGET_MS: 4.5 * 60 * 1000, // 4.5分で安全に切り上げる（6分上限の手前）
+  TRIGGER_DELAY_MS: 30 * 1000,     // 30秒後に続きを実行
+};
+
+// status が空欄の「未処理行」だけを上から拾う
+function nextPendingRows_(sheet, limit) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= CFG.HEADER_ROWS) return [];
+  const n = lastRow - CFG.HEADER_ROWS;
+  const status = sheet.getRange(CFG.HEADER_ROWS + 1, CFG.COL_STATUS, n, 1).getValues();
+  const input = sheet.getRange(CFG.HEADER_ROWS + 1, CFG.COL_INPUT, n, 1).getValues();
+  const rows = [];
+  for (let i = 0; i < n && rows.length < limit; i++) {
+    if (!String(status[i][0]).trim() && String(input[i][0]).trim()) {
+      rows.push({ row: CFG.HEADER_ROWS + 1 + i, text: String(input[i][0]) });
+    }
+  }
+  return rows;
+}
+```
+
+ポイントは、`status` を見て対象を決めている点です。出力列が埋まっているかどうかで判定すると、Gemini が空文字を返したケースを「未処理」と誤認してしまいます。状態は専用の列で明示的に持つほうが、後からの目視確認も楽になります。
+
+## Gemini を1行に適用する最小の関数
+
+行単位の処理本体は、できるだけ薄く保ちます。Apps Script から Gemini を呼ぶときは外部ライブラリは不要で、`UrlFetchApp` で REST エンドポイントを直接叩けます。結果を後工程（並べ替えや集計）で使うことを考えると、自由なテキストではなく JSON で受け取っておくと扱いが安定します。`responseMimeType` に `application/json` を指定し、`responseSchema` で形を固定するのが要点です。
+
+```javascript
+const MODEL = 'gemini-2.5-flash'; // 高速モデルを指定。新しい Flash 系に差し替え可能
+const ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models/'
+  + MODEL + ':generateContent';
+
+function classifyOne_(text) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  const payload = {
+    contents: [{ parts: [{ text:
+      'あなたはアプリレビューの分類器です。次のレビューを分類してください。\n' + text }] }],
+    generationConfig: {
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          sentiment: { type: 'STRING', enum: ['positive', 'neutral', 'negative'] },
+          topic: { type: 'STRING' },
+          needs_reply: { type: 'BOOLEAN' },
+        },
+        required: ['sentiment', 'topic', 'needs_reply'],
+      },
+    },
+  };
+  const res = UrlFetchApp.fetch(ENDPOINT + '?key=' + apiKey, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true, // 429 等を例外にせず自分で判定する
+  });
+  const code = res.getResponseCode();
+  if (code === 429 || code >= 500) {
+    throw { retryable: true, code: code }; // 後述のバックオフで拾う
+  }
+  if (code !== 200) {
+    throw { retryable: false, code: code, body: res.getContentText().slice(0, 200) };
+  }
+  const json = JSON.parse(res.getContentText());
+  const out = json.candidates[0].content.parts[0].text;
+  return JSON.parse(out); // responseSchema があるので JSON.parse が通る
+}
+```
+
+`muteHttpExceptions: true` を付けているのは意図的です。これがないと `UrlFetchApp` は 429 や 500 を即座に例外として投げてしまい、ステータスコードを見て「これはリトライすべきか」を判断する余地がなくなります。API キーは `PropertiesService` のスクリプトプロパティに置き、コードにもシートにも直書きしません。構造化出力でつまずいたときの切り分けは、別記事の[Gemini API の Structured Output でバリデーションエラーが返るときの原因と対処](/articles/gemini-api/gemini-api-structured-output-schema-validation-fix)に整理してあります。
+
+## 時間予算を見ながら止まる前に自分でバトンを渡す
+
+中心になるのがメイン関数です。やることは単純で、開始時刻を覚えておき、1行処理するたびに経過時間を確認します。残り時間が予算を超えそうなら、その場でループを抜けて「続きを実行するトリガー」を仕掛けます。
+
+```javascript
+function runBatch() {
+  // 同じ関数の多重起動を防ぐ
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return;
+
+  const start = Date.now();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(CFG.SHEET);
+
+  try {
+    while (Date.now() - start < CFG.TIME_BUDGET_MS) {
+      const batch = nextPendingRows_(sheet, 20); // 20行ずつ取得
+      if (batch.length === 0) {
+        cleanupTriggers_();   // 未処理ゼロなら継続トリガーを掃除して終了
+        Logger.log('全行の処理が完了しました');
+        return;
+      }
+      for (const item of batch) {
+        if (Date.now() - start >= CFG.TIME_BUDGET_MS) break; // 予算超過なら中断
+        processRow_(sheet, item);
+      }
+    }
+    // 予算を使い切った: 続きを次の実行へ引き継ぐ
+    scheduleContinuation_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// 30秒後に runBatch を一度だけ呼ぶトリガーを仕掛ける
+function scheduleContinuation_() {
+  cleanupTriggers_(); // 古い継続トリガーを必ず消してから新規作成（増殖防止）
+  ScriptApp.newTrigger('runBatch').timeBased()
+    .after(CFG.TRIGGER_DELAY_MS).create();
+}
+
+function cleanupTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'runBatch') ScriptApp.deleteTrigger(t);
+  });
+}
+```
+
+`cleanupTriggers_()` を継続トリガーの作成前に必ず呼ぶのは、トリガーの増殖を防ぐためです。これを忘れると、実行のたびにトリガーが1つずつ積み上がり、やがて同じ `runBatch` が複数同時に走り始めます。`LockService` で多重起動自体は弾けますが、無駄な発火が増えるので、入口（作成前の掃除）と出口（完了時の掃除）の両方でゼロに戻すのが安全です。`TIME_BUDGET_MS` を上限の6分ぴったりにせず4.5分に置いているのも同じ発想で、トリガー作成やシート書き込みに使う数秒の余白を残しておくためです。
+
+## 429 と一時エラーを行単位で隔離する
+
+数千行を流すと、必ずどこかで 429（レート超過）や一時的な 500 が出ます。ここで全体を止めてしまうと、1行のために全部が前に進まなくなります。方針は「リトライできるものは行内で粘り、それでも駄目なら `error` を立てて次の行へ進む」です。1行の失敗が全体を巻き込まないように隔離します。
+
+```javascript
+function processRow_(sheet, item) {
+  try {
+    const result = withBackoff_(function () { return classifyOne_(item.text); });
+    sheet.getRange(item.row, CFG.COL_OUTPUT).setValue(JSON.stringify(result));
+    sheet.getRange(item.row, CFG.COL_STATUS).setValue('done');
+  } catch (e) {
+    // リトライ不能、またはリトライ上限超過: error を立てて隔離し、次へ進む
+    sheet.getRange(item.row, CFG.COL_STATUS).setValue('error');
+    sheet.getRange(item.row, CFG.COL_OUTPUT)
+      .setValue('ERR ' + (e.code || '') + ' ' + (e.body || e.message || ''));
+  }
+}
+
+// 指数バックオフ + ジッター。retryable な失敗だけ粘る
+function withBackoff_(fn) {
+  const MAX = 5;
+  for (let attempt = 0; attempt < MAX; attempt++) {
+    try {
+      return fn();
+    } catch (e) {
+      if (!e.retryable || attempt === MAX - 1) throw e;
+      const wait = Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 500);
+      Utilities.sleep(wait); // 1s, 2s, 4s, 8s ... に揺らぎを足す
+    }
+  }
+}
+```
+
+バックオフに小さなジッター（`Math.random()`）を足しているのは、複数行が同時に 429 を踏んだとき、全行が同じ秒数で一斉に再送して再び 429 を踏む「足並みの揃った再試行」を崩すためです。`error` を立てた行はシートに残るので、原因を直したあとに `status` をまとめて空欄に戻せば、未処理として自然に拾い直されます。失敗が消えずに残ること自体が、冪等設計の利点です。レート制限そのものの考え方は[Gemini API レート制限と 429 対策の運用ノート](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide)に詳しくまとめています。
+
+### 失敗行だけを再投入する
+
+修正後の再実行は、特別な仕組みは要りません。`error` の行の `status` セルを空欄にするだけです。次の `runBatch` が未処理行として拾います。私はメニューから「error をリセット」を呼べるようにしておき、原因を直してからワンクリックで再投入できるようにしています。
+
+```javascript
+function resetErrors() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CFG.SHEET);
+  const n = sheet.getLastRow() - CFG.HEADER_ROWS;
+  if (n <= 0) return;
+  const range = sheet.getRange(CFG.HEADER_ROWS + 1, CFG.COL_STATUS, n, 1);
+  const vals = range.getValues();
+  for (let i = 0; i < n; i++) {
+    if (String(vals[i][0]).trim() === 'error') vals[i][0] = '';
+  }
+  range.setValues(vals);
+}
+```
+
+## 実際に流してみて分かったこと（実測メモ）
+
+このパターンで2,000行強のレビューを `gemini-2.5-flash` で分類したときの体感をいくつか残しておきます。数値は私の環境での目安で、レビュー文の長さやモデル、ネットワークで変わります。
+
+- **1行あたり1.2〜2.5秒**。4.5分の予算で1回あたりおおよそ120〜200行進みました。2,000行なら10〜15回の実行に分割される計算です
+- **トリガーの30秒間隔は短すぎないほうが安全**でした。10秒に詰めたところ、前の実行のシート書き込みと次の起動が重なってロック待ちが増えたため、30秒に戻しています
+- **`setValue` を1行ごとに呼ぶと書き込みが律速になる**場面がありました。行数が万単位になるなら、結果をいったん配列に貯めて `setValues` でまとめ書きするほうが速くなります。ただし「途中で落ちても進捗が残る」という冪等性とはトレードオフなので、私は数千行までは1行ずつ書く安全側を選んでいます
+- **`error` 行は全体の1〜2%**程度で、内訳のほとんどは 429 ではなく、入力セルに想定外の長文や空白が混ざっていたケースでした。スキーマを固定しておくと、こうした「データ側の問題」が出力に化けず、`error` として可視化されるのが助かりました
+
+この処理対象は App Store と Google Play 双方から集めたレビューでしたが、AdMob のレポートをシートに取り込んで要約させる、といった用途にもそのまま流用できています。入力列とプロンプト、スキーマを差し替えるだけです。Apps Script の実装パターン全般は[Google Workspace × Gemini API 業務自動化の運用ノート](/articles/gemini-workspace/gemini-api-google-workspace-apps-script-automation-masterclass)も合わせて読むと、トリガー設計の引き出しが増えると思います。
+
+## どこから手をつけるか
+
+まずは手元のシートに `status` 列を1つ足し、`nextPendingRows_` で「空欄の行だけ拾う」ところまでを動かしてみてください。冪等性さえ入れば、あとはトリガー継続もバックオフも、止まったときに困らない安心材料として後から足していけます。私自身まだ運用しながら調整を続けている部分もありますが、「1回で全部やろうとしない」という発想に切り替えるだけで、行数に怯えずにシートへ仕事を任せられるようになりました。

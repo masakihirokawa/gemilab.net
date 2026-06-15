@@ -1,0 +1,233 @@
+---
+title: "Processing Thousands of Sheet Rows with Gemini from Apps Script — Beating the 6-Minute Limit with Chunking and Idempotency"
+slug: "apps-script-gemini-sheets-batch-6min-limit-idempotent"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-06-16T10:45"
+author: "Gemini Lab"
+description: "How to stop Apps Script batch jobs from dying at the 6-minute limit: trigger-based continuation, a status-column idempotency design, and exponential backoff that carries thousands of rows to completion."
+highlights:
+  - "If your batch kept dying at the Apps Script 6-minute limit, you can now carry thousands of rows to completion via trigger continuation"
+  - "You can swap a setup that re-processed the same rows on every rerun for a status-column idempotency design that never double-bills the API"
+  - "You'll get copy-ready exponential backoff and per-row error isolation for row-level Gemini calls that used to stall on 429s"
+---
+
+I once tried to classify and summarize 2,000 app reviews sitting in a spreadsheet with Gemini in one pass, and the run was cut off at six minutes with nothing to show for it. As an indie developer running several apps, I keep reaching for Google Sheets to draft review replies or tidy up multilingual store metadata, because it's the surface I already live in. But when you write the obvious Apps Script loop, it dies the moment the row count grows. Worse, you don't know where it stopped, so rerunning re-processes from the top and double-bills the API. This article walks through the design that removes both walls at once, following code I actually run.
+
+## The six-minute cutoff is the first wall
+
+A single Apps Script execution has a hard time limit: about six minutes on a consumer Google account, and about 30 minutes on a Google Workspace account. If you call Gemini once per row inside a loop, each row takes one to three seconds, so a free account hits the ceiling somewhere around 150–300 rows.
+
+The tempting fix is to strip out every `Utilities.sleep()` and just go faster. I tried that first, and I think it's the wrong instinct. Speed doesn't remove the ceiling — double the rows and you stall again. The real fix is to stop trying to finish everything in one execution. You stop yourself *inside* a time budget and hand the rest to the next execution. Apps Script gives you time-based triggers precisely for this.
+
+So the plan looks like this:
+
+1. Give the sheet a column that records processing state, so the data itself remembers how far you got
+2. Have each execution stop on its own *before* the clock runs out
+3. Just before stopping, schedule a trigger that re-invokes the same function a few seconds later, passing the baton
+
+When those three fit together, a job of any size flows to completion, split across however many executions it needs.
+
+## The starting point is making every row idempotent
+
+The real danger in split execution is double-processing on resume. If the dying run and the next run disagree about "how far did we get," you call Gemini twice on the same row. The most reliable guard is to write progress not into a script variable, but **into the cell itself**.
+
+Concretely, add one `status` column next to your output column. It holds exactly three states: `done`, `error`, or empty. When you pick work, you only take rows where `status` is empty. Now, no matter when an execution dies, the next one naturally resumes from rows nobody has touched. Because nothing relies on script memory, even if a trigger fires twice, the row one run marked `done` simply drops out of the other run's candidates.
+
+```javascript
+// Config: adjust to your own sheet
+const CFG = {
+  SHEET: 'reviews',     // target sheet name
+  COL_INPUT: 1,         // input text column (A=1)
+  COL_OUTPUT: 2,        // column to write Gemini's result (B=2)
+  COL_STATUS: 3,        // processing-state column (C=3)
+  HEADER_ROWS: 1,       // number of header rows
+  TIME_BUDGET_MS: 4.5 * 60 * 1000, // bail at 4.5 min, short of the 6-min cap
+  TRIGGER_DELAY_MS: 30 * 1000,     // resume 30 seconds later
+};
+
+// Take only "pending" rows where status is empty, top to bottom
+function nextPendingRows_(sheet, limit) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= CFG.HEADER_ROWS) return [];
+  const n = lastRow - CFG.HEADER_ROWS;
+  const status = sheet.getRange(CFG.HEADER_ROWS + 1, CFG.COL_STATUS, n, 1).getValues();
+  const input = sheet.getRange(CFG.HEADER_ROWS + 1, CFG.COL_INPUT, n, 1).getValues();
+  const rows = [];
+  for (let i = 0; i < n && rows.length < limit; i++) {
+    if (!String(status[i][0]).trim() && String(input[i][0]).trim()) {
+      rows.push({ row: CFG.HEADER_ROWS + 1 + i, text: String(input[i][0]) });
+    }
+  }
+  return rows;
+}
+```
+
+The key is that selection keys off `status`, not the output column. If you decide "done" by whether the output cell is filled, a row where Gemini returned an empty string gets mistaken for pending. Holding state in a dedicated column also makes eyeballing the sheet afterward much easier.
+
+## The smallest function that applies Gemini to one row
+
+Keep the per-row body as thin as possible. You don't need any library to call Gemini from Apps Script — `UrlFetchApp` can hit the REST endpoint directly. Since you'll use the result downstream (sorting, aggregation), receiving JSON rather than free text keeps things stable. The trick is to set `responseMimeType` to `application/json` and lock the shape with `responseSchema`.
+
+```javascript
+const MODEL = 'gemini-2.5-flash'; // a fast model; swap in newer Flash models freely
+const ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models/'
+  + MODEL + ':generateContent';
+
+function classifyOne_(text) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  const payload = {
+    contents: [{ parts: [{ text:
+      'You are an app-review classifier. Classify the following review.\n' + text }] }],
+    generationConfig: {
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          sentiment: { type: 'STRING', enum: ['positive', 'neutral', 'negative'] },
+          topic: { type: 'STRING' },
+          needs_reply: { type: 'BOOLEAN' },
+        },
+        required: ['sentiment', 'topic', 'needs_reply'],
+      },
+    },
+  };
+  const res = UrlFetchApp.fetch(ENDPOINT + '?key=' + apiKey, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true, // don't throw on 429; decide for ourselves
+  });
+  const code = res.getResponseCode();
+  if (code === 429 || code >= 500) {
+    throw { retryable: true, code: code }; // caught by the backoff below
+  }
+  if (code !== 200) {
+    throw { retryable: false, code: code, body: res.getContentText().slice(0, 200) };
+  }
+  const json = JSON.parse(res.getContentText());
+  const out = json.candidates[0].content.parts[0].text;
+  return JSON.parse(out); // responseSchema guarantees JSON.parse succeeds
+}
+```
+
+The `muteHttpExceptions: true` is deliberate. Without it, `UrlFetchApp` throws immediately on a 429 or 500, and you lose the chance to inspect the status code and decide "should this be retried?" The API key lives in `PropertiesService` script properties — never hardcoded in the script or the sheet. For untangling structured-output failures, I keep notes in [Fixing validation errors from Gemini API Structured Output](/articles/gemini-api/gemini-api-structured-output-schema-validation-fix).
+
+## Watch the time budget and pass the baton before you stop
+
+The heart of it is the main function. It's simple: remember the start time, and check elapsed time after each row. If the remaining time is about to exceed budget, break out of the loop right there and schedule a trigger to "run the rest."
+
+```javascript
+function runBatch() {
+  // Prevent overlapping invocations of the same function
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return;
+
+  const start = Date.now();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(CFG.SHEET);
+
+  try {
+    while (Date.now() - start < CFG.TIME_BUDGET_MS) {
+      const batch = nextPendingRows_(sheet, 20); // pull 20 rows at a time
+      if (batch.length === 0) {
+        cleanupTriggers_();   // nothing pending: clear continuation trigger and finish
+        Logger.log('All rows processed');
+        return;
+      }
+      for (const item of batch) {
+        if (Date.now() - start >= CFG.TIME_BUDGET_MS) break; // over budget: stop
+        processRow_(sheet, item);
+      }
+    }
+    // Budget spent: hand the rest to the next execution
+    scheduleContinuation_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Schedule a single trigger that calls runBatch 30 seconds later
+function scheduleContinuation_() {
+  cleanupTriggers_(); // always delete old continuation triggers first (no breeding)
+  ScriptApp.newTrigger('runBatch').timeBased()
+    .after(CFG.TRIGGER_DELAY_MS).create();
+}
+
+function cleanupTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'runBatch') ScriptApp.deleteTrigger(t);
+  });
+}
+```
+
+Calling `cleanupTriggers_()` *before* creating a continuation trigger prevents triggers from breeding. Forget it, and every execution stacks one more trigger until several `runBatch` instances start running at once. `LockService` blocks the overlap itself, but the wasted fires pile up, so I reset to zero at both the entrance (clean before create) and the exit (clean on completion). Setting `TIME_BUDGET_MS` to 4.5 minutes rather than a flat six follows the same logic: leave a few seconds of headroom for trigger creation and sheet writes.
+
+## Isolate 429s and transient errors per row
+
+Run a few thousand rows and you *will* hit a 429 (rate limit) or a transient 500 somewhere. If that halts the whole job, one row blocks everything. The policy: retry what's retryable within the row, and if it still fails, set `error` and move to the next row. One row's failure must not drag the rest down.
+
+```javascript
+function processRow_(sheet, item) {
+  try {
+    const result = withBackoff_(function () { return classifyOne_(item.text); });
+    sheet.getRange(item.row, CFG.COL_OUTPUT).setValue(JSON.stringify(result));
+    sheet.getRange(item.row, CFG.COL_STATUS).setValue('done');
+  } catch (e) {
+    // Non-retryable, or retries exhausted: mark error, isolate, move on
+    sheet.getRange(item.row, CFG.COL_STATUS).setValue('error');
+    sheet.getRange(item.row, CFG.COL_OUTPUT)
+      .setValue('ERR ' + (e.code || '') + ' ' + (e.body || e.message || ''));
+  }
+}
+
+// Exponential backoff with jitter; only persist through retryable failures
+function withBackoff_(fn) {
+  const MAX = 5;
+  for (let attempt = 0; attempt < MAX; attempt++) {
+    try {
+      return fn();
+    } catch (e) {
+      if (!e.retryable || attempt === MAX - 1) throw e;
+      const wait = Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 500);
+      Utilities.sleep(wait); // 1s, 2s, 4s, 8s ... plus a little jitter
+    }
+  }
+}
+```
+
+The small jitter (`Math.random()`) on the backoff matters: when several rows hit a 429 together, it breaks up the "synchronized retry" where every row waits the same number of seconds and slams into another 429 in lockstep. Rows marked `error` stay in the sheet, so once you fix the cause you can blank their `status` and they get picked up again as pending. Failures persisting rather than vanishing is itself the payoff of an idempotent design. For the thinking behind rate limits themselves, see [Operational notes on Gemini API rate limits and 429s](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide).
+
+### Re-injecting only the failed rows
+
+Rerunning after a fix needs no special machinery. Blank the `status` cell of the `error` rows. The next `runBatch` picks them up as pending. I wire a "reset errors" menu item so I can re-inject with one click after fixing the cause.
+
+```javascript
+function resetErrors() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CFG.SHEET);
+  const n = sheet.getLastRow() - CFG.HEADER_ROWS;
+  if (n <= 0) return;
+  const range = sheet.getRange(CFG.HEADER_ROWS + 1, CFG.COL_STATUS, n, 1);
+  const vals = range.getValues();
+  for (let i = 0; i < n; i++) {
+    if (String(vals[i][0]).trim() === 'error') vals[i][0] = '';
+  }
+  range.setValues(vals);
+}
+```
+
+## What I learned actually running it (field notes)
+
+A few impressions from classifying 2,000-plus reviews with `gemini-2.5-flash` this way. The numbers are rough guides from my environment and will shift with review length, model, and network.
+
+- **1.2–2.5 seconds per row.** A 4.5-minute budget moved roughly 120–200 rows per execution, so 2,000 rows splits into about 10–15 executions
+- **A 30-second trigger gap is safer than something tighter.** When I shortened it to 10 seconds, the previous run's sheet writes overlapped the next startup and lock waits grew, so I went back to 30
+- **Calling `setValue` per row can become the bottleneck.** Past tens of thousands of rows, buffering results into an array and writing once with `setValues` is faster. But that trades against the "progress survives a crash" property, so up to a few thousand rows I choose the safe side and write per row
+- **`error` rows ran 1–2% of the total,** and most weren't 429s — they were unexpectedly long or blank input cells. Locking the schema meant those data-side problems surfaced as `error` instead of corrupting the output, which I was grateful for
+
+This particular workload was reviews pulled from both the App Store and Google Play, but the same shape carries over to, say, importing an AdMob report into a sheet and summarizing it — you just swap the input column, prompt, and schema. For Apps Script patterns in general, reading it alongside [Operational notes on Google Workspace × Gemini API automation](/articles/gemini-workspace/gemini-api-google-workspace-apps-script-automation-masterclass) will widen your trigger-design toolkit.
+
+## Where to start
+
+Add a single `status` column to your sheet and get `nextPendingRows_` — "take only the empty rows" — running first. Once idempotency is in, trigger continuation and backoff are things you can add later as peace of mind for when something stalls. I'm still tuning parts of this as I run it, but simply switching to the mindset of "don't try to finish it all in one go" is what let me hand work to a sheet without flinching at the row count.
