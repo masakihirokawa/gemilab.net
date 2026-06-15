@@ -1,0 +1,257 @@
+---
+title: "When Your Firestore × Gemini Embeddings RAG Quietly Degrades — Designing for Re-Embedding"
+slug: "firestore-gemini-embeddings-rag-reembedding-drift-notes"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-06-15T19:45"
+author: "Gemini Lab"
+description: "A RAG built on Firestore native vector search and Gemini Embeddings drifts when the embedding model changes generations, and retrieval quality drops with no errors. Here is how to detect the drift, re-embed without downtime, and keep retrieval cost in check."
+tags: ["gemini-api", "firestore", "vector-search", "rag", "embeddings", "reembedding", "production"]
+highlights:
+  - "How an embedding model upgrade silently misaligns your vector space, and the detection query that surfaces it in production"
+  - "A blue-green re-embedding migration that rebuilds every document vector without taking the service down"
+  - "Using RETRIEVAL_DOCUMENT vs RETRIEVAL_QUERY correctly, with a distance threshold and rerank to hold retrieval cost down"
+---
+## When results get "somehow worse," start here
+
+A RAG built on Firestore native vector search plus Gemini embeddings is shockingly easy to stand up. You skip the separate vector database entirely, store a vector next to each document, fire a KNN query, and reasonable-looking search just works.
+
+The trouble shows up later. After a few months in production, you start getting a vague report one day: search results have gotten "somehow worse." No errors. Latency is fine. Yet documents that used to land at the top with one query no longer surface.
+
+Running help search for several of my own sites on this exact setup, as an indie developer, I have hit this more than once. The cause is almost always an embedding model generation change. Through 2026, Gemini's embeddings moved to `gemini-embedding-001` as the GA model, and a multimodal line grew up alongside it for File Search. When the model changes, the same sentence embeds to a different vector. If your stored document vectors and your freshly generated query vectors live in different spaces, the distance math stops meaning anything.
+
+This kind of silent degradation is easy to miss precisely because nothing throws. Below, I lay out how to detect the drift, how to rebuild without downtime, and how to keep retrieval cost under control — all in code.
+
+## Why the vector space drifts — the trap of version-less design
+
+Vector search assumes the document side and the query side are expressed with the same embedding model, the same dimensionality, and the same normalization. In practice, that assumption breaks along three paths.
+
+The first is swapping the embedding model itself. Vectors made with the `text-embedding-004` generation and vectors made with `gemini-embedding-001` differ in both dimensionality and internal representation. Change one line of model name in your code, and only new documents land in the new space while older ones stay in the old one.
+
+The second is changing the output dimensionality. `gemini-embedding-001` defaults to 3072 dimensions, but truncating to 768 or 1536 to save cost and storage is common. Firestore's vector index requires a fixed dimension, so the moment old and new dimensions mix, queries break outright.
+
+The third is mismatching the task type. Gemini embeddings distinguish `RETRIEVAL_DOCUMENT` from `RETRIEVAL_QUERY`. Only when you embed with `RETRIEVAL_DOCUMENT` on write and `RETRIEVAL_QUERY` on search do you get the space tuned for asymmetric retrieval. Forget to align these and accuracy drops with no error at all.
+
+The shared root cause is that the vector carries no metadata about which model, which dimension, and which task produced it. A version-less vector becomes indistinguishable the instant a new generation arrives.
+
+## Stamp an embedding version onto every document
+
+The fix starts simply: store the vector's provenance alongside it. At minimum I stamp the model name, dimension, task type, and a hash of the source text onto each document. Re-embedding and detection both depend on that metadata existing.
+
+```javascript
+// embed.js — a wrapper that produces Gemini embeddings "with provenance"
+import { GoogleGenAI } from "@google/genai";
+import crypto from "node:crypto";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// Pin the embedding config in one place. Swaps happen only here.
+export const EMBED_CONFIG = {
+  model: "gemini-embedding-001",
+  dimensions: 1536,        // truncated from the 3072 default; must match the Firestore index
+  version: "v2",           // internal version; bump whenever the config changes
+};
+
+function sha256(text) {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+// pass RETRIEVAL_DOCUMENT on write, RETRIEVAL_QUERY on search
+export async function embed(text, taskType) {
+  const res = await ai.models.embedContent({
+    model: EMBED_CONFIG.model,
+    contents: text,
+    config: {
+      taskType,
+      outputDimensionality: EMBED_CONFIG.dimensions,
+    },
+  });
+  const values = res.embeddings[0].values;
+  return {
+    values,
+    meta: {
+      embedModel: EMBED_CONFIG.model,
+      embedDims: EMBED_CONFIG.dimensions,
+      embedVersion: EMBED_CONFIG.version,
+      taskType,
+      textHash: sha256(text),
+    },
+  };
+}
+```
+
+On the write side, flatten that metadata onto the document. Firestore lets you combine an ordinary `where` filter with the KNN stage, so exposing `embedVersion` as a top-level field you can equality-filter on makes both the migration and the query far easier later.
+
+```javascript
+// store.js — save the vector and its metadata together
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { embed, EMBED_CONFIG } from "./embed.js";
+
+const db = getFirestore();
+
+export async function upsertDoc(docId, text, extraFields = {}) {
+  const { values, meta } = await embed(text, "RETRIEVAL_DOCUMENT");
+  await db.collection("kb").doc(docId).set(
+    {
+      text,
+      ...extraFields,
+      embedding: FieldValue.vector(values),  // stored as the native vector type
+      embedVersion: meta.embedVersion,       // keep top-level; we filter on it
+      embedModel: meta.embedModel,
+      embedDims: meta.embedDims,
+      textHash: meta.textHash,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+}
+```
+
+Keeping `embedVersion` at the top level matters. Buried in a nested object, it would force a composite index for the narrowing query during migration and make operations fiddly.
+
+## Detect the drift — make a silent failure visible
+
+What makes a generation change dangerous is that nobody notices. Build detection up front, and degradation becomes an alert instead of an incident. What I actually run is a light two-part monitor.
+
+The first part watches for config mismatch. Periodically compare the current `EMBED_CONFIG.version` against the set of `embedVersion` values present in the collection, and count whether any old-version documents remain. This is a plain aggregation with no KNN, so it costs almost nothing.
+
+```javascript
+// drift-check.js — count how many stale vectors remain
+import { getFirestore } from "firebase-admin/firestore";
+import { EMBED_CONFIG } from "./embed.js";
+
+const db = getFirestore();
+
+export async function countStaleVectors() {
+  const snap = await db
+    .collection("kb")
+    .where("embedVersion", "!=", EMBED_CONFIG.version)
+    .count()
+    .get();
+  const stale = snap.data().count;
+  if (stale > 0) {
+    console.warn(`[drift] ${stale} vectors are still on an old version`);
+  }
+  return stale;
+}
+```
+
+The second part watches for quality regression. Keep a small fixed golden set of 20-30 pairs of a representative query and the document ID that should rank near the top, run search periodically, and measure Recall@5. If that number drops between before and after a model swap, that is the signal to re-embed. It catches degradation that staring at error logs never will.
+
+```javascript
+// golden-eval.js — measure Recall@5 over fixed queries
+import { search } from "./search.js";
+
+const GOLDEN = [
+  { query: "where do I check the refund policy", expectId: "faq-refund" },
+  { query: "how to cancel my subscription", expectId: "guide-cancel-subscription" },
+  // ... 20-30 pairs
+];
+
+export async function evalRecallAt5() {
+  let hit = 0;
+  for (const g of GOLDEN) {
+    const results = await search(g.query, { limit: 5 });
+    if (results.some((r) => r.id === g.expectId)) hit++;
+  }
+  const recall = hit / GOLDEN.length;
+  console.log(`Recall@5 = ${recall.toFixed(3)}`);
+  return recall;
+}
+```
+
+The golden set does not need to be perfect. Even 30 pairs make a generation-change cliff plainly visible. Rather than insisting on a flawless evaluation harness before you operate, it is more effective against silent degradation to start running something rough, early.
+
+## Rebuild without downtime — blue-green re-embedding
+
+Once stale vectors turn up, re-embed every document with the new model. The one thing you must not do is rewrite the production collection's vectors in place, top to bottom. Mid-rewrite, old and new vectors coexist in the collection, and search quality stays unstable the whole time.
+
+I use a blue-green approach. Keep two vector fields that search can read, and flip the read target only after the rewrite fully completes. Firestore vector indexes are per-field, so by building a separate index on a new field `embedding_v2`, you can construct the new space in the background while still reading the old `embedding`.
+
+```javascript
+// reembed.js — backfill into a new field, then flip the read target on completion
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { embed, EMBED_CONFIG } from "./embed.js";
+
+const db = getFirestore();
+const NEW_FIELD = "embedding_v2";
+
+// skip the API call when text is unchanged (the key to cost control)
+export async function backfill(batchSize = 100) {
+  let last = null;
+  let processed = 0;
+  for (;;) {
+    let q = db.collection("kb").orderBy("__name__").limit(batchSize);
+    if (last) q = q.startAfter(last);
+    const snap = await q.get();
+    if (snap.empty) break;
+
+    for (const doc of snap.docs) {
+      const d = doc.data();
+      // already embedded with the latest config? skip it
+      if (d.embedVersionV2 === EMBED_CONFIG.version) continue;
+      const { values, meta } = await embed(d.text, "RETRIEVAL_DOCUMENT");
+      await doc.ref.update({
+        [NEW_FIELD]: FieldValue.vector(values),
+        embedVersionV2: meta.embedVersion,
+        embedDimsV2: meta.embedDims,
+      });
+      processed++;
+    }
+    last = snap.docs[snap.docs.length - 1];
+  }
+  console.log(`backfill done: re-embedded ${processed} documents`);
+}
+```
+
+When the backfill finishes and `embedVersionV2` is present on every row, switch the search read target from `embedding` to `embedding_v2`. Make that switch a single config value so that if anything goes wrong you can revert to the old field instantly. Staying revertible throughout is the safety valve of a downtime-free migration.
+
+Delete the old field and old index only after several days of running on the new field with a stable Recall@5. Delete in a hurry and you throw away your own rollback.
+
+## Keep retrieval cost down — threshold and rerank
+
+Alongside the re-embedding design, per-search cost control pays off. Firestore vector search bills by documents read, so cranking `limit` up to grab a wide top-N and handing it all to the LLM inflates both retrieval and generation cost.
+
+What I use is a two-stage approach: cut off by distance threshold, then rerank only when needed. The KNN grabs a generous candidate set, but I receive each candidate's distance via `distanceResultField` and drop anything farther than the threshold before it reaches the context. Simply not passing semantically irrelevant documents to generation improves both answer quality and token consumption.
+
+```javascript
+// search.js — vector search with a distance threshold
+import { getFirestore } from "firebase-admin/firestore";
+import { embed } from "./embed.js";
+
+const db = getFirestore();
+const VECTOR_FIELD = "embedding_v2";     // after migration, flip just this one line
+const MAX_DISTANCE = 0.55;               // COSINE distance; tune against the golden set
+
+export async function search(query, { limit = 8 } = {}) {
+  const { values } = await embed(query, "RETRIEVAL_QUERY");
+  const snap = await db
+    .collection("kb")
+    .where("embedVersionV2", "==", "v2")  // physically exclude un-migrated rows
+    .findNearest({
+      vectorField: VECTOR_FIELD,
+      queryVector: values,
+      limit,
+      distanceMeasure: "COSINE",
+      distanceResultField: "_distance",
+    })
+    .get();
+
+  return snap.docs
+    .map((d) => ({ id: d.id, ...d.data(), distance: d.get("_distance") }))
+    .filter((r) => r.distance <= MAX_DISTANCE);  // discard candidates that are too far
+}
+```
+
+If the threshold consistently leaves you with a handful of results (two or three), you do not need a rerank at all. Only when candidates stay numerous and the threshold cannot narrow them does it pay to rescore relevance with a lightweight model. Reaching for a heavy `Pro` model here inverts the cost, so I assign reranking to a fast model like `gemini-3.5-flash` and reserve the top-tier model for final generation alone.
+
+Do not forget to pass `RETRIEVAL_QUERY` on the query side. Paired with `RETRIEVAL_DOCUMENT` on the write side, that is what gives asymmetric retrieval its accuracy. That is a quality point rather than a cost one, but threshold tuning assumes the two are aligned.
+
+## What to decide now, before the next generation change
+
+Embedding models will keep updating. That is exactly why it is realistic to design re-embedding not as a one-time migration but as a recurring operational event.
+
+Three things you can do right now: stamp a version onto each vector, prepare a golden set (30 pairs is enough), and make the read-target field switchable from a config value. With just those in place, the next time the model changes you can flow a backfill and flip the read target, and move over without taking the service down.
+
+Failures that degrade quietly are far cheaper to prepare for than to repair after the fact — the win is building a state where you can notice it happened. If you run RAG on this same stack, I hope this helps you prepare for the next generation change.

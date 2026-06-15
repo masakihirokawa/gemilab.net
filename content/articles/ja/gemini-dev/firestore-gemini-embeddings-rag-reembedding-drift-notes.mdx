@@ -1,0 +1,263 @@
+---
+title: "Firestore × Gemini Embeddings の RAG が静かに劣化する — 埋め込み世代交代に耐える再埋め込み設計"
+slug: "firestore-gemini-embeddings-rag-reembedding-drift-notes"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-06-15T19:45"
+author: "Gemini Lab"
+description: "Firestore のネイティブベクトル検索と Gemini Embeddings で組んだ RAG は、埋め込みモデルの世代交代でベクトル空間がずれ、検索品質が静かに落ちます。ドリフトの検知、無停止の再埋め込み移行、取得コストの抑え方を実装で詰めます。"
+tags: ["gemini-api", "firestore", "vector-search", "rag", "embeddings", "reembedding", "production"]
+highlights:
+  - "埋め込みモデルの世代交代でベクトル空間がずれ、検索品質が静かに劣化する仕組みと、本番で気づくための検知クエリ"
+  - "サービスを止めずに全ドキュメントを再埋め込みするブルーグリーン方式のインデックス移行手順"
+  - "RETRIEVAL_DOCUMENT と RETRIEVAL_QUERY を使い分け、距離しきい値と再ランクで取得コストを抑える実装"
+---
+## 検索結果が「なんとなく悪くなった」とき、最初に疑うこと
+
+Firestore のネイティブベクトル検索と Gemini の埋め込みを組み合わせた RAG は、最初の構築こそ驚くほど簡単です。専用のベクトルデータベースを別建てせずに、いつものドキュメントのとなりにベクトルを置いて KNN クエリを投げるだけで、それらしい検索が動いてしまいます。
+
+問題が起きるのはそのあとです。数か月運用していると、ある日を境に「検索結果がなんとなく悪くなった」という曖昧な報告が届きます。エラーは出ていません。レイテンシも正常です。それでも、以前なら一発で出ていた関連ドキュメントが上位に来なくなります。
+
+私自身、個人開発で複数のサイトのヘルプ検索をこの構成で回していて、同じ現象に何度かぶつかりました。原因のほとんどは、埋め込みモデルの世代交代です。2026 年に入ってから Gemini の埋め込みは `gemini-embedding-001` が GA となり、File Search 向けにマルチモーダル対応の系列も増えました。モデルが変わると、同じ文章を埋め込んでも出てくるベクトルが別物になります。保存済みのドキュメントベクトルと、新しいモデルで作ったクエリベクトルが別の空間に住んでいれば、距離計算は意味を失います。
+
+この「静かな劣化」は、エラーが出ないぶん本番運用で見逃されやすい障害です。ここでは、ドリフトをどう検知し、サービスを止めずにどう作り直し、取得コストをどう抑えるかを、実装に落として整理します。
+
+## なぜベクトル空間はずれるのか — バージョンを持たない設計の罠
+
+ベクトル検索の前提は、ドキュメント側とクエリ側が「同じ埋め込みモデル・同じ次元・同じ正規化」で表現されていることです。この前提が崩れる経路は、現場では次の3つに集約されます。
+
+ひとつ目は、埋め込みモデルそのものの差し替えです。`text-embedding-004` 世代で作ったベクトルと `gemini-embedding-001` で作ったベクトルは、次元数も内部表現も異なります。コード上のモデル名を一行書き換えただけで、新規ドキュメントだけが新空間、過去ドキュメントは旧空間という分断が生まれます。
+
+ふたつ目は、出力次元（output dimensionality）の変更です。`gemini-embedding-001` は既定で 3072 次元ですが、コストとストレージを抑えるために 768 や 1536 に切り詰める運用がよく行われます。たとえば 3072 次元を半分の 1536 に切り詰めれば、ベクトルのストレージは約 50% 削減できます。ただし途中で次元を変えると、Firestore のベクトルインデックスは固定次元を要求するため、新旧が混ざった瞬間にクエリが破綻します。
+
+三つ目は、タスクタイプの取り違えです。Gemini の埋め込みは `RETRIEVAL_DOCUMENT` と `RETRIEVAL_QUERY` を区別します。保存時に `RETRIEVAL_DOCUMENT`、検索時に `RETRIEVAL_QUERY` を指定して初めて、非対称な検索向けに最適化された空間が使えます。ここを揃え忘れると、エラーは出ないのに精度だけが落ちます。
+
+共通する根本原因は、ベクトルに「どのモデル・どの次元・どのタスクで作ったか」というメタ情報を持たせていないことです。バージョンを持たないベクトルは、世代交代が来た瞬間に区別がつかなくなります。
+
+## ドキュメントには必ず埋め込みバージョンを刻む
+
+対策の起点はシンプルで、ベクトルと一緒に「素性」を保存することです。私は最低限、モデル名・次元・タスクタイプ・元テキストのハッシュをドキュメントに刻むようにしています。後述する再埋め込みも、検知も、すべてこのメタ情報があるから成立します。
+
+```javascript
+// embed.js — Gemini Embeddings を「素性つき」で生成するラッパー
+import { GoogleGenAI } from "@google/genai";
+import crypto from "node:crypto";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// 埋め込み構成を1か所に固定する。差し替えはここだけを変える。
+export const EMBED_CONFIG = {
+  model: "gemini-embedding-001",
+  dimensions: 1536,        // 既定3072から切り詰め。Firestoreインデックスと必ず一致させる
+  version: "v2",           // 構成を変えたら必ずインクリメントする内部バージョン
+};
+
+function sha256(text) {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+// taskType は保存時 RETRIEVAL_DOCUMENT / 検索時 RETRIEVAL_QUERY を渡す
+export async function embed(text, taskType) {
+  const res = await ai.models.embedContent({
+    model: EMBED_CONFIG.model,
+    contents: text,
+    config: {
+      taskType,
+      outputDimensionality: EMBED_CONFIG.dimensions,
+    },
+  });
+  const values = res.embeddings[0].values;
+  return {
+    values,
+    meta: {
+      embedModel: EMBED_CONFIG.model,
+      embedDims: EMBED_CONFIG.dimensions,
+      embedVersion: EMBED_CONFIG.version,
+      taskType,
+      textHash: sha256(text),
+    },
+  };
+}
+```
+
+保存側は、このメタ情報をドキュメントのフラットなフィールドとして展開します。Firestore は KNN クエリの前段で通常の `where` フィルタを併用できるため、`embedVersion` を等値フィルタに使えるようにしておくと、後の移行とクエリの絞り込みが一気に楽になります。
+
+```javascript
+// store.js — ベクトルとメタ情報を一緒に保存する
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { embed, EMBED_CONFIG } from "./embed.js";
+
+const db = getFirestore();
+
+export async function upsertDoc(docId, text, extraFields = {}) {
+  const { values, meta } = await embed(text, "RETRIEVAL_DOCUMENT");
+  await db.collection("kb").doc(docId).set(
+    {
+      text,
+      ...extraFields,
+      embedding: FieldValue.vector(values),  // ネイティブベクトル型で保存
+      embedVersion: meta.embedVersion,       // フィルタに使うので必ずトップレベル
+      embedModel: meta.embedModel,
+      embedDims: meta.embedDims,
+      textHash: meta.textHash,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+}
+```
+
+`embedVersion` をトップレベルに出している点が肝心です。これがネストの奥にあると、移行中の絞り込みクエリで複合インデックスが必要になり、運用がややこしくなります。
+
+## ドリフトを「検知」する — 沈黙する障害を可視化する
+
+世代交代の怖さは、誰も気づかないことにあります。検知の仕組みを先に仕込んでおくと、劣化を「事故」ではなく「アラート」として扱えます。私が実際に使っているのは、軽い二段構えの監視です。
+
+ひとつ目は構成の不一致監視です。現在の `EMBED_CONFIG.version` と、コレクション内に存在する `embedVersion` の集合を突き合わせ、旧バージョンのドキュメントが残っていないかを定期的に数えます。これは KNN を使わない単純な集計なので、コストもほぼかかりません。
+
+```javascript
+// drift-check.js — 旧バージョンの残量を数える
+import { getFirestore } from "firebase-admin/firestore";
+import { EMBED_CONFIG } from "./embed.js";
+
+const db = getFirestore();
+
+export async function countStaleVectors() {
+  const snap = await db
+    .collection("kb")
+    .where("embedVersion", "!=", EMBED_CONFIG.version)
+    .count()
+    .get();
+  const stale = snap.data().count;
+  if (stale > 0) {
+    console.warn(`[drift] 旧バージョンのベクトルが ${stale} 件残っています`);
+  }
+  return stale;
+}
+```
+
+ふたつ目は品質の回帰監視です。代表的なクエリと「本来上位に来てほしいドキュメントID」を 20〜30 組だけ固定のゴールデンセットとして持ち、定期的に検索を回して Recall@5 を測ります。モデルを差し替える前と後で、この数字が落ちていれば再埋め込みの合図です。エラーログを眺めていても絶対に出てこない劣化を、数値で捕まえられます。
+
+```javascript
+// golden-eval.js — 固定クエリで Recall@5 を測る
+import { search } from "./search.js";
+
+const GOLDEN = [
+  { query: "返金ポリシーはどこで確認できますか", expectId: "faq-refund" },
+  { query: "サブスクの解約手順", expectId: "guide-cancel-subscription" },
+  // ... 20〜30組
+];
+
+export async function evalRecallAt5() {
+  let hit = 0;
+  for (const g of GOLDEN) {
+    const results = await search(g.query, { limit: 5 });
+    if (results.some((r) => r.id === g.expectId)) hit++;
+  }
+  const recall = hit / GOLDEN.length;
+  console.log(`Recall@5 = ${recall.toFixed(3)}`);
+  return recall;
+}
+```
+
+ゴールデンセットは完璧でなくて構いません。30 組でも、世代交代による段差は十分に見えます。むしろ「完璧な評価基盤を作ってから運用する」と構えるより、粗くても早く回し始めるほうが、静かな劣化に対しては効きます。
+
+## 無停止で作り直す — ブルーグリーン方式の再埋め込み
+
+旧バージョンのベクトルが見つかったら、全ドキュメントを新モデルで埋め直します。ここで一番やってはいけないのは、本番コレクションのベクトルを上から順に書き換えていくことです。書き換えの途中はコレクション内に新旧が混在し、その間ずっと検索品質が不安定になります。
+
+私が採るのはブルーグリーン方式です。検索が読むベクトルのフィールドを2系統用意し、書き換えが完全に終わってから読み先を切り替えます。Firestore のベクトルインデックスはフィールド単位で張れるので、新フィールド `embedding_v2` に対して別のインデックスを作っておけば、旧 `embedding` を読んだままバックグラウンドで新空間を構築できます。
+
+```javascript
+// reembed.js — 新フィールドへバックフィルし、完了後に読み先を切り替える
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { embed, EMBED_CONFIG } from "./embed.js";
+
+const db = getFirestore();
+const NEW_FIELD = "embedding_v2";
+
+// テキストが変わっていない行は再API呼び出しを省く（コスト削減の要）
+export async function backfill(batchSize = 100) {
+  let last = null;
+  let processed = 0;
+  for (;;) {
+    let q = db.collection("kb").orderBy("__name__").limit(batchSize);
+    if (last) q = q.startAfter(last);
+    const snap = await q.get();
+    if (snap.empty) break;
+
+    for (const doc of snap.docs) {
+      const d = doc.data();
+      // すでに最新構成で埋め込み済みならスキップ
+      if (d.embedVersionV2 === EMBED_CONFIG.version) continue;
+      const { values, meta } = await embed(d.text, "RETRIEVAL_DOCUMENT");
+      await doc.ref.update({
+        [NEW_FIELD]: FieldValue.vector(values),
+        embedVersionV2: meta.embedVersion,
+        embedDimsV2: meta.embedDims,
+      });
+      processed++;
+    }
+    last = snap.docs[snap.docs.length - 1];
+  }
+  console.log(`backfill 完了: ${processed} 件を再埋め込みしました`);
+}
+```
+
+バックフィルが終わり、`embedVersionV2` が全件そろったことを確認したら、検索側の読み先を `embedding` から `embedding_v2` に切り替えます。切り替えは設定値ひとつで行えるようにしておき、問題が出たら即座に旧フィールドへ戻せるようにします。切り戻せる状態を保ったまま進めるのが、無停止移行の安全弁です。
+
+旧フィールドと旧インデックスの削除は、新フィールドで数日運用して Recall@5 が安定してから行います。急いで消すと、切り戻し手段を自ら捨てることになります。新フィールドへ完全に移ったあとも、旧フィールドは数日残しておくことを推奨します。
+
+## 取得コストを抑える — しきい値と再ランクの二段構え
+
+再埋め込みの設計と並んで効くのが、検索1回あたりのコスト管理です。Firestore のベクトル検索は読み取りドキュメント数に応じて課金されるため、`limit` を大きくして上位を多めに取り、それを LLM に丸投げすると、取得コストと生成コストの両方が膨らみます。
+
+私が使っているのは、距離しきい値で足切りし、必要なときだけ再ランクをかける二段構えです。まず KNN で多めに候補を取りますが、`distanceResultField` で各候補の距離を受け取り、しきい値より遠いものはコンテキストに入れません。意味的に無関係なドキュメントを生成から回避するだけで、回答品質とトークン消費の両方が改善します。
+
+```javascript
+// search.js — 距離しきい値つきベクトル検索
+import { getFirestore } from "firebase-admin/firestore";
+import { embed } from "./embed.js";
+
+const db = getFirestore();
+const VECTOR_FIELD = "embedding_v2";     // 移行後はこの1行だけ切り替える
+const MAX_DISTANCE = 0.55;               // COSINE距離。ゴールデンセットで調整する
+
+export async function search(query, { limit = 8 } = {}) {
+  const { values } = await embed(query, "RETRIEVAL_QUERY");
+  const snap = await db
+    .collection("kb")
+    .where("embedVersionV2", "==", "v2")  // 移行漏れの行を物理的に除外
+    .findNearest({
+      vectorField: VECTOR_FIELD,
+      queryVector: values,
+      limit,
+      distanceMeasure: "COSINE",
+      distanceResultField: "_distance",
+    })
+    .get();
+
+  return snap.docs
+    .map((d) => ({ id: d.id, ...d.data(), distance: d.get("_distance") }))
+    .filter((r) => r.distance <= MAX_DISTANCE);  // 遠すぎる候補を捨てる
+}
+```
+
+しきい値で削った結果が常に少数（2〜3 件）に収まるなら、再ランクは不要です。候補が多くしきい値だけでは絞りきれない場合のみ、軽量モデルで関連度を採点し直します。ここで重い `Pro` 系を使うとコストが逆転するので、再ランクには `gemini-3.5-flash` のような速いモデルを充て、最終生成にだけ上位モデルを使う、という役割分担にしています。
+
+`RETRIEVAL_QUERY` をクエリ側に指定している点も忘れないでください。保存側の `RETRIEVAL_DOCUMENT` と対になって初めて、非対称検索の精度が出ます。これはコストではなく品質の話ですが、しきい値の調整は両者が揃っていることが大前提になります。
+
+## 次の世代交代に備えて、いま決めておくこと
+
+埋め込みモデルは今後も更新され続けます。だからこそ、再埋め込みは「一度きりの移行作業」ではなく「定期的に来る運用イベント」として設計しておくのが現実的です。
+
+いますぐできる準備は、次の3つです。
+
+1. ベクトルにモデル名・次元・タスクタイプのバージョンを刻むこと
+2. 代表クエリのゴールデンセットを 30 組だけ用意すること
+3. 検索の読み先フィールドを設定値ひとつで切り替えられるようにしておくこと
+
+この3点さえ仕込んでおけば、次にモデルが変わったときも、バックフィルを流して読み先を切り替えるだけで、サービスを止めずに乗り換えられます。
+
+静かに劣化する障害は、起きてから直すよりも、起きたことに気づける状態を先に作るほうがずっと安くつきます。同じ構成で RAG を運用している方の、次の世代交代の備えになれば幸いです。
