@@ -1,0 +1,266 @@
+---
+title: "既定モデルが勝手に上がる時代に、プロンプト変更の劣化を数値で捕まえる — バリアント管理とカナリア評価の実装メモ"
+slug: "gemini-prompt-variant-canary-regression-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-15T16:30"
+author: "Gemini Lab"
+description: "Gemini 3.5 Flash が既定に上がり、無効化もできなくなりました。プロンプトを触っていないのに応答が変わる前提で、バリアントを束ねて管理し、カナリアと LLM-as-judge で劣化を数値として捕まえる仕組みを、動くコードで組み立てます。"
+tags: ["gemini", "gemini-api", "prompt-engineering", "canary", "llm-as-judge", "production"]
+highlights:
+  - "プロンプト・モデル・サンプリングを1つの「バリアント」に束ね、決定論ハッシュで安定した割り当てを作る Firestore レジストリの実装"
+  - "新バリアントを shadow → カナリア → 昇格の3段で進め、最低サンプル数を満たすまで勝ち判定を凍結する運用ルール"
+  - "応答より一段強い gemini-3-pro を審判に使い、回帰を平均スコア差と簡易 z 値で検知する評価バッチのコード"
+---
+先日、Gemini 3.5 Flash が一般提供になり、Enterprise 系のアプリでは既定モデルとして有効化され、無効化トグルまで消えました。私はこの知らせを読みながら、半年ほど前に味わった気味の悪い半日を思い出していました。個人開発でチャット系のアプリを運用していたのですが、プロンプトは一文字も変えていないのに、ある朝から一部のユーザー層だけ応答のトーンが妙に硬くなった。ログを追っても変更履歴は空っぽで、原因にたどり着くまでに午前中がまるごと溶けました。
+
+結論から言えば、背後でモデルのチェックポイントが入れ替わっていた、というのが私の推測です。確証は取れませんでした。確証が取れない、という事実こそが問題でした。プロンプトを「いつ・誰が・なぜ変えたか」しか記録していなかったので、モデル側が動いたときに切り分ける物差しが手元になかったのです。
+
+## 「触っていないのに変わる」を前提に計測を組む
+
+既定が 3.5 Flash に上がり、しかも無効化できないということは、API を指定なしで叩いている自動化にとって「ある日から挙動が変わる」が制度として起こるということです。これは事故ではなく仕様の側の話なので、こちらの設計で受け止めるしかありません。
+
+受け止め方は一つだけです。応答を生む条件を毎回スナップショットとして固定し、その条件ごとに品質を継続計測する。チャットのように正解が一つに定まらないワークロードでは、ユニットテストが「エラーは出ていない」以上のことを教えてくれません。エラーゼロのまま品質だけが沈んでいく劣化を、テストは素通りさせます。だからこそ、プロンプトを明示的な「バージョン」として扱い、本番トラフィックの上で複数版を並走させながら数値で比べる仕組みが要ります。
+
+ここで私が強く勧めたいのは、版管理の単位を「プロンプト文字列」にしないことです。プロンプトだけ版を切っても、裏でモデルやサンプリングパラメータが独立に動くと、計測した差がどの要因のものか永遠に確定できません。版管理の単位は「プロンプト + モデルID + サンプリング設定」を一つに束ねたバリアントにします。これが本稿の背骨です。
+
+## 全体像 — 4つの部品と、shadow を挟む理由
+
+組み上げるのは次の4つです。
+
+Prompt Registry は、バリアントを Firestore のドキュメントとして持つ小さなレジストリです。配信中か、控え室にいるか、退役したかを `status` で制御します。Traffic Splitter は、ユーザーIDとタスクキーから決定論的にバリアントを選ぶロジックです。同じ人には常に同じ版が返るので、比較が途中で崩れません。Metrics Collector は API 呼び出しを包む薄いラッパーで、どのバリアントが、どれだけのレイテンシとトークンで、成功したか失敗したかを必ず1レコード残します。Evaluation Loop は、溜まったログをサンプリングして審判モデルで採点し、バリアント別の平均スコアの差を見る評価バッチです。
+
+設計上のいちばんの工夫は、`status` に `active` と `shadow` を分けて持たせることです。`active` は実トラフィックに出ますが、`shadow` は出しません。控え室に置いたまま、少数のサンプルでオフライン採点だけ回します。いきなりユーザーに当てる前に「この版は明らかに弱い」を捨てられる関所を持っておくと、本番投入の事故がはっきり減ります。私はこの関所を入れてから、新バリアントを当てる手つきがずいぶん大胆になりました。
+
+## Step 1 — バリアントを束ねて持つレジストリ
+
+まず Firestore に `prompt_variants` コレクションを用意し、Python から読み出す薄いクラスを書きます。キャッシュは60秒程度の雑な TTL で十分です。プロンプトは1日に何度も書き換えるものではないので、過剰なリアルタイム性は要りません。
+
+```python
+# prompt_registry.py
+# プロンプト + モデル + サンプリングを1つのバリアントとして Firestore で管理する
+from google.cloud import firestore
+from dataclasses import dataclass
+import time
+
+@dataclass
+class PromptVariant:
+    variant_id: str          # 例: v4 / v4-terse
+    model: str               # 例: gemini-3.5-flash / gemini-3-pro
+    system_instruction: str
+    temperature: float
+    thinking_level: str      # "low" / "medium" / "high"（3 世代の推論深度指定）
+    weight: int              # active のものだけ合計して分母にする配信比率
+    status: str              # active / shadow / archived
+
+class PromptRegistry:
+    def __init__(self, collection: str = "prompt_variants"):
+        self._db = firestore.Client()
+        self._collection = collection
+        self._cache: dict[str, list[PromptVariant]] = {}
+        self._refreshed_at = 0.0
+        self._ttl = 60  # 秒
+
+    def _refresh(self, prompt_key: str) -> None:
+        docs = (self._db.collection(self._collection)
+                .where("prompt_key", "==", prompt_key)
+                .where("status", "in", ["active", "shadow"])
+                .stream())
+        # ドキュメントに prompt_key が混ざっていても dataclass 側で弾けるよう間引く
+        rows = []
+        for doc in docs:
+            d = doc.to_dict()
+            d.pop("prompt_key", None)
+            rows.append(PromptVariant(**d))
+        self._cache[prompt_key] = rows
+        self._refreshed_at = time.time()
+
+    def get_variants(self, prompt_key: str) -> list[PromptVariant]:
+        if (time.time() - self._refreshed_at) > self._ttl:
+            self._refresh(prompt_key)
+        rows = self._cache.get(prompt_key)
+        if not rows:
+            raise RuntimeError(f"no variants for prompt_key: {prompt_key}")
+        return rows
+```
+
+`thinking_level` をバリアントに含めているのは、3 世代では推論深度がコストと品質を同時に左右する一級のパラメータになったからです。`low` で十分なタスクに `high` を当て続けると、品質はほぼ変わらないのにコストだけ膨らみます。深度もバリアントの一部として版を切り、計測対象に入れておくべきだと考えています。
+
+## Step 2 — 決定論ハッシュで割り当てを安定させる
+
+A/B 比較の生命線は、同じユーザーに常に同じバリアントを返すことです。毎回ランダムに振ると、同じ人が同じ質問を3回投げたときに3つの版が混ざり、比較が壊れる前に体験が壊れます。注意点として、Python 組み込みの `hash()` はプロセス起動ごとにシードが変わるため決定論には使えません。SHA-256 のような素直なハッシュを使います。
+
+```python
+# traffic_split.py
+# user_id と prompt_key の SHA-256 を取り、weight 比で区間に落とす
+import hashlib
+from typing import Iterable
+from prompt_registry import PromptVariant
+
+def pick_variant(user_id: str, prompt_key: str,
+                 variants: Iterable[PromptVariant]) -> PromptVariant:
+    actives = [v for v in variants if v.status == "active"]
+    if not actives:
+        raise RuntimeError("no active variant")
+    total = sum(v.weight for v in actives)
+    if total <= 0:
+        raise ValueError("weight sum must be positive")
+
+    seed = f"{prompt_key}:{user_id}".encode()
+    bucket = int(hashlib.sha256(seed).hexdigest(), 16) % total
+
+    acc = 0
+    for v in actives:
+        acc += v.weight
+        if bucket < acc:
+            return v
+    return actives[-1]  # 丸めへのフォールバック（通常到達しない）
+```
+
+種に `prompt_key` も混ぜているのは、別タスクで同じユーザーを同じ側に偏らせないためです。チャット応答でも要約でも常に同じ人が新版に落ちると、その人の体験だけが偏り、不具合の苦情も特定層に集中します。`prompt_key` を混ぜれば、タスクごとに独立して割り当てられます。多言語アプリなら、ここに `lang:ja` のような補助キーを足すと、言語別に独立した分割になり、後で「スコア差だと思ったら実は言語差だった」を防げます。
+
+## Step 3 — 計測をラッパー1か所に閉じ込める
+
+ログ取得をアプリのあちこちに散らすと、必ずどこかで取り忘れます。Gemini を叩く場所を一つのラッパーに寄せ、そこで必ずバリアントID・レイテンシ・トークン・成否を残す規律にします。
+
+```python
+# gemini_client.py
+# 呼び出しをバリアント選択とログ書き込みで包む
+import time, uuid
+from google import genai
+from google.cloud import firestore
+from prompt_registry import PromptRegistry
+from traffic_split import pick_variant
+
+_client = genai.Client()
+_registry = PromptRegistry()
+_logs = firestore.Client().collection("prompt_logs")
+
+def generate(user_id: str, prompt_key: str, user_input: str) -> tuple[str, str]:
+    variant = pick_variant(user_id, prompt_key, _registry.get_variants(prompt_key))
+    log_id = uuid.uuid4().hex
+    started = time.monotonic()
+    error, usage, text = None, {}, ""
+    try:
+        resp = _client.models.generate_content(
+            model=variant.model,
+            contents=user_input,
+            config={
+                "system_instruction": variant.system_instruction,
+                "temperature": variant.temperature,
+                "thinking_config": {"thinking_level": variant.thinking_level},
+            },
+        )
+        text = resp.text or ""
+        um = resp.usage_metadata
+        if um:
+            usage = {
+                "prompt_tokens": um.prompt_token_count,
+                "output_tokens": um.candidates_token_count,
+                "thoughts_tokens": getattr(um, "thoughts_token_count", 0) or 0,
+                "cached_tokens": getattr(um, "cached_content_token_count", 0) or 0,
+            }
+    except Exception as e:
+        error = f"{type(e).__name__}: {str(e)[:200]}"  # PII を含みうる stack は別経路へ
+        raise
+    finally:
+        # 例外が出ても必ず残す。エラー率の急増が回帰の一次シグナルになる
+        _logs.document(log_id).set({
+            "log_id": log_id, "user_id": user_id, "prompt_key": prompt_key,
+            "variant_id": variant.variant_id, "model": variant.model,
+            "user_input": user_input, "output_text": text,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "error": error, "usage": usage,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+    return text, log_id
+```
+
+`finally` で書いているのは意図的です。例外が出たケースこそ「ある版でエラーが増えていないか」を追う一次情報なので、成功パスと同じ形でそろえます。3 世代では `thoughts_token_count`(推論に使ったトークン)も取れるので、`thinking_level` を上げ下げしたときのコスト変動が、ここを見れば実数で追えます。これは旧世代のラッパーには無かった視点で、深度をバリアント化する判断はこの数字があって初めて根拠を持ちます。
+
+## Step 4 — 審判は応答より一段強いモデルに任せる
+
+ログが溜まったら、日次・週次でサンプリングしてバリアント別に採点します。採点を人手で続けるのは現実的でないので、評価自体もモデルに任せます。ここで外せない原則が一つあります。審判モデルは応答モデルより一段強いものを使うことです。同じモデルに自己評価させると、現状肯定に寄った甘い点が出がちです。応答を `gemini-3.5-flash` で出しているなら、採点は `gemini-3-pro` に回します。
+
+```python
+# eval_regression.py
+# ログをサンプリングし、LLM-as-judge でバリアント別スコア平均と簡易 z を出す
+import json, math, statistics
+from google import genai
+from google.cloud import firestore
+
+_client = genai.Client()
+_db = firestore.Client()
+
+JUDGE = """あなたは応答品質の厳格な評価者です。
+次の3観点を 1〜5 の整数で採点してください（5が最高）。
+- accuracy: 事実として正しいか
+- helpfulness: 質問者の目的を満たしているか
+- conciseness: 冗長でないか
+JSON のみ出力。キーは上記3つ。説明文は書かないでください。"""
+
+def judge(user_input: str, output_text: str) -> dict:
+    resp = _client.models.generate_content(
+        model="gemini-3-pro",
+        contents=f"【質問】\n{user_input}\n\n【応答】\n{output_text}",
+        config={"system_instruction": JUDGE,
+                "response_mime_type": "application/json",
+                "temperature": 0.0},
+    )
+    try:
+        return json.loads(resp.text)
+    except (json.JSONDecodeError, TypeError):
+        return {"accuracy": 0, "helpfulness": 0, "conciseness": 0, "parse_error": True}
+
+def score_overall(d: dict) -> float:
+    # 3観点の単純平均。重み付けしたいときはここを差し替える
+    return (d["accuracy"] + d["helpfulness"] + d["conciseness"]) / 3
+
+def evaluate(prompt_key: str, sample: int = 400) -> dict:
+    logs = (_db.collection("prompt_logs")
+            .where("prompt_key", "==", prompt_key)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(sample).stream())
+    buckets: dict[str, list[float]] = {}
+    for log in logs:
+        d = log.to_dict()
+        if d.get("error") or not d.get("output_text"):
+            continue
+        s = judge(d["user_input"], d["output_text"])
+        if s.get("parse_error"):
+            continue
+        buckets.setdefault(d["variant_id"], []).append(score_overall(s))
+    return {vid: {"n": len(v), "mean": round(statistics.mean(v), 3),
+                  "stdev": round(statistics.stdev(v), 3) if len(v) > 1 else 0.0}
+            for vid, v in buckets.items() if v}
+
+def compare(base: dict, cand: dict) -> dict:
+    # base を現行、cand を新版とし、平均差と簡易 z を返す
+    diff = cand["mean"] - base["mean"]
+    se = math.sqrt(base["stdev"]**2 / max(base["n"], 1) +
+                   cand["stdev"]**2 / max(cand["n"], 1))
+    z = diff / se if se > 0 else 0.0
+    return {"diff": round(diff, 3), "z": round(z, 2),
+            "verdict": "regression" if z < -2 else "win" if z > 2 else "inconclusive"}
+```
+
+差が有意かどうかは、平均差を標準誤差で割った z を見ます。`compare()` のように、`z < -2` なら回帰、`z > 2` なら改善、間は判定保留、という素朴な基準で個人開発の運用には十分です。厳密な検定を持ち込む前に、まずこの粗い物差しで「明らかな劣化を止める」が回ることのほうが大切だと考えています。
+
+## 私が実際に踏んだ落とし穴
+
+仕組みを組んでも、運用側の設計ミスで計測は簡単に崩れます。私が踏んだものを共有します。
+
+一つ目は、プロンプトとモデルIDを別々のフラグで管理してしまったことです。プロンプト側のフラグで新版を20%に回しつつ、モデル側のフラグを独立に切り替えた結果、新版のサンプルが二つのモデルに散り、スコアのばらつきが説明不能になりました。バリアントを1ドキュメントに束ねていれば、この分裂は物理的に起きません。今回の設計でいちばん効いている部分です。
+
+二つ目は、サンプルが小さいまま勝ち判定したことです。20件で「平均0.3点高いから勝ち」としたら、翌週には差が消えていました。いまは最低400件・片側50件以上が揃うまで判定を凍結しています。応答は確率的なので、信頼区間の広さをなめると必ず痛い目に遭います。
+
+三つ目は、キャッシュとA/B分割の衝突です。コンテキストキャッシュを使っていると、バリアントごとに別キャッシュが立ってヒット率が落ち、コストが跳ねます。新版の `weight` を10〜20%以下のカナリアに抑えるか、キャッシュ対象を System Instructions の共通部分だけに限り、版固有の差分はコンテンツ側に逃がす再構成が要ります。
+
+四つ目は、時系列の偏りです。週末は日本語ユーザーが多く平日昼は英語が多い、といった分布のうねりが、ユーザーIDだけのハッシュではバリアント間に漏れます。スコア差に見えたものが言語差や時間帯差だった、が起こります。`prompt_key` に `lang:ja` のような補助キーを足し、評価も言語別に切ってから比べると、この種の錯覚をだいぶ減らせます。
+
+## 最初の一歩は、ラッパーだけ入れること
+
+4部品を一度に作ろうとすると重く感じますが、費用対効果がいちばん高いのは Step 3 のラッパーだけ先に入れ、バリアントIDを `default` 固定でログを残し始めることです。1週間でレイテンシ分布とトークン消費の実態が見え、どこを直せばコストが下がるかが数字で分かります。レジストリとカナリアは、次に試したい変更が出てきたときに足せば十分間に合います。
+
+既定モデルが勝手に上がる流れは、これからも続きます。だからこそ「触っていないのに変わった」を後から証明できる計測を、いまのうちに薄く一枚だけ敷いておく。その一枚があるかないかで、半年後の自分が午前中を溶かすか、5分で切り分けて昼前にコーヒーを飲めるかが変わります。実装の参考になれば幸いです。

@@ -1,0 +1,263 @@
+---
+title: "When the Default Model Silently Upgrades: Catching Prompt Regressions in Numbers"
+slug: "gemini-prompt-variant-canary-regression-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-15T16:30"
+author: "Gemini Lab"
+description: "Gemini 3.5 Flash is now the default and you can no longer turn it off. Assuming your responses can shift without you touching the prompt, here is how to bundle prompt, model, and sampling into one variant and catch regressions with canaries and an LLM judge — in working code."
+tags: ["gemini", "gemini-api", "prompt-engineering", "canary", "llm-as-judge", "production"]
+highlights:
+  - "A Firestore registry that bundles prompt, model, and sampling into a single variant, with deterministic hashing for stable assignment"
+  - "A three-stage path — shadow, canary, promotion — that freezes win/lose calls until a minimum sample size is reached"
+  - "An evaluation batch that uses a stronger gemini-3-pro as judge and flags regressions with mean-score deltas and a quick z value"
+---
+The other day Gemini 3.5 Flash reached general availability, became the default in Enterprise apps, and the toggle to disable it simply disappeared. Reading that, I thought back to an unsettling half-day from about six months earlier. As an indie developer running my own chat app, I had not touched the prompt by a single character, yet one morning the tone of the responses turned oddly stiff for one slice of users. The change log was empty, and it ate my entire morning before I gave up looking for a cause I could prove.
+
+My best guess is that a model checkpoint had been swapped behind the scenes. I could never confirm it. That inability to confirm was the real problem. I had only ever recorded when, who, and why a prompt changed — so when the model moved, I had no ruler in hand to separate cause from coincidence.
+
+## Instrument for "it changed without me touching it"
+
+When the default rises to 3.5 Flash and cannot be disabled, any automation that calls the API without an explicit model is now subject, by policy rather than by accident, to "behavior changes one day." Since this comes from the platform side, the only place to absorb it is your own design.
+
+There is really only one way to absorb it: snapshot the conditions that produced each response and measure quality continuously, per condition. For open-ended workloads like chat, unit tests tell you nothing beyond "no error thrown." A decay where error stays at zero while quality quietly sinks slips right past them. That is exactly why you need to treat a prompt as an explicit version and run several versions side by side on production traffic, comparing them in numbers.
+
+The point I want to press hardest: do not make the unit of versioning the prompt string. If you version only the prompt while the model and sampling parameters move independently underneath, you can never pin down which factor a measured difference belongs to. Make the unit a variant that bundles prompt plus model ID plus sampling config. That is the spine of this whole piece.
+
+## The shape of it — four parts, and why shadow matters
+
+There are four parts to build.
+
+The Prompt Registry holds variants as Firestore documents, with a `status` field controlling whether each is serving, waiting in the wings, or retired. The Traffic Splitter picks a variant deterministically from a user ID and a task key, so the same person always gets the same version and the comparison never breaks mid-stream. The Metrics Collector is a thin wrapper around the API call that always writes one record: which variant, how much latency and how many tokens, and whether it succeeded or failed. The Evaluation Loop samples the accumulated logs, scores them with a judge model, and looks at the gap in mean score between variants.
+
+The single most useful design choice is splitting `status` into `active` and `shadow`. An `active` variant goes out to real traffic; a `shadow` one does not. It stays in the wings and only gets offline scoring on a small sample. Having a gate where you can discard "this version is clearly weaker" before it ever touches a user noticeably reduces production incidents. After I added that gate, I became far bolder about trying new variants — useful when you are a one-person team and every regression lands on you alone.
+
+## Step 1 — A registry that bundles variants
+
+First, create a `prompt_variants` collection in Firestore and write a thin class to read it from Python. A lazy 60-second TTL on the cache is plenty; prompts do not change many times a day, so real-time freshness is wasted effort.
+
+```python
+# prompt_registry.py
+# Manage prompt + model + sampling as one variant in Firestore
+from google.cloud import firestore
+from dataclasses import dataclass
+import time
+
+@dataclass
+class PromptVariant:
+    variant_id: str          # e.g. v4 / v4-terse
+    model: str               # e.g. gemini-3.5-flash / gemini-3-pro
+    system_instruction: str
+    temperature: float
+    thinking_level: str      # "low" / "medium" / "high" (Gen-3 reasoning depth)
+    weight: int              # share; sum only the active ones for the denominator
+    status: str              # active / shadow / archived
+
+class PromptRegistry:
+    def __init__(self, collection: str = "prompt_variants"):
+        self._db = firestore.Client()
+        self._collection = collection
+        self._cache: dict[str, list[PromptVariant]] = {}
+        self._refreshed_at = 0.0
+        self._ttl = 60  # seconds
+
+    def _refresh(self, prompt_key: str) -> None:
+        docs = (self._db.collection(self._collection)
+                .where("prompt_key", "==", prompt_key)
+                .where("status", "in", ["active", "shadow"])
+                .stream())
+        rows = []
+        for doc in docs:
+            d = doc.to_dict()
+            d.pop("prompt_key", None)  # not a dataclass field
+            rows.append(PromptVariant(**d))
+        self._cache[prompt_key] = rows
+        self._refreshed_at = time.time()
+
+    def get_variants(self, prompt_key: str) -> list[PromptVariant]:
+        if (time.time() - self._refreshed_at) > self._ttl:
+            self._refresh(prompt_key)
+        rows = self._cache.get(prompt_key)
+        if not rows:
+            raise RuntimeError(f"no variants for prompt_key: {prompt_key}")
+        return rows
+```
+
+I include `thinking_level` in the variant because, in the Gen-3 family, reasoning depth has become a first-class parameter that moves cost and quality at the same time. Keep pushing `high` onto a task that only needs `low`, and quality barely improves while cost balloons. Depth deserves to be versioned as part of the variant and kept inside the measurement.
+
+## Step 2 — Deterministic hashing for stable assignment
+
+The lifeline of an A/B comparison is returning the same variant to the same user every time. Assign randomly each call and a single person asking the same question three times gets three versions — the experience breaks before the comparison does. One caveat: Python's built-in `hash()` is re-seeded per process start, so it cannot be used for determinism. Use a plain hash like SHA-256.
+
+```python
+# traffic_split.py
+# Hash user_id + prompt_key with SHA-256, cut intervals by weight
+import hashlib
+from typing import Iterable
+from prompt_registry import PromptVariant
+
+def pick_variant(user_id: str, prompt_key: str,
+                 variants: Iterable[PromptVariant]) -> PromptVariant:
+    actives = [v for v in variants if v.status == "active"]
+    if not actives:
+        raise RuntimeError("no active variant")
+    total = sum(v.weight for v in actives)
+    if total <= 0:
+        raise ValueError("weight sum must be positive")
+
+    seed = f"{prompt_key}:{user_id}".encode()
+    bucket = int(hashlib.sha256(seed).hexdigest(), 16) % total
+
+    acc = 0
+    for v in actives:
+        acc += v.weight
+        if bucket < acc:
+            return v
+    return actives[-1]  # rounding fallback (normally unreachable)
+```
+
+I mix `prompt_key` into the seed so that a different task does not push the same user to the same side. If one person always lands on the new version across both chat replies and summaries, their experience skews and any complaints concentrate on one cohort. Mixing in `prompt_key` keeps the assignment independent per task. For a multilingual app, adding an auxiliary key like `lang:en` here gives you an independent split per language, which later prevents the classic "I thought it was a score gap but it was a language gap."
+
+## Step 3 — Confine measurement to one wrapper
+
+Scatter logging across the app and you will forget it somewhere, guaranteed. Funnel every Gemini call through one wrapper and make it a rule to always record variant ID, latency, tokens, and success or failure there.
+
+```python
+# gemini_client.py
+# Wrap the call with variant selection and log writing
+import time, uuid
+from google import genai
+from google.cloud import firestore
+from prompt_registry import PromptRegistry
+from traffic_split import pick_variant
+
+_client = genai.Client()
+_registry = PromptRegistry()
+_logs = firestore.Client().collection("prompt_logs")
+
+def generate(user_id: str, prompt_key: str, user_input: str) -> tuple[str, str]:
+    variant = pick_variant(user_id, prompt_key, _registry.get_variants(prompt_key))
+    log_id = uuid.uuid4().hex
+    started = time.monotonic()
+    error, usage, text = None, {}, ""
+    try:
+        resp = _client.models.generate_content(
+            model=variant.model,
+            contents=user_input,
+            config={
+                "system_instruction": variant.system_instruction,
+                "temperature": variant.temperature,
+                "thinking_config": {"thinking_level": variant.thinking_level},
+            },
+        )
+        text = resp.text or ""
+        um = resp.usage_metadata
+        if um:
+            usage = {
+                "prompt_tokens": um.prompt_token_count,
+                "output_tokens": um.candidates_token_count,
+                "thoughts_tokens": getattr(um, "thoughts_token_count", 0) or 0,
+                "cached_tokens": getattr(um, "cached_content_token_count", 0) or 0,
+            }
+    except Exception as e:
+        error = f"{type(e).__name__}: {str(e)[:200]}"  # PII-bearing stack goes elsewhere
+        raise
+    finally:
+        # Always write, even on exception. A spike in error rate is the first regression signal.
+        _logs.document(log_id).set({
+            "log_id": log_id, "user_id": user_id, "prompt_key": prompt_key,
+            "variant_id": variant.variant_id, "model": variant.model,
+            "user_input": user_input, "output_text": text,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "error": error, "usage": usage,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+    return text, log_id
+```
+
+Writing in `finally` is deliberate. The cases that threw are exactly the primary signal for "did errors rise on some version," so I keep them in the same shape as the success path. In Gen-3 you can also read `thoughts_token_count`, the tokens spent on reasoning, so the cost swing from raising or lowering `thinking_level` shows up here as a real number. That view did not exist in older wrappers, and the decision to versionize depth only earns its footing once you have that figure.
+
+## Step 4 — Let a stronger model be the judge
+
+Once logs accumulate, sample daily and weekly and score per variant. Hand scoring does not survive contact with reality, so let a model do the scoring too. One principle you cannot drop: the judge model should be a notch stronger than the response model. Self-evaluation by the same model tends to produce lenient, self-affirming scores. If you serve responses with `gemini-3.5-flash`, send the scoring to `gemini-3-pro`.
+
+```python
+# eval_regression.py
+# Sample logs, score per variant with an LLM judge, emit mean and a quick z
+import json, math, statistics
+from google import genai
+from google.cloud import firestore
+
+_client = genai.Client()
+_db = firestore.Client()
+
+JUDGE = """You are a strict evaluator of response quality.
+Score each of the three axes as an integer from 1 to 5 (5 is best).
+- accuracy: is it factually correct
+- helpfulness: does it meet the asker's goal
+- conciseness: is it free of bloat
+Output JSON only, keys as above. Do not write any prose."""
+
+def judge(user_input: str, output_text: str) -> dict:
+    resp = _client.models.generate_content(
+        model="gemini-3-pro",
+        contents=f"[Question]\n{user_input}\n\n[Response]\n{output_text}",
+        config={"system_instruction": JUDGE,
+                "response_mime_type": "application/json",
+                "temperature": 0.0},
+    )
+    try:
+        return json.loads(resp.text)
+    except (json.JSONDecodeError, TypeError):
+        return {"accuracy": 0, "helpfulness": 0, "conciseness": 0, "parse_error": True}
+
+def score_overall(d: dict) -> float:
+    return (d["accuracy"] + d["helpfulness"] + d["conciseness"]) / 3
+
+def evaluate(prompt_key: str, sample: int = 400) -> dict:
+    logs = (_db.collection("prompt_logs")
+            .where("prompt_key", "==", prompt_key)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(sample).stream())
+    buckets: dict[str, list[float]] = {}
+    for log in logs:
+        d = log.to_dict()
+        if d.get("error") or not d.get("output_text"):
+            continue
+        s = judge(d["user_input"], d["output_text"])
+        if s.get("parse_error"):
+            continue
+        buckets.setdefault(d["variant_id"], []).append(score_overall(s))
+    return {vid: {"n": len(v), "mean": round(statistics.mean(v), 3),
+                  "stdev": round(statistics.stdev(v), 3) if len(v) > 1 else 0.0}
+            for vid, v in buckets.items() if v}
+
+def compare(base: dict, cand: dict) -> dict:
+    diff = cand["mean"] - base["mean"]
+    se = math.sqrt(base["stdev"]**2 / max(base["n"], 1) +
+                   cand["stdev"]**2 / max(cand["n"], 1))
+    z = diff / se if se > 0 else 0.0
+    return {"diff": round(diff, 3), "z": round(z, 2),
+            "verdict": "regression" if z < -2 else "win" if z > 2 else "inconclusive"}
+```
+
+For whether a difference is significant, look at the z value — the mean delta divided by the standard error. The naive rule in `compare()` — `z < -2` is a regression, `z > 2` is a win, the middle is inconclusive — is plenty for indie operation. Before reaching for a rigorous test, it matters more that this coarse ruler actually runs and stops obvious decay.
+
+## Pitfalls I actually stepped in
+
+Even with the machinery built, an operational design slip breaks the measurement easily. Here are the ones I hit.
+
+First, I managed the prompt and the model ID under separate flags. The prompt flag sent the new version to 20% while the model flag flipped independently, so the new version's samples scattered across two models and the score variance became unexplainable. Bundle the variant into one document and that split cannot physically happen. It is the part of this design that pays off most.
+
+Second, I called a winner while the sample was small. With 20 records I declared "0.3 higher on average, so it wins," and the gap had vanished a week later. Now I freeze the call until at least 400 records, 50-plus per side, are in. Responses are probabilistic; underestimate the width of the confidence interval and it will bite you.
+
+Third, caching collides with the A/B split. With context caching on, each variant spins up its own cache, hit rate drops, and cost jumps. Hold the new version's `weight` to a 10–20% canary, or restrict the cached portion to the shared part of the System Instructions and push version-specific differences into the content side.
+
+Fourth, time-series skew. Weekends skew Japanese, weekday afternoons skew English, and that undulation leaks between variants when you hash on user ID alone. What looked like a score gap turns out to be a language or time-of-day gap. Add an auxiliary key like `lang:en` to `prompt_key` and compare per language, and you cut a lot of that illusion.
+
+## The first step is just the wrapper
+
+Building all four parts at once feels heavy, but the highest-leverage move is to install only the Step 3 wrapper first and start logging with the variant ID pinned to `default`. In a week the real shape of your latency distribution and token spend appears, and you can see in numbers where a fix would cut cost. The registry and the canary can wait until the next change you want to try shows up.
+
+Defaults will keep rising on their own. That is precisely why it is worth laying down one thin sheet of measurement now — the kind that lets a later version of you prove "it changed without me touching it." Whether that sheet exists decides whether six-months-from-now you loses a morning or separates cause from coincidence in five minutes and gets coffee before noon. I hope it helps in your own build.
