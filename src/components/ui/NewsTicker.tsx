@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH GA — Gemini 3.5 Flashが一般提供（GA）に。エージェント・コーディングで持続的なフロンティア性能を発揮する最も賢いモデルと位置づけられています",
-    "TOGGLE — Global・US・EUマルチリージョンでは6/16以降、Gemini 3.5 Flashの機能管理トグルが廃止されます。設定を参照している場合は確認が必要です",
-    "AGENTS — Managed Agentsが公開プレビューで登場。Googleホストの隔離Linuxサンドボックス内で動く自律的・ステートフルなエージェントを構築・デプロイできます",
-    "IMAGE — 画像プレビュー2モデル（gemini-3.1-flash-image-preview・gemini-3-pro-image-preview）が6/25に廃止。後継モデルへの移行が必要です",
-    "SEARCH — File Searchがマルチモーダル対応。gemini-embedding-2により画像をネイティブに埋め込み・検索できるようになりました",
-    "CLI — Gemini CLIとCode Assistが6/18で個人向け提供終了。無料ユーザーとAI Pro/Ultra加入者はAntigravity CLIへ誘導されます",
+    "CLI — Gemini CLI・Code Assist IDE拡張が6/18に無料個人・AI Pro/Ultra向けでリクエスト停止（残り2日）。Antigravity CLIへの移行が案内されています",
+    "GA — Gemini 3.5 FlashがGAに。6/8以降Gemini Enterpriseアプリでは既定で有効化され、オフにできなくなりました",
+    "AGENTS — Managed Agentsがパブリックプレビュー。Googleホストの隔離Linuxサンドボックスで自律エージェントを構築・デプロイできます",
+    "IMAGE — gemini-3.1-flash-image-preview・gemini-3-pro-image-previewが6/25に停止。OGP画像生成の依存先は後継への切替が必要です",
+    "PRO — Gemini 3.5 Proは5/19のI/Oで予告も6/15時点で未公開。6/23・6/30が有力な公開時期と見られています",
+    "API — v1beta Interactions APIに破壊的変更。mid-flightステアリングや非同期ツール呼び出しに向けてAPI形状が再構成されています",
   ],
   en: [
-    "FLASH GA — Gemini 3.5 Flash is now generally available, billed as the most intelligent model for sustained frontier performance on agentic and coding tasks",
-    "TOGGLE — From Jun 16 the Gemini 3.5 Flash feature toggle is removed in the Global, US, and EU multi-regions, so check any configs that depend on it",
-    "AGENTS — Managed Agents launched in public preview, letting developers build and deploy autonomous, stateful agents inside Google-hosted isolated Linux sandboxes",
-    "IMAGE — The image preview models gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down Jun 25; migrate to their successors",
-    "SEARCH — File Search now supports multimodal search, natively embedding and searching images via the gemini-embedding-2 model",
-    "CLI — Gemini CLI and Code Assist end individual access on Jun 18; free users and AI Pro/Ultra subscribers are directed to the Antigravity CLI",
+    "CLI — Gemini CLI and the Code Assist IDE extensions stop serving free, AI Pro, and Ultra users on Jun 18 (two days out), with users directed to the Antigravity CLI",
+    "GA — Gemini 3.5 Flash is now generally available and, since Jun 8, enabled by default and non-removable in the Gemini Enterprise app",
+    "AGENTS — Managed Agents entered public preview, letting you build and deploy stateful autonomous agents inside Google-hosted, isolated Linux sandboxes",
+    "IMAGE — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on Jun 25; OGP image pipelines should move to successors",
+    "PRO — Gemini 3.5 Pro, previewed at I/O on May 19, had not shipped as of Jun 15, with Jun 23 and Jun 30 seen as the likeliest release windows",
+    "API — The v1beta Interactions API has breaking changes, reshaping the API to support mid-flight steering and asynchronous tool calls",
   ],
 };
 
