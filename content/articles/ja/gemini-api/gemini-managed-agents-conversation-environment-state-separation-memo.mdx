@@ -1,0 +1,205 @@
+---
+title: "Gemini Managed Agents を自動化に組み込む ― 会話状態と環境状態を分けて扱う実装メモ"
+slug: "gemini-managed-agents-conversation-environment-state-separation-memo"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-16T15:00"
+author: "Gemini Lab"
+description: "Managed Agents は1回の API 呼び出しで Linux サンドボックスを立て、エージェントを走らせて結果を返します。自前ループから移すとき最初につまずく「会話状態と環境状態は別物」という設計を、実際に動かしながら整理しました。"
+tags: ["Gemini API", "Managed Agents", "Interactions API", "エージェント", "サンドボックス"]
+highlights:
+  - "previous_interaction_id（会話）と environment（ファイル）は独立した2軸であることを、4通りの組み合わせで使い分ける具体例"
+  - "自前のエージェントループから Managed Agents へ寄せる before/after のコードと、消えたボイラープレートの内訳"
+  - "サンドボックスの7日 TTL・135k トークン自動圧縮・ファイル取り出しまで、運用で引っかかる点の実測メモ"
+---
+
+公開プレビューの Managed Agents をはじめて自分の自動化に差し込んだとき、最初の30分でいちばん混乱したのは、エラーでもコスト見積もりでもなく「状態がどこに残るのか」でした。`client.interactions.create(...)` を一度叩くだけで、Google 側に Linux サンドボックスが立ち、Gemini 3.5 Flash がその中でコードを書いて実行し、結果のテキストが返ってきます。ここまでは拍子抜けするほど簡単です。問題は2回目の呼び出しでした。「さっきの続き」をやってもらおうとして、私は会話の履歴とサンドボックスのファイルを同じものだと思い込み、片方だけ引き継いで小一時間ハマりました。
+
+このメモは、その勘違いを正面から扱います。自前でエージェントループを書いてきた人ほど、ここで一度つまずくはずだからです。題材は、私自身が個人開発で回している記事整形の補助タスク（テキストを受け取って整形し、図を1枚作って書き出す）です。
+
+## 1回の呼び出しで何が起きているのか
+
+まずは最小の1回を動かします。グラウンディングのためにも、自分の手で叩いてレスポンスの形を見ておくのが確実です。
+
+```python
+# pip install google-genai
+from google import genai
+
+client = genai.Client()  # GEMINI_API_KEY を環境変数で読む
+
+interaction = client.interactions.create(
+    agent="antigravity-preview-05-2026",   # 既定の汎用 Managed Agent
+    input="最初の20個のフィボナッチ数を生成し fibonacci.txt に保存。"
+          "そのファイルを読み戻して中身を表示してください。",
+    environment="remote",                  # 新しいサンドボックスを毎回プロビジョニング
+)
+
+print("interaction.id      =", interaction.id)
+print("environment_id      =", interaction.environment_id)
+print("output_text         =", interaction.output_text)
+print("steps               =", len(interaction.steps))  # 推論・ツール呼び出し・コード実行の足跡
+```
+
+この `create` 1回が、サンドボックスのプロビジョニング・エージェントループの実行・結果の返却までをまとめて行います。返ってくる `Interaction` オブジェクトで、私が運用上いつも見るのは次の3つです。`output_text` が最終的な回答、`steps` がエージェントが踏んだ各ステップ（reasoning・tool call・code execution）の配列、そして `environment_id` が「いま使ったサンドボックスの識別子」です。最後のひとつが、続きをやる鍵になります。
+
+手元の整形タスクでは、`steps` の長さはおおむね6〜11でした。短い指示でも、計画→コード生成→実行→ファイル確認、と複数ステップを踏むので、`output_text` だけ見て満足せず `steps` を覗いておくと、エージェントが何をどう解いたかが追えます。
+
+## つまずきの正体 ― 状態は2軸ある
+
+Managed Agents は、状態を**2つの独立した次元**で管理します。ここを一本だと思い込むのが、自前ループ出身者の典型的な落とし穴です。
+
+ひとつは**会話コンテキスト**です。チャット履歴・推論トレース・ツール使用の流れで、`previous_interaction_id` に直前の `interaction.id` を渡すと引き継がれます。
+
+もうひとつは**環境状態**です。サンドボックス内のファイル・インストール済みパッケージ・作業ディレクトリの中身で、`environment` に前回の `environment_id` を渡すと引き継がれます。
+
+この2つは、混ぜずに別々に渡します。
+
+```python
+interaction_2 = client.interactions.create(
+    agent="antigravity-preview-05-2026",
+    previous_interaction_id=interaction.id,          # 会話を継ぐ
+    environment=interaction.environment_id,          # ファイルも継ぐ
+    input="さっきの数列を折れ線グラフにして chart.png として保存してください。",
+)
+print(interaction_2.output_text)
+```
+
+ここで `fibonacci.txt` は2回目でも残っていますし、エージェントは「さっきの数列」という指示語の意味も覚えています。私が最初にやった失敗は、`previous_interaction_id` だけ渡して `environment="remote"`（＝新しい箱）にしてしまったことでした。会話は続くのにファイルが消えているので、エージェントは「さっきのファイルが見当たりません」と正直に返してきます。状態が2軸だと腹落ちすれば、当たり前の挙動です。
+
+## 4つの組み合わせを意図して選ぶ
+
+2軸あるということは、引き継ぎ方は2×2の4通りあるということです。私はこれを表ではなく、運用上の「使う場面」とセットで覚えるようにしました。
+
+- **会話を継ぐ・ファイルも継ぐ**（両方渡す）: マルチターンで深掘りする本筋。前段の成果物を踏まえて次を頼むとき。
+- **会話を切る・ファイルは継ぐ**（`previous_interaction_id` を省略し `environment` だけ渡す）: 同じワークスペースで、文脈を引きずらず別の作業を始めたいとき。長い履歴を抱えたまま無関係な指示を出して「context rot」を起こさないための切り替えに使います。
+- **会話を継ぐ・ファイルは新品**（`previous_interaction_id` を渡し `environment="remote"`）: 直前の判断や方針は覚えていてほしいが、作業場は汚したくないとき。同じ方針で複数の対象を順に処理する場合に向きます。
+- **会話を切る・ファイルも新品**（どちらも渡さない）: 完全に独立した1回。バッチで毎回まっさらから走らせたいとき。
+
+この4択を「とりあえず両方継ぐ」で済ませないことが、Managed Agents を素直に運用するコツだと感じています。とくに3番目（会話継続・環境新品）は、自前ループでは実装が面倒だった組み合わせで、これが宣言的に選べるのは素直にありがたい点でした。
+
+## 自前ループから移すと、何が消えるか
+
+ここが、自前でエージェントを書いてきた人にとっていちばん体感の大きいところです。素朴な自前ループは、だいたい次のような骨格をしています。
+
+```python
+# Before: 自前のエージェントループ（運用層が本体になっている）
+history = []
+while True:
+    resp = model.generate(history)               # ① モデル呼び出し
+    if resp.tool_call:                            # ② ツール呼び出しの検知
+        if resp.tool_call.name == "run_python":
+            out = sandbox.exec(resp.tool_call.code)  # ③ 自前サンドボックスで実行
+            history.append(tool_result(out))      # ④ 結果を履歴へ戻す
+            continue
+    if looks_done(resp):                          # ⑤ 終了判定（これが地味に難しい）
+        break
+    history = compact_if_too_long(history)        # ⑥ コンテキスト肥大の手当て
+break
+```
+
+この `while` ループそのものは、実は本体ではありません。本体は、②のツール検知、③の隔離された実行環境、④の履歴整形、⑤の終了判定、⑥のコンテキスト圧縮といった「ループの周辺」です。Managed Agents に寄せると、その周辺がまるごと消えます。
+
+```python
+# After: Managed Agents（周辺の運用を Google 側へ預ける）
+interaction = client.interactions.create(
+    agent="antigravity-preview-05-2026",
+    input=task_text,
+    environment="remote",
+)
+result = interaction.output_text
+```
+
+私のケースで、消えたのは具体的に次の5点でした。サンドボックスのプロビジョニングと後始末、Python / Node / Bash の実行ハンドラ、ツール結果の履歴整形、終了判定のヒューリスティック、そしてコンテキスト圧縮です。最後の圧縮については、Managed Agents 側がおよそ135k トークン付近で**自動圧縮**を挟む設計になっていて、長いマルチターンでもトークン上限エラーや context rot を起こしにくいよう面倒を見てくれます。自前で書いていた「履歴が伸びたら古い tool 結果を要約に畳む」処理は、まるごと不要になりました。
+
+逆に言えば、ここで失うのは**実行環境の自由度**です。特定のシステムライブラリを焼き込んだ独自イメージを使いたい、社内ネットワークの中だけで実行したい、といった要件があるなら、自前サンドボックスを手放す前にそこを確認すべきです。私の整形タスクは「サンドボックスが何であるかに意味がない」種類だったので、預けて困りませんでした。
+
+## 生成物をサンドボックスから取り出す
+
+`chart.png` のように、エージェントがサンドボックス内で作ったファイルは、手元に降ろさないと使えません。現状の SDK には専用メソッドがまだなく、Files API へ直接 HTTP を投げてスナップショット（tar）を取り出します。
+
+```python
+import os, requests, tarfile
+
+env_id = interaction.environment_id
+api_key = os.environ["GEMINI_API_KEY"]
+
+resp = requests.get(
+    f"https://generativelanguage.googleapis.com/v1beta/files/environment-{env_id}:download",
+    params={"alt": "media"},
+    headers={"x-goog-api-key": api_key},
+    allow_redirects=True,
+)
+resp.raise_for_status()
+
+with open("snapshot.tar", "wb") as f:
+    f.write(resp.content)
+with tarfile.open("snapshot.tar") as tar:
+    tar.extractall(path="extracted_snapshot")   # ここに chart.png が入っている
+```
+
+返ってくるのは個別ファイルではなく環境スナップショットの tar である点に注意します。私は最初、`chart.png` を直接ダウンロードする API を探して時間を使いました。実際には「環境まるごとを落として展開し、欲しいファイルを拾う」のが現状の作法です。`allow_redirects=True` を外すと 302 のまま中身が来ないので、ここも忘れないようにします。
+
+## 長く走るタスクはストリームで様子を見る
+
+Hacker News を読んで上位5本を要約し PDF にする、といった重めのタスクは、完了まで待つより途中経過を流したほうが運用上は安心です。`stream=True` を付けると、ステップの差分（テキスト・推論トークン・ツール呼び出しの更新）がイテラブルで返ります。
+
+```python
+stream = client.interactions.create(
+    agent="antigravity-preview-05-2026",
+    input="Hacker News の上位5件を要約して PDF に保存してください。",
+    environment="remote",
+    stream=True,
+)
+for event in stream:
+    print(event)   # ここでログ送出・進捗バー更新・タイムアウト監視などを挟む
+```
+
+私はこのループの中で、一定時間ステップが進まなければ打ち切る監視を入れています。Managed Agents 側でも環境は最終アクティビティから7日間は再開可能で、使うたびに TTL が延びますが、これは「いつまでも待ってよい」という意味ではありません。クライアント側の待ち時間と、サンドボックスを生かしておく期間は別物として設計したほうが安全です。SDK 側のタイムアウト（JavaScript なら `{ timeout: 300_000 }` のように渡せます）と、自分の監視ループを二重にかけておくと、止まったまま気づかない事故を回避できます。
+
+## 繰り返す処理は「保存したエージェント」に固める
+
+ここまではインラインで設定を渡していましたが、同じ役割を毎日繰り返すなら、設定ごと保存して ID で呼べるようにしておくと取り回しが楽になります。`agents.create` で、システムインストラクションと初期環境（GitHub リポジトリやインラインのファイルを基底に焼き込む）を定義します。
+
+```python
+agent = client.agents.create(
+    id="report-formatter",
+    base_agent="antigravity-preview-05-2026",
+    system_instruction="入力テキストを整形し、要点表と図を1枚添えて PDF に書き出す整形エージェントです。",
+    base_environment={
+        "type": "remote",
+        "sources": [
+            {
+                "type": "inline",
+                "target": ".agents/AGENTS.md",
+                "content": "出力には必ず要約表と図を1枚含めること。",
+            },
+        ],
+    },
+)
+
+# 以降は ID 一本で呼べる。呼ぶたびに基底環境を fork するので毎回まっさらから始まる
+result = client.interactions.create(
+    agent="report-formatter",
+    input=today_text,
+    environment="remote",
+)
+print(result.output_text)
+```
+
+保存したエージェントを呼ぶと、毎回**基底環境を fork**して走るため、前回の汚れを持ち越しません。日次バッチのように「いつも同じ初期状態から始めたい」処理とは相性が良い設計です。逆に、前回の続きから積み上げたいなら、保存エージェントの fork に頼らず、前述の `environment_id` 引き継ぎを明示的に使う、という棲み分けになります。ここでも結局、効いてくるのは「会話状態と環境状態は別物」という最初の一点です。
+
+## 移行を考えている人への現実的な一歩
+
+Managed Agents は、自前ループの「ループ以外の全部」を肩代わりしてくれる代わりに、実行環境の中身を手放す前提の仕組みです。だからこそ、いきなり基幹のパイプラインを載せ替えるのではなく、**サンドボックスが何であるかに意味がない1本**から始めるのが現実的です。私の場合はそれが記事整形タスクでした。
+
+最初の検証で確認しておくと安心なのは、次の4点です。
+
+1. `environment_id` を使った続きの呼び出しで、ファイルが本当に残るか。
+2. 会話だけ切って環境を継ぐ組み合わせが、意図どおり動くか。
+3. 生成物の tar が、想定どおり取り出せるか。
+4. 長時間タスクで、クライアント側のタイムアウトと監視が効くか。
+
+この4点を1本のタスクで通せたら、2本目以降はぐっと楽になります。これから載せ替えを検討するなら、まずはこの一本から始めるのをお勧めします。プレビュー段階の機能なので、本番の隣に小さく置いて、壊れても本筋に波及しない位置から馴らしていくのが、私はこの距離感で運用しています。
+
+同じように自前ループから乗り換えを考えている方の、最初の30分のつまずきを一つ減らせたなら嬉しいです。
