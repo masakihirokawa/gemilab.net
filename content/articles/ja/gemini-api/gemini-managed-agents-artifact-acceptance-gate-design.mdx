@@ -1,0 +1,214 @@
+---
+title: "Managed Agents が作った成果物を本番に入れる前に — 受け入れゲートを自前で設計する"
+slug: "gemini-managed-agents-artifact-acceptance-gate-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-16T19:54"
+author: "Gemini Lab"
+description: "公開プレビューの Managed Agents にファイル生成まで任せると、品質がぶれたまま本番へ流れ込みます。サンドボックスの成果物を受け入れる前に通す検証ゲートを、そのまま動く Python コードと却下フィードバックの設計まで含めて組み立てます。"
+tags: ["gemini-api", "managed-agents", "production", "automation", "quality-gate", "agent-design"]
+highlights:
+  - "Managed Agents に成果物の生成を任せたいけれど品質がぶれて本番に出せない、という方が、エージェント出力を機械的に検証してから受け入れる仕組みを今日から組めるようになります"
+  - "サンドボックスから成果物を取り出し、スキーマ検証・段落の逐語重複検出・必須シグナル判定を通すまでの、そのまま動く Python の受け入れゲートを手に入れられます"
+  - "却下理由をエージェントに返して書き直させる feedback loop と、quarantine／accepted の二段ディレクトリ運用で、自動化が静かに劣化するのを止める設計判断が分かります"
+---
+
+Managed Agents の公開プレビューを自分の自動運用に差し込んでみて、最初に肝を冷やしたのは「エージェントが自信満々で壊れた成果物を返してくる」場面でした。Google ホストの隔離 Linux サンドボックス内で計画・推論・コード実行・ファイル操作までを完結させてくれるのは確かに楽なのですが、その出力をそのまま本番ディレクトリに置いた瞬間、品質の番人が一人もいなくなります。
+
+私は4サイトのコンテンツを自動で更新する仕組みを個人開発で回しているので、この「番人不在」は致命的でした。生成物が一度でも薄いまま外に出ると、サイト全体の評価がじわじわ下がることを過去に身をもって学んでいます。だからこそ、エージェントを賢くする話よりも先に、**エージェントの出力を信用しないための層**を一枚かませる設計をお伝えしたいと思います。
+
+## なぜ「賢いエージェント」だけでは本番に出せないのか
+
+公開プレビューの Managed Agents は、ステートフルに動いてファイルまで書き換えてくれます。ここで見落としがちなのは、エージェントが返す成功ステータスは「タスクを完了したと自己申告した」という意味でしかない、という点です。コンテナの中でファイルは確かに生成されました。ただ、それが要件を満たしているかどうかは別問題です。
+
+私が実際に遭遇したのは、こんな失敗でした。
+
+- 生成した記事ファイルの frontmatter から必須フィールドが1つ欠けていた（エージェントは「書いた」と申告）
+- 別タスクで作った段落を、今回の成果物にそっくり再利用していた（逐語重複）
+- 出力 JSON のキー名が前回と微妙に違っていて、後段のビルドが無言で空配列を返した
+
+どれもエージェント側のエラーにはなりません。だから、**受け入れ側に決定的（deterministic）な検証コードを置く**しかないのです。エージェントの自己申告とは独立した、人間が書いた判定ロジックが要ります。
+
+## 受け入れゲートの全体像
+
+設計の骨子はシンプルです。エージェントは「生産者」、ゲートは「検品」と割り切ります。
+
+1. Managed Agent をサンドボックス内で走らせ、成果物を生成させる
+2. サンドボックスから成果物ファイルを取り出す（accepted ではなく一旦 `quarantine/` へ）
+3. 受け入れゲートに通す（スキーマ・重複・必須シグナルを機械判定）
+4. 合格なら `accepted/` へ移動。不合格なら却下理由を構造化して残す
+5. 却下理由をエージェントに返し、同じタスクを書き直させる（feedback loop）
+
+ポイントは、3 の判定を**別の LLM に任せない**ことです。LLM-as-judge は補助層としては有効ですが、一次ゲートに置くと「賢いが気まぐれな検品員」をもう一人増やすだけになります。一次ゲートは必ず deterministic なコードにします。
+
+## そのまま動く受け入れゲート
+
+まずは成果物が「記事 JSON」だと仮定した、実際に動くゲートです。スキーマ検証・必須シグナル・段落の逐語重複の3点を見ます。
+
+```python
+# acceptance_gate.py — エージェント成果物の受け入れ検品（一次ゲートは決定的に）
+from __future__ import annotations
+import json, re, sys, hashlib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REQUIRED_FIELDS = ("title", "slug", "body", "tags")
+MIN_BODY_CHARS = 1200          # 薄い成果物のサニティ下限
+MIN_SIGNALS = 3                # 実用性シグナルの最低数
+
+@dataclass
+class GateResult:
+    accepted: bool
+    reasons: list[str] = field(default_factory=list)
+
+    def reject(self, msg: str) -> None:
+        self.accepted = False
+        self.reasons.append(msg)
+
+def _paragraphs(text: str) -> list[str]:
+    return [p.strip() for p in re.split(r"\n\s*\n", text) if len(p.strip()) >= 80]
+
+def _practical_signals(body: str) -> int:
+    """コード・数値・手順・推奨など、読者の実利になる要素を数える。"""
+    signals = 0
+    if (chr(96) * 3) in body:                       signals += 1   # 動くコード（コードフェンス）
+    if re.search(r"\d+\s?(ms|MB|%|円|回/|tok)", body): signals += 1   # 具体的な実測値
+    if re.search(r"^\s*\d+\.\s", body, re.M):        signals += 1   # 番号付きの手順
+    if re.search(r"(私は|個人開発|実際に|本番で)", body): signals += 1 # 一次体験の文脈
+    return signals
+
+def check_artifact(path: Path, corpus_hashes: set[str]) -> GateResult:
+    res = GateResult(accepted=True)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        res.reject(f"JSON として解釈できません: {e}")
+        return res
+
+    # 1) スキーマ: 必須フィールドの存在
+    for key in REQUIRED_FIELDS:
+        if not data.get(key):
+            res.reject(f"必須フィールド '{key}' が空または欠落しています")
+
+    body = data.get("body", "")
+    # 2) サニティ: 薄すぎる成果物を弾く
+    if len(body) < MIN_BODY_CHARS:
+        res.reject(f"本文が {len(body)} 字で下限 {MIN_BODY_CHARS} 字に満たない")
+
+    # 3) 実用性シグナル
+    n = _practical_signals(body)
+    if n < MIN_SIGNALS:
+        res.reject(f"実用性シグナルが {n} 個（最低 {MIN_SIGNALS} 個必要）")
+
+    # 4) 既存コーパスとの逐語重複（過去成果物の使い回しを検出）
+    for para in _paragraphs(body):
+        h = hashlib.sha256(para.encode("utf-8")).hexdigest()
+        if h in corpus_hashes:
+            res.reject("過去の成果物と逐語一致する段落が含まれています")
+            break
+    return res
+
+def load_corpus_hashes(accepted_dir: Path) -> set[str]:
+    hashes: set[str] = set()
+    for f in accepted_dir.glob("*.json"):
+        body = json.loads(f.read_text(encoding="utf-8")).get("body", "")
+        for para in _paragraphs(body):
+            hashes.add(hashlib.sha256(para.encode("utf-8")).hexdigest())
+    return hashes
+
+if __name__ == "__main__":
+    artifact = Path(sys.argv[1])
+    accepted = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("accepted")
+    accepted.mkdir(exist_ok=True)
+    result = check_artifact(artifact, load_corpus_hashes(accepted))
+    if result.accepted:
+        print("✅ accepted")
+        sys.exit(0)
+    print("🛑 rejected")
+    for r in result.reasons:
+        print("  -", r)
+    sys.exit(1)
+```
+
+ここで意図的にしているのは、**却下を「真偽値」ではなく「理由のリスト」で返す**ことです。後でこの理由をそのままエージェントへの再指示に使うので、「なぜ落ちたか」を文章で持っておく価値があります。`MIN_SIGNALS` のような閾値は、自分のコンテンツ基準に合わせて調整してください。私は実測値・動くコード・番号付き手順・一次体験の4観点を数え、3つ以上で通すようにしています。
+
+## サンドボックスの成果物を quarantine 経由で取り出す
+
+エージェントの実行から成果物取得までを薄くラップします。Managed Agents は公開プレビューで API 仕様が動いている最中なので、ここはエージェント呼び出し部分を「差し替え可能な一点」に閉じ込めておくのが安全です。生成物は必ず `accepted/` ではなく `quarantine/` に着地させます。
+
+```python
+# run_and_gate.py — エージェント実行 → quarantine → ゲート → accepted
+import shutil
+from pathlib import Path
+from acceptance_gate import check_artifact, load_corpus_hashes
+
+QUARANTINE = Path("quarantine")
+ACCEPTED = Path("accepted")
+
+def run_managed_agent(task: str) -> Path:
+    """
+    Managed Agent を起動して成果物を quarantine に取り出す。
+    公開プレビューの API は変わりうるため、ここだけを差し替え可能にしておく。
+    実運用では agents.create → run → list_files → download の流れを
+    この関数の内部に閉じ込め、戻り値は quarantine 上の Path に統一する。
+    """
+    QUARANTINE.mkdir(exist_ok=True)
+    out = QUARANTINE / "artifact.json"
+    # client.agents.run(model="antigravity-preview-05-2026", task=task, ...)
+    # downloaded = client.agents.download(run_id, "out/article.json")
+    # out.write_bytes(downloaded)
+    return out
+
+def accept_or_retry(task: str, max_attempts: int = 3) -> bool:
+    ACCEPTED.mkdir(exist_ok=True)
+    feedback = ""
+    for attempt in range(1, max_attempts + 1):
+        prompt = task if not feedback else f"{task}\n\n前回却下されました。次を必ず直してください:\n{feedback}"
+        artifact = run_managed_agent(prompt)
+        result = check_artifact(artifact, load_corpus_hashes(ACCEPTED))
+        if result.accepted:
+            shutil.move(str(artifact), ACCEPTED / artifact.name)
+            print(f"✅ {attempt} 回目で受け入れ")
+            return True
+        feedback = "\n".join(f"- {r}" for r in result.reasons)
+        print(f"🛑 {attempt} 回目却下:\n{feedback}")
+    print("⛔ 上限到達。人手レビューに回します")
+    return False
+```
+
+`quarantine/` と `accepted/` を物理的に分けておくと、何が起きても「まだ本番に入っていない成果物」が一目で分かります。私自身、ここを一つのディレクトリで済ませようとして、却下したはずのファイルが翌日のビルドに紛れ込んだ事故を経験しました。二段にしてからは、その手の取り違えがゼロになりました。
+
+## 却下理由をエージェントに戻す feedback loop の勘所
+
+`accept_or_retry` の肝は、却下理由を**そのまま次の指示に連結する**ところです。エージェントに「もう一度やって」とだけ言っても同じ失敗を繰り返しますが、「必須フィールド 'tags' が空でした」「本文が薄すぎました」と具体的に渡すと、二回目で通る確率が体感で2倍近くに上がります。私はこのループでも、却下理由は1件ずつ短文で渡すことを推奨します。長い説教を一度に渡すと、エージェントが要点を取りこぼす落とし穴があるからです。回避策はシンプルで、理由を箇条書き1行ずつに正規化してから本番のループに載せることです。
+
+ただし上限は必ず設けます。私は3回で打ち切り、それ以上は人手レビューのキューに送ります。無限リトライは、コストとサンドボックス実行時間をエージェントの気分次第で溶かしてしまうからです。Managed Agents はコンテナを起動するぶん、1回の実行が API 一発より重いことを忘れないようにしています。
+
+## LLM-as-judge は二次ゲートとして足す
+
+deterministic な一次ゲートを通った成果物に対してだけ、文章の自然さや事実の整合といった「機械では測りにくい品質」を LLM に見てもらう二次ゲートを足すと、全体の精度が上がります。順序が逆になると破綻します。先に LLM 判定を置くと、必須フィールド欠落のような自明な不良まで「だいたい良さそう」と通してしまうことがあるためです。
+
+```python
+# 二次ゲート（任意）: 一次ゲート通過後にだけ呼ぶ
+def llm_review(body: str, client) -> tuple[bool, str]:
+    rubric = (
+        "次の本文を検品してください。テンプレ的な導入、"
+        "同じ主張の繰り返し、根拠のない断定があれば指摘し、"
+        "なければ OK とだけ返答してください。"
+    )
+    resp = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=[rubric, body],
+    )
+    verdict = resp.text.strip()
+    return verdict.startswith("OK"), verdict
+```
+
+二次ゲートに `gemini-3.5-flash` を使っているのは、検品は速度と安さが効くタスクだからです。重い推論が要る最終採点だけ上位モデルや Deep Think に回し、日常の検品は Flash で十分まかなえる、というのが運用してみての実感です。
+
+## 明日から動かすための最初の一歩
+
+エージェントをいきなり本番ディレクトリに向けるのをやめて、まず `quarantine/` と `acceptance_gate.py` の2つだけ用意してみてください。最初は閾値を緩めにして、自分のこれまでの成果物が全部通るかを確かめるところから始めると、ゲートが過剰検出していないか安心して調整できます。エージェントを賢くするのは、検品が機能し始めてからで遅くありません。
+
+自動化は、生産者を強くするより検品を先に立てたほうが、結局は安心して任せられる範囲が広がっていきます。私もまだ閾値の調整を続けている最中ですが、同じように自律エージェントを運用に組み込もうとしている方の参考になれば嬉しいです。
