@@ -1,0 +1,193 @@
+---
+title: "Harden the Layer Before Gemini Sees User Media — A Validation Pipeline You Can Actually Run"
+slug: "gemini-files-api-untrusted-media-hardening-notes"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-16T16:30"
+author: "Gemini Lab"
+description: "Piping user-uploaded images and video straight into Gemini walks you into MIME spoofing, EXIF leaks, decompression bombs, and video that isn't ready yet. Here's the validation layer—magic-byte sniffing, Files API state polling, and cleanup—built up in working code."
+tags: ["gemini", "multimodal", "security", "files-api", "advanced"]
+highlights:
+  - "A sniff-by-content gate that rejects anything it cannot positively identify"
+  - "Structurally neutralizing decompression bombs and EXIF location data with Pillow"
+  - "A video path that polls Files API state and deletes the upload when done"
+---
+
+## One upload field, a whole new attack surface
+
+As an indie developer, the moment you add "upload a photo and let the AI describe it," your inputs shift from data you prepared to data strangers send you. Text you can at least scan by eye. Binary media is opaque. Extensions are trivially renamed, and a perfectly ordinary-looking landscape photo can carry the exact coordinates where it was taken buried in its metadata.
+
+What we build here is a safety valve that every piece of user media must pass through before it reaches Gemini. The only dependency is the `google-genai` SDK—no heavy framework. The trick is to order the gates from cheapest to most expensive, so anything we can reject with a light check gets rejected before we spend a file read or an API call on it.
+
+## Decide the gate order first
+
+Validation wastes the least work when it runs cheapest-first. The order I settled on in production is:
+
+1. **Size pre-check** — reject oversized files with `os.path.getsize` alone, before reading a single byte.
+2. **Content-based type detection** — confirm the real format by magic number, not extension.
+3. **Structural image sanitizing** — detect decompression bombs and strip EXIF in one pass.
+4. **Transport branch** — small images go inline; large media and video go through the Files API.
+5. **Output masking and cleanup** — redact the response and delete the uploaded file.
+
+With the gates in this order, when a new format or constraint appears later, it's obvious which gate to touch.
+
+## Reject by size before you open anything
+
+The first gate checks size before opening the file. Skip this and you'll read a giant file into memory, exhaust it, and only then discover the file was too large.
+
+```python
+import os
+
+INLINE_LIMIT = 18 * 1024 * 1024     # safe zone for inline (under the nominal 20MB)
+HARD_LIMIT = 480 * 1024 * 1024      # refuse anything bigger
+
+def check_size(path: str) -> int:
+    size = os.path.getsize(path)
+    if size == 0:
+        raise ValueError("empty file")
+    if size > HARD_LIMIT:
+        raise ValueError(f"file too large: {size} bytes")
+    return size
+```
+
+Keep the inline limit a little under the nominal value rather than exactly on it. Base64 encoding inflates the byte count beyond the raw size, so hugging the boundary gives you a request that only fails in production—a low-reproducibility error you don't want. A margin is cheaper than the debugging session.
+
+## Look at the bytes, not the name
+
+`photo.jpg` guarantees nothing about its contents being JPEG. Renaming an extension costs an attacker nothing. Read the leading bytes—the magic number—and verify the real format.
+
+```python
+SIGNATURES = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"RIFF", "image/webp"),         # confirm with "WEBP" at bytes 8-12
+    (b"\x00\x00\x00\x18ftyp", "video/mp4"),
+    (b"\x00\x00\x00\x20ftyp", "video/mp4"),
+)
+
+ALLOWED = {"image/jpeg", "image/png", "image/webp", "video/mp4"}
+
+def sniff_mime(path: str) -> str | None:
+    with open(path, "rb") as f:
+        head = f.read(32)
+    for sig, mime in SIGNATURES:
+        if head.startswith(sig):
+            if mime == "image/webp" and head[8:12] != b"WEBP":
+                continue
+            return mime
+    return None
+
+def resolve_mime(path: str) -> str:
+    mime = sniff_mime(path)
+    if mime not in ALLOWED:   # None and "not allowed" are rejected alike
+        raise ValueError("unrecognized or disallowed format")
+    return mime
+```
+
+The design point: don't distinguish "couldn't identify" (`None`) from "explicitly disallowed"—reject both. Making "if I can't tell, it doesn't pass" the default means an unknown format that slips in still fails safe. When the allowed set is a fixed handful, a hand-rolled table beats pulling in a dependency like `python-magic`: you can see exactly what you let through at a glance, which made operations easier.
+
+## With images, decoding is the real entry point
+
+Knowing the file is an image isn't enough yet. An image with an absurd pixel count—a decompression bomb—can be tiny on disk yet eat all your memory the instant it decodes. Pillow ships a ceiling for this; make it explicit.
+
+```python
+from PIL import Image, ImageFile
+
+Image.MAX_IMAGE_PIXELS = 40_000_000   # treat over ~40 megapixels as abnormal
+ImageFile.LOAD_TRUNCATED_IMAGES = False  # don't silently accept broken images
+
+def sanitize_image(src_path: str, dst_path: str) -> None:
+    with Image.open(src_path) as img:
+        img.verify()                  # validate structure without decoding
+    with Image.open(src_path) as img:  # must reopen after verify()
+        clean = Image.new(img.mode, img.size)
+        clean.putdata(list(img.getdata()))   # copy only pixels
+        clean.save(dst_path, format="PNG")    # carry no metadata forward
+```
+
+`verify()` checks structure without decoding the image, so it weeds out broken files first. By design the `Image` object is unusable after `verify()`, so reopening for the real work is the rule. For stripping EXIF, copying only the pixels into a fresh image is more reliable than blanking it with `exif=b""`: the latter can leave ICC profiles and comment blocks behind, while the former carries no ancillary data forward structurally, so nothing leaks through. If you want to see what was in there first, `img.getexif()` shows it. A GPS tag (ID `34853`) is the capture coordinates.
+
+## With video, the upload isn't the finish line
+
+Media over the inline limit gets uploaded through the Files API and referenced by name. What many implementations miss: video isn't necessarily usable the instant it uploads. It passes through a `PROCESSING` state server-side before becoming `ACTIVE`, so handing it to inference immediately gives you a "file not ready" error. You have to poll the state and wait.
+
+```python
+import time
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def upload_and_wait(path: str, timeout: int = 180):
+    f = client.files.upload(file=path)
+    started = time.time()
+    while f.state.name == "PROCESSING":
+        if time.time() - started > timeout:
+            client.files.delete(name=f.name)
+            raise TimeoutError("video processing timed out")
+        time.sleep(3)
+        f = client.files.get(name=f.name)
+    if f.state.name != "ACTIVE":
+        client.files.delete(name=f.name)
+        raise RuntimeError(f"file never became usable: {f.state.name}")
+    return f
+```
+
+On timeout, or any non-`ACTIVE` ending, delete the file right there. Leaving failed uploads around eats into your retention quota and leaves files in unknown states that muddy later debugging. Always clean up on the failure path too—that discipline kept operations calm.
+
+## Funnel it through one call path
+
+Now thread the gates into a single road that the analysis function travels: the transport branch, the safety settings, and deleting the file when done all live on the same path, so when formats or constraints grow, there's one place to fix.
+
+```python
+def build_part(path: str, mime: str, size: int):
+    if size <= INLINE_LIMIT and mime.startswith("image/"):
+        with open(path, "rb") as f:
+            return genai.types.Part.from_bytes(data=f.read(), mime_type=mime), None
+    uploaded = upload_and_wait(path)
+    return uploaded, uploaded   # second element is the handle to delete later
+
+def analyze(path: str, prompt: str) -> str:
+    size = check_size(path)
+    mime = resolve_mime(path)
+    part, to_cleanup = build_part(path, mime, size)
+    try:
+        resp = client.models.generate_content(
+            model="gemini-3.5-flash",   # GA as of 2026-06; fast enough for multimodal input
+            contents=[part, prompt],
+            config=genai.types.GenerateContentConfig(
+                safety_settings=[
+                    genai.types.SafetySetting(
+                        category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                        threshold="BLOCK_MEDIUM_AND_ABOVE",
+                    ),
+                ],
+                max_output_tokens=1024,
+            ),
+        )
+        return mask_pii(resp.text)
+    finally:
+        if to_cleanup is not None:
+            client.files.delete(name=to_cleanup.name)   # always delete when finished
+```
+
+The model is `gemini-3.5-flash`, generally available as of June 2026. Its speed-to-accuracy balance suits multimodal input interpretation well, and it's plenty for describing images and short clips. Beyond `HARM_CATEGORY_DANGEROUS_CONTENT` there are harassment and sexually-explicit categories; add thresholds to match your service's character. Deleting in `finally` keeps junk out of your retention quota even when an exception fires.
+
+## Don't pass the output through untouched either
+
+Even with inputs locked down, generated results can echo back the user's secrets. In OCR-style uses especially, a phone number or email inside the image gets transcribed verbatim. Run a light mask before you store or display the return value.
+
+```python
+import re
+
+def mask_pii(text: str) -> str:
+    text = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "[email]", text)
+    text = re.sub(r"\d{2,4}-\d{2,4}-\d{4}", "[phone]", text)
+    return text
+```
+
+Perfect PII detection is a hard problem in its own right, but just drawing the line at "never leave it in logs as plaintext" cuts down the incidents dramatically. Rather than aiming for airtight, apply one pass first—that's the realistic posture.
+
+## Your next move
+
+Bundle your functions into one pipeline in the order `check_size → resolve_mime → sanitize_image → analyze`, then run a single EXIF-bearing photo through it. Confirm with `getexif()` that the GPS tag is gone, and for good measure push a video over 40MB through and watch the `PROCESSING`-to-`ACTIVE` transition in your logs to get a feel for the wait. Whether this "pause before you hand it over" layer exists is the difference between shipping a multimodal feature with confidence and hoping for the best.

@@ -1,0 +1,193 @@
+---
+title: "ユーザー投稿のメディアを Gemini に渡す前段を固める — 安全弁としての検証パイプライン実装メモ"
+slug: "gemini-files-api-untrusted-media-hardening-notes"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-16T16:30"
+author: "Gemini Lab"
+description: "ユーザーがアップロードした画像や動画をそのまま Gemini に流すと、MIME 偽装・EXIF 漏洩・展開爆弾・動画の処理待ちといった落とし穴に次々はまります。先頭バイト判定から Files API の状態ポーリング、後始末までを動くコードで段階的に組み立てます。"
+tags: ["gemini", "multimodal", "security", "files-api", "advanced"]
+highlights:
+  - "拡張子を信用せず先頭バイトで形式を判定し、判定不能を既定で拒否する検証層"
+  - "展開爆弾と EXIF 位置情報を Pillow で構造的に無害化する手順"
+  - "Files API の状態ポーリングと使用後削除まで含めた動画処理の実装パターン"
+---
+
+## 受け口を一つ作った瞬間に増える攻撃面
+
+個人開発でアプリに「写真をアップロードして AI に説明させる」機能をひとつ足すだけで、扱う対象が一気に「自分で用意したデータ」から「他人が送ってくる未知のデータ」へ変わります。私自身、最初に画像分類を組み込んだとき、テスト用に通した1枚の写真の付帯情報に撮影地点の座標が残っていて肝を冷やしました。テキスト入力ならまだ目で追えますが、バイナリのメディアは中身が見えません。拡張子は付け替えられますし、見た目はただの風景写真でも、付帯メタデータに撮影地点の緯度経度が残っていることがあります。
+
+ここで組み立てるのは、ユーザー由来のメディアが Gemini に届く前に必ず通る「安全弁」です。題材は `google-genai` SDK 単体で、外部の重いフレームワークは持ち込みません。処理の流れは、安いチェックから順に並べてゲートを段階化していきます。重い読み込みや API 呼び出しに進む前に、軽い判定で弾けるものを弾くのが基本方針です。
+
+## ゲートの並び順を最初に決める
+
+検証は「コストの低い順」に並べると無駄が出ません。私が運用で落ち着いた順序は次の通りです。
+
+1. **サイズの事前確認** — バイトを1つも読まずに `os.path.getsize` だけで上限超過を弾く。
+2. **先頭バイトによる形式判定** — 拡張子ではなくマジックナンバーで実体を確認する。
+3. **画像の構造的サニタイズ** — 展開爆弾の検知と EXIF の除去をまとめて行う。
+4. **送信方式の分岐** — 小さい画像はインライン、大きいメディアと動画は Files API。
+5. **出力のマスキングと後始末** — 戻り値の機密除去と、アップロードしたファイルの削除。
+
+この順に並べておくと、新しい形式や制約が増えたときも「どのゲートを直すか」が迷わず決まります。
+
+## サイズは読み込む前に弾く
+
+最初のゲートは、ファイルを開く前のサイズ確認です。ここを後回しにすると、巨大ファイルを読み込んでメモリを使い切ってから「大きすぎました」と気づくことになります。
+
+```python
+import os
+
+INLINE_LIMIT = 18 * 1024 * 1024     # インライン送信の安全圏（公称20MBより手前で止める）
+HARD_LIMIT = 480 * 1024 * 1024      # これ以上は受け付けない
+
+def check_size(path: str) -> int:
+    size = os.path.getsize(path)
+    if size == 0:
+        raise ValueError("空のファイルです")
+    if size > HARD_LIMIT:
+        raise ValueError(f"ファイルが大きすぎます: {size} bytes")
+    return size
+```
+
+インラインの上限は公称値ぴったりではなく、少し手前に置きます。Base64 でエンコードすると実バイト数より膨らむため、境界ぎりぎりを攻めると本番でだけリクエストが弾かれる、という嫌な再現性の低いエラーになりがちです。境界を数バイト下げて回避できるなら、本番運用で余白を持たせておくほうが安全です。
+
+## 拡張子ではなく実体を見る
+
+`photo.jpg` という名前は、中身が JPEG であることを何も保証しません。攻撃側にとって拡張子の書き換えは手間ゼロです。先頭の数バイト（マジックナンバー）を読んで、実体の形式を確かめます。
+
+```python
+SIGNATURES = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"RIFF", "image/webp"),         # 9〜12バイト目の "WEBP" で最終確認する
+    (b"\x00\x00\x00\x18ftyp", "video/mp4"),
+    (b"\x00\x00\x00\x20ftyp", "video/mp4"),
+)
+
+ALLOWED = {"image/jpeg", "image/png", "image/webp", "video/mp4"}
+
+def sniff_mime(path: str) -> str | None:
+    with open(path, "rb") as f:
+        head = f.read(32)
+    for sig, mime in SIGNATURES:
+        if head.startswith(sig):
+            if mime == "image/webp" and head[8:12] != b"WEBP":
+                continue
+            return mime
+    return None
+
+def resolve_mime(path: str) -> str:
+    mime = sniff_mime(path)
+    if mime not in ALLOWED:   # None も許可外も同じく拒否する
+        raise ValueError("許可されない、または判定できない形式です")
+    return mime
+```
+
+設計の肝は、判定不能（`None`）と明示的な許可外を区別せず、同じく拒否することです。「分からないものは通さない」を既定値にしておくと、未知の形式が紛れ込んだときも安全側に倒れます。許可形式が数種類で固定なら、`python-magic` のような外部依存を入れるより、こうして自前のテーブルを持つほうが「何を通しているか」がコードから一望できて運用が楽でした。
+
+## 画像は「展開してから」が本当の入口
+
+形式が画像だと分かっても、まだ安心はできません。ピクセル数が異常に多い画像（いわゆる展開爆弾）は、ファイルサイズ自体は小さくても、デコード後のメモリ占有が数百倍に膨らみ、一瞬で使い尽くします。Pillow には上限が用意されているので、これを明示的に効かせます。
+
+```python
+from PIL import Image, ImageFile
+
+Image.MAX_IMAGE_PIXELS = 40_000_000   # 約4000万画素を超えたら異常とみなす
+ImageFile.LOAD_TRUNCATED_IMAGES = False  # 壊れた画像は黙って通さない
+
+def sanitize_image(src_path: str, dst_path: str) -> None:
+    with Image.open(src_path) as img:
+        img.verify()                  # まず構造の妥当性だけ確認する
+    with Image.open(src_path) as img:  # verify 後は開き直しが必要
+        clean = Image.new(img.mode, img.size)
+        clean.putdata(list(img.getdata()))   # ピクセルだけを移し替える
+        clean.save(dst_path, format="PNG")    # 付帯情報を持ち越さない
+```
+
+`verify()` は構造の検証だけで画像をデコードしないため、まずこれで壊れたファイルを弾きます。検証後の `Image` オブジェクトは使えなくなる仕様なので、本処理では開き直すのが約束事です。EXIF の除去は、`exif=b""` で空にするより、新しい画像へピクセルだけを移し替えるほうが確実です。前者は ICC プロファイルやコメント領域が残ることがありますが、後者は構造的に付帯情報を引き継がないため、取りこぼしが起きません。除去前に何が入っていたか覗きたいときは `img.getexif()` で確認できます。GPS タグ（ID `34853`）が入っていれば、それが撮影地点の座標です。
+
+## 動画は「アップロードして終わり」ではない
+
+インラインの上限を超えるメディアは Files API でアップロードして参照します。ここで多くの実装が見落とすのが、動画はアップロード直後に使えるとは限らない、という点です。サーバー側で `PROCESSING` 状態を経てから `ACTIVE` になるため、アップロード直後に推論へ渡すと「ファイルがまだ準備できていない」というエラーになります。状態をポーリングして待つ必要があります。
+
+```python
+import time
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def upload_and_wait(path: str, timeout: int = 180):
+    f = client.files.upload(file=path)
+    started = time.time()
+    while f.state.name == "PROCESSING":
+        if time.time() - started > timeout:
+            client.files.delete(name=f.name)
+            raise TimeoutError("動画の処理がタイムアウトしました")
+        time.sleep(3)
+        f = client.files.get(name=f.name)
+    if f.state.name != "ACTIVE":
+        client.files.delete(name=f.name)
+        raise RuntimeError(f"ファイルが利用可能になりませんでした: {f.state.name}")
+    return f
+```
+
+タイムアウトに達したときや `ACTIVE` 以外で終わったときは、その場でファイルを削除しておきます。失敗したアップロードを放置すると、保持枠を圧迫するうえ、あとで状態の分からないファイル名が残ってデバッグを濁らせます。失敗経路でも必ず後始末をする、を徹底するのが落ち着いた運用でした。
+
+## 1本の呼び出し経路にまとめる
+
+ここまでのゲートを、ひとつの解析関数に通る一本道としてつなぎます。送信方式の分岐、安全設定、そして使い終わったファイルの削除まで、同じ経路に集約しておくと、形式や制約が増えても直す場所が一箇所で済みます。
+
+```python
+def build_part(path: str, mime: str, size: int):
+    if size <= INLINE_LIMIT and mime.startswith("image/"):
+        with open(path, "rb") as f:
+            return genai.types.Part.from_bytes(data=f.read(), mime_type=mime), None
+    uploaded = upload_and_wait(path)
+    return uploaded, uploaded   # 第2要素は後で削除するための参照
+
+def analyze(path: str, prompt: str) -> str:
+    size = check_size(path)
+    mime = resolve_mime(path)
+    part, to_cleanup = build_part(path, mime, size)
+    try:
+        resp = client.models.generate_content(
+            model="gemini-3.5-flash",   # 2026-06 時点の GA。マルチモーダル入力に十分速い
+            contents=[part, prompt],
+            config=genai.types.GenerateContentConfig(
+                safety_settings=[
+                    genai.types.SafetySetting(
+                        category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                        threshold="BLOCK_MEDIUM_AND_ABOVE",
+                    ),
+                ],
+                max_output_tokens=1024,
+            ),
+        )
+        return mask_pii(resp.text)
+    finally:
+        if to_cleanup is not None:
+            client.files.delete(name=to_cleanup.name)   # 使い終わったら必ず消す
+```
+
+モデルは 2026 年 6 月時点で一般提供されている `gemini-3.5-flash` を指定しています。マルチモーダルの入力解釈には速度と精度のバランスがよく、画像・短い動画の説明用途には十分です。`HARM_CATEGORY_DANGEROUS_CONTENT` 以外にも、ハラスメントや性的表現のカテゴリがあるので、サービスの性格に応じて閾値を足します。`finally` で削除を行うのは、例外が出ても保持枠にゴミを残さないためです。
+
+## 出力も素通しにしない
+
+入力を固めても、生成結果にユーザーの機密が引き写されて返ってくることがあります。とくに OCR 的な使い方では、画像内の電話番号やメールアドレスがそのままテキスト化されます。戻り値を保存・表示する前に、軽いマスキングを一段かけておきます。
+
+```python
+import re
+
+def mask_pii(text: str) -> str:
+    text = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "[email]", text)
+    text = re.sub(r"\d{2,4}-\d{2,4}-\d{4}", "[phone]", text)
+    return text
+```
+
+完全な PII 検出はそれ自体が難題ですが、「ログに平文で残さない」という一線を引くだけでも、事故の芽はかなり減ります。万全を期すより、まず一段かける、という姿勢が現実的だと感じています。
+
+## 次の一手
+
+手元の関数を `check_size → resolve_mime → sanitize_image → analyze` の順に一本のパイプラインへ束ね、EXIF 付きの写真を1枚通してみてください。`getexif()` で GPS タグが消えていることを確認し、ついでに 40MB を超える動画を1本流して `PROCESSING` から `ACTIVE` への遷移をログで眺めると、状態待ちの感覚がつかめます。この「渡す前に一度立ち止まる層」があるかないかで、マルチモーダル機能を安心して本番に出せるかが大きく変わってきます。
