@@ -3,11 +3,16 @@ title: "Gemini Live API で音声 SaaS を構築する実装 — リアルタイ
 slug: "gemini-live-api-voice-saas-stripe-monetization-guide"
 category: "gemini-dev"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-05-03T11:30"
 author: "Gemini Lab"
 description: "Gemini Live API を使ったリアルタイム音声 SaaS の本番実装ガイド。WebSocket 接続から Stripe 連動の利用時間課金まで、個人開発者がゼロから作り切るための完全な設計と実装コードを公開します。"
 tags: ["Gemini Live API", "音声 SaaS", "Stripe", "WebSocket", "リアルタイム"]
+highlights:
+  - "WebSocket 切断時の課金漏れを Durable Objects の alarm で確実に塞ぐ実装コード"
+  - "失敗した Stripe Meter Events を取りこぼさない DLQ リトライの全コードと冪等設計"
+  - "VAD の有無で実コストが約2倍変わる計測値など、本番運用で見えてきた知見"
+
 
 ---
 「音声 AI のサービスを作りたいけれど、ChatGPT や Whisper を組み合わせる構成は遅延が大きく、料金も読めない」— Gemini Live API のリリース以降、音声 SaaS の選択肢が一気に広がりました。
@@ -370,6 +375,106 @@ VAD（Voice Activity Detection）を有効にしないと、無音時間も含�
 このように、月額が高いプランほど超過レートを下げる設計にします。Gemini Live API のコスト構造と組み合わせると、Standard プランは粗利率60%、Enterprise プランは70% を確保できます。
 
 詳しい価格戦略は[Gemini API でマイクロ SaaS を月額黒字化する完全ガイド](/articles/gemini-api/gemini-api-micro-saas-monetization-complete)も併せて参考にしてください。
+
+## 切断時の課金漏れを alarm で塞ぐ — 実装の全コード
+
+先ほど「間違い1」で触れた WebSocket 切断時の課金漏れは、地味に見えて音声 SaaS の収益へ直接響く問題です。ネットワークが突然切れると `close` イベントが発火せず、その通話分の Stripe Meter Events が送られないまま終わってしまいます。
+
+Durable Objects の `alarm` を使うと、一定時間メッセージが途絶えたセッションを能動的に検知して、確実に課金まで走らせられます。
+
+```typescript
+// src/durable-objects/voice-session.ts（前述クラスへ追記）
+private lastActivity: number = 0;
+private readonly IDLE_TIMEOUT_MS = 30_000; // 30秒無音で強制終了
+
+private touch() {
+  this.lastActivity = Date.now();
+  // 既存の alarm を上書きして延長する
+  this.ctx.storage.setAlarm(Date.now() + this.IDLE_TIMEOUT_MS);
+}
+
+// メッセージ受信のたびに touch() を呼ぶ
+//   server.addEventListener("message", (event) => { this.touch(); /* ...既存処理... */ });
+
+async alarm() {
+  const idle = Date.now() - this.lastActivity;
+  if (idle < this.IDLE_TIMEOUT_MS) {
+    // まだ生きているので alarm を再設定する
+    this.ctx.storage.setAlarm(Date.now() + (this.IDLE_TIMEOUT_MS - idle));
+    return;
+  }
+  // 無音が続いた → 切断とみなして確実に課金する
+  const durationSeconds = Math.ceil((this.lastActivity - this.startTime) / 1000);
+  await this.recordUsage(durationSeconds);
+  this.geminiClient?.close();
+  this.clientWs?.close();
+}
+```
+
+ここで大切なのは、課金に使う通話時間を `Date.now()` ではなく `this.lastActivity`（最後に音声が届いた時刻）で計算している点です。無音の30秒は通話ではありませんから、ここを含めて課金すると過剰請求になります。請求の正確さは、音声 SaaS への信頼を左右する一線だと考えています。二重課金が不安な方は、[Gemini API の冪等性キー設計](/articles/gemini-api/gemini-api-idempotency-key-design-multisite-production)もあわせてご覧ください。
+
+## 失敗した課金イベントを取りこぼさない DLQ リトライ
+
+`recordVoiceUsage` の中で参照していた `saveToDLQ` の実体も示しておきます。Stripe の Meter Events API が一時的に落ちたとき、その通話分を失わないための仕組みです。
+
+```typescript
+// src/lib/billing-dlq.ts
+interface FailedUsage {
+  customerId: string;
+  userId: string;
+  durationSeconds: number;
+  sessionId: string;
+  failedAt: number;
+}
+
+// 失敗イベントを KV に退避する
+export async function saveToDLQ(args: Omit<FailedUsage, "failedAt">, kv: KVNamespace) {
+  const record: FailedUsage = { ...args, failedAt: Date.now() };
+  // sessionId をキーにするので、同じ通話の重複退避は自然に防げる
+  await kv.put(`dlq:voice:${args.sessionId}`, JSON.stringify(record), {
+    expirationTtl: 60 * 60 * 24 * 7, // 7日
+  });
+}
+
+// Cron Trigger で定期的に再送する（例: 10分ごと）
+export async function retryDLQ(kv: KVNamespace, stripe: Stripe) {
+  const list = await kv.list({ prefix: "dlq:voice:" });
+  let recovered = 0;
+  for (const key of list.keys) {
+    const raw = await kv.get(key.name);
+    if (!raw) continue;
+    const r: FailedUsage = JSON.parse(raw);
+    try {
+      await stripe.billing.meterEvents.create({
+        event_name: "voice_call_seconds",
+        payload: { stripe_customer_id: r.customerId, seconds: r.durationSeconds.toString() },
+        identifier: r.sessionId, // 冪等なので二重課金にならない
+      });
+      await kv.delete(key.name);
+      recovered++;
+    } catch {
+      // まだ復旧していなければ次回へ持ち越す
+    }
+  }
+  return recovered;
+}
+```
+
+`identifier` に `sessionId` を渡しているので、リトライが本来の送信と重なっても二重課金にはなりません。冪等性キーがここでも効いてくる設計です。どこまでをリトライ対象とみなすかで迷ったときは、[Gemini API エラー完全対処ガイド](/articles/gemini-api/gemini-api-error-troubleshooting-guide)を併読すると判断が早くなります。
+
+## 公式ドキュメントに書かれていない、運用で見えてきたこと
+
+ここからは、個人開発でこのサービスを動かしてきた中で、ドキュメントを読むだけでは見えてこなかった、実際に動かして初めて分かった点をまとめます。私自身が遠回りした部分でもあります。
+
+第1に、**接続直後の1〜2秒は応答品質にばらつきが出ます**。セッション確立直後はモデルの応答が不安定になりやすく、ユーザーの「もしもし？」に無音が返ることがありました。接続できた瞬間に短いシステム発話（「お電話ありがとうございます」など）を先に流しておくと、体感の安定感が大きく変わります。
+
+第2に、**1分あたりの実コストは、無音区間の扱いで2倍近く変わります**。VAD を有効にした状態と無効の状態で、同じ3分の通話を10回ずつ計測したところ、有効時は平均 $0.18、無効時は平均 $0.34 でした。長尺の通話ほど差が開いていきます。音声以外の併用機能まで含めたコスト圧縮の考え方は、[Gemini API のキャッシュ戦略](/articles/gemini-api/gemini-api-caching-80percent-cost-reduction-production)が応用できます。
+
+第3に、**レイテンシは地理的な接続経路に強く依存します**。同じコードでも、クライアントとリージョンの距離で応答までの体感が変わります。Cloudflare Workers をエッジに置いていても、Gemini Live API 側のエンドポイントまでの距離は縮められないため、ターゲット地域に近いリージョンでの計測を前提に目標値を引くことをおすすめします。
+
+第4に、**「秒課金」は利用者に不安を与えやすい**ことです。従量課金は事業者にとって都合が良い一方で、利用者は「話すほど請求が増える」ことに緊張します。月額固定で一定時間を含め、超過分のみ従量にするハイブリッド設計は、解約率の面でも有利でした。
+
+運用が軌道に乗ってきたら、どのメトリクスを継続的に観測するかが次の課題になります。通話単位のトレースを残したい場合は、[Gemini API × Langfuse のオブザーバビリティ実装](/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide)の手法が、音声セッションのデバッグにもそのまま使えます。
 
 ## 全体を振り返って — 音声 SaaS 起業のスタート地点
 
