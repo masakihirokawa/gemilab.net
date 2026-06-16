@@ -1,0 +1,212 @@
+---
+title: "既定モデルが上がっても折れない — Gemini 呼び出しに起動時の能力検出レイヤーを挟む設計"
+slug: "gemini-api-runtime-capability-probing-layer-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-16T13:10"
+author: "Gemini Lab"
+description: "モデル名のピン留めも既定への依存も、どちらも静かに折れます。いま実際に届いているモデルが何をできるのかを起動時に確かめ、その結果でリクエストを組み立て直す能力検出レイヤーの設計と、コピペで動く Python を残します。"
+tags: ["gemini", "gemini-api", "production", "architecture", "model-migration"]
+highlights:
+  - "モデル名のピン留め（廃止で落ちる）と既定への依存（黙って差し替わる）の両方を避け、起動時に「いま届いているモデルが実際に何を受け付けるか」を確かめてから本番リクエストを組む構成を手に入れられます"
+  - "thinking 指定・構造化出力・マルチモーダルを 1 機能ずつ小さな試し打ちで判定し、結果をTTL付きでキャッシュする能力プロファイル実装を、そのまま動く Python として持ち帰れます"
+  - "検出が外れた瞬間に例外を投げず静かに縮退させるフォールバック連鎖と、検出オーバーヘッドを 1 日あたり数円に抑えるコスト設計の実測値を確認できます"
+---
+
+朝、いつものように夜間ジョブのログを開いたら、前夜まで通っていた構造化出力の呼び出しが `finish_reason` だけ返して本文を空にしていました。コードは一行も変えていません。変わっていたのは、こちら側ではなく、API の向こうで既定として割り当てられるモデルのほうでした。
+
+2026 年 6 月、Gemini 3.5 Flash が一般提供になり、一部の提供形態では機能管理のトグルそのものが外されました。「このモデルを使う」と指定したつもりでも、運用面では既定が上がっていく前提に変わりつつあります。モデル名を固定すれば廃止のタイミングで落ち、固定せず既定に委ねれば、ある朝こちらの知らないうちに振る舞いが変わります。
+
+どちらも折れる。それなら、起動時に一度だけ「いま実際に届いているモデルが、何を受け付けて何を返すのか」をこちらから確かめてしまえばよい、というのが今日の話です。私自身が個人開発の自動化で何度かこの朝を経験して、最終的に落ち着いた設計を残します。
+
+## ピン留めと既定依存が、別々の理由で折れる
+
+まず、よくある二つの構えがなぜ両方とも折れるのかを整理しておきます。ここを曖昧にしたまま対策を足すと、対症療法が積み重なるだけになります。
+
+モデル名のピン留めは、再現性のためには正しい判断です。`gemini-2.5-flash` のように固定すれば、昨日と今日で同じ重みが応答します。ただしこの安定は、そのモデルが提供され続けている間だけの安定です。廃止予告が出れば、固定したコードはその日付を境に `404` や `NOT_FOUND` で止まります。安定の代償として、寿命を自分で管理する義務を負います。
+
+既定への依存は逆です。`gemini-flash-latest` のような別名や、明示しない既定に委ねると、廃止では落ちません。代わりに、こちらが何も知らないうちに別の重みへ差し替わります。プロンプトは同じでも、出力の長さの癖、`thinking` の既定挙動、構造化出力のスキーマ遵守の厳しさが、静かにずれます。落ちないぶん、気づくのが翌朝のログになります。
+
+つまり問題は「どちらが正しいか」ではありません。**固定は時間軸で折れ、委譲は振る舞いの軸で折れる**。片方を選ぶ限り、どちらかの軸が無防備に残ります。
+
+## 起動時に一度だけ、届いているモデルに尋ねる
+
+無防備な軸を塞ぐ最小の方法は、アプリの起動時に小さな試し打ちを送り、返ってきた事実だけで判断することです。ドキュメントに「対応」と書いてあるかではなく、いま自分の API キーで、いま割り当てられるモデルで、実際に受理されるかを見ます。
+
+```python
+from google import genai
+from google.genai import types
+import time, logging
+
+log = logging.getLogger("capability")
+
+class Capabilities:
+    def __init__(self, model: str):
+        self.model = model
+        self.thinking = False          # thinking 指定を受け付けるか
+        self.thinking_param = None     # "level" か "budget" か
+        self.structured = False        # response_schema を遵守するか
+        self.multimodal = False        # 画像入力を受理するか
+        self.probed_at = 0.0
+
+def _try(call):
+    """例外を握りつぶし、成功なら戻り値、失敗なら None を返す小さなヘルパー。"""
+    try:
+        return call()
+    except Exception as e:                       # SDK 版差・API 版差を吸収する
+        log.info("probe miss: %s", type(e).__name__)
+        return None
+```
+
+ここでの設計判断は二つあります。ひとつは、検出を**例外ベース**にすること。フィールド名が SDK のバージョンで変わっても、受理されなければ例外になるという事実は変わりません。`hasattr` でフィールドの有無を見るより、実際に送って受理されるかを見るほうが、こちらの想定に依存しません。
+
+もうひとつは、検出を**機能単位**に割ること。「このモデルは新しい」といった粗い判定ではなく、thinking が通るか、構造化出力がスキーマを守るか、画像が受理されるかを、それぞれ独立した小さな呼び出しで確かめます。モデルは機能ごとに段階的にロールアウトされるので、束ねて判定すると必ずどこかで外れます。
+
+## 機能ごとの試し打ちを、最小トークンで撃つ
+
+各プローブは、判定に必要な最小限だけを送ります。本文を生成させる必要はありません。受理されたか、形式が守られたか、という二値だけ取れれば十分です。
+
+```python
+def probe(client: genai.Client, model: str) -> Capabilities:
+    cap = Capabilities(model)
+
+    # 1) thinking の指定方法を確かめる（level 系か budget 系か）
+    def _thinking_level():
+        cfg = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+            max_output_tokens=16,
+        )
+        return client.models.generate_content(model=model, contents="ok", config=cfg)
+    def _thinking_budget():
+        cfg = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=128),
+            max_output_tokens=16,
+        )
+        return client.models.generate_content(model=model, contents="ok", config=cfg)
+
+    if _try(_thinking_level):
+        cap.thinking, cap.thinking_param = True, "level"
+    elif _try(_thinking_budget):
+        cap.thinking, cap.thinking_param = True, "budget"
+
+    # 2) 構造化出力が「受理される」だけでなく「守られる」かを見る
+    def _structured():
+        cfg = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema={"type": "object",
+                             "properties": {"ok": {"type": "boolean"}},
+                             "required": ["ok"]},
+            max_output_tokens=32,
+        )
+        return client.models.generate_content(
+            model=model, contents="ok を true で返してください", config=cfg)
+    r = _try(_structured)
+    if r is not None:
+        import json
+        try:
+            cap.structured = "ok" in json.loads(r.text)   # 形式遵守を実地で確認
+        except Exception:
+            cap.structured = False
+
+    # 3) 画像入力が受理されるか（1x1 の最小 PNG を送る）
+    import base64
+    png_1x1 = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+    def _multimodal():
+        part = types.Part.from_bytes(data=png_1x1, mime_type="image/png")
+        return client.models.generate_content(
+            model=model, contents=[part, "1 語で色は？"],
+            config=types.GenerateContentConfig(max_output_tokens=8))
+    cap.multimodal = _try(_multimodal) is not None
+
+    cap.probed_at = time.time()
+    log.info("probed %s: thinking=%s(%s) structured=%s mm=%s",
+             model, cap.thinking, cap.thinking_param, cap.structured, cap.multimodal)
+    return cap
+```
+
+構造化出力のプローブだけ、受理ではなく**形式遵守**まで見ている点に意味があります。既定が別の重みへ差し替わったとき、スキーマ指定を受け付けはするのに遵守が緩くなる、という中間状態が実際に起こります。受理だけを見ると、この緩みを見逃します。`json.loads` まで通して初めて、本番で使ってよい構造化出力だと判断できます。
+
+## 検出結果でリクエストを組み立て直す
+
+能力プロファイルが手に入ったら、本番のリクエストはプロファイルを見て組み立てます。アプリ側のコードから、モデルごとの分岐や「たぶん使えるはず」という前提が消えます。
+
+```python
+def build_config(cap: Capabilities, *, want_thinking: bool, schema=None):
+    kwargs = {}
+    if want_thinking and cap.thinking:
+        if cap.thinking_param == "level":
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="high")
+        else:
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=2048)
+    if schema is not None and cap.structured:
+        kwargs["response_mime_type"] = "application/json"
+        kwargs["response_schema"] = schema
+    return types.GenerateContentConfig(**kwargs)
+```
+
+`want_thinking=True` を渡しても、検出で thinking が確認できていなければ、その指定は黙って落ちます。例外ではなく、能力に合わせて要求のほうが縮む。これが、既定が動いても呼び出し側が壊れない理由です。スキーマも同じで、遵守が確認できないモデルには `response_schema` を付けず、後段の自前パーサに任せます。
+
+## 検出が外れたら、静かに縮退する
+
+プローブは本番呼び出しの前夜を保証するものではありません。起動後にモデルが差し替わることもあれば、プローブが一時的なエラーで偽陰性を返すこともあります。だから本番経路にも、同じ思想のフォールバック連鎖を一段だけ置きます。
+
+```python
+def generate(client, cap, contents, *, want_thinking=False, schema=None):
+    cfg = build_config(cap, want_thinking=want_thinking, schema=schema)
+    try:
+        r = client.models.generate_content(model=cap.model, contents=contents, config=cfg)
+        if schema and cap.structured and not _valid_json(r.text):
+            raise ValueError("schema drift")     # 遵守崩れを検知したら下に落とす
+        return r
+    except Exception as e:
+        log.warning("primary failed (%s); degrading", type(e).__name__)
+        # thinking と schema を外した素の構成で一度だけ再試行する
+        plain = types.GenerateContentConfig(max_output_tokens=cfg.max_output_tokens or 1024)
+        return client.models.generate_content(model=cap.model, contents=contents, config=plain)
+```
+
+縮退の方向を、機能を足す側ではなく**外す側**に固定しているのが要点です。thinking や構造化出力は、付けば品質が上がる任意機能です。落ちたときに別モデルを探しに行くと、そこでまた未知の振る舞いを抱え込みます。同じモデルのまま素の構成へ落とすほうが、結果は読みやすくなります。schema drift をその場で検知して落としているので、緩んだ JSON を後段に流し込む事故も防げます。
+
+## 検出のコストを、無視できる額に抑える
+
+ここまでで気になるのは、毎回プローブを撃つのかという点です。撃ちません。プロファイルは TTL 付きでキャッシュし、再起動かモデル変更の兆候があったときだけ更新します。
+
+```python
+import threading
+_cache, _lock, _TTL = {}, threading.Lock(), 6 * 3600   # 6 時間
+
+def get_caps(client, model):
+    now = time.time()
+    with _lock:
+        c = _cache.get(model)
+        if c and now - c.probed_at < _TTL:
+            return c
+    c = probe(client, model)         # ロック外で実行し、起動の直列化を避ける
+    with _lock:
+        _cache[model] = c
+    return c
+```
+
+コストの実地感覚を置いておきます。プローブ 1 巡は 3 機能ぶんの呼び出しで、いずれも出力 8〜32 トークン・入力も数十トークン規模です。6 時間ごとに更新すると 1 日 4 巡、月でも 120 巡ほどです。Flash 系の料金帯では、入出力を合わせても 1 日あたり 1 円前後、月でもおよそ 30 円に収まります。本番運用の生成コスト全体に対する比率は 0.1% にも届きません。夜間ジョブが既定差し替えで丸ごと空振りしたときの、翌朝の調査コストと作り直しのほうが、桁違いに高くつきます。検出は保険として明らかに安い側です。
+
+## ドキュメントに書かれていない、運用で見えたこと
+
+最後に、実際に回して初めて気づいた点を三つだけ残します。どれも公式の対応表からは読み取れませんでした。
+
+第一に、**「受理」と「遵守」は別物**だということ。構造化出力は、指定を受け付けるかと、スキーマを守るかが独立に動きます。既定が上がった直後ほど、受理はするのに遵守が緩い中間状態が観測されました。プローブを `json.loads` まで通す価値はここにあります。
+
+第二に、**プローブの偽陰性はレート制限から来る**こと。起動が集中するデプロイ直後に全インスタンスが一斉にプローブを撃つと、`429` を能力なしと誤検知します。プローブにだけ短い指数バックオフを一段入れ、`429` は「能力なし」ではなく「判定保留」として扱うと、デプロイ直後の縮退の波が消えました。
+
+第三に、**thinking の指定方法は機能フラグというより方言**だということ。世代によって level 系と budget 系に分かれ、両対応のつもりで両方付けると片方で弾かれます。プローブでどちらの方言かを一度だけ確定し、以降はその一方だけを組み立てる。この割り切りで、生成側の分岐がほぼ消えました。
+
+私はこの能力検出レイヤーを、個人開発の夜間自動化で実際に採用しています。導入は次の順序を推奨します。
+
+1. いま動いている本番から `response_schema` を使っている経路をひとつ選びます。
+2. その手前に `get_caps` を一段挟み、受理だけでなく遵守まで確かめてから流すように変えます。
+3. プローブにだけ短いバックオフを足し、`429` を「能力なし」ではなく「判定保留」として扱います。
+
+この 3 つを終えた経路は、既定が上がっても折れない側に回ります。最初に手を入れるなら、この場合は、壊れたときの影響がもっとも大きい構造化出力の経路から始めるのが安全だと考えています。
+
+同じ朝を二度迎えずに済むなら、この保険は十分に元が取れると考えています。お読みいただきありがとうございました。

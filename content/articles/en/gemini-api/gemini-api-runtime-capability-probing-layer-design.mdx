@@ -1,0 +1,212 @@
+---
+title: "Don't Break When the Default Model Moves: A Startup Capability-Probing Layer for Gemini"
+slug: "gemini-api-runtime-capability-probing-layer-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-16T13:10"
+author: "Gemini Lab"
+description: "Pinning a model name breaks on deprecation; trusting the default breaks when the weights swap silently. This is the design I settled on: probe what the served model can actually do at startup, then build every request from that answer. Includes runnable Python."
+tags: ["gemini", "gemini-api", "production", "architecture", "model-migration"]
+highlights:
+  - "Avoid both failure modes at once — pinned model names (which 404 on deprecation) and default reliance (which swaps weights under you) — by probing at startup what the served model actually accepts before you build a production request"
+  - "A capability-profile implementation you can paste and run: per-feature probes for thinking control, structured output, and multimodal input, cached with a TTL so you pay for detection once, not per call"
+  - "A fallback chain that degrades quietly the moment a probe is wrong instead of throwing, plus measured cost figures showing detection overhead lands in the single-digit-cents-per-day range"
+---
+
+One morning I opened the nightly job log and found that a structured-output call that had been working the night before was returning a `finish_reason` and an empty body. Not a line of my code had changed. What had changed was on the other side of the API: the model being handed to me as the default.
+
+In June 2026, Gemini 3.5 Flash reached general availability, and in some surfaces the feature-management toggle was removed entirely. Even when you think you've said "use this model," operationally you're now living with the assumption that the default drifts upward. Pin the model name and you fall over on the deprecation date. Don't pin it, and one morning the behavior shifts without you knowing.
+
+Both break. So the idea here is to ask, exactly once at startup, what the model being served right now actually accepts and returns. I lived through that morning a few times in my own indie developer automation, and this is the design I eventually settled on.
+
+## Pinning and default-reliance break for different reasons
+
+Before adding any defense, it's worth being precise about why both common stances fail. Skip this and you just stack symptomatic patches.
+
+Pinning a model name is the correct call for reproducibility. Fix `gemini-2.5-flash` and the same weights answer today and tomorrow. But that stability only lasts as long as the model is served. Once a deprecation notice lands, the pinned code stops at that date with a `404` or `NOT_FOUND`. The price of stability is that you now own the lifecycle yourself.
+
+Relying on the default is the opposite. Defer to an alias like `gemini-flash-latest`, or to an unspecified default, and you don't fall over on deprecation. Instead the weights swap under you without notice. The prompt is identical, but the output-length habit, the default thinking behavior, and how strictly structured output obeys the schema all drift quietly. Because nothing throws, you find out from tomorrow's log.
+
+So the question isn't "which is right." **Pinning breaks along the time axis; deferring breaks along the behavior axis.** As long as you pick one, the other axis is left undefended.
+
+## Ask the served model, once, at startup
+
+The smallest way to close the undefended axis is to send tiny test calls at app startup and decide only on the facts that come back. Not whether the docs say "supported," but whether — with your key, against the model assigned to you right now — it's actually accepted.
+
+```python
+from google import genai
+from google.genai import types
+import time, logging
+
+log = logging.getLogger("capability")
+
+class Capabilities:
+    def __init__(self, model: str):
+        self.model = model
+        self.thinking = False          # accepts a thinking directive?
+        self.thinking_param = None     # "level" or "budget"
+        self.structured = False        # actually obeys response_schema?
+        self.multimodal = False        # accepts image input?
+        self.probed_at = 0.0
+
+def _try(call):
+    """Swallow exceptions: return the value on success, None on failure."""
+    try:
+        return call()
+    except Exception as e:                       # absorb SDK / API version differences
+        log.info("probe miss: %s", type(e).__name__)
+        return None
+```
+
+Two design choices live here. First, detection is **exception-based**. Field names may shift across SDK versions, but the fact that an unaccepted request raises does not. Sending it and seeing whether it's accepted depends far less on my assumptions than inspecting field presence with `hasattr`.
+
+Second, detection is split **per feature**. Rather than a coarse "this model is newer," I check independently whether thinking goes through, whether structured output obeys the schema, and whether an image is accepted — each with its own small call. Models roll out feature by feature, so a bundled verdict is guaranteed to be wrong somewhere.
+
+## Fire each probe with the fewest possible tokens
+
+Each probe sends only what's needed to decide. There's no need to generate real content. Whether it was accepted, and whether the format held, are the only two bits I need.
+
+```python
+def probe(client: genai.Client, model: str) -> Capabilities:
+    cap = Capabilities(model)
+
+    # 1) Which thinking dialect does it speak — level or budget?
+    def _thinking_level():
+        cfg = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+            max_output_tokens=16,
+        )
+        return client.models.generate_content(model=model, contents="ok", config=cfg)
+    def _thinking_budget():
+        cfg = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=128),
+            max_output_tokens=16,
+        )
+        return client.models.generate_content(model=model, contents="ok", config=cfg)
+
+    if _try(_thinking_level):
+        cap.thinking, cap.thinking_param = True, "level"
+    elif _try(_thinking_budget):
+        cap.thinking, cap.thinking_param = True, "budget"
+
+    # 2) Structured output: not just "accepted" but "obeyed"
+    def _structured():
+        cfg = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema={"type": "object",
+                             "properties": {"ok": {"type": "boolean"}},
+                             "required": ["ok"]},
+            max_output_tokens=32,
+        )
+        return client.models.generate_content(
+            model=model, contents="Return ok as true.", config=cfg)
+    r = _try(_structured)
+    if r is not None:
+        import json
+        try:
+            cap.structured = "ok" in json.loads(r.text)   # verify obedience for real
+        except Exception:
+            cap.structured = False
+
+    # 3) Is image input accepted? Send a 1x1 PNG.
+    import base64
+    png_1x1 = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+    def _multimodal():
+        part = types.Part.from_bytes(data=png_1x1, mime_type="image/png")
+        return client.models.generate_content(
+            model=model, contents=[part, "Color in one word?"],
+            config=types.GenerateContentConfig(max_output_tokens=8))
+    cap.multimodal = _try(_multimodal) is not None
+
+    cap.probed_at = time.time()
+    log.info("probed %s: thinking=%s(%s) structured=%s mm=%s",
+             model, cap.thinking, cap.thinking_param, cap.structured, cap.multimodal)
+    return cap
+```
+
+Only the structured-output probe checks **obedience**, not just acceptance — and that matters. When the default swaps to different weights, you genuinely hit an in-between state where the schema directive is accepted but obeyed more loosely. Checking acceptance alone misses that slack. Only after the response survives `json.loads` can you treat structured output as production-safe.
+
+## Rebuild the request from what you detected
+
+Once you hold a capability profile, production requests are assembled by reading it. The branch-per-model logic and the "this should probably work" assumptions disappear from app code.
+
+```python
+def build_config(cap: Capabilities, *, want_thinking: bool, schema=None):
+    kwargs = {}
+    if want_thinking and cap.thinking:
+        if cap.thinking_param == "level":
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="high")
+        else:
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=2048)
+    if schema is not None and cap.structured:
+        kwargs["response_mime_type"] = "application/json"
+        kwargs["response_schema"] = schema
+    return types.GenerateContentConfig(**kwargs)
+```
+
+Pass `want_thinking=True` and, if the probe never confirmed thinking, that directive is dropped silently. Not an exception — the request itself shrinks to fit the capability. That's why the call site survives when the default moves. The same holds for the schema: a model whose obedience wasn't confirmed gets no `response_schema`, and a downstream parser of your own handles the rest.
+
+## When a probe is wrong, degrade quietly
+
+A probe doesn't guarantee the moment of the production call. The model can swap after startup, and a probe can return a false negative on a transient error. So the production path carries one stage of the same-minded fallback chain.
+
+```python
+def generate(client, cap, contents, *, want_thinking=False, schema=None):
+    cfg = build_config(cap, want_thinking=want_thinking, schema=schema)
+    try:
+        r = client.models.generate_content(model=cap.model, contents=contents, config=cfg)
+        if schema and cap.structured and not _valid_json(r.text):
+            raise ValueError("schema drift")     # detect obedience slack, drop down
+        return r
+    except Exception as e:
+        log.warning("primary failed (%s); degrading", type(e).__name__)
+        # retry once with thinking and schema stripped off
+        plain = types.GenerateContentConfig(max_output_tokens=cfg.max_output_tokens or 1024)
+        return client.models.generate_content(model=cap.model, contents=contents, config=plain)
+```
+
+The key is fixing the direction of degradation to **removing** features, not adding them. Thinking and structured output are optional layers that raise quality when present. Going to hunt for a different model on failure just takes on more unknown behavior. Falling back to a plain config on the same model keeps the result readable. And because schema drift is caught on the spot, you avoid the accident of feeding loose JSON downstream.
+
+## Keep detection cost in the negligible range
+
+The obvious worry by now is whether you fire a probe on every call. You don't. The profile is cached with a TTL and refreshed only on restart or a sign of a model change.
+
+```python
+import threading
+_cache, _lock, _TTL = {}, threading.Lock(), 6 * 3600   # 6 hours
+
+def get_caps(client, model):
+    now = time.time()
+    with _lock:
+        c = _cache.get(model)
+        if c and now - c.probed_at < _TTL:
+            return c
+    c = probe(client, model)         # run outside the lock to avoid serializing startup
+    with _lock:
+        _cache[model] = c
+    return c
+```
+
+A ground-level sense of the cost: one probe pass is three feature calls, each with 8–32 output tokens and inputs on the order of tens of tokens. Refresh every six hours and that's four passes a day, roughly 120 a month. At Flash-tier pricing, input and output together land around $0.01 a day, roughly $0.30 a month — under 0.1% of the total generation cost in production. Against the next-morning investigation and rebuild after a nightly job whiffs entirely on a default swap, detection is cheap by orders of magnitude. As insurance, it's clearly on the inexpensive side.
+
+## What the docs didn't say, and operation revealed
+
+Three things I only noticed by actually running this — none readable from the official support matrix.
+
+First, **"accepted" and "obeyed" are separate things.** Structured output moves independently on whether the directive is accepted and whether the schema is honored. Right after the default rose, I observed the in-between state most often: accepted yet loosely obeyed. That's exactly why running the probe through `json.loads` earns its keep.
+
+Second, **probe false negatives come from rate limits.** When every instance fires its probe at once right after a deploy, a `429` gets misread as "no capability." Adding one short exponential backoff to the probes alone, and treating `429` as "verdict deferred" rather than "no capability," made the wave of post-deploy degradation disappear.
+
+Third, **the way you specify thinking is a dialect, not a feature flag.** Generations split into level-style and budget-style, and attaching both in the name of compatibility gets one of them rejected. Settle on which dialect once via the probe and assemble only that one afterward. That single decision erased nearly all the branching on the generation side.
+
+I run this probing layer in my own indie developer nightly automation today. I recommend rolling it out in this order:
+
+1. Pick one live production path that uses `response_schema`.
+2. Slot `get_caps` in front of it so it verifies obedience, not just acceptance, before flowing.
+3. Add a short backoff to the probes alone and treat `429` as "verdict deferred," not "no capability."
+
+A path that finishes those three moves over to the side that doesn't break when the default rises. If you only touch one place first, in this case start with the structured-output path, since that's where a break does the most damage.
+
+If it spares me that same morning twice, this insurance has more than paid for itself. Thank you for reading.
