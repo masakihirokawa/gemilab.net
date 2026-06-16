@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLI — Gemini CLI・Code Assist IDE拡張が6/18に無料個人・AI Pro/Ultra向けでリクエスト停止（残り2日）。Antigravity CLIへの移行が案内されています",
-    "GA — Gemini 3.5 FlashがGAに。6/8以降Gemini Enterpriseアプリでは既定で有効化され、オフにできなくなりました",
-    "AGENTS — Managed Agentsがパブリックプレビュー。Googleホストの隔離Linuxサンドボックスで自律エージェントを構築・デプロイできます",
-    "IMAGE — gemini-3.1-flash-image-preview・gemini-3-pro-image-previewが6/25に停止。OGP画像生成の依存先は後継への切替が必要です",
-    "PRO — Gemini 3.5 Proは5/19のI/Oで予告も6/15時点で未公開。6/23・6/30が有力な公開時期と見られています",
-    "API — v1beta Interactions APIに破壊的変更。mid-flightステアリングや非同期ツール呼び出しに向けてAPI形状が再構成されています",
+    "CLI — Gemini CLIのホスト応答は明日6/18に停止し、後継のAntigravity CLIへ一本化されます。依存スクリプトは本日中に切替確認をおすすめします",
+    "PRO — Gemini 3.5 ProがGA間近です。Antigravity 2.0はすでにFlashで稼働し、GA当日にProが加わる見込みです",
+    "FLASH — Gemini Enterpriseでは6/8以降、3.5 Flashが既定で有効化され無効化できません。既定モデルが変わると出力の癖も変わります",
+    "OMNI — I/O 2026で発表されたGemini Omniは、任意の入力から生成し、会話でそのまま自然に編集できます",
+    "SPARK — パーソナルAIエージェントGemini Spark、Daily Brief、再設計されたUIも公開され、チャットから連携型の作業環境へと進んでいます",
+    "STACK — Deep Think・Deep Research・Gemini Liveと合わせ、推論・調査・音声・動画を横断する一体運用が前面に出ています",
   ],
   en: [
-    "CLI — Gemini CLI and the Code Assist IDE extensions stop serving free, AI Pro, and Ultra users on Jun 18 (two days out), with users directed to the Antigravity CLI",
-    "GA — Gemini 3.5 Flash is now generally available and, since Jun 8, enabled by default and non-removable in the Gemini Enterprise app",
-    "AGENTS — Managed Agents entered public preview, letting you build and deploy stateful autonomous agents inside Google-hosted, isolated Linux sandboxes",
-    "IMAGE — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on Jun 25; OGP image pipelines should move to successors",
-    "PRO — Gemini 3.5 Pro, previewed at I/O on May 19, had not shipped as of Jun 15, with Jun 23 and Jun 30 seen as the likeliest release windows",
-    "API — The v1beta Interactions API has breaking changes, reshaping the API to support mid-flight steering and asynchronous tool calls",
+    "CLI — Gemini CLI stops serving hosted responses tomorrow (Jun 18) and consolidates into its successor, Antigravity CLI; confirm any dependent scripts today",
+    "PRO — Gemini 3.5 Pro is close to GA; Antigravity 2.0 already runs Flash and is expected to add Pro on launch day",
+    "FLASH — In Gemini Enterprise, 3.5 Flash has been the default since Jun 8 and cannot be turned off; a new default model means new output quirks",
+    "OMNI — Gemini Omni, unveiled at I/O 2026, creates from any input and lets you edit naturally through conversation",
+    "SPARK — Google also shipped Gemini Spark (a personal AI agent), Daily Brief, and a redesigned UI, moving from chatbot to a connected work system",
+    "STACK — Together with Deep Think, Deep Research, and Gemini Live, the lineup spans reasoning, research, voice, and video in one workflow",
   ],
 };
 
