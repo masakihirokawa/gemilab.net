@@ -1,0 +1,261 @@
+---
+title: "Your Gemini Live API session forgets the conversation every time it reconnects — field notes on token refresh and session resumption"
+slug: "gemini-live-api-reconnect-token-refresh-session-resumption-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-16T13:00"
+author: "Gemini Lab"
+description: "Why a Gemini Live API WebSocket drops the conversation and the user's in-flight speech on every reconnect, and how to close the gap with single-use ephemeral tokens, session resumption handles, and the goAway warning."
+tags: ["Gemini Live API", "WebSocket", "Ephemeral Token", "Session Resumption", "Reconnect", "Realtime"]
+highlights:
+  - "The classic 401 loop where reconnects reuse a spent token, and the exact code that fetches a fresh one right before each connect"
+  - "Carrying conversation context across a drop with sessionResumption handles, so the user never loses a turn mid-sentence"
+  - "Turning the goAway warning into a proactive reconnect instead of an abrupt disconnect, with the state machine to do it"
+---
+
+A train enters a tunnel, the WebSocket drops for a few seconds, and when it comes back the assistant has forgotten how the conversation started. The Gemini Live API voice assistant I was building as an indie developer ran flawlessly in the demo, then started dropping turns like this every day once it shipped to real devices.
+
+The disconnects themselves are unavoidable. Mobile networks drop, and Live API sessions have limits. What production really tests is how you come back. Plenty of implementations get as far as reconnect logic, yet lose two things the moment they return: authentication, and the conversation context. These notes build a reconnect that keeps both, in the order I actually hit the problems.
+
+One note on models: this assumes the `gemini-2.5-flash` family that reached general availability in June 2026. If you are still on `gemini-2.0-flash`, fold the model ID migration into this reconnect work rather than doing it separately.
+
+## Reconnects break authentication — tokens are not reusable
+
+The first wall was getting rejected with a 401 on every reconnect. The initial connect succeeds, but every attempt after that fails.
+
+The cause is the nature of ephemeral tokens. The short-lived token your backend issues is consumed once a connection is established. In other words, a single token is good for one WebSocket. If your reconnect code holds the first token in a variable and reuses it, the second attempt sends a spent token and authentication fails.
+
+The fix is simple ordering: fetch a fresh token from the backend every time you try to connect. Here is the issuing endpoint.
+
+```typescript
+// app/api/live/token/route.ts
+import { NextRequest, NextResponse } from "next/server";
+
+const TOKEN_ENDPOINT =
+  "https://generativelanguage.googleapis.com/v1alpha/ephemeralTokens:create";
+
+export async function POST(req: NextRequest) {
+  // Always check your own auth first. Skip it and this becomes an open token vending machine.
+  const session = await getServerSession(req);
+  if (!session?.user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return NextResponse.json({ error: "Server misconfigured" }, { status: 500 });
+  }
+
+  const res = await fetch(`${TOKEN_ENDPOINT}?key=${apiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      // Separate the window to open a session (newSessionExpireTime) from the overall lifetime (expireTime).
+      uses: 1,
+      expireTime: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      newSessionExpireTime: new Date(Date.now() + 60 * 1000).toISOString(),
+      liveConnectConstraints: {
+        model: "models/gemini-2.5-flash",
+        config: {
+          responseModalities: ["AUDIO"],
+          systemInstruction: {
+            parts: [{ text: "You are this app's dedicated assistant." }],
+          },
+        },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    console.error("token issue failed:", await res.text());
+    return NextResponse.json({ error: "Failed to issue token" }, { status: 502 });
+  }
+
+  const data = await res.json();
+  return NextResponse.json({ token: data.name, expiresAt: data.expireTime });
+}
+```
+
+The lever here is `newSessionExpireTime`. Separate from the token's overall lifetime (`expireTime`), you can keep the window for opening the first connection short. If the token leaks, an attacker only has a few dozen seconds to open a new session. When you connect immediately after issuing, a one-minute window is plenty.
+
+On the client, do not hold the token. Pass a function that fetches one right before connecting.
+
+```typescript
+// Hand the connector a token-getter, not the token itself.
+const getToken = async (): Promise<string> => {
+  const res = await fetch("/api/live/token", { method: "POST" });
+  if (!res.ok) throw new Error("token fetch failed");
+  const { token } = await res.json();
+  return token;
+};
+```
+
+That one change ends the 401 loop. Keep no token as state; pull a fresh one the instant you need it. That is the baseline posture for auth when reconnects are expected.
+
+## Session resumption handles — return without losing context
+
+Even with auth fixed, a problem remains: the reconnect succeeds, but the assistant no longer remembers the previous exchange.
+
+When you open a fresh WebSocket, Live API sees a brand-new session. Send only the `setup` message and every prior turn is gone. The defense is **session resumption**.
+
+It works like this. During a connection, the server periodically sends a `sessionResumptionUpdate` message. Its `newHandle` is a ticket pointing at the current session state. The client keeps the latest one and passes it inside `setup` on reconnect, and Live API carries the old context into the new connection.
+
+Keep the latest handle and send a resuming `setup` in one place.
+
+```typescript
+// lib/LiveSession.ts
+type Json = Record<string, unknown>;
+
+export class LiveSession {
+  private ws: WebSocket | null = null;
+  private resumptionHandle: string | null = null;  // latest resumption handle
+  private attempts = 0;
+  private closedByUser = false;
+  private readonly maxAttempts = 6;
+  private readonly base = 1000;
+
+  constructor(
+    private readonly getToken: () => Promise<string>,
+    private readonly wsBase: string,
+    private readonly onMessage: (m: Json) => void,
+  ) {}
+
+  async connect() {
+    this.closedByUser = false;
+    await this.open();
+  }
+
+  private async open() {
+    const token = await this.getToken();  // always a fresh token
+    const ws = new WebSocket(`${this.wsBase}?access_token=${token}`);
+
+    ws.onopen = () => {
+      this.attempts = 0;
+      ws.send(JSON.stringify({
+        setup: {
+          model: "models/gemini-2.5-flash",
+          generationConfig: { responseModalities: ["AUDIO"] },
+          // Pass the handle if we have one; omit it for a fresh start.
+          sessionResumption: this.resumptionHandle
+            ? { handle: this.resumptionHandle }
+            : {},
+        },
+      }));
+    };
+
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data) as Json;
+      // Overwrite the handle on every update so it stays current.
+      const update = msg.sessionResumptionUpdate as
+        | { resumable?: boolean; newHandle?: string }
+        | undefined;
+      if (update?.resumable && update.newHandle) {
+        this.resumptionHandle = update.newHandle;
+      }
+      // Treat the server's disconnect warning as a trigger to reconnect early.
+      if ("goAway" in msg) {
+        this.reconnectSoon();
+        return;
+      }
+      this.onMessage(msg);
+    };
+
+    ws.onclose = () => {
+      this.ws = null;
+      if (!this.closedByUser) this.reconnectSoon();
+    };
+    ws.onerror = (err) => console.error("ws error", err);
+    this.ws = ws;
+  }
+
+  private reconnectSoon() {
+    if (this.attempts >= this.maxAttempts) {
+      console.error("reconnect limit reached; prompt the user to resume manually");
+      return;
+    }
+    // Exponential backoff + jitter: 1s, 2s, 4s, ... plus randomness to avoid a thundering herd.
+    const delay = this.base * 2 ** this.attempts + Math.random() * 500;
+    this.attempts++;
+    setTimeout(() => this.open(), delay);
+  }
+
+  send(data: Json): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;  // silently drop while disconnected
+    this.ws.send(JSON.stringify(data));
+    return true;
+  }
+
+  disconnect() {
+    this.closedByUser = true;
+    this.ws?.close();
+    this.ws = null;
+  }
+}
+```
+
+Two things to watch in this code.
+
+First, update the handle *on every arrival*. As the conversation advances, `sessionResumptionUpdate` swaps in a ticket pointing at newer state. Hold onto an old handle and resumption still works, but it rewinds the context by several turns. Keep overwriting with the latest.
+
+Second, do not grab the handle when `resumable` is `false`. The server also sends updates at moments when a resumption point is not yet settled. Resuming from that ticket fails, so only store it when `resumable` is true and a handle is present.
+
+## Do not ignore goAway — disconnects are announced
+
+Hitting the reconnect limit should not be common. If it happens a lot, you are usually missing `goAway`.
+
+Live API sessions have a time limit, and the server sends a `goAway` message before it cuts you off. Its `timeLeft` field is a warning: "this many seconds until I close." Ignore it and the connection drops mid-sentence, you fall into the `onclose` backoff path, and the speech during that gap is lost.
+
+The right move is to start your own quiet reconnect the moment the warning arrives. In the code above, receiving `goAway` calls `reconnectSoon()` immediately and slides over to a new session using the resumption handle you already hold. From the user's side, the conversation never breaks.
+
+```typescript
+// Logging the remaining time on the receiving side gives you a feel for the limit.
+if ("goAway" in msg) {
+  const left = (msg.goAway as { timeLeft?: string }).timeLeft;
+  console.warn(`session ending in ${left}; pre-reconnecting`);
+}
+```
+
+In practice, `goAway` tended to arrive relatively early when the session went quiet, and active conversations were held open longer. The numbers shift with conditions, so the reliable starting point is to stream `timeLeft` to your logs and learn your own app's behavior.
+
+## A send queue to protect speech during reconnect
+
+The last hole is whatever the user says or types during the few seconds you are reconnecting. `send()` returns `false` and drops messages while disconnected, so those are lost.
+
+To avoid losing them across a short reconnect, stash unsent messages in a small queue and flush it when the connection returns in `onopen`.
+
+```typescript
+private queue: Json[] = [];
+
+send(data: Json): boolean {
+  if (this.ws?.readyState === WebSocket.OPEN) {
+    this.ws.send(JSON.stringify(data));
+    return true;
+  }
+  // Don't drop while disconnected; stash it. Cap the size so it can't run away.
+  if (this.queue.length < 50) this.queue.push(data);
+  return false;
+}
+
+private flushQueue() {
+  while (this.queue.length && this.ws?.readyState === WebSocket.OPEN) {
+    this.ws.send(JSON.stringify(this.queue.shift()));
+  }
+}
+```
+
+Call `flushQueue()` at the end of `onopen` and speech crosses the reconnect seam. One caveat: if you queue raw PCM audio frames too, a flood of stale audio replays on return and sounds wrong. Limit the queue to text and turn-level input, and drop realtime audio frames if you are disconnected. That line is the easy one to hold.
+
+## Measure reconnect health with numbers
+
+Whether all this machinery is working is better confirmed with numbers than with gut feel. On the client I track four values: reconnects per minute, the time from receiving `goAway` to a completed reconnect, the share of reconnects that carried context via a resumption handle, and the count of messages parked in the send queue.
+
+The most telling of these is the resumption-success share. When it drops, you are either grabbing a handle while `resumable` was false, or your handle overwrites are lagging. Watch only the reconnect count and the app looks "flaky"; with a high resumption share you can judge that the user's experience never broke.
+
+My recommendation is to emit these four as plain counters first, watch them for a day, and only then set thresholds. Rather than building a perfect dashboard up front, starting as lightly as aggregating `console` output lets the app's raw behavior surface.
+
+## Where to start
+
+You do not need all of this at once. Fix the single point of fetching a fresh token on every reconnect and you stop the most common production failure, the 401 loop. Then add `sessionResumption` handle retention, and finally layer in the `goAway` head start and the send queue, in that order.
+
+Stream `sessionResumptionUpdate` and `goAway` to your logs once on your own app. Seeing how often the resumption point updates and when the disconnect warning lands lets you tune the backoff base and the queue cap against real numbers rather than guesses. Thanks for reading.

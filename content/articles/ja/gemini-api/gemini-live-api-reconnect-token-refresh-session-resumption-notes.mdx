@@ -1,0 +1,261 @@
+---
+title: "Gemini Live API のセッションが切れるたびに会話が消える — 期限切れトークンの再取得とセッション再開の実装メモ"
+slug: "gemini-live-api-reconnect-token-refresh-session-resumption-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-16T13:00"
+author: "Gemini Lab"
+description: "Gemini Live API の WebSocket が再接続するたびに会話履歴とユーザーの発話を取りこぼす問題を、エフェメラルトークンの単発消費・セッション再開ハンドル・goAway 予告の3点から実装で塞ぐ運用メモです。"
+tags: ["Gemini Live API", "WebSocket", "エフェメラルトークン", "セッション再開", "再接続", "リアルタイム"]
+highlights:
+  - "再接続時にトークンを使い回して 401 で落ちる典型パターンと、発行直後に取得し直す具体的な実装コード"
+  - "sessionResumption ハンドルで切断前の文脈を引き継ぎ、ユーザーの発話途中でも会話を失わない再開フロー"
+  - "goAway を無視して突然切れる事故を、予告受信から先回り再接続につなげる状態機械の組み方"
+---
+
+電車がトンネルに入った数秒で WebSocket が切れ、戻ってきたら AI が会話の冒頭を忘れている。個人開発で作っていた Gemini Live API の音声アシスタントは、デモでは完璧に動いていました。それを実機に載せた途端、私自身こうした取りこぼしに毎日のように悩まされました。
+
+切断そのものは避けられません。モバイル回線は切れますし、Live API のセッションにも上限があります。プロダクションで問われるのは「切れた後にどう戻るか」です。ここがデモと本番運用を分ける落とし穴でした。多くの実装が再接続のコードまでは書いているのに、戻った瞬間に二つのものを失っています。ひとつは認証、もうひとつは会話の文脈です。この二つを落とさない再接続を、実際に詰まった順番で組み立てていきます。
+
+なお Live API のモデル指定は、2026 年 6 月に一般提供となった `gemini-2.5-flash` 系を前提にしています。`gemini-2.0-flash` を使っている場合は、ここで扱う再接続の作り込みとあわせてモデル ID も移行しておくのが無難です。
+
+## 再接続が認証を落とす — トークンは使い回せない
+
+最初にぶつかったのは、再接続のたびに 401 で弾かれる現象でした。初回接続は通るのに、二回目以降だけ失敗します。
+
+原因はエフェメラルトークンの性質にあります。バックエンドが発行する短命トークンは、接続を一度確立すると消費されます。つまり、一本のトークンで張れる WebSocket は原則ひとつです。再接続のコードが「最初に取得したトークンを変数に保持して再利用する」設計になっていると、二回目の接続で使用済みのトークンを送ってしまい、認証に失敗します。
+
+正しい順序は単純です。再接続を試みるたびに、バックエンドからトークンを取り直すこと。トークン発行 API はこう組みます。
+
+```typescript
+// app/api/live/token/route.ts
+import { NextRequest, NextResponse } from "next/server";
+
+const TOKEN_ENDPOINT =
+  "https://generativelanguage.googleapis.com/v1alpha/ephemeralTokens:create";
+
+export async function POST(req: NextRequest) {
+  // 自社の認証を必ず先に通す。ここを抜くと誰でもトークンを引ける踏み台になる
+  const session = await getServerSession(req);
+  if (!session?.user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return NextResponse.json({ error: "Server misconfigured" }, { status: 500 });
+  }
+
+  const res = await fetch(`${TOKEN_ENDPOINT}?key=${apiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      // 接続確立の猶予(newSessionExpireTime)と、セッション全体の上限(expireTime)を分けて指定する
+      uses: 1,
+      expireTime: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      newSessionExpireTime: new Date(Date.now() + 60 * 1000).toISOString(),
+      liveConnectConstraints: {
+        model: "models/gemini-2.5-flash",
+        config: {
+          responseModalities: ["AUDIO"],
+          systemInstruction: {
+            parts: [{ text: "あなたはこのアプリ専用のアシスタントです。" }],
+          },
+        },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    console.error("token issue failed:", await res.text());
+    return NextResponse.json({ error: "Failed to issue token" }, { status: 502 });
+  }
+
+  const data = await res.json();
+  return NextResponse.json({ token: data.name, expiresAt: data.expireTime });
+}
+```
+
+ここで効くのが `newSessionExpireTime` です。トークン全体の寿命（`expireTime`）とは別に、「最初の接続を張るまでの猶予」を短く切れます。トークンが漏れても、攻撃者が新規セッションを開ける窓は数十秒に限られます。発行直後にすぐ繋ぐ前提なら、この猶予は 1 分もあれば十分です。
+
+クライアント側は、トークンを保持せず「接続の直前に取りに行く関数」として渡します。
+
+```typescript
+// 接続を張る側には、トークンそのものではなく「取得関数」を渡す
+const getToken = async (): Promise<string> => {
+  const res = await fetch("/api/live/token", { method: "POST" });
+  if (!res.ok) throw new Error("token fetch failed");
+  const { token } = await res.json();
+  return token;
+};
+```
+
+この一段で 401 ループは消えます。トークンは状態として持たず、必要になった瞬間に毎回新しく引く。これが再接続を前提にした認証の基本姿勢です。
+
+## セッション再開ハンドル — 文脈を失わずに戻る
+
+認証が直っても、まだ問題は残ります。再接続には成功するのに、戻ってきた AI が直前の会話を覚えていないのです。
+
+新しい WebSocket を張り直すと、Live API から見れば別の真新しいセッションです。`setup` メッセージだけ送って繋ぎ直すと、それまでのターンはすべて失われます。これを防ぐのが**セッション再開（session resumption）**です。
+
+仕組みはこうです。接続中、サーバーは定期的に `sessionResumptionUpdate` というメッセージを送ってきます。この中の `newHandle` が、現在のセッション状態を指す引換券です。クライアントはこれを常に最新の状態で保持しておき、再接続時に `setup` の中で渡します。すると Live API は新しい接続に古い文脈を引き継いでくれます。
+
+最新ハンドルの保持と、再開つき `setup` の送信を一箇所にまとめます。
+
+```typescript
+// lib/LiveSession.ts
+type Json = Record<string, unknown>;
+
+export class LiveSession {
+  private ws: WebSocket | null = null;
+  private resumptionHandle: string | null = null;  // 最新の再開ハンドル
+  private attempts = 0;
+  private closedByUser = false;
+  private readonly maxAttempts = 6;
+  private readonly base = 1000;
+
+  constructor(
+    private readonly getToken: () => Promise<string>,
+    private readonly wsBase: string,
+    private readonly onMessage: (m: Json) => void,
+  ) {}
+
+  async connect() {
+    this.closedByUser = false;
+    await this.open();
+  }
+
+  private async open() {
+    const token = await this.getToken();  // 毎回新しいトークンを引く
+    const ws = new WebSocket(`${this.wsBase}?access_token=${token}`);
+
+    ws.onopen = () => {
+      this.attempts = 0;
+      ws.send(JSON.stringify({
+        setup: {
+          model: "models/gemini-2.5-flash",
+          generationConfig: { responseModalities: ["AUDIO"] },
+          // ハンドルがあれば渡す。初回は handle 省略で新規開始
+          sessionResumption: this.resumptionHandle
+            ? { handle: this.resumptionHandle }
+            : {},
+        },
+      }));
+    };
+
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data) as Json;
+      // 再開ハンドルは届くたびに上書きして最新を保つ
+      const update = msg.sessionResumptionUpdate as
+        | { resumable?: boolean; newHandle?: string }
+        | undefined;
+      if (update?.resumable && update.newHandle) {
+        this.resumptionHandle = update.newHandle;
+      }
+      // サーバーからの切断予告は先回り再接続のトリガーにする
+      if ("goAway" in msg) {
+        this.reconnectSoon();
+        return;
+      }
+      this.onMessage(msg);
+    };
+
+    ws.onclose = () => {
+      this.ws = null;
+      if (!this.closedByUser) this.reconnectSoon();
+    };
+    ws.onerror = (err) => console.error("ws error", err);
+    this.ws = ws;
+  }
+
+  private reconnectSoon() {
+    if (this.attempts >= this.maxAttempts) {
+      console.error("再接続の上限に到達。利用者に手動再開を促す");
+      return;
+    }
+    // 指数バックオフ + ジッター: 1s, 2s, 4s, ... に乱数を足して同時殺到を避ける
+    const delay = this.base * 2 ** this.attempts + Math.random() * 500;
+    this.attempts++;
+    setTimeout(() => this.open(), delay);
+  }
+
+  send(data: Json): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;  // 切断中は黙って捨てる
+    this.ws.send(JSON.stringify(data));
+    return true;
+  }
+
+  disconnect() {
+    this.closedByUser = true;
+    this.ws?.close();
+    this.ws = null;
+  }
+}
+```
+
+実装で気をつける点が二つあります。
+
+ひとつは、ハンドルは「届くたびに」更新すること。`sessionResumptionUpdate` は会話が進むほど新しい状態を指す券に差し替わります。古いハンドルを掴んだままだと、再開はできても文脈が数ターン前まで巻き戻ります。最新で上書きし続けるのが正解です。
+
+もうひとつは、`resumable` が `false` のときは握らないこと。サーバーはまだ再開点が確定していない瞬間にも更新を送ってきます。そのときの券で再開しようとすると失敗するので、`resumable` が真でハンドルが入っているときだけ保存します。
+
+## goAway を無視しない — 切断は予告されている
+
+再接続の上限到達は、本来そう頻発しないはずです。それが多発するなら、たいてい `goAway` を見落としています。
+
+Live API のセッションには時間上限があり、サーバーは切断する前に `goAway` メッセージを送ってきます。中の `timeLeft` が「あと何秒で切る」という予告です。これを無視していると、利用者が話している最中に唐突に接続が落ち、`onclose` 経由のバックオフ再接続に入って、その間の発話が丸ごと消えます。
+
+予告を受け取った時点で、こちらから先に静かな再接続を始めるのが正着です。上のコードでは `goAway` を受けた瞬間に `reconnectSoon()` を呼び、保持済みの再開ハンドルで新しいセッションへ滑らかに乗り換えます。利用者から見れば会話は途切れません。
+
+```typescript
+// 受信側で goAway の残り時間をログに出すと、上限の体感がつかめる
+if ("goAway" in msg) {
+  const left = (msg.goAway as { timeLeft?: string }).timeLeft;
+  console.warn(`session ending in ${left}; pre-reconnecting`);
+}
+```
+
+実測では、無音が続くと比較的早めに `goAway` が来て、会話が活発なセッションは長く保たれる傾向がありました。数値は状況で変わるので、まずは `timeLeft` をログに流して自分のアプリの体感をつかむところから始めるのが確実です。
+
+## 送信キューで「再接続中の発話」を守る
+
+最後の穴は、再接続している数秒の間にユーザーが話したり入力したりした内容です。`send()` は切断中に `false` を返して捨てるので、この瞬間のメッセージは消えます。
+
+短い再接続中の取りこぼしを防ぐには、未送信メッセージを小さなキューに退避し、接続が `onopen` で復帰したときに吐き出します。
+
+```typescript
+private queue: Json[] = [];
+
+send(data: Json): boolean {
+  if (this.ws?.readyState === WebSocket.OPEN) {
+    this.ws.send(JSON.stringify(data));
+    return true;
+  }
+  // 切断中は捨てずに退避。ただし上限を設けて暴走を防ぐ
+  if (this.queue.length < 50) this.queue.push(data);
+  return false;
+}
+
+private flushQueue() {
+  while (this.queue.length && this.ws?.readyState === WebSocket.OPEN) {
+    this.ws.send(JSON.stringify(this.queue.shift()));
+  }
+}
+```
+
+`onopen` の最後で `flushQueue()` を呼べば、再接続の切れ目をまたいで発話が届きます。ただし音声の生 PCM フレームまでキューに積むと、復帰時に過去の音声がどっと流れて不自然になります。これを回避するには、キューに載せるのはテキストやターン単位の入力に絞り、リアルタイム音声フレームは切断中なら捨てる、という線引きが扱いやすいです。
+
+## 再接続の健全性を数字で見る
+
+ここまでの仕掛けが効いているかは、体感ではなく数字で確かめるのが確実です。私はクライアント側で四つの値を計測しています。1分あたりの再接続回数、`goAway` 受信から再接続完了までの所要時間、再開ハンドルで文脈を引き継げた割合、そして送信キューに退避したメッセージ数です。
+
+このうち最も雄弁なのは「再開できた割合」です。これが下がっているときは、`resumable` が偽のハンドルを掴んでいるか、ハンドルの上書きが追いついていません。再接続回数だけ見ていると「よく切れるアプリ」に見えますが、再開割合が高ければ利用者の体験は途切れていない、という判断ができます。
+
+実装の推奨としては、まずこの四つを単純なカウンタとして送信し、1日眺めてから閾値を決めることをお勧めします。最初から完璧なダッシュボードを作るより、`console` 出力を集計するくらいの軽さで始めるほうが、自分のアプリの素の挙動が見えてきます。
+
+## 次の一歩
+
+ここまでを一度に入れる必要はありません。まず再接続のたびにトークンを取り直す一点だけ直せば、本番でいちばん多い 401 ループは止まります。そのうえで `sessionResumption` のハンドル保持を足し、最後に `goAway` の先回りと送信キューを重ねる、という順で入れていくのが安全です。
+
+手元のアプリで `sessionResumptionUpdate` と `goAway` を一度ログに流してみてください。自分の利用パターンでどのくらいの頻度で再開点が更新され、どのタイミングで切断予告が来るのかが見えると、バックオフの初期値やキュー上限を実測で詰められます。お読みいただきありがとうございました。
