@@ -1,0 +1,174 @@
+---
+title: "Moving My Automation Off the Gemini CLI Before the June 18 Shutdown"
+slug: "gemini-cli-shutdown-automation-api-migration-2026"
+category: "gemini-api"
+level: "intermediate"
+premium: true
+date: "2026-06-17T19:45"
+author: "Gemini Lab"
+description: "On June 18, the Gemini CLI stops responding for hosted plans. Here is how I moved unattended scripts that called gemini from the shell over to the google-genai SDK, with structured output, retries, and cost measurement built in."
+tags: ["gemini", "gemini-api", "automation", "migration", "python"]
+highlights:
+  - "You will be able to move automation scripts that embed the Gemini CLI onto the google-genai SDK calmly, before they break on June 18"
+  - "You will rewrite implementations that just shell out to gemini -p into API code with structured output, retries, and cost measurement"
+  - "You will get a real-world sense of how cost and latency shift between the CLI and the API, so you can decide how to migrate"
+---
+
+Behind the apps I run as an indie developer, several small automation scripts fire every night. One gathers reviews from the App Store and Google Play and classifies them; another summarizes AdMob reports. Many of them leaned on a single shell call: `gemini -p "..."`. That assumption breaks on June 18.
+
+For Google AI Pro / Ultra and Gemini Code Assist, the Gemini CLI stops responding on June 18 and consolidates into the successor Antigravity CLI. The backend agent harness is the same, so for interactive use you simply switch over. Unattended scripts driven from cron are a different story. The moment responses stop coming back, the nightly job fails quietly, night after night.
+
+This article is the migration path I actually took to prevent that silent failure. The short version: instead of swapping one CLI for another, I moved only the automation parts onto the google-genai SDK. I will walk through why, along with what changed before and after.
+
+## Start by Taking Inventory of What the CLI Was Doing
+
+The first stumbling block in a migration is not rewriting code. It is that you do not have a full picture of which scripts depend on the CLI. When interactive use and unattended use are tangled together in your head, you cannot prioritize.
+
+So I mechanically surfaced every place that called the CLI.
+
+```bash
+# Pull gemini calls out of crontab and your script directories
+grep -rn -E '(^|[^a-z])gemini( |$)' ~/scripts ~/cron 2>/dev/null
+crontab -l | grep -n gemini
+```
+
+Then split the results by whether they run unattended. Interactive, investigative use can move straight to the Antigravity CLI. What you should rewrite first is only what runs from cron or hooks without a human watching. In my case, of six scripts, only three were unattended jobs that needed urgent attention. Just deciding not to touch the rest in a hurry made the whole thing feel far more manageable.
+
+## Replace the Shell Call With an SDK Call
+
+The pre-migration implementation was naive: call the CLI from the shell, take standard output, done.
+
+```bash
+# Before: hand a prompt to the CLI and take the output as-is
+RESULT=$(gemini -p "Classify this review text: ${REVIEW_TEXT}")
+echo "$RESULT" >> labels.txt
+```
+
+Replace that with a google-genai SDK call. If you are on Python, install the SDK first.
+
+```bash
+pip install google-genai
+```
+
+Then move the prompt you handed the CLI straight into `generate_content`.
+
+```python
+import os
+from google import genai
+
+# Read the key from the environment; never hardcode it in the script
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def classify(review_text: str) -> str:
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=f"Classify this review text:\n{review_text}",
+    )
+    return response.text
+```
+
+At this point behavior is roughly the same as in the CLI days. But stopping here means you also inherit the fragility. The structure you used to pry open with regular expressions on CLI text output is worth rebuilding while you are here. If you trip over SDK-specific errors or initialization, I collected the common snags in [errors you hit migrating to the google-genai SDK](/articles/gemini-api/gemini-api-google-genai-sdk-migration-errors).
+
+## Make It a "Won't Break" Migration With Structured Output
+
+What troubled me most in the CLI days was that output was unstable: sometimes prose, sometimes JSON. Downstream scripts parse that output, so every time the shape shifted, they failed. If you are moving to the SDK, fix the output shape here with `response_schema`.
+
+```python
+from pydantic import BaseModel
+
+class ReviewLabel(BaseModel):
+    sentiment: str
+    category: str
+    needs_reply: bool
+
+def classify_structured(review_text: str) -> ReviewLabel:
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=review_text,
+        config={
+            "response_mime_type": "application/json",
+            "response_schema": ReviewLabel,
+        },
+    )
+    # parsed holds a ReviewLabel instance
+    return response.parsed
+```
+
+Pass a schema and you receive a typed object back. Downstream code no longer parses text and can work with attributes like `label.needs_reply`. If you run into the schema being ignored, [what to do when structured output schema validation fails](/articles/gemini-api/gemini-api-structured-output-schema-validation-fix) is a useful reference.
+
+## Prepare for Retries and Rate Limits
+
+In the CLI days I got away with a sloppy stance: if it fails, the next day's job picks it up. But wiring an unattended job directly to the API makes it easy for a transient 429 (rate exceeded) or 503 (overload) to take down the entire nightly batch. Design it so the failures you can swallow get swallowed, using exponential backoff.
+
+```python
+import time
+from google.genai import errors
+
+def classify_with_retry(review_text: str, max_attempts: int = 5) -> ReviewLabel:
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return classify_structured(review_text)
+        except errors.APIError as e:
+            # 429 / 503 are transient, so wait and retry
+            if e.code in (429, 503) and attempt < max_attempts:
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+                continue
+            raise
+    raise RuntimeError("max_attempts exhausted")
+```
+
+The thing to watch here is to always cap the wait. Uncapped exponential backoff means a sustained overload can leave a job sleeping for hours. I cap mine at 30 seconds, and if that still fails, I give up and defer to the next day. For the thinking behind rate limits themselves, see [resolving Gemini API rate limit errors](/articles/gemini-api/gemini-api-rate-limit-error-fix).
+
+## Measure Cost and Latency Before and After
+
+What you cannot skip in the migration decision is a feel for what it actually costs. In the CLI days it was hard to see which model ran internally and how many tokens were consumed, so cost was a guess. With the SDK you can read per-call token counts from `usage_metadata`.
+
+```python
+def classify_and_measure(review_text: str):
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=review_text,
+        config={
+            "response_mime_type": "application/json",
+            "response_schema": ReviewLabel,
+        },
+    )
+    usage = response.usage_metadata
+    return {
+        "label": response.parsed,
+        "input_tokens": usage.prompt_token_count,
+        "output_tokens": usage.candidates_token_count,
+    }
+```
+
+Here is a rough comparison from my own setup, classifying about 200 reviews in a nightly job before and after. The numbers move with prompt length and load, so treat them as a trend within my environment.
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>Via CLI (before)</th><th>API direct (after)</th></tr>
+</thead>
+<tbody>
+<tr><td>Response time per item</td><td>~2.4 sec</td><td>~1.3 sec</td></tr>
+<tr><td>Total for 200 items</td><td>~9 min</td><td>~5 min</td></tr>
+<tr><td>Output parse failure rate</td><td>~6%</td><td>nearly 0%</td></tr>
+<tr><td>Cost visibility</td><td>opaque</td><td>per-call</td></tr>
+</tbody>
+</table>
+
+What helped most, in practice, was not the response time but the drop in parse failures. Back when I pried open CLI output with regular expressions, roughly one item in twenty came out malformed, and I fixed it by hand the next morning. After switching to structured output, that cleanup nearly vanished, and total processing time dropped by about 40%. For a production design around cost tracking with `usage_metadata`, I go deeper in [tracking cost with usage_metadata in production](/articles/gemini-api/gemini-api-usage-metadata-cost-tracking-production).
+
+## The Call to Drop the CLI and Lean on the API
+
+The official guidance is to migrate to the Antigravity CLI. For interactive use, I think that is the natural choice. But for unattended automation, I chose to drop the CLI dependency itself and lean on the API.
+
+There are three reasons. First, the CLI is a layer designed for humans to converse with, and its output format and behavior can change across versions. For the foundation of an unattended job, an API with a stable contract feels safer. Second, the tooling production needs—structured output, retries, cost measurement—comes naturally with the API. Third, moving from one CLI to another leaves the "someday another shutdown notice arrives" risk in place. Not wanting to repeat a migration like this one is, honestly, the lesson of years of indie development.
+
+Conversely, rewriting interactive, exploratory use over to the API feels excessive. Leave that to the Antigravity CLI, and harden only the unattended parts onto the API. For solo development run in limited time, that line feels realistic to me.
+
+## What to Do Before the Cutover
+
+There is not much time left. The one thing worth doing today: run `grep` to surface your unattended jobs that depend on the CLI, and rewrite just the single one you would most hate to lose into the retry-plus-structured-output version from this article. Once one runs, the rest are repetitions of the same pattern.
+
+I am still mid-migration myself, with small adjustments ongoing, but heading off a nightly job that quietly stops was a real relief. I hope it helps anyone carrying the same kind of CLI-dependent automation prepare in time.
