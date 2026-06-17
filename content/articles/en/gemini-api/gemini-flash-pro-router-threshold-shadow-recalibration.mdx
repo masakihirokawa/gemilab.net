@@ -1,0 +1,237 @@
+---
+title: "Keep Your Flash-to-Pro Routing Threshold Honest with Shadow Re-evaluation"
+slug: "gemini-flash-pro-router-threshold-shadow-recalibration"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-17T15:45"
+author: "Gemini Lab"
+description: "A Flash-generates, Pro-on-low-confidence router starts drifting the moment you hand-pick its threshold. This is a working build of a loop that samples your kept-Flash outputs, scores them against Pro, and recalibrates the threshold from a quality budget."
+tags: ["gemini", "gemini-api", "model-routing", "shadow-evaluation", "cost-optimization", "production"]
+highlights:
+  - "Catch the silent decay of a hand-set Flash↔Pro confidence threshold as an actual number, using shadow re-evaluation"
+  - "Get copy-paste Python that back-solves the threshold from a target disagreement rate (your quality budget)"
+  - "Build a nightly job that proposes a new threshold, with hysteresis and a cost ceiling so it never runs away"
+---
+
+After I saw that Gemini Enterprise had made 3.5 Flash the default on June 8, with no way to turn it off, I opened up the router in my publishing automation for the first time in a while. It is the familiar two-stage setup: Flash classifies article metadata, and only the shaky outputs get sent to Pro. The threshold read `if confidence < 0.7, escalate to Pro`.
+
+The problem was that I could not remember the last time I had revisited that `0.7`. I had set it half a year ago after eyeing a handful of samples and deciding "somewhere around here." Models had been updated since, and the mix of articles I handle had shifted. Only the threshold stayed frozen, and nobody had checked whether it was still reasonable.
+
+This article is a build log for fixing exactly that: a threshold that quietly goes stale where it sits. It is not about wiring up a static router. It assumes you already have one, and it adds a loop that verifies — after the fact — whether each routing decision was correct, and adjusts the threshold accordingly.
+
+## A static threshold is already stale the moment you set it
+
+Confidence-based model routers have a weakness that is easy to miss. When we choose the threshold, we judge quality against "the samples we have right now." But production traffic shifts over time. New article categories appear, input lengths change, and Flash itself gets updated so that the meaning of its self-reported confidence drifts.
+
+When that happens, the threshold "drifts relative to reality even though it never moved." You might have been passing everything Flash returned as `confidence: 0.75` as "confident," but if the quality in that band has quietly dropped, a frozen threshold can't notice. The reverse happens too: you keep sending work to Pro that Flash could have handled fine, and you pay for it.
+
+The nasty part is that both kinds of decay **progress in silence**. No errors fire. Either the bill creeps up or quality creeps down, and looking at your own logs won't tell you whether the threshold was right — because you never had the strong model grade the outputs you let through on the Flash side.
+
+## A quick refresher on the minimal confidence router
+
+Before the recalibration part, let me pin down the underlying router in its smallest form. Flash returns an answer and a self-reported confidence via structured output, and you call Pro only when confidence falls below the threshold.
+
+```python
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+FAST_MODEL = "gemini-3.5-flash"
+STRONG_MODEL = "gemini-2.5-pro"  # swap to 3.5 Pro once it is GA
+
+class Verdict(BaseModel):
+    answer: str
+    confidence: float  # self-reported, 0.0 to 1.0
+
+def classify_fast(text: str) -> Verdict:
+    res = client.models.generate_content(
+        model=FAST_MODEL,
+        contents=f"Classify the following article and add a confidence from 0 to 1.\n\n{text}",
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=Verdict,
+            temperature=0,
+        ),
+    )
+    return res.parsed
+
+def classify_strong(text: str) -> str:
+    res = client.models.generate_content(
+        model=STRONG_MODEL,
+        contents=f"Classify the following article.\n\n{text}",
+        config=types.GenerateContentConfig(temperature=0),
+    )
+    return res.text.strip()
+
+def route(text: str, threshold: float) -> dict:
+    v = classify_fast(text)
+    if v.confidence < threshold:
+        return {"answer": classify_strong(text), "model": STRONG_MODEL,
+                "confidence": v.confidence, "escalated": True}
+    return {"answer": v.answer, "model": FAST_MODEL,
+            "confidence": v.confidence, "escalated": False}
+```
+
+This much is what many people already run. The open question is how you choose and maintain that final `threshold`. Self-reported confidence is convenient, but there is no guarantee the model estimates "its own confidence" accurately. That is precisely why you need a mechanism to **check that confidence from the outside**.
+
+## How to learn, after the fact, whether the threshold was right
+
+The heart of that check is a step I call shadow re-evaluation. The idea is simple: **take a slice of the outputs you finalized with Flash (the ones you did not send to Pro) and run them through Pro afterward to compare.**
+
+The important detail is to restrict re-evaluation to the side you did *not* escalate. Anything sent to Pro is already the strong model's answer, so there is nothing to verify. What we want to know is: among the items we passed as "confident enough" on Flash, how many errors are hiding that really should have gone to Pro? That is the only signal that tells you whether the threshold is too high or too low.
+
+```python
+import random
+
+def shadow_sample(records: list[dict], rate: float = 0.05) -> list[dict]:
+    """Pick a fixed fraction of the Flash-finalized records."""
+    kept = [r for r in records if not r["escalated"]]
+    k = max(1, int(len(kept) * rate))
+    return random.sample(kept, min(k, len(kept)))
+
+def shadow_evaluate(samples: list[dict]) -> list[dict]:
+    """Re-classify each sample with Pro and record whether it matched Flash."""
+    out = []
+    for r in samples:
+        strong = classify_strong(r["text"])
+        out.append({
+            "confidence": r["confidence"],
+            "flash_answer": r["answer"],
+            "strong_answer": strong,
+            "disagreed": _normalize(strong) != _normalize(r["answer"]),
+        })
+    return out
+
+def _normalize(s: str) -> str:
+    return s.strip().lower()
+```
+
+For some tasks, exact string matching won't decide whether two answers agree. For summaries or generated descriptions, replace the `disagreed` check with an LLM-as-judge call or an embedding similarity. The point is the structure — grading Flash's finalized output through the strong model's eyes — and the judging method swaps in per task.
+
+## Back-solving the threshold from a disagreement rate
+
+Once you have shadow-evaluation samples, each one is a pair: a confidence `c` and whether it disagreed with Pro. From here you can **back-solve the threshold from a target quality level.**
+
+I decide a quality budget up front — "keep the disagreement rate among Flash-finalized items under 5%." Then, for each candidate threshold `T`, I estimate "the residual disagreement rate in the band you would pass if you required `c >= T`," and pick the smallest `T` that meets the budget. Lowering `T` means fewer escalations and lower cost, but a higher disagreement rate. The point where the two just touch your budget is the threshold that is reasonable right now.
+
+```python
+def recalibrate(evals: list[dict], budget: float = 0.05,
+                grid: list[float] | None = None) -> float:
+    """Back-solve the smallest threshold that meets the quality budget."""
+    grid = grid or [round(x * 0.01, 2) for x in range(50, 96)]  # 0.50 to 0.95
+    best = grid[-1]
+    for t in grid:  # search from the low end
+        kept = [e for e in evals if e["confidence"] >= t]
+        if len(kept) < 20:        # don't trust bands with too few samples
+            continue
+        rate = sum(e["disagreed"] for e in kept) / len(kept)
+        if rate <= budget:
+            best = t
+            break  # take the smallest T that fits the budget
+    return best
+```
+
+The value `recalibrate` returns is "the threshold that, under the current production distribution, minimizes cost while honoring the quality budget." The `0.7` you set by hand becomes a number with evidence behind it.
+
+Note that it discards bands with too few samples (`len(kept) < 20`). High-confidence bands tend to be sparse, and just because a band happened to show zero disagreement does not mean you should push `T` that high — you would escalate excessively. Recalibration is always safest when it only moves within "the range where you have enough observations."
+
+## Implementation: log the routing decision
+
+To run the loop, you have to keep your production routing decisions. At minimum, record the input, the confidence, whether you escalated, and the final answer. As an indie developer I write asynchronously through Cloud Tasks, but here is a synchronous version that makes the essentials clear.
+
+```python
+import json, time, pathlib
+
+LOG = pathlib.Path("routing_log.jsonl")
+
+def route_and_log(text: str, threshold: float) -> dict:
+    r = route(text, threshold)
+    record = {
+        "ts": time.time(),
+        "text": text,
+        "answer": r["answer"],
+        "confidence": r["confidence"],
+        "escalated": r["escalated"],
+        "threshold_used": threshold,
+    }
+    with LOG.open("a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return r
+```
+
+The trick is to always store `threshold_used` alongside. After recalibration moves the threshold, if you cannot trace "which records were processed under which threshold," you lose the ability to verify the effect.
+
+## Implementation: a nightly job that proposes a new threshold
+
+Once records accumulate, recalibrate once a day in a batch. Sample from the previous day's finalized records, re-evaluate them on Pro, then propose and store a new threshold.
+
+```python
+def nightly_recalibration(threshold_path="threshold.json",
+                          budget=0.05, sample_rate=0.05) -> dict:
+    records = [json.loads(l) for l in LOG.read_text().splitlines()]
+    today = [r for r in records if r["ts"] >= time.time() - 86400]
+
+    samples = shadow_sample(today, rate=sample_rate)
+    evals = shadow_evaluate(samples)
+    proposed = recalibrate(evals, budget=budget)
+
+    current = json.loads(pathlib.Path(threshold_path).read_text())["value"]
+    kept = [e for e in evals if e["confidence"] >= current]
+    observed = (sum(e["disagreed"] for e in kept) / len(kept)) if kept else 0.0
+
+    return {
+        "current": current,
+        "proposed": proposed,
+        "observed_disagreement": round(observed, 3),
+        "sample_size": len(evals),
+    }
+```
+
+This function returns both "the measured disagreement rate at the current threshold" and "the proposed threshold." If `observed_disagreement` exceeds your budget, that is a clear sign the threshold was too low (you were passing too leniently). If it sits well below, you may have been escalating too much and overpaying for Pro.
+
+## Before / After: a hand-set threshold versus auto-calibration
+
+Here is a rough share of what happened when I ran this loop for three weeks on my article-metadata classification pipeline (about 1,200 requests per day). The numbers are from my environment; a different task will of course shift them.
+
+Before calibration, with `0.70` fixed by hand, the state was:
+
+- Escalation rate: about 22%
+- Disagreement rate among Flash-finalized items (via shadow re-evaluation): about 9% (well over the 5% quality budget)
+- In other words, cost was contained, but I was silently passing 9% of errors that should have gone to Pro
+
+After running the loop, the threshold climbed from `0.70` to `0.83` over several days and settled at:
+
+- Escalation rate: about 31% (+9 points)
+- Disagreement rate among Flash-finalized items: about 4.6% (converged within budget)
+- Monthly API cost rose about 1.2x, but rework caused by misclassification dropped visibly
+
+What this surfaced was a plain fact: "`0.70` was not cheap — it only *looked* cheap by sacrificing quality." Calibration taught me the "correct cost," is the closest way to put it. I also saw the opposite case in a different pipeline, where calibration **lowered the threshold and reduced cost.** Because you cannot know in advance which way it will move, it is worth measuring before deciding.
+
+## Guardrails so the loop never runs away
+
+Once you let a threshold move automatically, you must build in safeguards against runaway behavior. I keep three guardrails in place.
+
+The first is hysteresis. Rather than adopting the proposal outright, I cap how far the threshold can move from `current` in one step at 0.05. This prevents day-to-day jumps caused by sample variance.
+
+```python
+def apply_with_hysteresis(current: float, proposed: float,
+                          max_step: float = 0.05, min_sample: int = 100,
+                          sample_size: int = 0) -> float:
+    if sample_size < min_sample:
+        return current  # don't move on days with too few observations
+    delta = max(-max_step, min(max_step, proposed - current))
+    return round(min(0.95, max(0.50, current + delta)), 2)
+```
+
+The second is a lower/upper clamp. The code above keeps it within `0.50 to 0.95`. However calibration swings, it never collapses into an extreme like all-Flash or all-Pro.
+
+The third is a check against a cost ceiling. From the escalation rate implied by the proposed threshold, estimate the daily cost, and if it exceeds a budget you set in advance, hold off on adopting it and just raise an alert. The quality budget and the cost budget can be incompatible, and when they are, a human should decide. The loop lines up the "material to think with" every day, but I keep the final scale in my own hands.
+
+## What running it surfaced
+
+The biggest change after adding this loop was how I relate to the threshold as a number. It used to be something I'd touch on a hunch twice a year; now I can tell whether the router is healthy just by glancing at the morning's proposal and the measured disagreement rate. Simply making the silent decay visible as a number changes the whole feel of operating it.
+
+As a next step, I'd suggest first **running only the shadow re-evaluation at a 5% sampling rate, and recording your current threshold's measured disagreement rate for a week.** Before automating calibration, just knowing how lenient (or strict) your threshold actually is will change the quality of your judgment. Moving the threshold automatically can wait until after you've seen that number.

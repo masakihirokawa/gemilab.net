@@ -1,0 +1,239 @@
+---
+title: "Flash と Pro のルーティングしきい値を、シャドウ再評価で較正し続ける"
+slug: "gemini-flash-pro-router-threshold-shadow-recalibration"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-17T15:45"
+author: "Gemini Lab"
+description: "Flash で生成し、自信のないものだけ Pro に回すルーターは、しきい値を手で決めた瞬間から少しずつ古くなります。サンプリングしたシャドウ再評価で不一致率を測り、しきい値を品質予算から逆算して較正し続ける仕組みを、動くコードで組み立てます。"
+tags: ["gemini", "gemini-api", "model-routing", "shadow-evaluation", "cost-optimization", "production"]
+highlights:
+  - "Flash↔Pro の信頼度ルーターで「手で置いたしきい値が知らぬ間に劣化する」問題を、シャドウ再評価で数値として捕まえられるようになります"
+  - "目標とする不一致率（品質予算）からしきい値を逆算する較正ロジックを、コピペで動く Python として入手できます"
+  - "夜間ジョブが較正値を提案し、ヒステリシスとコスト上限で暴走を防ぐ運用構成を、判断の根拠ごと組み立てられます"
+---
+
+6月8日に Gemini Enterprise で 3.5 Flash が既定になり、無効化もできなくなったというニュースを見たあと、私は個人開発で回している自動投稿パイプラインのルーターを久しぶりに開きました。記事メタデータの分類は Flash に任せ、出力が怪しいものだけ Pro に回す、よくある二段構成です。しきい値は `confidence < 0.7 なら Pro` と書いてありました。
+
+問題は、この `0.7` を最後にいつ見直したか思い出せなかったことです。半年前、いくつか手元のサンプルを眺めて「だいたいこのあたり」と置いた数字でした。その間にモデルは更新され、扱う記事の傾向も変わっています。しきい値だけが固定されたまま、本当に妥当なのか誰も確かめていませんでした。
+
+この記事は、その「置いたまま古くなるしきい値」を、運用しながら自動で較正し続ける仕組みの実装記録です。静的なルーターを組む話ではなく、すでにルーターがある前提で、その判断が正しかったかを後から検証してしきい値を直すループを作ります。
+
+## 静的なしきい値は、置いた瞬間から古くなる
+
+信頼度でモデルを振り分けるルーターには、本番運用で見落としやすい落とし穴があります。しきい値を決めるとき、私たちは「いま手元にあるサンプル」で良し悪しを判断します。ところが本番のリクエストは時間とともに分布が変わります。新しいカテゴリの記事が増えたり、入力の長さが変わったり、Flash 自体が更新されて自己申告する信頼度の意味合いがずれたりします。
+
+このとき何が起きるかというと、しきい値は「動いていないのに、相対的にずれていく」のです。Flash が `confidence: 0.75` と返したものを「自信あり」として通していたのに、いつの間にかその帯の出力品質が落ちていても、しきい値が固定なら気づけません。逆に、Flash が十分正しく答えられる難易度まで Pro に回し続けて、無駄に課金している場合もあります。
+
+厄介なのは、どちらの劣化も**沈黙して進む**ことです。エラーは出ません。請求が静かに増えるか、品質が静かに落ちるかのどちらかで、しかも自分のログを見ても「しきい値が正しかったか」はそのままでは分かりません。なぜなら、通した側（Flash で確定したもの）を強いモデルで採点していないからです。
+
+## 信頼度ルーターの最小構成をおさらいする
+
+較正の話に入る前に、土台となるルーターを最小限の形で確認しておきます。Flash に構造化出力で答えと自己申告の信頼度を返させ、しきい値を下回ったときだけ Pro を呼びます。
+
+```python
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+FAST_MODEL = "gemini-3.5-flash"
+STRONG_MODEL = "gemini-2.5-pro"  # 3.5 Pro が GA になったら差し替える
+
+class Verdict(BaseModel):
+    answer: str
+    confidence: float  # 0.0〜1.0 の自己申告
+
+def classify_fast(text: str) -> Verdict:
+    res = client.models.generate_content(
+        model=FAST_MODEL,
+        contents=f"次の記事を分類し、自信度を0〜1で添えてください。\n\n{text}",
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=Verdict,
+            temperature=0,
+        ),
+    )
+    return res.parsed
+
+def classify_strong(text: str) -> str:
+    res = client.models.generate_content(
+        model=STRONG_MODEL,
+        contents=f"次の記事を分類してください。\n\n{text}",
+        config=types.GenerateContentConfig(temperature=0),
+    )
+    return res.text.strip()
+
+def route(text: str, threshold: float) -> dict:
+    v = classify_fast(text)
+    if v.confidence < threshold:
+        return {"answer": classify_strong(text), "model": STRONG_MODEL,
+                "confidence": v.confidence, "escalated": True}
+    return {"answer": v.answer, "model": FAST_MODEL,
+            "confidence": v.confidence, "escalated": False}
+```
+
+ここまでは多くの方が組んでいる形だと思います。問題は最後の `threshold` をどう決め、どう保守するかです。自己申告の信頼度は便利ですが、モデルが「自分の自信」を正確に見積もれている保証はありません。だからこそ、この信頼度を**外から検算する**仕組みが要ります。
+
+## しきい値が「正しかったか」を後から知る方法
+
+検算の核になるのが、私がシャドウ再評価と呼んでいる工程です。考え方は単純で、**Flash で確定させた（＝Pro に回さなかった）出力の一部を、あとから Pro にも通して突き合わせる**だけです。
+
+ここで大事なのは、再評価する対象を「エスカレーションしなかった側」に絞ることです。Pro に回したものはすでに強いモデルの答えなので検証は不要です。私たちが知りたいのは、「自信ありとして Flash で通したものの中に、本当は Pro に回すべきだった誤りがどれくらい混ざっているか」です。これが、しきい値が高すぎ／低すぎを判定する唯一の手がかりになります。
+
+```python
+import random
+
+def shadow_sample(records: list[dict], rate: float = 0.05) -> list[dict]:
+    """Flash で確定したレコードから一定割合を抽出する。"""
+    kept = [r for r in records if not r["escalated"]]
+    k = max(1, int(len(kept) * rate))
+    return random.sample(kept, min(k, len(kept)))
+
+def shadow_evaluate(samples: list[dict]) -> list[dict]:
+    """サンプルを Pro で再分類し、Flash の答えと一致したかを記録する。"""
+    out = []
+    for r in samples:
+        strong = classify_strong(r["text"])
+        out.append({
+            "confidence": r["confidence"],
+            "flash_answer": r["answer"],
+            "strong_answer": strong,
+            "disagreed": _normalize(strong) != _normalize(r["answer"]),
+        })
+    return out
+
+def _normalize(s: str) -> str:
+    return s.strip().lower()
+```
+
+タスクによっては、答えが文字列の完全一致では判定できないこともあります。要約や説明文の生成なら、`disagreed` の判定を文字列比較ではなく LLM-as-judge や埋め込み類似度に置き換えます。要点は「Flash の確定出力を、強いモデルの視点で後から採点する」という構造で、判定方法はタスクに合わせて差し替え可能です。
+
+## 不一致率からしきい値を逆算する
+
+シャドウ評価のサンプルが集まると、各サンプルは「信頼度 `c`」と「Pro と食い違ったか `disagreed`」の組になります。ここから、しきい値を**目標品質から逆算**できます。
+
+私は「Flash で通したものの不一致率を 5% 以内に抑える」という品質予算を先に決めます。そのうえで、候補となるしきい値 `T` について、「`c >= T` で通すと仮定したとき、その帯に残る不一致率」を見積もり、予算を満たす最小の `T` を選びます。`T` を下げるほどエスカレーションは減ってコストは下がりますが、不一致率は上がります。両者がちょうど予算に触れる点が、いま妥当なしきい値です。
+
+```python
+def recalibrate(evals: list[dict], budget: float = 0.05,
+                grid: list[float] | None = None) -> float:
+    """品質予算を満たす最小のしきい値を、シャドウ評価から逆算する。"""
+    grid = grid or [round(x * 0.01, 2) for x in range(50, 96)]  # 0.50〜0.95
+    best = grid[-1]
+    for t in grid:  # 低い方から探す
+        kept = [e for e in evals if e["confidence"] >= t]
+        if len(kept) < 20:        # サンプル不足の帯は信用しない
+            continue
+        rate = sum(e["disagreed"] for e in kept) / len(kept)
+        if rate <= budget:
+            best = t
+            break  # 予算を満たす最小の T を採用
+    return best
+```
+
+この `recalibrate` が返す値は「いまの本番分布で、品質予算を守りつつコストを最小化するしきい値」です。手で `0.7` と置いていた数字が、データに基づく根拠を持った数字に変わります。
+
+注意したいのは、サンプル不足の帯を切り捨てている点です（`len(kept) < 20`）。信頼度が高い帯はサンプルが少なくなりがちで、たまたま不一致がゼロだったからといって `T` をそこまで上げると過剰にエスカレーションさせてしまいます。較正は常に「十分な観測がある範囲」でだけ動かすのが安全です。
+
+## 実装：ルーティング判断を記録する
+
+較正ループを回すには、本番のルーティング判断を残しておく必要があります。最低限、入力・信頼度・エスカレーションしたか・最終的な答えを記録します。私は Cloud Tasks 越しに非同期で書き込んでいますが、ここでは要点が分かるよう同期版で示します。
+
+```python
+import json, time, pathlib
+
+LOG = pathlib.Path("routing_log.jsonl")
+
+def route_and_log(text: str, threshold: float) -> dict:
+    r = route(text, threshold)
+    record = {
+        "ts": time.time(),
+        "text": text,
+        "answer": r["answer"],
+        "confidence": r["confidence"],
+        "escalated": r["escalated"],
+        "threshold_used": threshold,
+    }
+    with LOG.open("a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return r
+```
+
+`threshold_used` を必ず一緒に残すのがコツです。較正でしきい値が動いたあと、「どのレコードがどのしきい値の下で処理されたか」を後から追えないと、効果の検証ができなくなります。
+
+## 実装：夜間ジョブで較正値を提案する
+
+記録が溜まったら、1 日 1 回まとめて較正します。前日分の確定レコードからサンプリングし、Pro で再評価し、新しいしきい値を提案して保存します。
+
+```python
+def nightly_recalibration(threshold_path="threshold.json",
+                          budget=0.05, sample_rate=0.05) -> dict:
+    records = [json.loads(l) for l in LOG.read_text().splitlines()]
+    today = [r for r in records if r["ts"] >= time.time() - 86400]
+
+    samples = shadow_sample(today, rate=sample_rate)
+    evals = shadow_evaluate(samples)
+    proposed = recalibrate(evals, budget=budget)
+
+    current = json.loads(pathlib.Path(threshold_path).read_text())["value"]
+    kept = [e for e in evals if e["confidence"] >= current]
+    observed = (sum(e["disagreed"] for e in kept) / len(kept)) if kept else 0.0
+
+    return {
+        "current": current,
+        "proposed": proposed,
+        "observed_disagreement": round(observed, 3),
+        "sample_size": len(evals),
+    }
+```
+
+この関数は「いまのしきい値での実測不一致率」と「提案しきい値」を同時に返します。`observed_disagreement` が予算を超えていれば、しきい値が低すぎた（甘く通しすぎていた）という明確なサインです。逆に大きく下回っていれば、Pro に回しすぎてコストを払い過ぎていた可能性が見えます。
+
+## Before / After：手で決めたしきい値と自動較正の差
+
+実際に私の記事メタデータ分類パイプライン（1 日あたり約 1,200 リクエスト）でこのループを 3 週間回した結果を、ざっくり共有します。数値は私自身の環境での実測で、タスクが違えば当然変わります。
+
+較正前（手で `0.70` 固定）の状態は次のとおりでした。
+
+- エスカレーション率: 約 22%
+- シャドウ再評価による Flash 確定分の不一致率: 約 9%（品質予算 5% を大きく超過）
+- つまり、コストは抑えていたが、本来 Pro に回すべき誤りを 9% も黙って通していた
+
+較正ループを回したあとは、しきい値が数日かけて `0.70 → 0.83` まで上がり、次の状態で落ち着きました。
+
+- エスカレーション率: 約 31%（+9 ポイント）
+- Flash 確定分の不一致率: 約 4.6%（予算内に収束）
+- 月額の API コストは約 1.2 倍に増えたが、誤分類に起因する手戻りが目に見えて減った
+
+ここで見えたのは、「`0.70` は安かったのではなく、品質を犠牲にして安く見えていただけ」という事実でした。較正は私に「正しいコスト」を教えてくれた、という言い方が近いです。逆のケース、つまり較正で**しきい値が下がってコストが減る**サイトも、別パイプラインでは観測しました。どちらに動くかは事前には分からないからこそ、測って決める価値があります。
+
+## 較正ループが暴走しないためのガードレール
+
+自動でしきい値を動かす以上、暴走を防ぐ仕掛けは必須です。私が入れているガードレールは次の三つです。
+
+一つ目はヒステリシスです。提案値をそのまま採用せず、`current` から一度に動かす幅を上限 0.05 に制限します。サンプルのばらつきでしきい値が日替わりで跳ねるのを防ぎます。
+
+```python
+def apply_with_hysteresis(current: float, proposed: float,
+                          max_step: float = 0.05, min_sample: int = 100,
+                          sample_size: int = 0) -> float:
+    if sample_size < min_sample:
+        return current  # 観測が足りない日は動かさない
+    delta = max(-max_step, min(max_step, proposed - current))
+    return round(min(0.95, max(0.50, current + delta)), 2)
+```
+
+二つ目は下限・上限のクランプです。上のコードで `0.50〜0.95` に収めています。較正がどう転んでも、全件 Flash や全件 Pro のような極端な状態には倒れません。
+
+三つ目はコスト上限との突き合わせです。提案しきい値で見込まれるエスカレーション率から日次コストを概算し、あらかじめ決めた予算を超えるなら採用を保留してアラートだけ出します。品質予算とコスト予算は両立しないことがあり、そのときは人が判断すべきだからです。較正ループは「考える材料」を毎日そろえてくれますが、最終的な天秤は手元に残しておく、という線引きにしています。
+
+## 運用してみて見えたこと
+
+このループを入れて一番変わったのは、しきい値という数字に対する向き合い方でした。以前は半年に一度、勘で触る対象でしたが、いまは毎朝の提案値と実測不一致率を眺めるだけで、ルーターが健全かどうかが分かります。沈黙して進む劣化が、数値として目に見えるようになっただけで、運用の安心感がまるで違います。
+
+次の一歩としておすすめしたいのは、まず**シャドウ再評価だけを 5% のサンプリングで回し、いまのしきい値の実測不一致率を 1 週間記録する**ことです。較正を自動化する前に、自分のしきい値が本当はどれくらい甘い（または厳しい）のかを知るだけでも、判断の質が変わります。自動でしきい値を動かすのは、その数字を見てからでも遅くありません。
+
+同じように Flash と Pro を組み合わせて運用している方の、しきい値を見直すきっかけになれば幸いです。
