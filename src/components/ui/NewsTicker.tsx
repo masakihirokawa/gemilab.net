@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLI — Gemini CLIのホスト応答は明日6/18に停止し、後継のAntigravity CLIへ一本化されます。依存スクリプトは本日中に切替確認をおすすめします",
-    "PRO — Gemini 3.5 ProがGA間近です。Antigravity 2.0はすでにFlashで稼働し、GA当日にProが加わる見込みです",
-    "FLASH — Gemini Enterpriseでは6/8以降、3.5 Flashが既定で有効化され無効化できません。既定モデルが変わると出力の癖も変わります",
-    "OMNI — I/O 2026で発表されたGemini Omniは、任意の入力から生成し、会話でそのまま自然に編集できます",
-    "SPARK — パーソナルAIエージェントGemini Spark、Daily Brief、再設計されたUIも公開され、チャットから連携型の作業環境へと進んでいます",
-    "STACK — Deep Think・Deep Research・Gemini Liveと合わせ、推論・調査・音声・動画を横断する一体運用が前面に出ています",
+    "CLI — 本日6/18、Gemini CLIとGemini Code Assist IDE拡張がAI Pro/Ultra・無料個人利用向けにリクエスト提供を終了。後継はAntigravity CLIです",
+    "FLASH — Gemini 3.5シリーズが始動し3.5 Flashが提供開始。エージェントとコーディング向けにフロンティア級、長時間タスクに強いと説明されています",
+    "DEEPTHINK — Gemini 3 Deep ThinkがGoogle AI Ultra向けに展開中。数学・科学・論理・多段推論の最上位モードです",
+    "APP — GeminiアプリにDaily Brief、再設計UI、AI動画モデルGemini Omni、個人AIエージェントGemini Sparkが加わりました",
+    "DESIGN — 新デザイン言語Neural Expressiveで、よりリッチな視覚出力とモダリティ間の素早い切替に向けて再構築されています",
+    "ULTRA — Google AI Ultraはモデル最上位アクセス・Deep Research・Veo 3動画生成・100万トークンコンテキストを束ねるプレミアム枠です",
   ],
   en: [
-    "CLI — Gemini CLI stops serving hosted responses tomorrow (Jun 18) and consolidates into its successor, Antigravity CLI; confirm any dependent scripts today",
-    "PRO — Gemini 3.5 Pro is close to GA; Antigravity 2.0 already runs Flash and is expected to add Pro on launch day",
-    "FLASH — In Gemini Enterprise, 3.5 Flash has been the default since Jun 8 and cannot be turned off; a new default model means new output quirks",
-    "OMNI — Gemini Omni, unveiled at I/O 2026, creates from any input and lets you edit naturally through conversation",
-    "SPARK — Google also shipped Gemini Spark (a personal AI agent), Daily Brief, and a redesigned UI, moving from chatbot to a connected work system",
-    "STACK — Together with Deep Think, Deep Research, and Gemini Live, the lineup spans reasoning, research, voice, and video in one workflow",
+    "CLI — As of Jun 18, Gemini CLI and the Gemini Code Assist IDE extensions stop serving AI Pro/Ultra and free individual users; Antigravity CLI is the successor",
+    "FLASH — The Gemini 3.5 series begins with 3.5 Flash, built for agents and coding with strength on long-horizon tasks",
+    "DEEPTHINK — Gemini 3 Deep Think is rolling out to Google AI Ultra as the top reasoning mode for math, science, and logic",
+    "APP — The Gemini app gains a Daily Brief, a redesigned interface, the Gemini Omni video model, and a personal agent called Gemini Spark",
+    "DESIGN — A new design language, Neural Expressive, rebuilds the experience for richer visuals and faster switching between modalities",
+    "ULTRA — Google AI Ultra bundles top model access, Deep Research, Veo 3 video, and a 1M-token context window",
   ],
 };
 
