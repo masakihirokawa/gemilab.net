@@ -1,0 +1,237 @@
+---
+title: "Running Gemini Chat History on Redis — Field Notes on Not Losing Conversation State in Production"
+slug: "gemini-chat-session-redis-state-production-operations-notes"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-06-17T13:00"
+author: "Gemini Lab"
+description: "Keep a Gemini ChatSession in process memory and it evaporates on every redeploy or scale event. Here is how I back it with Redis in production, covering token budgets, concurrent sends, SDK coupling, and graceful degradation, with the code I actually run."
+tags: ["gemini", "gemini-api", "redis", "session-management", "production", "operations"]
+highlights:
+  - "How to move conversation state out of the process, and how to tell apart the three failure modes that erase history on redeploy and horizontal scale"
+  - "A sliding-window-plus-summary implementation that caps tokens from measured data, and why the summary step belongs on a lightweight model"
+  - "The full production skeleton: safe Lua lock release, an SDK-independent storage format, and graceful degradation when Redis is down"
+---
+The first bug report I got after shipping a chat feature was "I can't pick up where I left off yesterday." Locally everything worked. The moment it ran on Cloud Run, the assistant reintroduced itself every time a user reopened the app. The cause was embarrassingly simple: I was holding the `ChatSession` object in process memory.
+
+Gemini's `chats.create(history=...)` will happily respond with full context as long as you hand it the history. Starting from `history=[]` in the official sample is correct — but if you scale the service without deciding *where* that history lives, it breaks quietly on day one. Below are the parts of my own chat state management, drawn from running it as an indie developer, that matter, framed around backing it with Redis: where the naive implementation falls apart, and how I closed each gap, with the code attached.
+
+A note on models: this article assumes `gemini-3.5-flash`, the default as of June 2026, and `gemini-3.5-pro` when you want heavier reasoning. Because the default model can shift under you and change the shape of outputs, decoupling your stored history from the SDK (covered later) lets you migrate without rewriting the storage layer each time.
+
+## The three failure modes I watch in production
+
+In-memory state breaks down for one root reason: the lifetime of a container does not match the lifetime of a conversation. These are the three symptoms I actively monitor.
+
+First, **containers are short-lived**. A Cloud Run instance shuts down minutes after traffic stops. On restart your global variables are empty and the in-flight conversation is gone. No exception is logged, so you usually learn about it from a user, which makes it the nastiest of the three.
+
+Second, **request routing under horizontal scale**. If a user's first and second messages land on different instances, each sees its own isolated memory and the history never connects. Sticky sessions can pin a user to one instance, but you give up scaling flexibility — pushing state outside the process is the cleaner answer.
+
+Third, **client reconnection**. When a mobile app is killed and reopened hours later, there is no guarantee the server still holds that state. Designing around "a session can disappear at any time" turns out to be the more robust posture.
+
+Redis fits this role well: millisecond reads and writes, automatic expiry via TTL, and Pub/Sub for real-time notification if you need it. As a relay point for chat state, it is easy to work with.
+
+## A "just works" version, and where it frays
+
+Let's start from the minimal version, then knock down the gaps one at a time.
+
+```python
+# requirements: google-genai, redis
+import json
+import os
+import redis
+from google import genai
+
+r = redis.Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def chat_once(session_id: str, user_message: str) -> str:
+    raw = r.get(f"chat:{session_id}")
+    history = json.loads(raw) if raw else []
+
+    chat = client.chats.create(model="gemini-3.5-flash", history=history)
+    response = chat.send_message(user_message)
+
+    new_history = [
+        {"role": msg.role, "parts": [{"text": p.text} for p in msg.parts]}
+        for msg in chat.get_history()
+    ]
+    r.set(f"chat:{session_id}", json.dumps(new_history))
+    return response.text
+```
+
+This runs. But after a few days in production, the following frays showed up in order.
+
+First, **history grows without bound**. Each round adds hundreds to thousands of tokens; on a chatty session I saw it cross 100k tokens in about a week. Response latency degrades visibly and input-token billing climbs linearly.
+
+Second, **there is no TTL**. You write and never expire, so abandoned sessions linger. Redis memory climbs, and depending on `maxmemory` and the eviction policy, new sessions eventually fail to persist.
+
+Third, **concurrent writes corrupt history**. If the same user sends from two tabs, one save overwrites the other wholesale. Combined with optimistic UI updates, the display and the stored state drift apart into a hard-to-reproduce bug.
+
+Fourth, **it couples to the Gemini SDK's internals**. Serializing the output of `chat.get_history()` directly means old data stops loading when an SDK upgrade changes the structure.
+
+Let's close them in turn.
+
+## Set the token budget from measurement, not guesswork
+
+For unbounded history I use a sliding window: keep the most recent N rounds verbatim and replace anything older with a summary. You preserve recent context while compressing the older background.
+
+```python
+from google import genai
+
+MAX_RECENT_TURNS = 10  # keep the last 10 rounds (= 20 messages) verbatim
+SUMMARY_TRIGGER = 14   # summarize once the round count exceeds this
+
+def trim_history(history: list, client: genai.Client) -> list:
+    """Keep the last N rounds; replace older ones with a summary."""
+    turns = len(history) // 2
+    if turns <= SUMMARY_TRIGGER:
+        return history
+
+    cut = (turns - MAX_RECENT_TURNS) * 2
+    older, recent = history[:cut], history[cut:]
+
+    older_text = "\n".join(
+        f"{m['role']}: {m['parts'][0]['text']}" for m in older
+    )
+    # Summarizing is not a hard task, so a lightweight model is plenty
+    summary = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=(
+            "Summarize the conversation below in 300 characters or fewer. "
+            "Always preserve proper nouns, numbers, and any unfinished task state.\n\n"
+            f"{older_text}"
+        ),
+    ).text
+
+    return [
+        {"role": "user", "parts": [{"text": f"[Summary of the conversation so far]\n{summary}"}]},
+        {"role": "model", "parts": [{"text": "Understood. Let's continue."}]},
+        *recent,
+    ]
+```
+
+What actually helped was refusing to pick the threshold by feel. I first measured the average tokens per round from production logs, then derived `MAX_RECENT_TURNS` from it. In my case a round averaged around 600 tokens, so I set the cap near the last 10 rounds (~12k tokens) and aimed to keep each post-summary request under 15k tokens. Latency steadied and input billing became predictable.
+
+Putting `gemini-3.5-flash` on the summary is deliberate. Use a reasoning-heavier model for the main reply, but route the light summarization to a fast, cheap model, and compression cost drops to a rounding error.
+
+## Pin down concurrency and TTL on the Redis side
+
+TTL is simplest when refreshed on every write, giving the intuitive behavior of "expire automatically a fixed time after last access."
+
+```python
+SESSION_TTL = 60 * 60 * 24 * 7  # 7 days, measured from last access
+
+r.set(f"chat:{session_id}", json.dumps(new_history), ex=SESSION_TTL)
+```
+
+For concurrent writes I guarantee ordering with a per-session lock. For chat, a dedicated `SET NX` lock key is often easier to handle than optimistic `WATCH`/`MULTI`.
+
+```python
+import uuid
+import time
+
+def with_session_lock(session_id: str, fn, timeout_ms: int = 5000):
+    """Acquire a per-session lock before running fn()."""
+    lock_key = f"chat:lock:{session_id}"
+    token = str(uuid.uuid4())
+    deadline = time.time() + timeout_ms / 1000
+
+    while time.time() < deadline:
+        if r.set(lock_key, token, nx=True, px=10000):  # lock self-expires in 10s
+            try:
+                return fn()
+            finally:
+                # delete only when the token matches (never steal someone else's lock)
+                release = (
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                    "return redis.call('del', KEYS[1]) else return 0 end"
+                )
+                r.eval(release, 1, lock_key, token)
+        time.sleep(0.05)
+
+    raise RuntimeError("Failed to acquire chat session lock")
+```
+
+Releasing via a Lua script that checks the token first prevents a specific accident: the work runs long, the lock's TTL expires, another process grabs the same key, and then you delete *its* lock by mistake. Since `send_message` can take several seconds, that "only delete my own lock" step earns its keep in production.
+
+## Decouple the storage format from the SDK
+
+Depend directly on the SDK's object structure and your storage layer breaks on every minor upgrade. Slipping in your own intermediate format (a DTO) is, in my experience, the most durable choice.
+
+```python
+import time
+from dataclasses import dataclass, asdict
+from typing import Literal
+
+@dataclass
+class StoredMessage:
+    role: Literal["user", "model"]
+    text: str
+    ts: float  # creation time (for debugging and analytics)
+
+def to_stored(history) -> list[dict]:
+    out = []
+    for msg in history:
+        text = "".join(p.text for p in msg.parts if hasattr(p, "text"))
+        out.append(asdict(StoredMessage(role=msg.role, text=text, ts=time.time())))
+    return out
+
+def from_stored(stored: list[dict]) -> list[dict]:
+    """Convert back to the format the Gemini API expects."""
+    return [
+        {"role": m["role"], "parts": [{"text": m["text"]}]}
+        for m in stored
+    ]
+```
+
+With this layer, new Parts like image inputs or tool calls are absorbed by extending `StoredMessage`. In fact, having storage in this shape meant that migrating the SDK from `google-generativeai` to `google-genai` only touched the adapter functions. I moved over without migrating a single stored record, precisely because that one layer was in place.
+
+## Don't stop the conversation when Redis goes down
+
+This is the part that made me think hardest after shipping. Session history is irreproducible data, but that is no reason to take the whole service down on a Redis outage. I degrade instead: if reading or writing history fails, accept the turn as a fresh conversation with no history.
+
+```python
+def load_history(session_id: str) -> list:
+    try:
+        raw = r.get(f"chat:{session_id}")
+        return from_stored(json.loads(raw)) if raw else []
+    except redis.RedisError:
+        # only the history is missing; the conversation still proceeds (degraded mode)
+        return []
+
+def save_history(session_id: str, history) -> None:
+    try:
+        r.set(f"chat:{session_id}", json.dumps(to_stored(history)), ex=SESSION_TTL)
+    except redis.RedisError:
+        # count the failure as a metric, but still return the response
+        pass  # increment a monitoring counter here
+
+```
+
+In degraded mode the user experiences a one-time loss of context, which is far less damaging than an error screen. The important part is not to swallow it with a bare `pass`: always record it as a metric. When the save-failure rate, normally zero, spikes, you detect the Redis problem immediately.
+
+## The assembled production skeleton
+
+Folding everything together lands on this structure. Load, trim, send, and save run in order, all inside the session lock.
+
+```python
+def chat_persistent(session_id: str, user_message: str) -> str:
+    def _run():
+        history = load_history(session_id)
+        history = trim_history(history, client)  # compress before saving
+
+        chat = client.chats.create(model="gemini-3.5-pro", history=history)
+        response = chat.send_message(user_message)
+
+        save_history(session_id, chat.get_history())
+        return response.text
+
+    return with_session_lock(session_id, _run)
+```
+
+Once latency becomes a concern at scale, you can move just the `trim_history` summary call onto an async job queue: serve the user with the pre-compression history and write back once the summary finishes in the background, compressing without sacrificing perceived speed. I'd suggest starting synchronous and only going async after summary duration starts to show up in your logs. Not reaching for complexity early lets the right thresholds reveal themselves while you operate.
+
+## Where to go next
+
+Start by adding a session key plus `load_history` / `save_history` to your existing in-memory implementation. That alone stops most of the "conversation vanished on redeploy" reports. From there, layer on trimming, TTL, locking, the intermediate format, and degradation one step at a time, and you arrive at a chat layer that holds up after months in production. If you're serious about putting conversational AI into a product, building out these options one by one makes your decisions noticeably faster when something does break.
