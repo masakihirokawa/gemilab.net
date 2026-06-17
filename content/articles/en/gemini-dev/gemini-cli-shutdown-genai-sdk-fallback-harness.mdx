@@ -1,0 +1,196 @@
+---
+title: "Keeping Nightly Batches Alive After the Gemini CLI Stops Responding: A google-genai SDK Fallback"
+slug: "gemini-cli-shutdown-genai-sdk-fallback-harness"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-06-18T04:45"
+author: "Gemini Lab"
+description: "On June 18 the Gemini CLI stops answering requests. Here is a small fallback harness that probes whether the CLI can still respond and quietly reroutes unattended batch jobs to the google-genai SDK, built from my own automation."
+tags: ["Gemini CLI", "fallback", "automation", "google-genai", "production"]
+highlights:
+  - "Detect the state where the gemini binary still exists but no longer answers, using a real one-shot generation instead of --version"
+  - "Collapse CLI-first and SDK-fallback into a single generate() with exponential backoff, so calls survive the shutdown"
+  - "Add a 16-character idempotency key to nightly jobs to stop duplicate publishing on re-runs"
+---
+
+On June 18, the Gemini CLI stops answering requests on the host side. As an indie developer running several sites that publish on a nightly schedule, I only realized how deeply that one command was wired into my pipeline once I started preparing for the cutover. I assumed `gemini -p "..."` was only doing article generation, but the same command was quietly buried in screenshot caption work and in pre-publish title proofreading too.
+
+The tricky part is that the `gemini` binary is still found by `which gemini` after June 18. What stops is the host response, not the local command. So if you judge liveness by "does the binary exist," you mistake a dead CLI for a live one, and your batch builds a mountain of timeouts. I wrote my first probe with `--version`, which passed in testing but left only the production nightly batch hanging.
+
+This is not a migration inventory. Rather than the broad plan of finding every place you depend on the CLI, I want to go deep on a single piece after that audit is done: a small harness that keeps work moving even when the CLI goes silent.
+
+## Which work to reroute to the SDK, and which to keep on the CLI
+
+Moving everything to the SDK is the safe choice, but you give up the interactive completions and project-context loading that make the CLI pleasant to use. I sorted my work into three buckets before touching any code.
+
+<table>
+<thead>
+<tr><th>Nature of the work</th><th>Destination</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Unattended nightly batch generation</td><td>SDK directly</td><td>No interaction needed; must run independently of the CLI</td></tr>
+<tr><td>Interactive local experimentation</td><td>Antigravity CLI</td><td>Keep context retention and the conversational feel</td></tr>
+<tr><td>One-shot calls inside CI</td><td>SDK directly</td><td>Prefer reproducibility and an audit trail</td></tr>
+</tbody>
+</table>
+
+The more unattended a job is, the more it belongs on the SDK. Only work where a person is in front of the screen stays on the CLI (the Antigravity CLI after migration); everything else escapes to the API. The code below is narrowed to one goal: keeping unattended batches alive.
+
+## Checking whether the CLI can respond right now
+
+The key to the check is not whether the binary exists, but whether one real response comes back. Send a short prompt; if it times out or exits non-zero, treat the CLI as unusable.
+
+```python
+import shutil
+import subprocess
+
+def cli_available(timeout_sec: int = 12) -> bool:
+    """Check whether the gemini CLI can answer right now.
+    The point is to try one real generation instead of --version.
+    The binary can remain while the host side no longer responds."""
+    if shutil.which("gemini") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["gemini", "-p", "ping"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+```
+
+I keep `timeout_sec` short, at 12 seconds, because waiting minutes on a probe defeats the purpose. A shut-down CLI never returns a response, so the longer you wait, the more you waste. A probe should knock lightly and give up fast.
+
+## A minimal google-genai SDK implementation
+
+The SDK call that serves as the fallback is surprisingly short. Because it runs independently of the CLI, this is the most solid foundation you have.
+
+```python
+import os
+from google import genai
+
+_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def run_via_sdk(prompt: str, model: str = "gemini-3.5-flash") -> str:
+    """Push non-interactive work to a direct SDK call.
+    This is the fallback that runs regardless of the CLI's state."""
+    response = _client.models.generate_content(
+        model=model,
+        contents=prompt,
+    )
+    return response.text
+```
+
+I specify `gemini-3.5-flash` because that model became the default starting June 8, and it suits speed-oriented stages such as unattended bulk generation. I only swap in a Pro-tier model for the stages that genuinely need heavier reasoning. Treat `GEMINI_API_KEY` as a placeholder in examples and never commit a real-format key.
+
+## Folding CLI execution and fallback into one function
+
+With a CLI runner in place, I fold retries and fallback into a single `generate()`. The caller never has to know which path was used.
+
+```python
+def run_via_cli(prompt: str, timeout_sec: int = 120) -> str:
+    result = subprocess.run(
+        ["gemini", "-p", prompt],
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"gemini CLI exited {result.returncode}: {result.stderr[:200]}")
+    return result.stdout.strip()
+```
+
+```python
+import time
+
+def generate(prompt: str, *, prefer_cli: bool = False, max_attempts: int = 3) -> str:
+    """Set prefer_cli=True only for work you want to keep on the CLI.
+    Everything else uses the SDK first and switches automatically if the CLI is down."""
+    last_error = None
+
+    if prefer_cli and cli_available():
+        for attempt in range(max_attempts):
+            try:
+                return run_via_cli(prompt)
+            except (subprocess.TimeoutExpired, RuntimeError) as exc:
+                last_error = exc
+                time.sleep(2 ** attempt)  # exponential backoff: 1, 2, 4 seconds
+
+    for attempt in range(max_attempts):
+        try:
+            return run_via_sdk(prompt)
+        except Exception as exc:  # APIError and friends
+            last_error = exc
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError(f"both CLI and SDK failed: {last_error}")
+```
+
+Defaulting `prefer_cli=False` is my own call. With the shutdown imminent, an unattended batch is safer calling the SDK from the start, and the CLI is worth trying only for work a person is watching. The `2 ** attempt` backoff is insurance against transient rate limits and network jitter. The easy mistake here is conflating CLI failures and SDK failures and swallowing them together; I once shipped a bug to production where the fallback never fired. Handle the exception types separately.
+
+## Giving nightly batches idempotency to prevent duplicate posts
+
+Once you add fallback, you re-run interrupted batches more often, and that is when duplicate publishing becomes the real risk. To avoid generating the same article twice in a day, slip in a lightweight idempotency key.
+
+```python
+import hashlib
+import pathlib
+
+STATE_DIR = pathlib.Path.home() / ".cache" / "nightly-batch"
+
+def already_done(site: str, slug: str, run_date: str) -> bool:
+    """An idempotency key so the same article is not processed twice a day.
+    Even if a batch dies midway and is re-run, duplicate posting is prevented."""
+    key = hashlib.sha1(f"{site}:{slug}:{run_date}".encode()).hexdigest()[:16]
+    marker = STATE_DIR / key
+    if marker.exists():
+        return True
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    marker.write_text(run_date)
+    return False
+```
+
+```python
+def nightly_job(site: str, slug: str, prompt: str, run_date: str) -> None:
+    if already_done(site, slug, run_date):
+        print(f"skip: {site}/{slug} already processed on {run_date}")
+        return
+    body = generate(prompt, prefer_cli=False)  # unattended generation: SDK is enough
+    publish(site, slug, body)                  # hand off to your existing publish step
+```
+
+Including `run_date` in the key is the point. Mixing in the date lets the next day's legitimate run proceed while only a same-day re-run is skipped. Whether you store the marker as a file or in a key-value store depends on scale, but for a personal-scale nightly batch a local cache directory was plenty.
+
+## What I verified on cutover day, and where I stumbled
+
+After preparing, I deliberately created an unusable-CLI state to confirm behavior: I temporarily removed `gemini` from the path, watched the probe return `False`, and saw `generate()` drop into the SDK path. That is where I noticed that setting the `cli_available()` timeout too high wastes 12-plus seconds on the probe alone after shutdown. Once the shutdown is confirmed, the sensible move is to flip `prefer_cli` to `False` everywhere and stop calling the probe at all.
+
+The other trap is that the CLI sometimes mixes progress messages or decoration into its output, which you can mistake for generated body text. The SDK's `response.text` returns body text only, so the downstream steps were actually steadier after the fallback. A shutdown is hardly a welcome event, but it did turn out to be a good reason to move unattended work onto the API.
+
+## Operational rules worth locking in after the cutover
+
+Once the shutdown is confirmed, the safe move is to lock your settings down without hesitation. Here are the three things I settled in production, in order.
+
+1. Flip `prefer_cli` to `False` for every unattended batch and stop calling the probe entirely, since after shutdown the probe is just 12 wasted seconds.
+2. Cap the SDK-side retries at three. Pushing past that rarely recovers and only crowds the nightly window, which I wanted to avoid.
+3. Pin the idempotency marker to a directory that survives restarts. Put it on volatile storage and you lose protection against duplicate posts on re-run.
+
+### Pin the model default explicitly
+
+When the default model changes, the output's character changes with it. In that case I recommend naming the model on the caller side, as in `model="gemini-3.5-flash"`. Leaving it to the default means one day a prompt's behavior shifts under you with no warning.
+
+### Periodically prove the fallback actually fires
+
+The fallback is code that normally never runs. That is exactly why it helps to run `generate()` once a month with the CLI deliberately down, confirming it drops into the SDK path. The scariest thing in production is insurance that does not move when you finally need it.
+
+### Always log which path was used
+
+Logging whether generation went through the CLI or the SDK makes later behavior much easier to trace. It speeds up triage in production, so even adding a short tag like `via=cli` / `via=sdk` pays off when something breaks.
+
+## Your next step
+
+Start by running `grep -rn "gemini -p" .` across your repository once, and replace even a single CLI call site with `generate()`. Once one site works, the rest is the same shape of work. I am still in the middle of this myself, moving the Dolice Labs nightly batches over piece by piece toward a configuration that survives the shutdown. If you are carrying CLI-dependent automation of your own, I hope this helps with the first step. Thank you for reading to the end.

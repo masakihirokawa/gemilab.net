@@ -1,0 +1,196 @@
+---
+title: "Gemini CLI 停止に備え、夜間バッチに google-genai SDK フォールバックを組み込む"
+slug: "gemini-cli-shutdown-genai-sdk-fallback-harness"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-06-18T04:45"
+author: "Gemini Lab"
+description: "6月18日で Gemini CLI のホスト応答が止まります。CLI に依存した夜間バッチを落とさないよう、CLI の生死を確かめてから google-genai SDK へ自動で逃がすフォールバック・ハーネスを、自分の運用を題材に組みました。"
+tags: ["Gemini CLI", "フォールバック", "自動化", "google-genai", "本番運用"]
+highlights:
+  - "CLI のバイナリが残っていても応答が返らない状態を、--version ではなく実生成1回で正しく検知できる"
+  - "CLI 優先・SDK フォールバックを1つの generate() に閉じ込め、指数バックオフ付きで停止に強い呼び出しに置き換えられる"
+  - "夜間バッチに16文字の冪等キーを足して、再実行時の二重投稿を防ぐ実装を今日から入れられる"
+---
+
+6月18日を境に、Gemini CLI のホスト応答が止まります。個人で複数のサイトを夜間に自動運用していると、この一行の依存が思っていたより深いところに刺さっていることに、移行準備をして初めて気づきました。`gemini -p "..."` を叩いているのは記事生成だけだと思い込んでいたのですが、実際にはスクリーンショットの説明文づくりや、投稿前のタイトル校正にも同じコマンドが混ざっていました。
+
+厄介なのは、CLI のバイナリ自体は 6月18日以降も `which gemini` で見つかってしまう点です。停止するのはホスト側の応答であって、ローカルのコマンドが消えるわけではありません。つまり「バイナリの有無」で生死を判定すると、落ちているのに生きていると誤認して、バッチがタイムアウトの山を築きます。私自身、最初のプローブを `--version` で書いてしまい、テスト環境では通るのに本番の夜間バッチだけが固まる、という回り道をしました。
+
+ここで扱うのは「移行の棚卸し」ではありません。どこで CLI に依存しているかを洗い出す全体計画ではなく、洗い出したあとの一点 ―― CLI が黙っても処理を止めないための小さなハーネス ―― だけを、動くコードで深掘りします。
+
+## どの処理を SDK に逃がし、どれを CLI に残すか
+
+すべてを SDK に寄せれば確実ですが、対話的な補完やプロジェクト文脈の読み込みなど、CLI ならではの使い勝手を捨てることになります。私は処理を3つに仕分けてから手を動かしました。
+
+<table>
+<thead>
+<tr><th>処理の性質</th><th>移行先</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>夜間バッチの一括生成（無人）</td><td>SDK 直叩き</td><td>対話不要。CLI の停止と独立に動かしたい</td></tr>
+<tr><td>手元での対話的な試行錯誤</td><td>Antigravity CLI</td><td>文脈保持と対話の体験を残したい</td></tr>
+<tr><td>CI 内の単発呼び出し</td><td>SDK 直叩き</td><td>再現性と監査ログを優先したい</td></tr>
+</tbody>
+</table>
+
+無人で動くものほど SDK へ寄せるのが基本方針です。人が画面の前にいる処理だけ CLI（移行後は Antigravity CLI）に残し、それ以外は API へ逃がします。以降のコードは、この「無人バッチを止めない」という一点に絞っています。
+
+## CLI が今この瞬間に応答できるかを確かめる
+
+判定の肝は、バイナリの有無ではなく「実際に1回応答が返るか」を見ることです。短いプロンプトを与えて、タイムアウトか非ゼロ終了なら使えないと判断します。
+
+```python
+import shutil
+import subprocess
+
+def cli_available(timeout_sec: int = 12) -> bool:
+    """gemini CLI が今この瞬間に応答を返せるかを確かめる。
+    --version ではなく実際の生成を1回試すのが要点。
+    バイナリが残っていてもホスト側が止まっていれば応答は返らない。"""
+    if shutil.which("gemini") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["gemini", "-p", "ping"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+```
+
+ここで `timeout_sec` を短めの12秒にしているのは、プローブで何分も待たされては本末転倒だからです。停止後の CLI は応答そのものが返らないので、長く待つほど無駄が増えます。プローブは「軽く叩いてすぐ諦める」のが正解だと感じています。
+
+## google-genai SDK 側の最小実装
+
+フォールバック先となる SDK 呼び出しは、驚くほど短く書けます。CLI の停止とは独立に動くため、ここが最も堅い土台になります。
+
+```python
+import os
+from google import genai
+
+_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def run_via_sdk(prompt: str, model: str = "gemini-3.5-flash") -> str:
+    """対話を必要としない処理は SDK 直叩きに寄せる。
+    CLI の生死と無関係に動くフォールバック先。"""
+    response = _client.models.generate_content(
+        model=model,
+        contents=prompt,
+    )
+    return response.text
+```
+
+モデルに `gemini-3.5-flash` を指定しているのは、6月8日以降このモデルが既定で有効になっており、夜間の一括生成のような速度重視の工程に向いているからです。重い推論が必要な工程だけ Pro 系に差し替えれば十分でした。なお `GEMINI_API_KEY` はコード例ではプレースホルダーとして扱い、実フォーマットの鍵は決して書き込まないでください。
+
+## CLI 実行とフォールバックを1つの関数に閉じ込める
+
+CLI 実行側も用意したうえで、リトライとフォールバックを `generate()` 1つにまとめます。呼び出し側はどちらが使われたかを意識しなくて済みます。
+
+```python
+def run_via_cli(prompt: str, timeout_sec: int = 120) -> str:
+    result = subprocess.run(
+        ["gemini", "-p", prompt],
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"gemini CLI exited {result.returncode}: {result.stderr[:200]}")
+    return result.stdout.strip()
+```
+
+```python
+import time
+
+def generate(prompt: str, *, prefer_cli: bool = False, max_attempts: int = 3) -> str:
+    """CLI を優先したい処理だけ prefer_cli=True にする。
+    それ以外は最初から SDK を使い、CLI が落ちていれば自動で SDK に切り替える。"""
+    last_error = None
+
+    if prefer_cli and cli_available():
+        for attempt in range(max_attempts):
+            try:
+                return run_via_cli(prompt)
+            except (subprocess.TimeoutExpired, RuntimeError) as exc:
+                last_error = exc
+                time.sleep(2 ** attempt)  # 1, 2, 4 秒の指数バックオフ
+
+    for attempt in range(max_attempts):
+        try:
+            return run_via_sdk(prompt)
+        except Exception as exc:  # APIError 等
+            last_error = exc
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError(f"CLI と SDK の両方が失敗しました: {last_error}")
+```
+
+`prefer_cli=False` を既定にしているのが、私なりの判断です。停止が目前に迫っている以上、無人バッチは最初から SDK を呼んだ方が安全で、CLI を試すのは人が見ている処理だけで構いません。`2 ** attempt` の指数バックオフは、一時的なレート制限やネットワークの揺らぎを吸収するための保険です。ここでつまずきやすいのは、CLI の失敗例外と SDK の失敗例外を取り違えて握りつぶしてしまう点で、私は一度フォールバックが発火しないバグを本番で踏みました。例外の型を分けて扱うのが安全です。
+
+## 夜間バッチに冪等性を持たせて二重投稿を防ぐ
+
+フォールバックを入れると、途中で落ちたバッチを再実行する機会が増えます。そのとき怖いのが二重投稿です。同じ日に同じ記事を二度生成しないよう、軽い冪等キーを挟みます。
+
+```python
+import hashlib
+import pathlib
+
+STATE_DIR = pathlib.Path.home() / ".cache" / "nightly-batch"
+
+def already_done(site: str, slug: str, run_date: str) -> bool:
+    """同じ日に同じ記事を二度処理しないための冪等キー。
+    バッチが途中で落ちて再実行されても二重投稿を防げる。"""
+    key = hashlib.sha1(f"{site}:{slug}:{run_date}".encode()).hexdigest()[:16]
+    marker = STATE_DIR / key
+    if marker.exists():
+        return True
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    marker.write_text(run_date)
+    return False
+```
+
+```python
+def nightly_job(site: str, slug: str, prompt: str, run_date: str) -> None:
+    if already_done(site, slug, run_date):
+        print(f"skip: {site}/{slug} は {run_date} に処理済みです")
+        return
+    body = generate(prompt, prefer_cli=False)  # 無人生成は SDK で十分
+    publish(site, slug, body)                  # 既存の公開処理に渡す
+```
+
+`run_date` をキーに含めるのが要点です。日付を混ぜておけば、翌日の正規実行はちゃんと走り、同じ日の再実行だけがスキップされます。マーカーをファイルで持つかキーバリューで持つかは規模次第ですが、個人開発の夜間バッチならローカルのキャッシュディレクトリで十分でした。
+
+## 切り替え当日に確認したこと、そしてつまずいた点
+
+準備を終えてから、私はわざと CLI を使えない状態を作って挙動を確かめました。具体的には、`gemini` を一時的にパスから外し、プローブが `False` を返し、`generate()` が SDK 経路に落ちることを目視しました。ここで気づいたのは、`cli_available()` のタイムアウトを長く取りすぎると、停止後はプローブだけで毎回12秒以上を浪費するという点です。停止が確定したら、`prefer_cli` を全面的に `False` に倒し、プローブ自体を呼ばなくするのが合理的でした。
+
+もう1つの落とし穴は、CLI が出力に進捗メッセージや装飾を混ぜることがあり、それを生成本文と取り違える危険です。SDK の `response.text` は本文だけが返るので、フォールバック後の方がむしろ後段の処理が安定しました。停止はもちろん歓迎すべき出来事ではありませんが、無人処理を API へ寄せる良いきっかけにはなったと感じています。
+
+## 切り替え後に固定したい運用ルール
+
+停止が確定したあとは、設定を迷わず固定してしまうのが安全です。私が本番運用で落ち着かせた3点を、順番に挙げます。
+
+1. 無人バッチの `prefer_cli` はすべて `False` に倒し、プローブ呼び出し自体を止めます。停止後はプローブが12秒の無駄になるだけだからです。
+2. SDK 側のリトライ上限は3回までに抑えます。それ以上粘っても回復しないことが多く、夜間枠を圧迫する事態を回避したいからです。
+3. 冪等マーカーの保存先は、再起動でも消えないディレクトリに固定します。揮発する領域に置くと、再実行時の二重投稿を防げなくなります。
+
+### モデルの既定を明示的に固定する
+
+既定モデルが切り替わると出力の癖も変わります。この場合は、`model="gemini-3.5-flash"` のように呼び出し側でモデルを明示しておくことを推奨します。既定任せにすると、ある日突然プロンプトの相性が変わって戸惑うことになります。
+
+### フォールバックが本当に発火するか定期的に試す
+
+フォールバックは、普段は出番のないコードです。だからこそ、月に一度はわざと CLI を落とした状態で `generate()` を走らせ、SDK 経路に正しく落ちることを確かめておくと安心です。本番運用で一番怖いのは、いざというときに保険が動かないことだと感じています。
+
+### ログに経路を必ず残す
+
+どちらの経路で生成されたかをログに残しておくと、あとから挙動を追いやすくなります。プロダクションでの切り分けが速くなるので、`via=cli` / `via=sdk` のような短いタグを1行足すだけでも、トラブル時の回避策を見つけやすくなります。
+
+## 次の一手
+
+まずは手元のリポジトリで `grep -rn "gemini -p" .` を一度走らせ、CLI を呼んでいる箇所を1か所だけでも `generate()` に置き換えてみてください。1か所動けば、残りは同じ型の作業です。私自身、Dolice Labs の夜間バッチでこの置き換えを進めながら、停止に強い構成へ少しずつ寄せている最中です。同じように CLI 依存の自動化を抱えている方の、最初の一歩の助けになれば嬉しいです。最後までお読みいただき、ありがとうございました。
