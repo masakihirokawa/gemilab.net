@@ -1,0 +1,212 @@
+---
+title: "When Revenue and Cost Don't Line Up in a Gemini-Powered Niche SaaS — Field Notes on Metering Usage and Reconciling with Stripe"
+slug: "gemini-niche-saas-usage-cost-stripe-reconciliation-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-18T13:00"
+author: "Gemini Lab"
+description: "In a niche SaaS built on the Gemini API, monthly revenue is visible but per-user usage cost is not, so your margin stays a mystery until month-end. These notes cover a metering layer that converts tokens to money in real time, monthly reconciliation against Stripe, early detection of unprofitable users, and idempotent webhooks."
+tags: ["Gemini API", "Niche SaaS", "Cost management", "Stripe", "Usage-based pricing", "Indie dev"]
+highlights:
+  - "A metering layer that accrues per-user Gemini API cost in real time and converts token usage to money immediately"
+  - "Reconciliation logic that lines up Stripe revenue against API cost each month to surface unprofitable users early"
+  - "An idempotent webhook that prevents double-counting invoice.paid, plus a budget guard that stops cost before it spikes"
+---
+
+## The problem: you can't tell how much you kept until the month ends
+
+A flat monthly subscription and the Gemini API's per-token cost move to different rhythms. Revenue lands once at the start of the billing cycle; cost creeps up all day, a little with every request. The MRR chart on your dashboard is a tidy set of bars, but how much actually stays in your account is a mystery until month-end. Running a niche SaaS solo, this is the first place you trip.
+
+I run a few small services that embed the Gemini API as an indie developer, and one month revenue was up over the prior month while the balance left in my account was actually down. Tracing it, a handful of top users were burning more than ten times the average tokens, and their cost was eating right through the flat fee they paid. Looking at an overall gross-margin percentage, that "handful of red accounts" stayed invisible to the very end. Since then I put a per-user cost metering layer in first.
+
+This article walks through the implementation that kills the mismatch, in order: meter, reconcile, detect, and stay idempotent. It's not a story about a million yen a month — it's about keeping a few-thousand-dollar service profitable.
+
+## Why revenue and cost drift apart structurally
+
+The drift has three sources.
+
+First, **different time axes**. Stripe's `invoice.paid` fires once a month; Gemini API billing accrues by the second. Revenue posts at the start while cost lags behind, so the first half of the month looks more profitable than it is.
+
+Second, **variance across users**. Flat pricing assumes everyone uses an average amount, but AI features are extreme: the gap between heavy and light users is enormous. A single decile of users running 3x the median is enough to push average cost sharply up.
+
+Third, **different units and granularity**. Gemini bills in tokens (with separate rates for input, output, and cached input); Stripe bills a settled amount in yen or dollars. To compare the two you need a layer that translates tokens into your service's currency.
+
+The metering layer and monthly reconciliation below absorb all three.
+
+## The metering layer — convert tokens to money and accrue immediately
+
+The first thing to do is read `usageMetadata` the instant a response returns and add to that user's cost. Use the actual returned token counts, not an estimate. Gemini charges different rates for input, output, and cached input, so convert each separately.
+
+```typescript
+// Constants of price per million tokens (in JPY) from your own contracted rates.
+// Always confirm real numbers on Google's pricing page and update on any change.
+const PRICE_PER_MTOK = {
+  input: 4.5,        // normal input
+  cachedInput: 1.1,  // cache-hit input (much cheaper)
+  output: 18.0,      // output
+} as const;
+
+const JPY_PER_USD = 158; // review the FX rate monthly
+
+function costJpy(u: {
+  promptTokenCount: number;
+  cachedContentTokenCount?: number;
+  candidatesTokenCount: number;
+}): number {
+  const fresh = u.promptTokenCount - (u.cachedContentTokenCount ?? 0);
+  const usd =
+    (fresh / 1_000_000) * PRICE_PER_MTOK.input +
+    ((u.cachedContentTokenCount ?? 0) / 1_000_000) * PRICE_PER_MTOK.cachedInput +
+    (u.candidatesTokenCount / 1_000_000) * PRICE_PER_MTOK.output;
+  return usd * JPY_PER_USD;
+}
+```
+
+`promptTokenCount` includes cached tokens, so remember to subtract `cachedContentTokenCount` to get the input that is actually billed fresh. Double-counting here overstates cost and skews your pricing decisions.
+
+Accrue the converted cost into a per-user, per-month ledger. In an eventually-consistent store like Cloudflare KV you can't fully prevent the race between read, add, and write, but since the goal is an approximate cost, a light optimistic update is enough. Treat it as a separate layer from the billing system of record, which needs exact figures.
+
+```typescript
+async function recordCost(env: Env, userId: string, jpy: number, usage: object) {
+  const month = new Date().toISOString().slice(0, 7); // "2026-06"
+  const key = `cost:${userId}:${month}`;
+  const prev = parseFloat((await env.KV.get(key)) ?? "0");
+  const next = +(prev + jpy).toFixed(4);
+  // keep it for two more months so monthly reconciliation can read it
+  await env.KV.put(key, String(next), { expirationTtl: 60 * 60 * 24 * 70 });
+
+  // also keep one row per request for audit (append to Analytics Engine or R2)
+  await env.LEDGER.writeDataPoint?.({
+    blobs: [userId, month],
+    doubles: [jpy],
+    indexes: [userId],
+  });
+}
+```
+
+The call site just pulls `usageMetadata` off the Gemini response and runs it through both functions.
+
+```typescript
+const res = await ai.models.generateContent({ model: "gemini-2.5-flash", contents });
+const u = res.usageMetadata;
+const jpy = costJpy({
+  promptTokenCount: u.promptTokenCount,
+  cachedContentTokenCount: u.cachedContentTokenCount,
+  candidatesTokenCount: u.candidatesTokenCount,
+});
+await recordCost(env, userId, jpy, u);
+```
+
+Now "how much each user ate this month" updates with every request.
+
+## Reconcile — line up Stripe revenue and cost monthly
+
+With the metering layer running, monthly reconciliation is just "put revenue and cost side by side under the same user ID." On the Stripe side, pull settled invoices with `invoices.list` and join on the service user ID you stored in metadata.
+
+```typescript
+async function reconcile(env: Env, stripe: Stripe, month: string) {
+  const rows: { userId: string; revenue: number; cost: number; margin: number }[] = [];
+
+  // aggregate invoices that became paid this period (paging omitted)
+  const invoices = await stripe.invoices.list({ status: "paid", limit: 100 });
+  const revenueByUser = new Map<string, number>();
+  for (const inv of invoices.data) {
+    const userId = inv.metadata?.app_user_id;
+    if (!userId) continue;
+    const jpy = inv.currency === "jpy" ? inv.amount_paid : inv.amount_paid / 100 * JPY_PER_USD;
+    revenueByUser.set(userId, (revenueByUser.get(userId) ?? 0) + jpy);
+  }
+
+  for (const [userId, revenue] of revenueByUser) {
+    const cost = parseFloat((await env.KV.get(`cost:${userId}:${month}`)) ?? "0");
+    rows.push({ userId, revenue, cost, margin: revenue - cost });
+  }
+  rows.sort((a, b) => a.margin - b.margin); // smallest (red) margins first
+  return rows;
+}
+```
+
+Watch the currency units. Stripe's `amount_paid` is the raw integer for zero-decimal currencies like JPY, but "cents" for two-decimal currencies like USD. Add them without normalizing and your dollar-billed users will look 100x off on cost. Always populate `inv.metadata.app_user_id` when you create the Checkout Session — without it the join is impossible.
+
+Sort the result ascending by margin so red accounts float to the top; the rows worth looking at each month naturally come first.
+
+## Detect — notice red accounts before they grow
+
+Monthly reconciliation is after the fact. On its own it means "by the time you notice, a full month of loss is locked in." So put a light threshold check inside the metering layer to catch danger signs mid-month.
+
+Base the check not on an absolute amount but on **cost as a ratio of the monthly price that user pays**. On a ¥1,000 plan, margin gets thin once cost passes ¥700, and it goes red past ¥1,000.
+
+```typescript
+async function maybeAlert(env: Env, userId: string, monthlyPriceJpy: number) {
+  const month = new Date().toISOString().slice(0, 7);
+  const cost = parseFloat((await env.KV.get(`cost:${userId}:${month}`)) ?? "0");
+  const ratio = cost / monthlyPriceJpy;
+  if (ratio < 0.7) return;
+
+  // don't re-alert the same user in the same month
+  const flag = `alert:${userId}:${month}`;
+  if (await env.KV.get(flag)) return;
+  await env.KV.put(flag, "1", { expirationTtl: 60 * 60 * 24 * 35 });
+
+  await notify(env, `⚠️ ${userId}: cost ratio ${(ratio * 100).toFixed(0)}% (¥${cost.toFixed(0)} / ¥${monthlyPriceJpy})`);
+}
+```
+
+A user who trips this alert is usually using the product in a way you didn't expect. If they're sending needlessly long prompts from a misunderstanding, one note fixes it; if they're clearly a heavy professional user, it's a chance to guide them to a higher tier. Use red margin as a signal to move someone onto the right plan, not to cut off a "bad user," and it turns into an upsell rather than a churn.
+
+## Idempotency — prevent double-counting revenue
+
+Reconciliation is only as accurate as your ability to process each Stripe event exactly once. Webhooks get retried, and both `checkout.session.completed` and `invoice.paid` arrive, so a naive handler extends access and counts revenue twice.
+
+Deduplicate by event ID so only the first pass goes through.
+
+```typescript
+async function handleStripeEvent(env: Env, event: Stripe.Event) {
+  const seen = `evt:${event.id}`;
+  // already processed -> bail out (KV existence check makes it idempotent)
+  if (await env.KV.get(seen)) return;
+  await env.KV.put(seen, "1", { expirationTtl: 60 * 60 * 24 * 30 });
+
+  if (event.type === "invoice.paid") {
+    const inv = event.data.object as Stripe.Invoice;
+    const userId = inv.metadata?.app_user_id;
+    if (userId) {
+      await env.KV.put(
+        `member:${userId}`,
+        JSON.stringify({ plan: "pro", expiresAt: Date.now() + 35 * 864e5 }),
+        { expirationTtl: 60 * 60 * 24 * 40 }
+      );
+    }
+  }
+}
+```
+
+Make `invoice.paid` the source of truth for extending access. `checkout.session.completed` is handy as the signal of a first purchase, but it doesn't fire on monthly auto-renewals. Anchor access to `invoice.paid`, which arrives on every renewal, and the "member but locked out" problem from month two onward disappears. Setting the expiry a little longer than the billing interval (35 days here) is a practical guard against access blinking off during a webhook delay.
+
+## Budget guard — the last line is a global daily cap
+
+On top of per-user detection, keep exactly one last line of defense: a service-wide daily budget. This isn't revenue analysis — it's a mechanism to cap the damage to a single day when a burst or an attack spikes daily cost.
+
+<table>
+<thead><tr><th>Layer</th><th>Purpose</th><th>Basis</th><th>Behavior when exceeded</th></tr></thead>
+<tbody>
+<tr><td>User × month</td><td>Detect red accounts</td><td>cost / monthly price</td><td>Alert (don't block)</td></tr>
+<tr><td>User × day</td><td>Curb abnormal usage</td><td>absolute token volume</td><td>Limit for that day only</td></tr>
+<tr><td>Global × day</td><td>Contain incidents</td><td>total cost across users</td><td>Pause new generation</td></tr>
+</tbody>
+</table>
+
+Keep the roles separate — monthly for awareness, daily for incident response — and you avoid loading too much responsibility onto a single threshold.
+
+## Small things that paid off in practice
+
+You don't need to stare at the numbers daily. I run the reconciliation script once at the start of the month and look only at the top five users by cost ratio. Narrowing what you look at is what makes it sustainable.
+
+The conversion-rate constants go stale on two fronts: pricing changes and FX. Since they're hard-coded, make it a habit to check the pricing page and the exchange rate at month-start reconciliation, and your cost estimate won't drift from reality.
+
+Once cost is visible, pricing decisions change. A "¥1,000 because it felt right" plan becomes "¥1,000 because it covers the cost of the top decile" — a number with a reason behind it. You can price with confidence because you see the distribution, not just the average.
+
+## Closing
+
+The feeling that revenue and cost don't line up almost always comes down to only ever seeing the average. Accrue cost per user, and at month-start glance only at the tails of the distribution. Put this one metering layer in first, and build yourself a state where, next month-end, the margin is finally readable. Thank you for reading.

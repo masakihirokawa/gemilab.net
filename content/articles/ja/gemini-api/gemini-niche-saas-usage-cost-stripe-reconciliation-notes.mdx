@@ -1,0 +1,212 @@
+---
+title: "Gemini API のニッチ SaaS で「請求とコストが噛み合わない」を消す — 従量原価の計測と Stripe 突合の運用メモ"
+slug: "gemini-niche-saas-usage-cost-stripe-reconciliation-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-18T13:00"
+author: "Gemini Lab"
+description: "Gemini API を組み込んだニッチ SaaS では、月額売上は見えてもユーザー単位の従量原価が見えず、月末に粗利が読めなくなりがちです。トークン消費を即時に円換算する計測層、Stripe 売上との月次突合、赤字ユーザーの早期検知、冪等な Webhook までを実装メモとして整理します。"
+tags: ["Gemini API", "ニッチSaaS", "コスト管理", "Stripe", "従量課金", "個人開発"]
+highlights:
+  - "ユーザー単位で Gemini API の従量原価をリアルタイムに積み上げ、トークン消費を即座に円換算する計測層の実装"
+  - "Stripe の月額売上と API 原価を月次で突合し、赤字ユーザーを早期に検知する突合ロジックの設計"
+  - "invoice.paid の二重計上を防ぐ冪等な Webhook と、原価が跳ねる前に止める予算ガードの実務"
+---
+
+## 月末に「いくら残ったか」が読めない、という問題
+
+定額の月額課金と、トークン単位で動く Gemini API の従量原価。この二つは別々のリズムで動きます。売上は月初に Stripe が一括で立て、原価は一日中、リクエストのたびに少しずつ増えていきます。ダッシュボードの MRR は綺麗な棒グラフなのに、手元にいくら残るかは月末まで分からない。ニッチ SaaS をひとりで回していると、まずここでつまずきます。
+
+個人開発で Gemini API を組み込んだ小さなサービスをいくつか運用していますが、ある月、売上は前月より伸びているのに口座に残った額はむしろ減っていたことがありました。原因を追うと、上位数名のユーザーが平均の十数倍のトークンを消費していて、その人たちの原価が定額の月額を食い尽くしていたのです。全体の粗利率という平均値では、この「数名の赤字」は最後まで見えませんでした。それ以来、私自身はユーザー単位で原価を積む計測層を最初に入れるようにしています。
+
+ここでは、売上と原価が噛み合わない状態を消すための実装を、計測・突合・検知・冪等性の順にまとめます。月100万円の話ではなく、月数万円規模を黒字で続けるための運用の話です。
+
+## なぜ売上と原価は構造的にずれるのか
+
+ずれの正体は三つあります。
+
+ひとつ目は**時間軸の違い**です。Stripe の `invoice.paid` は月に一度ですが、Gemini API の課金は秒単位です。月初に売上だけが立ち、原価は遅れて積み上がるので、月の前半は実態より儲かって見えます。
+
+ふたつ目は**ユーザー間の分散**です。定額制は「全員が平均的に使う」前提で価格を決めますが、AI 機能は使う人と使わない人の差が極端です。中央値の3倍を超えるヘビーユーザーが一割いるだけで、平均原価は跳ね上がります。
+
+みっつ目は**通貨と粒度の違い**です。Gemini API の請求はトークン数（しかも入力・出力・キャッシュで単価が違う）、Stripe は円またはドルの確定額。この二つを突き合わせるには、トークンを自分のサービスの通貨に翻訳する層が要ります。
+
+この三つを吸収するのが、以下の計測層と月次突合です。
+
+## 計測層 — トークンを即座に円換算して積む
+
+最初にやるのは、レスポンスが返ってきた瞬間に `usageMetadata` を読み、ユーザーごとの原価を加算することです。推定値ではなく、実際に返ってきたトークン数を使うのが肝心です。Gemini API は入力・出力・キャッシュ済み入力で単価が異なるので、それぞれを別々に換算します。
+
+```typescript
+// 自分の契約している料金表から、100万トークンあたりの単価（円）を定数化する。
+// 実際の数値は Google の料金ページで必ず確認し、改定があれば更新すること。
+const PRICE_PER_MTOK = {
+  input: 4.5,        // 通常の入力
+  cachedInput: 1.1,  // キャッシュヒットした入力（大幅に安い）
+  output: 18.0,      // 出力
+} as const;
+
+const JPY_PER_USD = 158; // 為替は月次でまとめて見直す
+
+function costJpy(u: {
+  promptTokenCount: number;
+  cachedContentTokenCount?: number;
+  candidatesTokenCount: number;
+}): number {
+  const fresh = u.promptTokenCount - (u.cachedContentTokenCount ?? 0);
+  const usd =
+    (fresh / 1_000_000) * PRICE_PER_MTOK.input +
+    ((u.cachedContentTokenCount ?? 0) / 1_000_000) * PRICE_PER_MTOK.cachedInput +
+    (u.candidatesTokenCount / 1_000_000) * PRICE_PER_MTOK.output;
+  return usd * JPY_PER_USD;
+}
+```
+
+`promptTokenCount` にはキャッシュ済みトークンも含まれるため、`cachedContentTokenCount` を差し引いて「新規に課金される入力」を出すのを忘れないでください。ここを二重計上すると、原価を実際より高く見積もって価格判断を誤ります。
+
+換算した原価は、ユーザー単位・月単位の台帳に積みます。Cloudflare KV のような結果整合ストアでは、読んで足して書く間の競合を完全には防げませんが、原価の概算が目的なので、軽い楽観更新で十分です。厳密な金額が要る課金本体とは別レイヤーだと割り切ります。
+
+```typescript
+async function recordCost(env: Env, userId: string, jpy: number, usage: object) {
+  const month = new Date().toISOString().slice(0, 7); // "2026-06"
+  const key = `cost:${userId}:${month}`;
+  const prev = parseFloat((await env.KV.get(key)) ?? "0");
+  const next = +(prev + jpy).toFixed(4);
+  // 翌々月まで保持して、月次突合のときに参照できるようにする
+  await env.KV.put(key, String(next), { expirationTtl: 60 * 60 * 24 * 70 });
+
+  // 監査用に1リクエスト1行のログも残す（Workers Analytics Engine や R2 への追記でよい）
+  await env.LEDGER.writeDataPoint?.({
+    blobs: [userId, month],
+    doubles: [jpy],
+    indexes: [userId],
+  });
+}
+```
+
+呼び出し側では、Gemini のレスポンスから `usageMetadata` を取り出してこの二つを通すだけです。
+
+```typescript
+const res = await ai.models.generateContent({ model: "gemini-2.5-flash", contents });
+const u = res.usageMetadata;
+const jpy = costJpy({
+  promptTokenCount: u.promptTokenCount,
+  cachedContentTokenCount: u.cachedContentTokenCount,
+  candidatesTokenCount: u.candidatesTokenCount,
+});
+await recordCost(env, userId, jpy, u);
+```
+
+これでユーザーごとの「今月いくら食べたか」が、リクエストのたびに更新される状態になります。
+
+## 突合 — Stripe 売上と原価を月次で並べる
+
+計測層が動いていれば、月次の突合は「同じユーザー ID で、売上と原価を横に並べる」だけです。Stripe 側は `invoices.list` で確定済みの請求を取り、メタデータに入れておいた自分のサービスのユーザー ID で名寄せします。
+
+```typescript
+async function reconcile(env: Env, stripe: Stripe, month: string) {
+  const rows: { userId: string; revenue: number; cost: number; margin: number }[] = [];
+
+  // 当月に paid になった請求を集計（ページングは省略）
+  const invoices = await stripe.invoices.list({ status: "paid", limit: 100 });
+  const revenueByUser = new Map<string, number>();
+  for (const inv of invoices.data) {
+    const userId = inv.metadata?.app_user_id;
+    if (!userId) continue;
+    const jpy = inv.currency === "jpy" ? inv.amount_paid : inv.amount_paid / 100 * JPY_PER_USD;
+    revenueByUser.set(userId, (revenueByUser.get(userId) ?? 0) + jpy);
+  }
+
+  for (const [userId, revenue] of revenueByUser) {
+    const cost = parseFloat((await env.KV.get(`cost:${userId}:${month}`)) ?? "0");
+    rows.push({ userId, revenue, cost, margin: revenue - cost });
+  }
+  rows.sort((a, b) => a.margin - b.margin); // 赤字（マージン最小）が先頭に来る
+  return rows;
+}
+```
+
+注意したいのは通貨の単位です。Stripe の `amount_paid` は、JPY のようなゼロ小数通貨はそのままの整数、USD のような二桁小数通貨は「セント」です。ここを揃えずに足すと、ドル課金のユーザーだけ原価が100倍ずれて見えます。`inv.metadata.app_user_id` は Checkout Session を作るときに必ず埋めておきます。これがないと名寄せができません。
+
+突合結果は、先頭に赤字ユーザーが並ぶように原価マージンで昇順ソートしておくと、毎月眺めるべき行が自然に上に来ます。
+
+## 検知 — 赤字が育つ前に気づく
+
+月次の突合は事後分析です。これだけだと「気づいたときには一ヶ月分の赤字が確定している」ことになります。そこで、計測層の中に軽いしきい値チェックを入れて、月の途中で危ない兆候を拾います。
+
+判定の軸は金額そのものではなく、**そのユーザーが払っている月額に対する原価の比率**にします。¥1,000 のプランなら、原価が ¥700 を超えた時点で粗利が薄くなり、¥1,000 を超えたら赤字です。
+
+```typescript
+async function maybeAlert(env: Env, userId: string, monthlyPriceJpy: number) {
+  const month = new Date().toISOString().slice(0, 7);
+  const cost = parseFloat((await env.KV.get(`cost:${userId}:${month}`)) ?? "0");
+  const ratio = cost / monthlyPriceJpy;
+  if (ratio < 0.7) return;
+
+  // 同じユーザーに同じ月で何度も鳴らさないよう、通知済みフラグを置く
+  const flag = `alert:${userId}:${month}`;
+  if (await env.KV.get(flag)) return;
+  await env.KV.put(flag, "1", { expirationTtl: 60 * 60 * 24 * 35 });
+
+  await notify(env, `⚠️ ${userId}: 原価比 ${(ratio * 100).toFixed(0)}%（¥${cost.toFixed(0)} / ¥${monthlyPriceJpy}）`);
+}
+```
+
+このアラートが鳴ったユーザーは、たいてい使い方が想定とずれています。仕様の誤解で無駄に長いプロンプトを送っているなら案内一通で解決しますし、明らかにヘビーな本職利用なら、上位プランへの誘導の好機です。赤字を「悪いユーザー」として遮断するのではなく、適正なプランへ動いてもらう合図として使うと、解約ではなくアップセルにつながります。
+
+## 冪等性 — 売上の二重計上を防ぐ
+
+突合の精度は、そもそも Stripe イベントを正しく一度だけ処理できているかに依存します。Webhook は再送されますし、`checkout.session.completed` と `invoice.paid` は両方届くので、素朴に書くと権限延長や売上計上が二重に走ります。
+
+イベント ID で重複排除し、初回だけ処理が通るようにします。
+
+```typescript
+async function handleStripeEvent(env: Env, event: Stripe.Event) {
+  const seen = `evt:${event.id}`;
+  // 既に見たイベントなら即終了（KV の存在チェックで冪等化）
+  if (await env.KV.get(seen)) return;
+  await env.KV.put(seen, "1", { expirationTtl: 60 * 60 * 24 * 30 });
+
+  if (event.type === "invoice.paid") {
+    const inv = event.data.object as Stripe.Invoice;
+    const userId = inv.metadata?.app_user_id;
+    if (userId) {
+      await env.KV.put(
+        `member:${userId}`,
+        JSON.stringify({ plan: "pro", expiresAt: Date.now() + 35 * 864e5 }),
+        { expirationTtl: 60 * 60 * 24 * 40 }
+      );
+    }
+  }
+}
+```
+
+`invoice.paid` を権限延長の正本に据えるのがポイントです。`checkout.session.completed` は初回購入の合図としては便利ですが、毎月の自動更新では飛んできません。更新の度に届く `invoice.paid` を権限の源にしておくと、2ヶ月目以降の「会員なのに使えない」が起きなくなります。有効期限を請求間隔より少し長め（ここでは35日）に取るのも、Webhook の遅延で一瞬権限が切れる事故を防ぐ実務的な工夫です。
+
+## 予算ガード — 最後の砦は全体日次
+
+ユーザー単位の検知に加えて、サービス全体の日次予算という最後の砦を一本だけ置いておきます。これは収益分析ではなく、バズや攻撃で一日の原価が跳ねたときに、被害を一日分で止めるための仕掛けです。
+
+<table>
+<thead><tr><th>層</th><th>目的</th><th>判定の軸</th><th>越えたときの挙動</th></tr></thead>
+<tbody>
+<tr><td>ユーザー×月次</td><td>赤字ユーザーの検知</td><td>原価 / 月額</td><td>アラート（遮断しない）</td></tr>
+<tr><td>ユーザー×日次</td><td>異常消費の抑制</td><td>絶対トークン量</td><td>当日のみ制限</td></tr>
+<tr><td>全体×日次</td><td>事故の被害限定</td><td>全ユーザー合計原価</td><td>新規生成を一時停止</td></tr>
+</tbody>
+</table>
+
+月次は気づきのため、日次は事故対応のため、と役割を分けておくと、ひとつのしきい値に過剰な責任を負わせずに済みます。
+
+## 運用してみて効いた小さなこと
+
+数字を毎日見る必要はありません。私は突合スクリプトを月初に一度だけ走らせ、原価比が高い順に上位5名だけを眺めるようにしています。眺める対象を絞ると、続けられます。
+
+換算単価の定数は、料金改定と為替の二つで古びます。コードに直書きしている以上、月初の突合のタイミングで料金ページと為替を確認する習慣にしておくと、原価の見積もりが現実から乖離しません。
+
+そして、原価が見えるようになると価格判断が変わります。「なんとなく ¥1,000」だった月額が、「上位1割の原価をまかなえる ¥1,000」という根拠のある数字になります。値付けに自信が持てるのは、平均ではなく分布が見えているからです。
+
+## さいごに
+
+売上と原価が噛み合わない感覚の正体は、たいてい「平均しか見ていない」ことにあります。ユーザー単位で原価を積み、月初に分布の端だけ眺める。まずはこの計測層を一つ入れて、次の月末に粗利が読める状態を作ってみてください。お読みいただきありがとうございました。
