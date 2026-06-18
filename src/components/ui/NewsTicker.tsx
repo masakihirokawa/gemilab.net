@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLI — 本日6/18、Gemini CLIとGemini Code Assist IDE拡張がAI Pro/Ultra・無料個人利用向けにリクエスト提供を終了。後継はAntigravity CLIです",
-    "FLASH — Gemini 3.5シリーズが始動し3.5 Flashが提供開始。エージェントとコーディング向けにフロンティア級、長時間タスクに強いと説明されています",
-    "DEEPTHINK — Gemini 3 Deep ThinkがGoogle AI Ultra向けに展開中。数学・科学・論理・多段推論の最上位モードです",
-    "APP — GeminiアプリにDaily Brief、再設計UI、AI動画モデルGemini Omni、個人AIエージェントGemini Sparkが加わりました",
-    "DESIGN — 新デザイン言語Neural Expressiveで、よりリッチな視覚出力とモダリティ間の素早い切替に向けて再構築されています",
-    "ULTRA — Google AI Ultraはモデル最上位アクセス・Deep Research・Veo 3動画生成・100万トークンコンテキストを束ねるプレミアム枠です",
+    "CLI — Gemini CLIとGemini Code Assist IDE拡張は6/18でリクエスト受付を終了しました。移行先はAntigravity、ターミナル派にはGo製のAntigravity CLIです",
+    "FLASH — Gemini 3.5 Flashが一般提供（GA）に。エージェントとコーディング用途で持続的にフロンティア性能を出す最も賢いモデルと位置づけられています",
+    "IMAGE — gemini-3.1-flash-image-previewとgemini-3-pro-image-previewが非推奨となり、6/25にシャットダウン予定です。参照コードは後継へ切替を",
+    "AGENTS — Managed Agentsが公開プレビューに。Googleがホストする隔離Linuxサンドボックスでステートフルな自律エージェントを動かせます",
+    "SEARCH — File Searchがgemini-embedding-2による画像のマルチモーダル検索に対応しました",
+    "MIGRATE — 期限つきの非推奨や停止が続くため、CLIや旧モデルを組み込んだ自動化は移行状況の記録が欠かせません",
   ],
   en: [
-    "CLI — As of Jun 18, Gemini CLI and the Gemini Code Assist IDE extensions stop serving AI Pro/Ultra and free individual users; Antigravity CLI is the successor",
-    "FLASH — The Gemini 3.5 series begins with 3.5 Flash, built for agents and coding with strength on long-horizon tasks",
-    "DEEPTHINK — Gemini 3 Deep Think is rolling out to Google AI Ultra as the top reasoning mode for math, science, and logic",
-    "APP — The Gemini app gains a Daily Brief, a redesigned interface, the Gemini Omni video model, and a personal agent called Gemini Spark",
-    "DESIGN — A new design language, Neural Expressive, rebuilds the experience for richer visuals and faster switching between modalities",
-    "ULTRA — Google AI Ultra bundles top model access, Deep Research, Veo 3 video, and a 1M-token context window",
+    "CLI — Gemini CLI and the Gemini Code Assist IDE extensions stopped serving requests on Jun 18; migrate to Antigravity or the new Go-based Antigravity CLI",
+    "FLASH — Gemini 3.5 Flash is now generally available, billed as the smartest model for sustained frontier performance on agentic and coding tasks",
+    "IMAGE — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview are deprecated and shut down on Jun 25; move to the successor models",
+    "AGENTS — Managed Agents is in public preview, running stateful autonomous agents in secure, isolated Google-hosted Linux sandboxes",
+    "SEARCH — File Search now supports multimodal image search natively via the gemini-embedding-2 model",
+    "MIGRATE — With deadline-bound deprecations piling up, any automation built on the CLI or old models needs a tracked migration",
   ],
 };
 
