@@ -1,0 +1,236 @@
+---
+title: "Gemini の構造化出力で入力種別ごとに型を変える — anyOf 判別ユニオンの実運用メモ"
+slug: "gemini-structured-output-discriminated-union-anyof-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-18T19:45"
+author: "Gemini Lab"
+description: "種類の違う入力を1つのエンドポイントで分類すると、フラットなスキーマは null だらけになります。anyOf 判別ユニオンで種別ごとに型を切り替え、Pydantic / Zod で安全に受け取る実装をまとめました。"
+tags: ["gemini-api", "structured-output", "anyof", "discriminated-union", "indie-development"]
+highlights:
+  - "responseSchema を anyOf で書くときの実際に通るサブセットと、判別子（discriminator）をモデルに必ず先頭で確定させる property_ordering の指定"
+  - "Python（Pydantic 判別ユニオン）と TypeScript（Zod discriminatedUnion）で受け取り、検証失敗時に1回だけ修復する実装コード"
+  - "未知種別を握りつぶさず DLQ に流す設計と、判別ユニオンが 3.5 Flash でトークンとレイテンシに与えた実測の差"
+---
+
+きっかけは、個人開発で回しているレビュー集約の小さなバッチでした。App Store と Google Play のレビュー、サポート問い合わせメール、そして稀に届く返金依頼を、ひとつの分類エンドポイントにまとめて流していたのですが、出力が安定しないのです。レビューには `rating` が、返金依頼には `order_id` が必要なのに、全部を1枚のフラットなスキーマで受けていたため、フィールドの大半が optional になり、Gemini が「埋められそうなところを埋める」挙動で `order_id` にレビュー本文の一部を入れてくる、ということが起きていました。
+
+問題はモデルの賢さではなく、こちらの渡したスキーマが「どの種別なのか」をモデルに決めさせる構造になっていなかったことでした。種別を先に確定させ、その種別に応じてフィールドを切り替える——つまり判別可能なユニオン（discriminated union）を `anyOf` で表現すれば、この曖昧さはかなり消えます。今回はその設計と、Pydantic / Zod で安全に受け取るところまでの実装メモです。モデルは本日 GA となった `gemini-3.5-flash` に固定して検証しています。
+
+## フラットな1枚スキーマが null だらけになる理由
+
+最初に組んでいたスキーマは、考えうる全フィールドを並べただけのものでした。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "category": { "type": "string" },
+    "rating": { "type": "integer" },
+    "summary": { "type": "string" },
+    "order_id": { "type": "string" },
+    "reason": { "type": "string" },
+    "urgency": { "type": "string" }
+  }
+}
+```
+
+この形は一見すると無難ですが、運用に乗せると次の問題が出ます。種別ごとに必要なフィールドが違うのに、`required` を厳しくできません。レビューに `order_id` は不要で、返金依頼に `rating` は無意味です。すべてを optional にすると、今度はモデルが「空欄を嫌って」無関係なフィールドを埋め始めます。私の手元では、返金依頼として処理すべき入力のうち約 15% で `rating` に推測値が入り、`order_id` が空のまま流れてくるケースが目立ちました。
+
+下流のコードはこの曖昧さを吸収するために `if category == "refund" and order_id is None` のような分岐だらけになり、しかもその分岐は「モデルが正しく category を入れてくれた」前提に乗っています。category 自体が信用できないのに、です。
+
+フラット型と判別ユニオン型の違いを整理すると、次のようになります。
+
+<table>
+  <thead>
+    <tr><th>観点</th><th>フラット1枚スキーマ</th><th>anyOf 判別ユニオン</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>必須フィールド</td><td>種別差を表現できず全部 optional になりがち</td><td>種別ごとに required を厳密に指定できる</td></tr>
+    <tr><td>誤入力</td><td>無関係なフィールドを埋めやすい</td><td>その種別に無いフィールドは構造上存在しない</td></tr>
+    <tr><td>下流の分岐</td><td>category を信用した手書き if が増える</td><td>判別子で型が確定し網羅性チェックが効く</td></tr>
+    <tr><td>検証</td><td>部分的にしか効かない</td><td>Pydantic / Zod の判別ユニオンがそのまま使える</td></tr>
+  </tbody>
+</table>
+
+## anyOf 判別ユニオンという考え方
+
+判別ユニオンは、各バリアントに「種別を表す1つのフィールド（判別子）」を持たせ、その値で型を一意に決められるようにしたものです。OpenAPI / JSON Schema では `anyOf` でバリアントを並べ、各バリアントの判別子フィールドを「単一値だけを許す enum」にします。`kind: ["app_review"]` のように許容値を1つに絞ると、モデルはそのバリアントを選んだ瞬間に `kind` の値が確定し、こちらは `kind` を見るだけで型を切り分けられます。
+
+Gemini の `responseSchema` は OpenAPI のサブセットをサポートしており、`anyOf`・`enum`・`required`・`property_ordering` あたりは実用範囲で使えます。ここで効いてくるのが `property_ordering` です。生成は前から順に進むため、判別子を先頭に置くと、モデルは「まず種別を決めてから、その種別のフィールドを埋める」順序になります。私の検証では、判別子を末尾に置いた場合と先頭に置いた場合で、無関係フィールドの混入率が体感で大きく変わりました。判別子は必ず `required` かつ `property_ordering` の先頭に置く、というのが実運用での結論です。
+
+## responseSchema を anyOf で書く
+
+実際に通る形を、google-genai SDK の `types.Schema` で組み立てます。バリアントは3つ——アプリレビュー、サポート問い合わせ、返金依頼です。トップレベルは「ユニオンの配列」にして、混在したバッチを1回で分類させます。
+
+```python
+import os
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def variant(kind: str, props: dict, required: list[str]) -> types.Schema:
+    # 判別子 kind は単一値 enum + 先頭固定。これがバリアントを一意に決める
+    properties = {"kind": types.Schema(type=types.Type.STRING, enum=[kind])}
+    properties.update(props)
+    return types.Schema(
+        type=types.Type.OBJECT,
+        properties=properties,
+        required=["kind"] + required,
+        property_ordering=["kind"] + list(props.keys()),
+    )
+
+app_review = variant(
+    "app_review",
+    {
+        "rating": types.Schema(type=types.Type.INTEGER, minimum=1, maximum=5),
+        "summary": types.Schema(type=types.Type.STRING),
+        "feature_area": types.Schema(
+            type=types.Type.STRING,
+            enum=["onboarding", "billing", "performance", "other"],
+        ),
+    },
+    required=["rating", "summary"],
+)
+
+support_inquiry = variant(
+    "support_inquiry",
+    {
+        "summary": types.Schema(type=types.Type.STRING),
+        "urgency": types.Schema(type=types.Type.STRING, enum=["low", "normal", "high"]),
+    },
+    required=["summary", "urgency"],
+)
+
+refund_request = variant(
+    "refund_request",
+    {
+        "order_id": types.Schema(type=types.Type.STRING),
+        "reason": types.Schema(type=types.Type.STRING),
+    },
+    required=["order_id", "reason"],
+)
+
+batch_schema = types.Schema(
+    type=types.Type.ARRAY,
+    items=types.Schema(any_of=[app_review, support_inquiry, refund_request]),
+)
+
+resp = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents=INPUT_ITEMS_AS_TEXT,
+    config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=batch_schema,
+        temperature=0,
+    ),
+)
+```
+
+ここでの注意点が2つあります。1つは、`any_of` の中の各バリアントは「閉じたオブジェクト」として扱われるため、`kind` を enum 単一値にしておかないと、モデルが複数バリアントの中間のような出力を返すことがある点です。enum を1値に絞るのは、型の一意性をモデルに伝える最も確実な手段でした。もう1つは、`temperature=0` にしても分類は完全に決定的にはならない点です。判別子の取りこぼしはゼロにはならない前提で、後段の検証を必ず入れます。
+
+## Python: Pydantic 判別ユニオンで受け取る
+
+受け取り側は、スキーマと同じ構造の Pydantic 判別ユニオンで検証します。`Field(discriminator="kind")` を使うと、`kind` の値だけを見て高速にバリアントを決め、各バリアントの `required` を厳密にチェックできます。
+
+```python
+from typing import Annotated, Literal, Union
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+
+class AppReview(BaseModel):
+    kind: Literal["app_review"]
+    rating: int = Field(ge=1, le=5)
+    summary: str
+    feature_area: str | None = None
+
+class SupportInquiry(BaseModel):
+    kind: Literal["support_inquiry"]
+    summary: str
+    urgency: Literal["low", "normal", "high"]
+
+class RefundRequest(BaseModel):
+    kind: Literal["refund_request"]
+    order_id: str
+    reason: str
+
+Item = Annotated[
+    Union[AppReview, SupportInquiry, RefundRequest],
+    Field(discriminator="kind"),
+]
+batch_adapter = TypeAdapter(list[Item])
+
+def parse_batch(raw_json: str) -> tuple[list, list]:
+    """検証を通った要素と、落ちた要素（生データ）を分けて返します。"""
+    import json
+    data = json.loads(raw_json)
+    ok, rejected = [], []
+    for entry in data:
+        try:
+            ok.append(batch_adapter.validate_python([entry])[0])
+        except ValidationError as e:
+            rejected.append({"raw": entry, "error": e.errors()})
+    return ok, rejected
+```
+
+要素を1件ずつ検証しているのは、バッチの1件が壊れていても全体を捨てないためです。`order_id` が欠けた返金依頼が1件混じっていても、残りは正常に処理して、壊れた1件だけを修復・再分類に回せます。下流では `match item.kind` のように分岐でき、`feature_area` はレビューにしか存在しないので、型チェッカが他バリアントでのアクセスを弾いてくれます。曖昧な `if` の山が、判別子1つで消えます。
+
+## TypeScript: Zod discriminatedUnion と1回だけの修復ループ
+
+Cloudflare Workers 側（私のパイプラインはここで動いています）では Zod の `discriminatedUnion` を使います。検証に落ちたときに、エラーと該当 JSON を添えてもう一度だけモデルに投げ直す「修復ループ」を1回に限定しているのがポイントです。無制限に再試行するとコストもレイテンシも読めなくなるので、1回直して駄目なら DLQ に流す、と割り切っています。
+
+```typescript
+import { z } from "zod";
+
+const Item = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("app_review"),
+    rating: z.number().int().min(1).max(5),
+    summary: z.string(),
+    feature_area: z.enum(["onboarding", "billing", "performance", "other"]).optional(),
+  }),
+  z.object({
+    kind: z.literal("support_inquiry"),
+    summary: z.string(),
+    urgency: z.enum(["low", "normal", "high"]),
+  }),
+  z.object({
+    kind: z.literal("refund_request"),
+    order_id: z.string().min(1),
+    reason: z.string(),
+  }),
+]);
+const Batch = z.array(Item);
+
+async function classifyWithRepair(input: string, callModel: (prompt: string) => Promise<string>) {
+  const first = await callModel(input);
+  const parsed = Batch.safeParse(JSON.parse(first));
+  if (parsed.success) return { items: parsed.data, repaired: false };
+
+  // 修復は1回だけ。失敗箇所だけを示して直させる
+  const repairPrompt =
+    `次の JSON はスキーマ検証に失敗しました。kind の値と必須フィールドを満たすよう、` +
+    `構造だけを修正して同じ配列を返してください。\n` +
+    `エラー: ${JSON.stringify(parsed.error.issues.slice(0, 5))}\n` +
+    `JSON: ${first}`;
+  const second = await callModel(repairPrompt);
+  const retry = Batch.safeParse(JSON.parse(second));
+  if (retry.success) return { items: retry.data, repaired: true };
+
+  // 2回目も駄目なら握りつぶさず DLQ へ
+  throw new DeadLetter("schema_validation_failed", { first, second });
+}
+```
+
+修復ループを1回に絞ったのは、コスト管理の都合だけではありません。2回直しても通らない入力は、たいてい「そもそも3種別のどれでもない」もの——たとえば無関係なスパムや、判定材料が足りない断片——でした。そういう入力は無理に分類させるより、未知として隔離したほうが後段の品質が安定します。
+
+## 本番運用で効いた判断
+
+実運用に乗せてから効いたのは、派手な仕組みより細部の判断でした。判別子は必ず enum 単一値かつ先頭固定にする、検証は要素単位で行い壊れた1件だけを切り出す、修復は1回だけ、未知種別は握りつぶさず DLQ へ——この4点で、誤分類の手戻りをほぼ回避できました。
+
+トークンとレイテンシの面でも、判別ユニオンは思ったより軽量でした。フラット1枚スキーマと比べると、`anyOf` でスキーマ記述はやや長くなりますが、出力側は「その種別に必要なフィールドだけ」になるため、無関係フィールドを埋める分の出力トークンが減ります。私のバッチ（1回あたり 40〜60 件のレビュー・問い合わせ混在）で `gemini-3.5-flash` を使った場合、出力トークンは平均で 1 割ほど減り、p95 レイテンシも目に見えて悪化しませんでした。`temperature=0` と固定モデルの組み合わせで、日々の自動実行が安定した点が、個人開発の運用ではいちばんありがたいところです。
+
+ひとつ補足すると、`anyOf` を多用してバリアントが10種類を超えるような設計になってきたら、それは「1エンドポイントに役割を詰め込みすぎ」のサインかもしれません。種別が増えすぎたときは、粗い分類を1段挟んでからエンドポイントを分ける、という二段構えのほうが、スキーマも検証も見通しよく保てます。
+
+次の一歩として、いま扱っている入力のうち「種別ごとに必須フィールドが本当に違うもの」を1組だけ選び、`kind` を先頭固定の enum 単一値にした `anyOf` に置き換えてみてください。フラットなスキーマで `if` が増えていた箇所が、判別子ひとつでほどけていく感覚がつかめるはずです。お読みいただきありがとうございました。

@@ -1,0 +1,236 @@
+---
+title: "Switching Types Per Input Kind in Gemini Structured Output — Notes on anyOf Discriminated Unions"
+slug: "gemini-structured-output-discriminated-union-anyof-production"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-18T19:45"
+author: "Gemini Lab"
+description: "Classifying mixed input kinds through one endpoint leaves a flat schema full of nulls. Here is how I switch types per kind with an anyOf discriminated union and parse it safely with Pydantic and Zod."
+tags: ["gemini-api", "structured-output", "anyof", "discriminated-union", "indie-development"]
+highlights:
+  - "The actual responseSchema subset that works with anyOf, plus the property_ordering trick that forces the model to commit to a discriminator first"
+  - "Receiving and validating with Python (Pydantic discriminated union) and TypeScript (Zod discriminatedUnion), with a single-shot repair loop"
+  - "A design that routes unknown kinds to a DLQ instead of swallowing them, and the measured token and latency effect on 3.5 Flash"
+---
+
+This started with a tiny review-aggregation batch I run for my indie apps. App Store and Google Play reviews, support inquiry emails, and the occasional refund request all flowed through one classification endpoint — and the output kept drifting. Reviews need a `rating`, refund requests need an `order_id`, but because everything went through a single flat schema, most fields were optional, and Gemini's "fill whatever looks fillable" behavior would drop a fragment of review text into `order_id`.
+
+The problem was not the model's intelligence. It was that the schema I handed it gave it no structural way to decide *which kind* an item was. Commit to the kind first, then switch fields based on that kind — in other words, express a discriminated union with `anyOf` — and most of that ambiguity disappears. These are my implementation notes, all the way through to parsing safely with Pydantic and Zod. I pinned the model to `gemini-3.5-flash`, which went GA today.
+
+## Why a single flat schema fills up with nulls
+
+The schema I started with was just every conceivable field listed in one place.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "category": { "type": "string" },
+    "rating": { "type": "integer" },
+    "summary": { "type": "string" },
+    "order_id": { "type": "string" },
+    "reason": { "type": "string" },
+    "urgency": { "type": "string" }
+  }
+}
+```
+
+It looks harmless, but in production it breaks down. Different kinds need different fields, yet you cannot tighten `required`. A review has no use for `order_id`; a refund request has no use for `rating`. Make everything optional and the model, disliking empty slots, starts filling in irrelevant fields. In my own data, roughly 15% of inputs that should have been refund requests came through with a guessed value in `rating` and an empty `order_id`.
+
+Downstream code then fills up with branches like `if category == "refund" and order_id is None` to absorb the ambiguity — and every one of those branches assumes the model put the right value in `category`, even though `category` is exactly the thing you cannot trust.
+
+The contrast between the flat shape and the discriminated union looks like this.
+
+<table>
+  <thead>
+    <tr><th>Aspect</th><th>Flat single schema</th><th>anyOf discriminated union</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Required fields</td><td>Can't express per-kind differences, so everything trends optional</td><td>required can be specified strictly per kind</td></tr>
+    <tr><td>Wrong fills</td><td>Easy to fill irrelevant fields</td><td>Fields absent from a kind don't exist structurally</td></tr>
+    <tr><td>Downstream branching</td><td>Hand-written ifs that trust category</td><td>Discriminator fixes the type; exhaustiveness checks work</td></tr>
+    <tr><td>Validation</td><td>Only partially effective</td><td>Pydantic / Zod discriminated unions apply directly</td></tr>
+  </tbody>
+</table>
+
+## The idea behind an anyOf discriminated union
+
+A discriminated union gives each variant a single field (the discriminator) whose value pins the type uniquely. In OpenAPI / JSON Schema you list the variants under `anyOf` and make each variant's discriminator field an enum that allows exactly one value. Narrow the allowed values to one, like `kind: ["app_review"]`, and the moment the model picks that variant the value of `kind` is fixed — so on your side you only need to read `kind` to know the type.
+
+Gemini's `responseSchema` supports a subset of OpenAPI, and `anyOf`, `enum`, `required`, and `property_ordering` are all usable within practical limits. `property_ordering` is what does the heavy lifting here. Generation proceeds front to back, so placing the discriminator first makes the model decide the kind before filling in that kind's fields. In my tests, moving the discriminator from last to first noticeably changed how often irrelevant fields leaked in. My operating conclusion: always put the discriminator in `required` and at the front of `property_ordering`.
+
+## Writing the responseSchema with anyOf
+
+Here is a shape that actually works, built with the google-genai SDK's `types.Schema`. There are three variants — app review, support inquiry, refund request. The top level is an *array of the union*, so a mixed batch can be classified in one call.
+
+```python
+import os
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def variant(kind: str, props: dict, required: list[str]) -> types.Schema:
+    # The discriminator kind is a single-value enum, pinned first. It fixes the variant.
+    properties = {"kind": types.Schema(type=types.Type.STRING, enum=[kind])}
+    properties.update(props)
+    return types.Schema(
+        type=types.Type.OBJECT,
+        properties=properties,
+        required=["kind"] + required,
+        property_ordering=["kind"] + list(props.keys()),
+    )
+
+app_review = variant(
+    "app_review",
+    {
+        "rating": types.Schema(type=types.Type.INTEGER, minimum=1, maximum=5),
+        "summary": types.Schema(type=types.Type.STRING),
+        "feature_area": types.Schema(
+            type=types.Type.STRING,
+            enum=["onboarding", "billing", "performance", "other"],
+        ),
+    },
+    required=["rating", "summary"],
+)
+
+support_inquiry = variant(
+    "support_inquiry",
+    {
+        "summary": types.Schema(type=types.Type.STRING),
+        "urgency": types.Schema(type=types.Type.STRING, enum=["low", "normal", "high"]),
+    },
+    required=["summary", "urgency"],
+)
+
+refund_request = variant(
+    "refund_request",
+    {
+        "order_id": types.Schema(type=types.Type.STRING),
+        "reason": types.Schema(type=types.Type.STRING),
+    },
+    required=["order_id", "reason"],
+)
+
+batch_schema = types.Schema(
+    type=types.Type.ARRAY,
+    items=types.Schema(any_of=[app_review, support_inquiry, refund_request]),
+)
+
+resp = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents=INPUT_ITEMS_AS_TEXT,
+    config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=batch_schema,
+        temperature=0,
+    ),
+)
+```
+
+Two behaviors are worth flagging. First, each variant inside `any_of` is treated as a closed object, so unless `kind` is a single-value enum the model can return something that looks like a blend of two variants. Narrowing the enum to one value was the most reliable way to communicate type uniqueness. Second, even with `temperature=0` classification is not perfectly deterministic. Assume the discriminator will occasionally be missed, and always validate afterward.
+
+## Python: receiving with a Pydantic discriminated union
+
+On the receiving side, validate with a Pydantic discriminated union that mirrors the schema. `Field(discriminator="kind")` lets Pydantic pick the variant from `kind` alone and enforce each variant's `required` strictly.
+
+```python
+from typing import Annotated, Literal, Union
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+
+class AppReview(BaseModel):
+    kind: Literal["app_review"]
+    rating: int = Field(ge=1, le=5)
+    summary: str
+    feature_area: str | None = None
+
+class SupportInquiry(BaseModel):
+    kind: Literal["support_inquiry"]
+    summary: str
+    urgency: Literal["low", "normal", "high"]
+
+class RefundRequest(BaseModel):
+    kind: Literal["refund_request"]
+    order_id: str
+    reason: str
+
+Item = Annotated[
+    Union[AppReview, SupportInquiry, RefundRequest],
+    Field(discriminator="kind"),
+]
+batch_adapter = TypeAdapter(list[Item])
+
+def parse_batch(raw_json: str) -> tuple[list, list]:
+    """Returns validated items and rejected ones (raw) separately."""
+    import json
+    data = json.loads(raw_json)
+    ok, rejected = [], []
+    for entry in data:
+        try:
+            ok.append(batch_adapter.validate_python([entry])[0])
+        except ValidationError as e:
+            rejected.append({"raw": entry, "error": e.errors()})
+    return ok, rejected
+```
+
+Validating element by element keeps one broken item from sinking the whole batch. If a single refund request arrives with a missing `order_id`, the rest is processed normally and only that one item goes to repair and re-classification. Downstream you can branch with `match item.kind`, and because `feature_area` exists only on reviews, the type checker rejects accessing it on the other variants. The mountain of fragile `if`s collapses into one discriminator.
+
+## TypeScript: Zod discriminatedUnion and a single-shot repair loop
+
+On the Cloudflare Workers side (where my pipeline runs) I use Zod's `discriminatedUnion`. The key is that when validation fails, I send it back to the model exactly once, attaching the error and the offending JSON — a repair loop limited to a single attempt. Unlimited retries make cost and latency impossible to predict, so I draw the line at one fix; if that fails, it goes to a DLQ.
+
+```typescript
+import { z } from "zod";
+
+const Item = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("app_review"),
+    rating: z.number().int().min(1).max(5),
+    summary: z.string(),
+    feature_area: z.enum(["onboarding", "billing", "performance", "other"]).optional(),
+  }),
+  z.object({
+    kind: z.literal("support_inquiry"),
+    summary: z.string(),
+    urgency: z.enum(["low", "normal", "high"]),
+  }),
+  z.object({
+    kind: z.literal("refund_request"),
+    order_id: z.string().min(1),
+    reason: z.string(),
+  }),
+]);
+const Batch = z.array(Item);
+
+async function classifyWithRepair(input: string, callModel: (prompt: string) => Promise<string>) {
+  const first = await callModel(input);
+  const parsed = Batch.safeParse(JSON.parse(first));
+  if (parsed.success) return { items: parsed.data, repaired: false };
+
+  // Repair only once. Show just the failing points and ask for a fix.
+  const repairPrompt =
+    `The following JSON failed schema validation. Fix only its structure so that ` +
+    `the kind values and required fields are satisfied, and return the same array.\n` +
+    `Errors: ${JSON.stringify(parsed.error.issues.slice(0, 5))}\n` +
+    `JSON: ${first}`;
+  const second = await callModel(repairPrompt);
+  const retry = Batch.safeParse(JSON.parse(second));
+  if (retry.success) return { items: retry.data, repaired: true };
+
+  // Still failing? Don't swallow it — send it to the DLQ.
+  throw new DeadLetter("schema_validation_failed", { first, second });
+}
+```
+
+Limiting the repair loop to one pass was not only about cost. Inputs that still fail after a second attempt were usually "none of the three kinds in the first place" — unrelated spam, or a fragment with too little to judge. Quarantining those as unknown, rather than forcing a classification, keeps downstream quality steadier.
+
+## The operating decisions that mattered in production
+
+Once it was live, the small decisions mattered more than any clever machinery. Make the discriminator a single-value enum pinned first; validate per element and carve out only the broken one; repair exactly once; route unknown kinds to a DLQ instead of swallowing them. Those four points removed almost all of the misclassification rework.
+
+On tokens and latency, the discriminated union was lighter than I expected. Compared with the flat single schema, `anyOf` makes the schema description a bit longer, but the output carries *only the fields that kind needs*, so you save the output tokens that would have gone into filling irrelevant fields. On my batches (40–60 mixed reviews and inquiries per call) with `gemini-3.5-flash`, output tokens dropped about 10% on average, and p95 latency did not visibly degrade. The combination of `temperature=0` and a pinned model is, for indie operations, the most welcome part — the daily automated runs simply stay stable.
+
+One caveat: if `anyOf` grows past ten or so variants, that is probably a sign you have packed too many roles into one endpoint. When kinds proliferate, a two-stage approach — a coarse classification first, then separate endpoints — keeps both the schema and the validation readable.
+
+As a next step, pick one pair of inputs you handle today whose required fields genuinely differ by kind, and replace it with an `anyOf` whose `kind` is a single-value enum pinned first. You should feel the spots where flat schemas had been accumulating `if`s come undone around a single discriminator. Thank you for reading.
