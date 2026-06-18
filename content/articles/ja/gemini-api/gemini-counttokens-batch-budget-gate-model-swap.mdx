@@ -1,0 +1,182 @@
+---
+title: "countTokens でバッチ投入前にコスト超過を止める — 既定モデルが変わっても崩れない予算ゲートの設計"
+slug: "gemini-counttokens-batch-budget-gate-model-swap"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-18T15:53"
+author: "Gemini Lab"
+description: "夜間バッチが想定外に高くつく原因は、投入後にしかコストが分からないことです。countTokens を起点に、思考トークンまで織り込んだ予算ゲートを設計し、既定モデルが入れ替わっても見積もりが崩れない運用に立て直します。"
+tags: ["Gemini API", "countTokens", "コスト管理", "バッチ処理", "本番運用"]
+highlights:
+  - "countTokens を起点に、バッチ投入前へ projected_cost を算出して予算超過を止めるゲートのPythonコード"
+  - "Gemini 3.5 Flash の思考トークンを見積もりへ織り込み、出力だけ数える静的試算の30%前後の取りこぼしを補正する手順"
+  - "既定モデルが入れ替わっても校正係数1つで追従させる、運用に乗せやすい設計判断"
+---
+
+## 既定モデルが入れ替わった日に、月次コストの見積もりが静かにずれた
+
+私は個人開発のかたわら、壁紙アプリのレビューを夜間にまとめて分類するバッチと、AdMob の日次レポートを要約するバッチを Gemini API で回しています。どちらも件数が読めるので、月初に「だいたい月いくら」と当たりをつけ、その範囲に収まる前提で運用していました。
+
+ところが先日、既定モデルが新しい世代の Flash に切り替わったタイミングで、その当たりが静かに外れました。件数も入力の中身も変えていないのに、月の半ばで想定の予算枠を一日分ほど超えていたのです。ログを追って分かったのは、出力テキストの長さは変わっていないのに、課金対象のトークンが増えていたことでした。原因は思考（thinking）トークンです。私の見積もりは「入力トークン＋見えている出力トークン」だけを数えていたため、モデルが内部で消費する思考トークンをまるごと取りこぼしていました。
+
+この経験で痛感したのは、コストを「投入してから請求で知る」運用の脆さです。バッチは一度走り出すと数千件を一気に処理します。途中で気づいても、止める頃には大半が課金済みです。そこで、投入の直前にコストを見積もり、予算を超えるなら走らせない「予算ゲート」を入口に置く設計へ作り変えました。私自身が実際に作り直した設計を、そのまま再現できる形で以下に残します。
+
+## なぜ「投入後に気づく」超過が起きるのか
+
+バッチのコスト超過には、個人開発者が踏みやすい型がいくつかあります。
+
+ひとつは、入力サイズのばらつきです。レビュー分類のように1件あたりの入力が短い処理でも、たまに極端に長い本文が混ざると、その数件が全体のトークンを押し上げます。平均で見積もると、こうした裾の長い分布を取りこぼします。
+
+もうひとつは、出力トークンの過小評価です。要約や分類の出力は短く見えますが、構造化出力で JSON スキーマを返させると、フィールド名や区切り記号がトークンを食います。「見た目の文章量」と「課金トークン」は一致しません。
+
+そして最大の盲点が、思考トークンです。新しい世代のモデルは応答前に内部で推論を行い、その分のトークンも出力側として課金されます。可視テキストだけを数える静的な試算は、ここを構造的に取りこぼします。私の環境では、分類タスクで出力課金の3割前後が思考トークンでした。既定モデルが入れ替わると、この比率がそのまま見積もりの誤差として表面化します。
+
+## countTokens を予算ゲートの土台にする
+
+幸い、Gemini API には送信前にトークン数を測る `count_tokens` があり、この呼び出し自体は課金されません。これを1件ごとに回せば、入力トークンの実数をバッチ投入前に確定できます。まずは、入力の合計トークンを正確に積み上げる土台を作ります。
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+MODEL = "gemini-2.5-flash"  # 実運用では設定から注入します
+
+def count_input_tokens(contents: str) -> int:
+    """課金されない count_tokens で入力トークン数を返します。"""
+    resp = client.models.count_tokens(model=MODEL, contents=contents)
+    return resp.total_tokens
+
+def sum_batch_input_tokens(items: list[str]) -> int:
+    """バッチ全件の入力トークンを実数で積み上げます。"""
+    return sum(count_input_tokens(text) for text in items)
+```
+
+平均値ではなく1件ずつ実数を数えるのが要点です。`count_tokens` は無料なので、数千件でも投入前に全件を測れます。裾の長い入力が混ざっていても、ここで合計に正しく反映されます。
+
+## 思考トークンを見積もりに織り込む
+
+入力が確定したら、次は出力側です。ここで思考トークンを忘れると、新しいモデルで見積もりが崩れます。出力の見積もりは「可視出力の想定トークン × 思考トークン係数」で組み立てます。
+
+可視出力の想定トークンは、過去の実行ログから1件あたりの出力中央値を取って使います。思考トークン係数は、実際の応答に含まれる `usage_metadata` から逆算します。Gemini の応答メタデータには、思考トークンを含む出力側の内訳が入っています。
+
+```python
+def measure_thinking_ratio(sample_prompt: str) -> float:
+    """サンプル1件を実行し、出力に占める思考トークンの比率を計測します。
+    （この呼び出しだけは課金されますが、係数校正のための投資です）"""
+    resp = client.models.generate_content(model=MODEL, contents=sample_prompt)
+    um = resp.usage_metadata
+    visible = um.candidates_token_count or 0
+    thinking = getattr(um, "thoughts_token_count", 0) or 0
+    if visible == 0:
+        return 1.0
+    # 可視出力に対して、思考分をどれだけ上乗せすべきかの係数
+    return (visible + thinking) / visible
+
+# 例: 可視 120 トークン + 思考 52 トークン → 係数 ≈ 1.43
+THINKING_FACTOR = measure_thinking_ratio("分類タスクのサンプルプロンプト")
+```
+
+この係数を1つ持っておくだけで、既定モデルが入れ替わっても、サンプル1件を測り直して差し替えるだけで見積もりが追従します。モデルごとに固定値をハードコードする運用よりも、はるかに壊れにくくなります。
+
+## 予算ゲートをバッチランナーの入口に組み込む
+
+土台と係数がそろったら、投入直前に走らせる予算ゲートを組みます。ゲートの責務は、推定コストを算出し、予算を超えるなら投入を止め、超えないなら通すことです。
+
+```python
+from dataclasses import dataclass
+
+# 試算用の単価（執筆時点の例。実運用では公式の最新単価を設定から注入してください）
+PRICE_INPUT_PER_M = 0.30   # 入力 100万トークンあたりのドル単価（例）
+PRICE_OUTPUT_PER_M = 2.50  # 出力 100万トークンあたりのドル単価（例）
+
+@dataclass
+class BudgetEstimate:
+    input_tokens: int
+    output_tokens: int          # 思考トークン込み
+    projected_cost_usd: float
+    within_budget: bool
+
+def estimate_batch_cost(
+    items: list[str],
+    median_visible_output: int,
+    thinking_factor: float,
+    budget_usd: float,
+) -> BudgetEstimate:
+    input_tokens = sum_batch_input_tokens(items)
+    # 可視出力に思考係数を掛けて、課金される出力トークンを見積もります
+    output_per_item = round(median_visible_output * thinking_factor)
+    output_tokens = output_per_item * len(items)
+
+    cost = (
+        input_tokens / 1_000_000 * PRICE_INPUT_PER_M
+        + output_tokens / 1_000_000 * PRICE_OUTPUT_PER_M
+    )
+    return BudgetEstimate(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        projected_cost_usd=round(cost, 4),
+        within_budget=cost <= budget_usd,
+    )
+
+def run_batch_with_gate(items, *, median_visible_output, thinking_factor, budget_usd):
+    est = estimate_batch_cost(
+        items, median_visible_output, thinking_factor, budget_usd
+    )
+    print(
+        f"投入予定 {len(items)}件 / 入力 {est.input_tokens:,}tok / "
+        f"出力(思考込み) {est.output_tokens:,}tok / 推定 ${est.projected_cost_usd}"
+    )
+    if not est.within_budget:
+        raise RuntimeError(
+            f"予算ゲートで停止しました: 推定 ${est.projected_cost_usd} > 予算 ${budget_usd}"
+        )
+    # ここで初めて、課金される generate_content をバッチ実行します
+    return _execute_batch(items)
+```
+
+このゲートを通さない限り `generate_content` を呼ばない、という一点を守るだけで、想定外の超過は入口で止まります。私は `raise` で止める強い挙動にしていますが、運用次第では「予算の8割を超えたら警告だけ出して続行」という段階的な閾値も使えます。
+
+## Before / After — 静的試算から適応型ゲートへ
+
+作り変える前は、月初に一度だけ電卓で弾いた固定値を信じていました。
+
+```python
+# Before: 平均入力 × 件数 × 単価 を一度だけ手計算
+# 出力は「だいたい100トークンくらい」と決め打ち、思考トークンは未考慮
+monthly_cost = avg_input * item_count * price  # ← モデルが変わると静かにずれる
+```
+
+この方式は、入力の裾の長さ・構造化出力の区切り記号・思考トークンの3つをすべて取りこぼします。しかも固定値なので、既定モデルが入れ替わった瞬間に誤差が顕在化し、しかも気づくのは請求のあとです。
+
+```python
+# After: 投入直前に実数で測り、思考係数を掛け、予算で止める
+est = estimate_batch_cost(items, median_visible_output=120,
+                          thinking_factor=THINKING_FACTOR, budget_usd=3.0)
+if not est.within_budget:
+    skip_or_split(items)  # 分割投入や翌日送りに退避させます
+```
+
+After では、入力は `count_tokens` の実数、出力は思考係数込みの推定になり、予算超過は走らせる前に判定できます。係数を測り直す一手間だけで、モデル世代の切り替えにも耐えます。
+
+## 実測：壁紙分類バッチでの校正手順
+
+実際に私が校正したときの手順を、再現できる形で残しておきます。
+
+1. 直近の実行ログから、可視出力トークンの中央値を取りました（私の分類タスクでは120トークン前後でした）。
+2. 代表的なプロンプトを1件だけ `generate_content` で実行し、`usage_metadata` から思考トークン比率を計測しました（思考込みで係数およそ1.43）。
+3. その日のバッチ対象（約2,400件）に対して `count_tokens` を全件回し、入力トークンの実数を確定しました。
+4. 単価を掛けて推定コストを算出し、自分が許容する1回あたりの予算（私は3ドル前後を上限にしています）と突き合わせました。
+5. 推定が予算内であることを確認してから、本投入に進みました。
+
+このとき、出力だけを数える旧来の試算と比べて、推定コストはおよそ1.3倍に補正されました。つまり旧方式は3割ほど安く見積もっていたわけで、その差がそのまま「気づかない超過」になっていたと考えています。係数を入れた後は、実際の請求と推定のずれが数パーセント以内に収まるようになりました。
+
+## 運用に乗せるときの判断
+
+最後に、このゲートを実運用へ落とすうえで私が大切にしている点を挙げておきます。
+
+単価とモデル名は、コードに直書きせず設定から注入することをお勧めします。既定モデルが入れ替わる局面では、変えるべきは「コードの分岐」ではなく「設定値1つと係数1つ」であってほしいからです。注入できる形にしておけば、世代交代のたびにコードレビューを挟まずに追従できます。
+
+思考トークン係数は、四半期に一度ほど測り直すと安心です。モデルの更新で内部推論の重さが変わると、係数も静かに動きます。私はバッチの校正日をカレンダーに固定し、サンプル1件を流して係数を更新する運用にしています。
+
+次の一歩としては、まず手元の1つのバッチに `estimate_batch_cost` を挟み、推定値と翌月の実請求を突き合わせてみてください。ずれが大きければ、思考係数か出力中央値のどちらかがずれています。そこを直せば、見積もりは驚くほど安定します。同じように夜間バッチのコストに頭を悩ませている方の役に立てば嬉しいです。

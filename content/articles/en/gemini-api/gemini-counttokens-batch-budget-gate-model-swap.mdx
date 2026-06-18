@@ -1,0 +1,182 @@
+---
+title: "Stop a Batch Before It Overspends — A Budget Gate Built on countTokens That Survives a Default-Model Swap"
+slug: "gemini-counttokens-batch-budget-gate-model-swap"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-18T15:53"
+author: "Gemini Lab"
+description: "Nightly batches overspend because you only learn the cost after billing. Starting from countTokens, this guide builds a budget gate that folds in thinking tokens and keeps your estimate intact even when the default model changes underneath you."
+tags: ["Gemini API", "countTokens", "Cost Management", "Batch Processing", "Production"]
+highlights:
+  - "Python for a gate that computes projected_cost from countTokens and halts a batch before it overspends"
+  - "A procedure to fold Gemini 3.5 Flash thinking tokens into the estimate, correcting the ~30% undercount of output-only math"
+  - "A design that follows a default-model swap with a single recalibrated coefficient, easy to keep in production"
+---
+
+## The day the default model changed, my monthly estimate quietly drifted
+
+Alongside my day job I run a couple of Gemini batches as an indie developer: one classifies the overnight reviews for my wallpaper app, another summarizes daily AdMob reports. Both have predictable item counts, so at the start of each month I would pencil in a rough monthly figure and trust the batch to land inside it.
+
+Then the default model switched to a newer Flash generation, and that rough figure quietly stopped holding. The item count and the input contents were unchanged, yet by mid-month I had already crossed roughly a day's worth of budget. Tracing the logs, I found the visible output text was the same length as before — but the billed tokens had grown. The culprit was thinking tokens. My estimate counted only "input tokens plus visible output tokens," so it missed the thinking tokens the model burns internally.
+
+What that taught me was how fragile it is to discover cost from the invoice, after the fact. A batch fires through thousands of items at once. Even if you notice mid-run, most of it is already billed by the time you stop it. So I rebuilt the design to put a budget gate at the entrance: estimate the cost just before submission, and refuse to run if it exceeds the budget. This article shares that design in a form you can reproduce.
+
+## Why "notice it after submission" overspend happens
+
+Batch overspend follows a few shapes that indie developers walk into easily.
+
+One is variance in input size. Even in a task where each item is short, like review classification, an occasional very long body inflates the total. Estimating from an average misses that long tail.
+
+Another is underestimating output tokens. Summaries and classifications look short, but returning a JSON schema as structured output spends tokens on field names and delimiters. "How much text it looks like" and "how many tokens are billed" are not the same.
+
+The biggest blind spot is thinking tokens. Newer model generations reason internally before responding, and those tokens are billed on the output side. A static estimate that counts only visible text structurally misses them. In my environment, around 30 percent of output billing for the classification task was thinking tokens. When the default model swaps, that ratio surfaces directly as estimation error.
+
+## Make countTokens the foundation of the gate
+
+Fortunately, the Gemini API offers `count_tokens` to measure tokens before sending, and the call itself is not billed. Running it per item lets you fix the real input token count before the batch goes out. Start by accurately summing the input tokens.
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+MODEL = "gemini-2.5-flash"  # inject from config in production
+
+def count_input_tokens(contents: str) -> int:
+    """Return input tokens via the un-billed count_tokens call."""
+    resp = client.models.count_tokens(model=MODEL, contents=contents)
+    return resp.total_tokens
+
+def sum_batch_input_tokens(items: list[str]) -> int:
+    """Sum real input tokens across every item in the batch."""
+    return sum(count_input_tokens(text) for text in items)
+```
+
+The point is counting each item exactly, not from an average. Because `count_tokens` is free, you can measure all of even a few thousand items before submission. A long-tail input is reflected correctly in the total here.
+
+## Fold thinking tokens into the estimate
+
+Once input is fixed, the output side is next. Forget thinking tokens here and your estimate breaks on a newer model. Build the output estimate as "expected visible output tokens × a thinking-token factor."
+
+Take the expected visible output from the median per-item output in past run logs. Derive the thinking factor from the `usage_metadata` of a real response, which carries the output-side breakdown including thinking tokens.
+
+```python
+def measure_thinking_ratio(sample_prompt: str) -> float:
+    """Run one sample and measure thinking tokens as a share of output.
+    (Only this call is billed — an investment to calibrate the factor.)"""
+    resp = client.models.generate_content(model=MODEL, contents=sample_prompt)
+    um = resp.usage_metadata
+    visible = um.candidates_token_count or 0
+    thinking = getattr(um, "thoughts_token_count", 0) or 0
+    if visible == 0:
+        return 1.0
+    # how much to add on top of visible output for the thinking portion
+    return (visible + thinking) / visible
+
+# e.g. visible 120 + thinking 52 -> factor ~= 1.43
+THINKING_FACTOR = measure_thinking_ratio("a sample classification prompt")
+```
+
+Holding just this one coefficient means a default-model swap only requires re-measuring a single sample and swapping the value. That is far less brittle than hardcoding a fixed value per model.
+
+## Put the gate at the batch runner's entrance
+
+With the foundation and the factor in place, build the gate that runs right before submission. Its job is to compute the estimated cost, halt submission if it exceeds the budget, and pass it through if it does not.
+
+```python
+from dataclasses import dataclass
+
+# illustrative rates (examples at time of writing; inject the latest official rates from config)
+PRICE_INPUT_PER_M = 0.30   # USD per 1M input tokens (example)
+PRICE_OUTPUT_PER_M = 2.50  # USD per 1M output tokens (example)
+
+@dataclass
+class BudgetEstimate:
+    input_tokens: int
+    output_tokens: int          # thinking tokens included
+    projected_cost_usd: float
+    within_budget: bool
+
+def estimate_batch_cost(
+    items: list[str],
+    median_visible_output: int,
+    thinking_factor: float,
+    budget_usd: float,
+) -> BudgetEstimate:
+    input_tokens = sum_batch_input_tokens(items)
+    # multiply visible output by the thinking factor for billed output tokens
+    output_per_item = round(median_visible_output * thinking_factor)
+    output_tokens = output_per_item * len(items)
+
+    cost = (
+        input_tokens / 1_000_000 * PRICE_INPUT_PER_M
+        + output_tokens / 1_000_000 * PRICE_OUTPUT_PER_M
+    )
+    return BudgetEstimate(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        projected_cost_usd=round(cost, 4),
+        within_budget=cost <= budget_usd,
+    )
+
+def run_batch_with_gate(items, *, median_visible_output, thinking_factor, budget_usd):
+    est = estimate_batch_cost(
+        items, median_visible_output, thinking_factor, budget_usd
+    )
+    print(
+        f"submitting {len(items)} items / input {est.input_tokens:,}tok / "
+        f"output(incl. thinking) {est.output_tokens:,}tok / est ${est.projected_cost_usd}"
+    )
+    if not est.within_budget:
+        raise RuntimeError(
+            f"budget gate halted: est ${est.projected_cost_usd} > budget ${budget_usd}"
+        )
+    # only now do we run the billed generate_content batch
+    return _execute_batch(items)
+```
+
+As long as you never call `generate_content` without passing this gate, an unexpected overrun stops at the door. I prefer the hard `raise`, but depending on your operation you can use a staged threshold too — "warn but continue once you cross 80 percent of budget."
+
+## Before / After — from a static estimate to an adaptive gate
+
+Before the rebuild, I trusted a fixed number I had punched into a calculator once at the start of the month.
+
+```python
+# Before: average input x count x rate, computed once by hand
+# output guessed at "about 100 tokens", thinking tokens ignored
+monthly_cost = avg_input * item_count * price  # drifts quietly when the model changes
+```
+
+This misses all three: the long tail of inputs, the delimiters of structured output, and thinking tokens. Worse, being a fixed value, the error surfaces the moment the default model swaps — and you only notice after billing.
+
+```python
+# After: measure real tokens just before submission, apply the factor, halt on budget
+est = estimate_batch_cost(items, median_visible_output=120,
+                          thinking_factor=THINKING_FACTOR, budget_usd=3.0)
+if not est.within_budget:
+    skip_or_split(items)  # split the batch or defer to the next day
+```
+
+In the After version, input is the real `count_tokens` number, output includes the thinking factor, and overspend is decided before you run. One extra step of re-measuring the factor lets it survive a model-generation change.
+
+## A worked calibration on the wallpaper classification batch
+
+Here is the procedure I actually used, kept reproducible.
+
+1. I took the median visible output tokens from recent run logs (about 120 tokens for my classification task).
+2. I ran one representative prompt through `generate_content` and measured the thinking-token ratio from `usage_metadata` (about 1.43 including thinking).
+3. I ran `count_tokens` across all of that day's batch (about 2,400 items) to fix the real input token count.
+4. I multiplied by the rates to get the estimate and compared it against my per-run budget (I cap mine around three dollars).
+5. Only after confirming the estimate was within budget did I proceed to the real submission.
+
+Compared to the old output-only math, the estimate corrected upward by roughly 1.3x. In other words the old method underestimated by about 30 percent, and that gap was exactly the "overspend I never saw." After adding the factor, the gap between estimate and actual billing settled to within a few percent.
+
+## Judgment calls for putting it into production
+
+Finally, a few things I hold onto when taking this gate into real operation.
+
+I recommend injecting the rates and model name from config rather than hardcoding them. When a default model swaps, what should change is "one config value and one coefficient," not "a branch in the code." Keep it injectable and you follow each generation change without a code review.
+
+Re-measure the thinking-token factor about once a quarter. When a model update changes how heavy the internal reasoning is, the factor quietly shifts too. I pin a calibration day on the calendar and refresh the factor by running a single sample.
+
+As a next step, wrap one of your own batches in `estimate_batch_cost` and compare the estimate against next month's actual invoice. If the gap is large, either the thinking factor or the output median is off. Fix that, and the estimate becomes remarkably stable. I hope this helps anyone else losing sleep over nightly batch costs.
