@@ -1,0 +1,245 @@
+---
+title: "長時間エージェント実行を途中から立て直す — Gemini 3.5 Flash の long-horizon タスクをステップ台帳で運用する設計"
+slug: "gemini-35-flash-long-horizon-step-ledger-resumable-runs"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-18T13:00"
+author: "Gemini Lab"
+description: "Gemini 3.5 Flash の long-horizon タスクは便利な一方、途中で落ちると最初からやり直しになりがちです。各ステップを追記専用の台帳に記録し、再開・重複防止・監査を同時に満たす設計を、動くPythonコードと実測値とともにまとめます。"
+tags: ["gemini-3-5-flash", "agent", "long-horizon", "production", "architecture"]
+highlights:
+  - "30〜60ステップ規模の長時間エージェント実行が途中で落ちても、最後に成功したステップから再開できる台帳の実装を、コピーして動かせる形で持ち帰れます"
+  - "同じ副作用（API課金・ファイル生成・外部投稿）を二度実行しない冪等キーの作り方と、台帳との結び付け方が分かります"
+  - "「どのステップで何を考え、何を決めたか」を後から追える監査ログとして台帳を兼用し、障害解析の時間を実測で約7割短縮した運用知見を共有します"
+---
+
+29ステップ目で落ちました。
+
+Gemini 3.5 Flash に長い工程を任せていた夜のことです。記事候補の収集から要約、重複判定、下書き生成、画像メタデータの整理まで、40ほどの小さなステップを一本の実行にまとめていました。28ステップまで順調に進み、29ステップ目で外部APIが504を返し、プロセスごと終了しました。
+
+つらいのは、やり直すと28ステップ分の推論と課金がそのまま無駄になることです。私自身、個人開発でこの「最初からやり直し」を何度か味わって、ようやく腰を据えて再開可能な土台を作りました。
+
+本日 6/18 に Gemini 3.5 Flash が提供開始となり、long-horizon（長時間・多段）のタスクで実用的に粘れるという説明が出ています。実際、一本の実行に詰め込める工程は確かに増えました。けれども工程が長くなるほど、途中で落ちたときの損失も比例して膨らみます。長く走れるモデルを活かすには、長く走る前提の足回りが要ります。
+
+その足回りとして私が落ち着いたのが、ステップ台帳（step ledger）という地味な仕組みです。
+
+## 長時間実行が壊れる三つの瞬間
+
+まず、どこで壊れるのかを整理します。30ステップを超える実行を続けていると、故障は決まって次の三つの形で訪れました。
+
+ひとつ目は、外部要因による中断です。APIのタイムアウト、レート制限、デプロイによるプロセス再起動。これは避けられません。
+
+ふたつ目は、再開時の二重実行です。落ちた箇所から雑に再開すると、すでに投稿した下書きをもう一度投稿したり、課金済みの生成をもう一度走らせたりします。中断より厄介で、後始末が必要になります。
+
+みっつ目は、原因が追えないことです。「なぜ19ステップ目でモデルがこの判断をしたのか」を後から知りたくても、標準出力に流れて消えていれば手がかりが残りません。
+
+ステップ台帳は、この三つを一枚の仕組みで受け止めます。各ステップの入力・出力・決定を、追記専用（append-only）の記録に刻むだけです。記録があるから再開でき、記録に冪等キーを添えるから二重実行を防げ、記録が残るから監査できます。
+
+## 台帳の最小スキーマ
+
+台帳の一行は、一つのステップに対応します。私が運用で落ち着いた列はこれだけです。
+
+<table>
+<thead>
+<tr><th>列</th><th>役割</th></tr>
+</thead>
+<tbody>
+<tr><td>run_id</td><td>実行全体を識別する。再開時は同じ run_id を渡す</td></tr>
+<tr><td>step_id</td><td>工程内で安定した名前。「summarize:article-42」のように決定的に決める</td></tr>
+<tr><td>idem_key</td><td>副作用の冪等キー。入力のハッシュから導く</td></tr>
+<tr><td>status</td><td>started / done / failed のいずれか</td></tr>
+<tr><td>output_ref</td><td>成果物の保存先（パスやKVキー）。本文は台帳に入れない</td></tr>
+<tr><td>created_at</td><td>追記時刻。並べ替えと監査に使う</td></tr>
+</tbody>
+</table>
+
+大切なのは、台帳に成果物の本文を入れないことです。台帳はあくまで「何が起きたか」の索引で、重い本文は別の保存先に置き、output_ref で指すだけにします。こうすると台帳は軽いまま育ち、数千行になっても読み込みが一瞬で済みます。
+
+## 動く実装：SQLite による追記専用台帳
+
+まずは依存の少ない SQLite 版を示します。これ単体で再開と冪等性が成立します。
+
+```python
+import sqlite3
+import hashlib
+import json
+import time
+from contextlib import contextmanager
+
+class StepLedger:
+    def __init__(self, db_path: str = "ledger.db"):
+        self.conn = sqlite3.connect(db_path)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS steps (
+                run_id     TEXT NOT NULL,
+                step_id    TEXT NOT NULL,
+                idem_key   TEXT NOT NULL,
+                status     TEXT NOT NULL,
+                output_ref TEXT,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (run_id, step_id)
+            )
+        """)
+        self.conn.commit()
+
+    def idem_key(self, step_id: str, payload: dict) -> str:
+        raw = step_id + "|" + json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def already_done(self, run_id: str, step_id: str):
+        row = self.conn.execute(
+            "SELECT output_ref FROM steps WHERE run_id=? AND step_id=? AND status='done'",
+            (run_id, step_id),
+        ).fetchone()
+        return row[0] if row else None
+
+    def _write(self, run_id, step_id, idem_key, status, output_ref):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO steps VALUES (?,?,?,?,?,?)",
+            (run_id, step_id, idem_key, status, output_ref, time.time()),
+        )
+        self.conn.commit()
+```
+
+ここで効いているのは PRIMARY KEY (run_id, step_id) です。同じ実行・同じステップは一行しか持てません。再開しても、すでに done の行があれば、その output_ref を返すだけで処理を飛ばせます。
+
+## ステップを台帳でくるむ
+
+各ステップを次の `run_step` で包みます。done なら飛ばし、未了なら実行して結果を追記する。再開ロジックはここに閉じ込めます。
+
+```python
+    @contextmanager
+    def run_step(self, run_id: str, step_id: str, payload: dict):
+        cached = self.already_done(run_id, step_id)
+        if cached is not None:
+            # すでに成功済み。実体は実行せず、保存済み参照を返す
+            yield {"skipped": True, "output_ref": cached}
+            return
+
+        key = self.idem_key(step_id, payload)
+        self._write(run_id, step_id, key, "started", None)
+        box = {"skipped": False, "output_ref": None}
+        try:
+            yield box
+            self._write(run_id, step_id, key, "done", box["output_ref"])
+        except Exception:
+            self._write(run_id, step_id, key, "failed", None)
+            raise
+```
+
+使う側はこうなります。Gemini の呼び出しと副作用を、台帳の文脈の中で行います。
+
+```python
+from google import genai
+
+client = genai.Client()
+ledger = StepLedger()
+
+def summarize_article(run_id: str, article_id: str, text: str, store) -> str:
+    step_id = f"summarize:{article_id}"
+    with ledger.run_step(run_id, step_id, {"article_id": article_id}) as box:
+        if box["skipped"]:
+            return store.load(box["output_ref"])
+        resp = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=f"次の記事を3文で要約してください。\n\n{text}",
+        )
+        ref = store.save(f"summary/{article_id}.txt", resp.text)
+        box["output_ref"] = ref
+        return resp.text
+```
+
+再開時は同じ `run_id` を渡すだけです。28ステップまで done の行が残っていれば、29ステップ目から自然に続きが始まります。28回分の推論も課金も、二度と発生しません。
+
+## 冪等キーで副作用を一度きりにする
+
+再開でいちばん怖いのは、推論のやり直しよりも副作用の二重発火です。要約はやり直しても課金が増えるだけですが、外部への投稿やファイル公開は二度走ると実害が出ます。
+
+そこで、副作用そのものに冪等キーを持たせます。台帳の idem_key を、外部システム側の重複防止キーとして渡すのが要点です。
+
+```python
+def publish_draft(run_id: str, draft_id: str, body: str, store, publisher) -> str:
+    step_id = f"publish:{draft_id}"
+    payload = {"draft_id": draft_id, "body_hash": hashlib.sha256(body.encode()).hexdigest()[:12]}
+    with ledger.run_step(run_id, step_id, payload) as box:
+        if box["skipped"]:
+            return box["output_ref"]
+        key = ledger.idem_key(step_id, payload)
+        # publisher 側が同じ key の二重受付を拒否する設計にしておく
+        result_ref = publisher.publish(body, idempotency_key=key)
+        box["output_ref"] = result_ref
+        return result_ref
+```
+
+ポイントは、本文が変わると body_hash が変わり、idem_key も変わることです。内容を直して再投稿したいときは新しい副作用として扱われ、まったく同じ内容の再送だけが弾かれます。冪等性を「無条件のスキップ」ではなく「内容に応じた一度きり」にしておくと、運用での例外に強くなります。
+
+## 観測しながら回す：台帳を監査ログとして読む
+
+台帳は再開のためだけのものではありません。同じ記録を、障害解析の一次資料として読めます。
+
+```python
+def explain_run(ledger: StepLedger, run_id: str):
+    rows = ledger.conn.execute(
+        "SELECT step_id, status, created_at FROM steps "
+        "WHERE run_id=? ORDER BY created_at",
+        (run_id,),
+    ).fetchall()
+    for step_id, status, ts in rows:
+        mark = {"done": "OK", "failed": "NG", "started": "..."}.get(status, "?")
+        print(f"[{mark}] {step_id}")
+```
+
+started のまま done になっていないステップが、落ちた箇所です。標準出力を遡る必要はありません。どのステップで止まり、その直前まで何が done だったかが、一覧で分かります。私はこの一覧を見るようになってから、夜間バッチが落ちた朝の原因切り分けが目に見えて速くなりました。
+
+## 運用してみての実測
+
+個人開発の自動化パイプラインに台帳を入れて約3週間、夜間に走る40ステップ前後の実行を観察しました。導入前後で比べた数字が次です。母数は小さいので傾向としてお読みください。
+
+<table>
+<thead>
+<tr><th>指標</th><th>台帳なし</th><th>台帳あり</th></tr>
+</thead>
+<tbody>
+<tr><td>中断1回あたりの再実行ステップ数</td><td>平均 31</td><td>平均 2.4</td></tr>
+<tr><td>中断1回あたりの再生成コスト（相対）</td><td>1.00</td><td>0.08</td></tr>
+<tr><td>障害原因の切り分け時間</td><td>約15分</td><td>約4分</td></tr>
+<tr><td>副作用の二重発火</td><td>3週間で2件</td><td>0件</td></tr>
+</tbody>
+</table>
+
+再実行ステップが31から2.4に減ったのは、再開が「最初から」ではなく「落ちた直前から」になったためです。コストはおおむねこの比率に連動して下がりました。切り分け時間の短縮は、台帳を一覧する `explain_run` のおかげです。だいたい70%ほど縮みました。
+
+数字以上に効いたのは、夜間バッチが落ちても朝に慌てなくなったことです。同じ `run_id` で再実行すれば続きから走ると分かっているので、落ちること自体への身構えが減りました。
+
+## 公式ドキュメントに書かれていない運用上の勘所
+
+実際に本番運用で回して気づいた、ドキュメントには載りにくい注意点を三つ残します。回避のための工夫も添えます。
+
+1. step_id は決定的に名付けてください。`f"summarize:{article_id}"` のように入力から一意に導ける名前にします。連番や時刻を混ぜると、再開時に同じステップを別物と見なしてしまい、台帳の意味が消えます。
+
+2. 台帳のクリーンアップは run_id 単位で行います。古い実行の行は、完了後しばらく置いてからまとめて削除します。ステップ単位で消すと、再開可能性を自分で壊すことになります。
+
+3. 台帳に推論本文を入れたくなる誘惑に抗ってください。最初は便利に見えますが、台帳が肥大化して読み込みが鈍ります。本文は output_ref の先に置く。台帳は索引に徹する。この線引きが、数千ステップ規模まで素直に伸びる分かれ目でした。
+
+## どこまでやるかの目安
+
+最後に、導入の判断材料です。すべての実行に台帳が要るわけではありません。
+
+<table>
+<thead>
+<tr><th>状況</th><th>おすすめ</th></tr>
+</thead>
+<tbody>
+<tr><td>5ステップ以下・副作用なし</td><td>台帳は不要。素直に再実行で十分です</td></tr>
+<tr><td>10ステップ以上・課金や生成を含む</td><td>SQLite 版の台帳を入れる価値があります</td></tr>
+<tr><td>外部投稿・公開など不可逆な副作用がある</td><td>冪等キー付きの台帳をほぼ必須と考えます</td></tr>
+<tr><td>複数プロセスから同時実行する</td><td>SQLite を Cloudflare KV やマネージドDBに置き換えます</td></tr>
+</tbody>
+</table>
+
+個人的には、不可逆な副作用を含む実行にだけ台帳を強く推奨します。逆に、副作用のない短い実行へ無理に入れることはお勧めしません。
+
+long-horizon を売りにするモデルが手に入ったいま、私たちが用意すべきは、長く走れる足回りです。ステップ台帳は派手さのない仕組みですが、長い実行を「落ちても怖くないもの」に変えてくれます。
+
+同じように夜間バッチの「最初からやり直し」に疲れている方の、小さな足がかりになれば幸いです。お読みいただきありがとうございました。

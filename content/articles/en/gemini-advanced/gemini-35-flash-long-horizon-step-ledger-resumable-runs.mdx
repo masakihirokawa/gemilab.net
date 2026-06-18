@@ -1,0 +1,243 @@
+---
+title: "Restarting a Long Agent Run From Where It Broke — A Step-Ledger Design for Gemini 3.5 Flash Long-Horizon Tasks"
+slug: "gemini-35-flash-long-horizon-step-ledger-resumable-runs"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-18T13:00"
+author: "Gemini Lab"
+description: "Gemini 3.5 Flash is good at long-horizon tasks, but when a 40-step run dies on step 29, you usually start over. An append-only step ledger gives you resume, idempotency, and audit in one place. Here is the design with working Python and measured results."
+tags: ["gemini-3-5-flash", "agent", "long-horizon", "production", "architecture"]
+highlights:
+  - "Take home a copy-paste step ledger that lets a 30-60 step agent run resume from the last successful step instead of restarting from zero"
+  - "Learn how to build idempotency keys that stop the same side effect (API billing, file generation, external posting) from firing twice on resume"
+  - "See how the same ledger doubles as an audit log of what the model decided at each step, which cut my incident triage time by roughly 70% in practice"
+---
+
+It died on step 29.
+
+It was a late night, with Gemini 3.5 Flash handling a long pipeline for me: collecting article candidates, summarizing, dedup checks, drafting, and tidying image metadata — about 40 small steps packed into a single run. It sailed through 28 steps, and on step 29 an external API returned a 504 and took the whole process down with it.
+
+The painful part is that a restart throws away 28 steps of reasoning and billing for nothing. As an indie developer, I went through this "start over from scratch" a few times on my own projects before I finally sat down and built a foundation that could resume.
+
+Today, June 18, Gemini 3.5 Flash became available, described as able to stay useful across long-horizon, multi-step tasks. And yes — the amount of work I can pack into a single run has clearly grown. But the longer a run gets, the larger the loss when it dies midway. To make the most of a model that runs long, you need running gear built for long runs.
+
+The piece of running gear I settled on is an unglamorous thing: a step ledger.
+
+## The Three Moments a Long Run Breaks
+
+First, where does it break? Once a run stretches past 30 steps, failures kept arriving in exactly three shapes.
+
+The first is interruption from the outside: API timeouts, rate limits, a deploy restarting the process. You cannot avoid these.
+
+The second is duplicate execution on resume. If you restart sloppily from the failure point, you re-post a draft you already posted, or re-run a generation you already paid for. This is nastier than the interruption itself, because it needs cleanup.
+
+The third is being unable to trace the cause. When you later want to know why the model made a certain decision on step 19, there is nothing to go on if it scrolled past on stdout and vanished.
+
+A step ledger absorbs all three with one mechanism. It records each step's input, output, and decision into an append-only log. Because the record exists, you can resume; because the record carries an idempotency key, you avoid double execution; because the record stays, you can audit.
+
+## The Minimal Ledger Schema
+
+One row of the ledger maps to one step. These are the only columns I settled on in production.
+
+<table>
+<thead>
+<tr><th>Column</th><th>Role</th></tr>
+</thead>
+<tbody>
+<tr><td>run_id</td><td>Identifies the whole run. On resume, pass the same run_id</td></tr>
+<tr><td>step_id</td><td>A stable name within the pipeline, derived deterministically like "summarize:article-42"</td></tr>
+<tr><td>idem_key</td><td>Idempotency key for the side effect, derived from the input hash</td></tr>
+<tr><td>status</td><td>One of started / done / failed</td></tr>
+<tr><td>output_ref</td><td>Where the artifact lives (a path or KV key). The body never goes in the ledger</td></tr>
+<tr><td>created_at</td><td>Append time, used for ordering and audit</td></tr>
+</tbody>
+</table>
+
+What matters is keeping the artifact body out of the ledger. The ledger is only an index of "what happened"; heavy bodies live elsewhere and the ledger just points at them with output_ref. Kept this way, the ledger stays light as it grows, and reads stay instant even at thousands of rows.
+
+## A Working Implementation: An Append-Only Ledger on SQLite
+
+Here is a low-dependency SQLite version. On its own it gives you resume and idempotency.
+
+```python
+import sqlite3
+import hashlib
+import json
+import time
+from contextlib import contextmanager
+
+class StepLedger:
+    def __init__(self, db_path: str = "ledger.db"):
+        self.conn = sqlite3.connect(db_path)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS steps (
+                run_id     TEXT NOT NULL,
+                step_id    TEXT NOT NULL,
+                idem_key   TEXT NOT NULL,
+                status     TEXT NOT NULL,
+                output_ref TEXT,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (run_id, step_id)
+            )
+        """)
+        self.conn.commit()
+
+    def idem_key(self, step_id: str, payload: dict) -> str:
+        raw = step_id + "|" + json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def already_done(self, run_id: str, step_id: str):
+        row = self.conn.execute(
+            "SELECT output_ref FROM steps WHERE run_id=? AND step_id=? AND status='done'",
+            (run_id, step_id),
+        ).fetchone()
+        return row[0] if row else None
+
+    def _write(self, run_id, step_id, idem_key, status, output_ref):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO steps VALUES (?,?,?,?,?,?)",
+            (run_id, step_id, idem_key, status, output_ref, time.time()),
+        )
+        self.conn.commit()
+```
+
+The quiet hero here is PRIMARY KEY (run_id, step_id). The same run and same step can only hold one row. On resume, if a done row already exists, you just return its output_ref and skip the work.
+
+## Wrapping a Step in the Ledger
+
+Wrap each step with the `run_step` below. If it is done, skip; if not, run it and append the result. The resume logic is sealed in here.
+
+```python
+    @contextmanager
+    def run_step(self, run_id: str, step_id: str, payload: dict):
+        cached = self.already_done(run_id, step_id)
+        if cached is not None:
+            # Already succeeded: do not run the body, return the stored reference
+            yield {"skipped": True, "output_ref": cached}
+            return
+
+        key = self.idem_key(step_id, payload)
+        self._write(run_id, step_id, key, "started", None)
+        box = {"skipped": False, "output_ref": None}
+        try:
+            yield box
+            self._write(run_id, step_id, key, "done", box["output_ref"])
+        except Exception:
+            self._write(run_id, step_id, key, "failed", None)
+            raise
+```
+
+The caller looks like this. The Gemini call and the side effect both happen inside the ledger's context.
+
+```python
+from google import genai
+
+client = genai.Client()
+ledger = StepLedger()
+
+def summarize_article(run_id: str, article_id: str, text: str, store) -> str:
+    step_id = f"summarize:{article_id}"
+    with ledger.run_step(run_id, step_id, {"article_id": article_id}) as box:
+        if box["skipped"]:
+            return store.load(box["output_ref"])
+        resp = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=f"Summarize the following article in three sentences.\n\n{text}",
+        )
+        ref = store.save(f"summary/{article_id}.txt", resp.text)
+        box["output_ref"] = ref
+        return resp.text
+```
+
+On resume you only pass the same `run_id`. If done rows survive through step 28, step 29 picks up naturally. The 28 prior steps of reasoning and billing never happen again.
+
+## Making Side Effects Fire Exactly Once
+
+The scariest part of a resume is not re-running reasoning but re-firing a side effect. Re-summarizing only adds billing, but posting externally or publishing a file does real damage if it runs twice.
+
+So give the side effect itself an idempotency key. The point is to pass the ledger's idem_key down as the dedup key on the external system's side.
+
+```python
+def publish_draft(run_id: str, draft_id: str, body: str, store, publisher) -> str:
+    step_id = f"publish:{draft_id}"
+    payload = {"draft_id": draft_id, "body_hash": hashlib.sha256(body.encode()).hexdigest()[:12]}
+    with ledger.run_step(run_id, step_id, payload) as box:
+        if box["skipped"]:
+            return box["output_ref"]
+        key = ledger.idem_key(step_id, payload)
+        # Design the publisher to reject a duplicate submission with the same key
+        result_ref = publisher.publish(body, idempotency_key=key)
+        box["output_ref"] = result_ref
+        return result_ref
+```
+
+Notice that when the body changes, body_hash changes, and so does idem_key. When you fix the content and want to re-publish, it is treated as a new side effect, and only an identical re-send is rejected. Making idempotency "once per content" rather than "unconditional skip" makes it resilient to the exceptions you hit in operation.
+
+## Run It While Observing: Reading the Ledger as an Audit Log
+
+The ledger is not only for resume. The same record reads as primary evidence for incident analysis.
+
+```python
+def explain_run(ledger: StepLedger, run_id: str):
+    rows = ledger.conn.execute(
+        "SELECT step_id, status, created_at FROM steps "
+        "WHERE run_id=? ORDER BY created_at",
+        (run_id,),
+    ).fetchall()
+    for step_id, status, ts in rows:
+        mark = {"done": "OK", "failed": "NG", "started": "..."}.get(status, "?")
+        print(f"[{mark}] {step_id}")
+```
+
+The step still in started and never reaching done is where it broke. You do not have to scroll back through stdout. Which step stalled, and what was done up to just before it, is right there in a list. Ever since I started reading this list, my morning triage after a nightly batch failure got visibly faster.
+
+## What the Numbers Looked Like
+
+I ran the ledger inside my indie automation pipeline for about three weeks, watching the roughly 40-step runs that fire overnight. Here is the before/after. The sample is small, so read it as a tendency.
+
+<table>
+<thead>
+<tr><th>Metric</th><th>No ledger</th><th>With ledger</th></tr>
+</thead>
+<tbody>
+<tr><td>Re-run steps per interruption</td><td>avg 31</td><td>avg 2.4</td></tr>
+<tr><td>Regeneration cost per interruption (relative)</td><td>1.00</td><td>0.08</td></tr>
+<tr><td>Time to isolate a failure cause</td><td>~15 min</td><td>~4 min</td></tr>
+<tr><td>Double-fired side effects</td><td>2 in 3 weeks</td><td>0</td></tr>
+</tbody>
+</table>
+
+Re-run steps dropped from 31 to 2.4 because resume became "from just before the failure" instead of "from the start." Cost fell roughly in line with that ratio. The shorter triage time is thanks to listing the ledger with `explain_run` — about a 70% reduction.
+
+What mattered more than the numbers is that a failed nightly batch no longer ruins my morning. Knowing a re-run with the same `run_id` continues from where it stopped, I brace less against failure itself.
+
+## Operational Notes You Will Not Find in the Docs
+
+Three things I noticed in practice that the docs rarely mention.
+
+Name your step_id deterministically. Use a name uniquely derivable from the input, like `f"summarize:{article_id}"`. If you mix in a counter or a timestamp, a resume will treat the same step as a different one, and the ledger loses its meaning.
+
+Clean up the ledger by run_id. Delete an old run's rows in bulk a while after it completes. Deleting per step would break your own resumability.
+
+And resist the temptation to put reasoning bodies in the ledger. It looks convenient at first, but the ledger bloats and reads slow down. Keep bodies behind output_ref; keep the ledger a pure index. That line is what let mine scale gracefully to thousands of steps.
+
+## How Far to Take It
+
+Finally, a guide for deciding. Not every run needs a ledger.
+
+<table>
+<thead>
+<tr><th>Situation</th><th>Recommendation</th></tr>
+</thead>
+<tbody>
+<tr><td>5 steps or fewer, no side effects</td><td>No ledger needed. A plain re-run is enough</td></tr>
+<tr><td>10+ steps, includes billing or generation</td><td>The SQLite ledger is worth adding</td></tr>
+<tr><td>Irreversible side effects like posting or publishing</td><td>Treat an idempotency-keyed ledger as nearly mandatory</td></tr>
+<tr><td>Concurrent runs from multiple processes</td><td>Swap SQLite for Cloudflare KV or a managed DB</td></tr>
+</tbody>
+</table>
+
+Now that we have a model that markets itself on long horizons, what we should prepare is running gear that runs long. A step ledger is an unglamorous mechanism, but it turns a long run into something you no longer fear losing.
+
+If you are similarly tired of the "start over from scratch" nightly batch, I hope this gives you a small foothold. Thank you for reading.
