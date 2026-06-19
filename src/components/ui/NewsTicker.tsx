@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLI — Gemini CLIとGemini Code Assist IDE拡張は6/18でリクエスト受付を終了しました。移行先はAntigravity、ターミナル派にはGo製のAntigravity CLIです",
-    "FLASH — Gemini 3.5 Flashが一般提供（GA）に。エージェントとコーディング用途で持続的にフロンティア性能を出す最も賢いモデルと位置づけられています",
-    "IMAGE — gemini-3.1-flash-image-previewとgemini-3-pro-image-previewが非推奨となり、6/25にシャットダウン予定です。参照コードは後継へ切替を",
-    "AGENTS — Managed Agentsが公開プレビューに。Googleがホストする隔離Linuxサンドボックスでステートフルな自律エージェントを動かせます",
-    "SEARCH — File Searchがgemini-embedding-2による画像のマルチモーダル検索に対応しました",
-    "MIGRATE — 期限つきの非推奨や停止が続くため、CLIや旧モデルを組み込んだ自動化は移行状況の記録が欠かせません",
+    "FLASH — Gemini 3.5 Flashが一般提供（GA）に。エージェントやコーディングで持続的なフロンティア性能をうたいます",
+    "TIER — 3.1 Pro・3.1 Flash-Liteといった新ティアがアプリ・クラウド・業務ツールへ順次展開されています",
+    "PIXEL — 6月Pixel DropでGeminiの楽曲生成、AIによる動画・音楽作成、画面録画リアクションが追加されました",
+    "OMNI — 生成のGemini Omni、推論の3 Deep Think、調査のDeep Researchが並行して強化されています",
+    "LIVE — Gemini Liveのライブやりとりが、Android・検索・YouTube・各Googleアプリへ広がっています",
+    "ULTRA — Google AI Ultraは最上位アクセス・Deep Research・Veo 3動画・100万トークン文脈を提供します",
   ],
   en: [
-    "CLI — Gemini CLI and the Gemini Code Assist IDE extensions stopped serving requests on Jun 18; migrate to Antigravity or the new Go-based Antigravity CLI",
-    "FLASH — Gemini 3.5 Flash is now generally available, billed as the smartest model for sustained frontier performance on agentic and coding tasks",
-    "IMAGE — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview are deprecated and shut down on Jun 25; move to the successor models",
-    "AGENTS — Managed Agents is in public preview, running stateful autonomous agents in secure, isolated Google-hosted Linux sandboxes",
-    "SEARCH — File Search now supports multimodal image search natively via the gemini-embedding-2 model",
-    "MIGRATE — With deadline-bound deprecations piling up, any automation built on the CLI or old models needs a tracked migration",
+    "FLASH — Gemini 3.5 Flash is now generally available, billed as the most intelligent model for agentic and coding tasks",
+    "TIER — New tiers like 3.1 Pro and 3.1 Flash-Lite are rolling into apps, cloud products, and business tools",
+    "PIXEL — The June Pixel Drop adds Gemini music generation, AI video and music creation, and screen-recording reactions",
+    "OMNI — Gemini Omni (creation), 3 Deep Think (reasoning), and Deep Research (automation) all advance in parallel",
+    "LIVE — Gemini Live's real-time interaction is expanding across Android, Search, YouTube, and connected Google apps",
+    "ULTRA — Google AI Ultra offers top model access, Deep Research, Veo 3 video, and a 1M-token context window",
   ],
 };
 
