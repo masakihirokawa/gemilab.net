@@ -1,0 +1,171 @@
+---
+title: "見た目がほぼ同じ画像を公開前に弾く — gemini-embedding-2 で近重複ゲートを作る"
+slug: "gemini-embedding2-image-dedup-prepublish-gate"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-19T19:55"
+author: "Gemini Lab"
+description: "画像検索ではなく『近重複の除去』に gemini-embedding-2 のマルチモーダル埋め込みを使います。ベクトル化・クラスタリング・公開前ゲートの動くコードと、しきい値の決め方をまとめました。"
+tags: ["gemini", "gemini-embedding-2", "embeddings", "image", "deduplication"]
+highlights:
+  - "アセットが増えるたびに『これ前にも出した気がする』と迷っていた人が、公開前に近重複を自動で弾けるようになります"
+  - "gemini-embedding-2 のマルチモーダル埋め込みで画像をベクトル化し、コサイン類似度としきい値クラスタリングで近重複だけを取り出す動くコードが手に入ります"
+  - "しきい値をどう決め、トリミングや色違いをどう扱うかの落とし穴が分かり、複数サイトのOGP・壁紙アセットを破綻なく増やせるようになります"
+---
+
+複数サイトを運用していると、画像アセットは「足りない」より「似たものが増えすぎる」ことの方が後から効いてきます。私自身、壁紙アプリと4つのブログのOGP画像を個人開発で抱えていて、半年ほど前から「この淡いブルーの抽象背景、前にも公開した気がする」と手が止まる場面が増えました。1枚ずつ目で確かめるのは、枚数が三桁を超えたあたりで現実的でなくなります。
+
+2026年6月に File Search が `gemini-embedding-2` のマルチモーダル検索に対応したことで、この問題に素直な道具が増えました。ただ、ここで扱いたいのは「検索」ではありません。**似た画像を探して引っ張ってくる**のではなく、**似すぎている画像を公開前に弾く**ことです。この2つは目的も実装も別物で、混同するとゲートが素通りします。
+
+## なぜ「画像検索」では近重複を弾けないのか
+
+検索（retrieval）は「クエリに近い上位N件を返す」処理です。返ってくるのは常に何かしらの結果で、しきい値は緩くても成立します。一方、近重複の除去（near-duplicate detection）が必要とするのは「ある2枚が、実質的に同じと言えるほど近いか」という二値の判定です。
+
+retrieval をそのまま転用すると、「最も近い1件」は必ず返るので、まったく別の画像同士でも"似ている候補"として並びます。逆に、しきい値を検索向けに緩めたままだと、本当に弾きたい色違い・トリミング違いを取りこぼします。近重複ゲートでは、**スコアそのものを判定境界として使う**設計に切り替える必要があります。
+
+私はこの違いを最初は軽視していて、File Search の検索結果の上位を見て「重複なし」と判断していました。実際には、似た構図のグラデーション背景が3系統に膨らんでいて、検索の文脈では別々のヒットとして扱われていただけでした。
+
+## 画像をベクトル化する
+
+まず各画像を `gemini-embedding-2` で埋め込みベクトルに変換します。マルチモーダル対応なので、テキストと同じエンドポイントに画像パートを渡せます。
+
+```python
+import os
+from pathlib import Path
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+EMBED_MODEL = "gemini-embedding-2"  # マルチモーダル対応（2026-06 GA）
+
+def embed_image(path: Path) -> list[float]:
+    data = path.read_bytes()
+    mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    resp = client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=[types.Part.from_bytes(data=data, mime_type=mime)],
+    )
+    return resp.embeddings[0].values
+```
+
+ベクトルはあらかじめ L2 正規化しておくと、内積がそのままコサイン類似度になり、後段の計算が単純になります。
+
+```python
+import math
+
+def l2_normalize(v):
+    norm = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / norm for x in v]
+
+def cosine(a, b):
+    # a, b は正規化済みベクトル → 内積がコサイン類似度
+    return sum(x * y for x, y in zip(a, b))
+
+def build_index(paths):
+    index = {}
+    for p in paths:
+        index[str(p)] = l2_normalize(embed_image(p))
+    return index
+```
+
+埋め込みは1枚ごとにAPIを叩くため、アセットが増えると素朴な実装では毎回コストがかかります。私の運用では、ベクトルをファイルのハッシュをキーにしてローカルに保存し、内容が変わっていない画像は再埋め込みしないようにしています。
+
+## 近重複をクラスタリングする
+
+全ペアのコサイン類似度を取り、しきい値以上で結ばれた画像を1つのまとまりにします。「AとBが近い、BとCが近い」を1クラスタに束ねたいので、Union-Find（素集合データ構造）を使うと素直に書けます。
+
+```python
+class UnionFind:
+    def __init__(self, keys):
+        self.parent = {k: k for k in keys}
+
+    def find(self, k):
+        while self.parent[k] != k:
+            self.parent[k] = self.parent[self.parent[k]]  # 経路圧縮
+            k = self.parent[k]
+        return k
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[ra] = rb
+
+
+def cluster_near_duplicates(index, threshold=0.96):
+    keys = list(index)
+    uf = UnionFind(keys)
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            if cosine(index[keys[i]], index[keys[j]]) >= threshold:
+                uf.union(keys[i], keys[j])
+    clusters = {}
+    for k in keys:
+        clusters.setdefault(uf.find(k), []).append(k)
+    # メンバーが2枚以上のクラスタだけが「近重複」
+    return [m for m in clusters.values() if len(m) > 1]
+```
+
+全ペア比較は O(n²) なので、数千枚を超えるなら近似最近傍（ANN）に載せ替えますが、私のように1サイトあたり数百枚規模なら素朴な総当たりで十分に速く、まず動かして挙動を確かめる方を優先しています。
+
+## 公開前ゲートに組み込む
+
+実運用で効くのは「全アセットの再クラスタリング」よりも、**新しく追加する候補が既存資産と近すぎないか**を公開直前に判定するゲートです。既存ベクトルのインデックスは保存済みなので、候補だけを埋め込んで突き合わせます。
+
+```python
+from pathlib import Path
+
+def prepublish_dedup_gate(candidate_paths, existing_index, threshold=0.96):
+    flagged = []
+    for p in candidate_paths:
+        vec = l2_normalize(embed_image(Path(p)))
+        best_key, best_sim = None, 0.0
+        for old_key, old_vec in existing_index.items():
+            sim = cosine(vec, old_vec)
+            if sim > best_sim:
+                best_key, best_sim = old_key, sim
+        if best_sim >= threshold:
+            flagged.append((str(p), best_key, round(best_sim, 4)))
+    return flagged
+
+
+def pick_representative(members):
+    # 解像度・情報量の代理としてファイルサイズが最大のものを代表に残す
+    return max(members, key=lambda p: Path(p).stat().st_size)
+```
+
+`flagged` が空でなければ、CI やデプロイ前スクリプトを `exit 1` で止めます。私はここで自動削除はせず、「どの既存画像と、どれくらい近いか」を一覧で出すだけにとどめています。代表を残してどちらを捨てるかは、最終的には人の目で決めたい部分だからです。作品そのものをAIに作らせるのではなく、運用の判断補助にだけAIを使う、という線引きをここでも守っています。
+
+## しきい値の決め方と落とし穴
+
+しきい値は0.96前後から始めますが、これは固定値ではなく、自分のアセットの傾向で調整する数字です。手元の壁紙・OGP画像で測った大まかな目安は次の通りでした。
+
+<table>
+<thead>
+<tr><th>しきい値</th><th>検出される関係</th><th>運用上の印象</th></tr>
+</thead>
+<tbody>
+<tr><td>0.99以上</td><td>ほぼ完全一致（再書き出し・軽圧縮違い）</td><td>取りこぼしが多い。明確な重複だけ</td></tr>
+<tr><td>0.96〜0.98</td><td>色違い・微トリミング・同系統の構図</td><td>個人運用ではこの帯が実用的だと感じます</td></tr>
+<tr><td>0.93以下</td><td>「雰囲気が似ている」レベルまで</td><td>誤検出が増え、別物まで束ねてしまう</td></tr>
+</tbody>
+</table>
+
+注意したいのは、マルチモーダル埋め込みは**意味的な近さ**を捉えるため、人間が「これは別作品」と感じる微妙な差を、低めのしきい値では潰してしまう点です。たとえば同じ被写体を別の時間帯に撮った2枚は、構図が近いと高スコアになりがちです。これを重複として弾くかどうかは作品としての意図に関わるので、しきい値だけでは決め切れません。
+
+もう一つの落とし穴は、極端なアスペクト比の違いです。横長のOGP用と正方形のアプリアイコン用で同じ素材を切り出した場合、見た目の主役は同じでも埋め込みの距離は開きます。私はこの種の「用途違いの同素材」はゲートの対象外にしたいので、出力サイズの系統ごとにインデックスを分けて運用しています。
+
+## 運用に乗せて気づいたこと
+
+このゲートを挟むようになって一番変わったのは、「似たものを作ってしまう前」の意識でした。公開直前に弾かれると手戻りが大きいので、新しいアセットを作る段階で「既存の系統と意図的に変える」ことを考えるようになります。ゲートは重複を消す道具であると同時に、作る側の自己点検にもなっていました。
+
+導入は、いきなり全アセットに厳しいしきい値をかけるのではなく、次の順番を推奨します。
+
+1. 既存アセット全体を一度クラスタリングし、現状の近重複を可視化する
+2. 明らかな近重複だけを手で整理し、自分のアセットでのしきい値の体感を掴む
+3. 公開前ゲートを本番運用に常設し、新しく追加する候補だけを継続的に判定する
+
+この順番にしているのは、最初から全部を弾こうとすると過去の判断まで否定されているようで、運用が窮屈になるからです。本番運用で効くのは「完璧な一括判定」よりも、足し算のたびに小さく確認できる仕組みのほうでした。
+
+近重複の判定にAIを使うことに、最初は少し抵抗がありました。けれど、最終的に「どれを残すか」を自分で決められる形にしておけば、AIは迷いを減らす相棒になってくれます。同じように画像アセットの肥大化に悩んでいる方の、最初の一歩の参考になれば嬉しいです。
