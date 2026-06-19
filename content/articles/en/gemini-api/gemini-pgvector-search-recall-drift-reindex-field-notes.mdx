@@ -1,0 +1,234 @@
+---
+title: "When Your pgvector Search Quietly Gets Worse — Field Notes on Protecting Recall with Gemini Embeddings"
+slug: "gemini-pgvector-search-recall-drift-reindex-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-19T13:00"
+author: "Gemini Lab"
+description: "A semantic search built on Gemini Embeddings and PostgreSQL pgvector tends to lose precision over months without throwing a single error. These are field notes on the real causes — model pinning, operator/index mismatch, HNSW reindexing, and recall collapse under filters — with working code."
+tags: ["gemini-api", "pgvector", "semantic-search", "embeddings", "postgresql", "hnsw", "production"]
+highlights:
+  - "Why recall drops when storage and query embeddings drift in model, dimension, or task_type — and how to pin them down in config"
+  - "A measurement-driven routine for tuning HNSW ef_search, handling dead tuples, and timing reindexes"
+  - "Why HNSW recall collapses under WHERE filters, and how partial indexes, iterative scan, and candidate widening fix it"
+---
+
+Right after launch, the search felt sharp. Six months in, it feels "slightly dull." No errors. Latency unchanged. But the article that used to land at the top now sits third, and the trickle of "I searched but couldn't find it" messages slowly grows. As an indie developer running cross-site search on pgvector across several of my own projects, I have been caught by this quiet decay more than once.
+
+The tricky part is that it never surfaces as a bug. The `SELECT` succeeds and rows come back. What breaks is the **ranking**, not availability. These are field notes on how a semantic search built on Gemini Embeddings and PostgreSQL pgvector loses recall in production, and the fixes I actually applied, in order.
+
+## First, turn "dullness" into a number — you can't fix recall you don't measure
+
+Before debating decay, you need a way to measure Recall@k, or the whole discussion collapses into anecdotes. Start by fixing a small evaluation set with known answers.
+
+Treat exact (non-indexed) search as ground truth, then measure how much the approximate index path misses. In pgvector you can force exact scan by disabling the index scan.
+
+```python
+# recall_probe.py — measure HNSW Recall@k against exhaustive search
+import psycopg2
+
+DB = {"host": "localhost", "database": "semantic_search",
+      "user": "postgres", "password": "your_password"}
+
+def topk_ids(cur, qvec, k, exact: bool):
+    # disable index only for the exact (ground-truth) pass
+    cur.execute("SET LOCAL enable_indexscan = %s", ("off" if exact else "on",))
+    cur.execute(
+        """
+        SELECT id
+        FROM documents
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s
+        """,
+        (str(qvec), k),
+    )
+    return [r[0] for r in cur.fetchall()]
+
+def measure_recall(query_vectors, k=10):
+    conn = psycopg2.connect(**DB)
+    hits, total = 0, 0
+    for qv in query_vectors:
+        with conn.cursor() as cur:
+            truth = set(topk_ids(cur, qv, k, exact=True))
+            approx = set(topk_ids(cur, qv, k, exact=False))
+        hits += len(truth & approx)
+        total += k
+    conn.close()
+    return hits / total  # Recall@k
+
+# e.g. track Recall@10 over 200 representative queries
+# print(round(measure_recall(sample_query_vecs, k=10), 4))  # 0.991
+```
+
+Logging this weekly lets you isolate which of the causes below is biting. I settled on alerting when Recall@10 drops under 0.97 — catching the drift as it begins, not after rankings have already shifted.
+
+## Cause 1: storage and query build their vectors differently
+
+This is the most common and most overlooked. Embeddings are only comparable when they were made with the same model, the same dimension, the same normalization, and the same task intent. Over a long-running system, that consistency erodes.
+
+Three typical drifts:
+
+<table>
+<thead>
+<tr><th>Drift</th><th>How it happens</th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Silent model update</strong></td><td>Code points at a <code>latest</code> alias and the model swaps underneath</td><td>New rows land in a different space and mix with old ones</td></tr>
+<tr><td><strong>task_type mismatch</strong></td><td>Storage uses <code>RETRIEVAL_DOCUMENT</code> and the query reuses the same</td><td>Query-side optimization is lost; recall quietly drops</td></tr>
+<tr><td><strong>Dimension mix-up</strong></td><td><code>output_dimensionality</code> changed later, or normalization skipped</td><td>Distance scale shifts and thresholds become meaningless</td></tr>
+</tbody>
+</table>
+
+The fix is simple: pin the vector-generation config in one place and reference an explicit model ID. Do not use a `latest`-style alias on the production storage or query path.
+
+```python
+# embedding_config.py — pin generation config in one place
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+# Pin a fixed model, not an alias. Fix the dimension too, and make this
+# module the only place allowed to call embed.
+EMBED_MODEL = "gemini-embedding-001"   # never latest/exp in production
+EMBED_DIM = 768
+
+def embed(text: str, *, is_query: bool) -> list[float]:
+    res = client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=text,
+        config={
+            # always split task_type between storage and query
+            "task_type": "RETRIEVAL_QUERY" if is_query else "RETRIEVAL_DOCUMENT",
+            "output_dimensionality": EMBED_DIM,
+        },
+    )
+    v = res.embeddings[0].values
+    # When you request fewer than 3072 dims, Gemini may not normalize the
+    # output, so L2-normalize yourself if you rely on cosine distance.
+    norm = sum(x * x for x in v) ** 0.5
+    return [x / norm for x in v] if norm else v
+```
+
+Stamp each row with the config it was built under so you can audit later. Keep `embed_model` and `embed_dim` next to `embedding`, and you can detect rows that no longer match the current config.
+
+```sql
+ALTER TABLE documents ADD COLUMN embed_model TEXT;
+ALTER TABLE documents ADD COLUMN embed_dim INT;
+
+-- check whether vectors built under different configs got mixed in
+SELECT embed_model, embed_dim, count(*)
+FROM documents
+GROUP BY 1, 2
+ORDER BY 3 DESC;
+-- if this splits into 2+ groups, that mix is likely the "dullness" itself
+```
+
+## Cause 2: the distance operator and the index ops don't match
+
+In pgvector, the operator class used to build the index (`vector_cosine_ops` / `vector_l2_ops` / `vector_ip_ops`) must match the distance operator in your query (`<=>` cosine / `<->` L2 / `<#>` inner product). **If they don't match, the index simply isn't used** — and worse, if you "fix" one side and swap operators by mistake, rankings shift silently.
+
+```sql
+-- if you search with cosine, build the index with cosine_ops
+CREATE INDEX idx_documents_embedding_hnsw
+ON documents USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 200);
+```
+
+The reliable check is whether the index is actually used, via `EXPLAIN`. If you see a Seq Scan instead of an Index Scan, suspect an operator mismatch first.
+
+```sql
+EXPLAIN ANALYZE
+SELECT id FROM documents
+ORDER BY embedding <=> '[...]'::vector
+LIMIT 10;
+-- "Index Scan using idx_documents_embedding_hnsw" means it matches
+-- "Seq Scan" → suspect the operator class mismatch first
+```
+
+## Cause 3: HNSW parameters, and the buildup of dead rows
+
+HNSW recall and speed are governed by build-time `m` / `ef_construction` and search-time `ef_search`. The one you tune in operation is `ef_search` — the search width. Raise it for higher recall at the cost of speed.
+
+```sql
+-- adjustable per session/transaction
+SET hnsw.ef_search = 100;   -- default 40; raise gradually if recall is short
+```
+
+The practical point: don't pick `ef_search` by gut. Use the Recall@k probe from Cause 1, sweep 40 → 80 → 120, and take the smallest value that meets your target (say 0.98). On my data, around `ef_search = 100` was the sweet spot at ~100k rows — Recall@10 ≈ 0.99 against a few-ms latency. Your optimum will differ, so treat this as a measure-then-decide number.
+
+Another quiet factor is **dead and updated rows**. On tables with heavy churn, deleted tuples and stale vectors linger in the HNSW graph, degrading graph quality and slowly lowering recall. I handle this in two stages.
+
+```sql
+-- 1) reclaim dead tuples (when autovacuum can't keep up)
+VACUUM ANALYZE documents;
+
+-- 2) if churn is heavy and recall won't recover, rebuild the index.
+--    In production, rebuild CONCURRENTLY so writes aren't blocked.
+CREATE INDEX CONCURRENTLY idx_documents_embedding_hnsw_new
+ON documents USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 200);
+
+BEGIN;
+DROP INDEX idx_documents_embedding_hnsw;
+ALTER INDEX idx_documents_embedding_hnsw_new RENAME TO idx_documents_embedding_hnsw;
+COMMIT;
+```
+
+Rather than a fixed "once a month" reindex, run it when Recall@k drops below threshold. The metric is what keeps the decision out of guesswork.
+
+## Cause 4: recall collapses the moment you add a filter
+
+This was the first thing that surprised me in production. Add a `WHERE`-clause nearest-neighbor search — "filter by category, then find similar" — and the lower the filter's selectivity, the more HNSW recall falls off a cliff.
+
+The reason: HNSW gathers nearest candidates in vector space first, then applies the `WHERE`. If most candidates are filtered out, you either fall short of `LIMIT k` or the rows that should rank highest were never in the candidate set.
+
+Match the fix to selectivity.
+
+```sql
+-- Fix A: widen candidates before filtering/ordering (medium selectivity)
+SET hnsw.ef_search = 200;   -- widen so k rows survive after filtering
+
+-- Fix B: if the filter value is a small fixed set, use partial indexes
+CREATE INDEX idx_docs_emb_news
+ON documents USING hnsw (embedding vector_cosine_ops)
+WHERE category = 'news';
+
+-- Fix C: pgvector 0.8+ iterative scan keeps searching until k are found
+SET hnsw.iterative_scan = strict_order;   -- add candidates, preserve order
+```
+
+Empirically, if the filter takes only a small set of values (up to a few dozen), partial indexes are the cleanest win. If values are unbounded, absorb it with iterative scan or candidate widening. Either way, re-measure Recall@k *with the filter applied*. Unfiltered recall does not guarantee filtered recall.
+
+## A "shadow column" strategy for switching models
+
+Gemini's embedding models get updated. Moving to a new one often raises recall — but the migration is also a dangerous moment. Old and new vectors live in different spaces, so until you re-embed everything, a mix breaks search.
+
+What I do: leave the production column untouched, rebuild in a shadow column, validate, then cut over.
+
+```sql
+-- 1) add a shadow column (not used by production search)
+ALTER TABLE documents ADD COLUMN embedding_v2 vector(768);
+
+-- 2) backfill embedding_v2 with the new model in the background
+--    (small batches; keep searching the existing embedding column meanwhile)
+
+-- 3) once embedding_v2 is fully populated, measure Recall@k on it vs the old
+-- 4) if better, build the index on v2 and switch queries to embedding_v2
+-- 5) only after it's stable, drop the old embedding column and its index
+```
+
+Full re-embedding costs money, so for low-churn corpora I split batches over the night and space them out to avoid rate limits. Just inserting a validation window with the shadow column — instead of a single all-at-once `ALTER` — prevents nearly all migration-induced incidents.
+
+## A minimal checklist for production
+
+To close, here is everything above as an operational checklist.
+
+- Do storage and query match on model ID (pinned), dimension, normalization, and task_type?
+- Do the `embed_model` / `embed_dim` columns show no mixed-in vectors?
+- Does the index operator class match the query distance operator, with `EXPLAIN` confirming the index is used?
+- Is Recall@k logged weekly, with threshold breaches triggering a reindex or `ef_search` review?
+- Is filtered search measured *with the filter applied*?
+- Do model migrations go through a shadow column and a validation window?
+
+Semantic search is the kind of feature that is harder to keep running at the same precision six months later than it is to launch. Holding on to one metric that lets you notice the dullness — in the end, that mattered most. I hope it helps anyone else running pgvector in production.

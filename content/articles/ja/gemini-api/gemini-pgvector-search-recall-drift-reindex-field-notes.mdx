@@ -1,0 +1,234 @@
+---
+title: "pgvector のセマンティック検索が半年で「鈍く」なるとき — Gemini エンベディングの再現率を守る運用メモ"
+slug: "gemini-pgvector-search-recall-drift-reindex-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-19T13:00"
+author: "Gemini Lab"
+description: "Gemini Embedding と PostgreSQL pgvector で組んだ検索が、運用のうちに静かに精度を落とす理由を整理します。モデル固定・距離演算子の一致・HNSW の再インデックス・フィルタ付き検索の再現率低下まで、本番で踏んだ箇所を実装つきでまとめました。"
+tags: ["gemini-api", "pgvector", "semantic-search", "embeddings", "postgresql", "hnsw", "production"]
+highlights:
+  - "格納時と検索時でモデル・次元・task_type がずれると再現率が落ちる仕組みと、それを設定で固定する具体策"
+  - "HNSW の ef_search・削除行・再インデックスのタイミングを再現率の実測値から決める運用手順"
+  - "フィルタ付き検索で HNSW の再現率が崩れる理由と、partial index・iterative scan（pgvector 0.8+）・候補拡大の3通りの対処"
+---
+
+リリース直後はよく当たっていた検索が、半年ほど経つと「なんとなく鈍い」と感じる瞬間があります。エラーは出ていません。レイテンシも変わっていません。ただ、以前なら一番上に来ていた記事が3番目に落ち、ユーザーからの「探しても出てこない」という問い合わせが少しずつ増えていく。私自身、個人開発で複数のサイト横断検索を pgvector で回していて、この「静かな劣化」に何度かつかまりました。
+
+やっかいなのは、これがコードのバグとして現れないことです。`SELECT` は通り、結果も返ってくる。崩れているのは結果の**順位**であって、可用性ではありません。ここでは Gemini Embedding と PostgreSQL pgvector で組んだセマンティック検索が運用のうちに再現率を落とす典型的な経路と、本番で実際に手を入れた対処を、順を追ってまとめます。
+
+## まず「鈍さ」を数値にする — 再現率を測れないと直せない
+
+劣化の議論を始める前に、再現率（Recall@k）を測る仕組みがないと、すべてが体感の言い争いになります。最初にやるべきは、正解が分かっている評価セットを少量でいいので固定することです。
+
+評価用には総当たり（インデックスを使わない厳密検索）を「真の近傍」とみなし、HNSW など近似インデックス経由の結果がそれをどれだけ取りこぼすかを測ります。pgvector では検索時に `enable_indexscan` を切ると総当たりに落とせます。
+
+```python
+# recall_probe.py — HNSW の Recall@k を総当たりと突き合わせて測る
+import psycopg2
+
+DB = {"host": "localhost", "database": "semantic_search",
+      "user": "postgres", "password": "your_password"}
+
+def topk_ids(cur, qvec, k, exact: bool):
+    # exact=True のときだけインデックスを無効化して総当たりにする
+    cur.execute("SET LOCAL enable_indexscan = %s", ("off" if exact else "on",))
+    cur.execute(
+        """
+        SELECT id
+        FROM documents
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s
+        """,
+        (str(qvec), k),
+    )
+    return [r[0] for r in cur.fetchall()]
+
+def measure_recall(query_vectors, k=10):
+    conn = psycopg2.connect(**DB)
+    hits, total = 0, 0
+    for qv in query_vectors:
+        with conn.cursor() as cur:
+            truth = set(topk_ids(cur, qv, k, exact=True))
+            approx = set(topk_ids(cur, qv, k, exact=False))
+        hits += len(truth & approx)
+        total += k
+    conn.close()
+    return hits / total  # Recall@k
+
+# 例: 200 件の代表クエリで Recall@10 を継続的に記録する
+# print(round(measure_recall(sample_query_vecs, k=10), 4))  # 0.991 など
+```
+
+この値を週次で記録しておくと、後述する原因のどれが効いているかを切り分けられます。私はこの Recall@10 が 97% を下回ったらアラートにする、という運用に落ち着きました。順位がずれてからではなく、ずれ始めで気づけるのが利点です。
+
+## 原因1: 格納時と検索時で「ベクトルの作り方」がずれている
+
+最も多く、そして最も見落とされるのがこれです。エンベディングは「同じモデル・同じ次元・同じ正規化・同じ用途指定」で作られたベクトル同士でないと、距離が意味を持ちません。運用が長くなると、ここが少しずつずれていきます。
+
+典型的なずれ方は3つあります。
+
+<table>
+<thead>
+<tr><th>ずれの種類</th><th>起きる経緯</th><th>結果</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>モデルの暗黙更新</strong></td><td>コードが <code>latest</code> エイリアスを参照し、裏でモデルが入れ替わった</td><td>新規格納分だけ別空間のベクトルになり、既存と混ざる</td></tr>
+<tr><td><strong>task_type の不一致</strong></td><td>格納は <code>RETRIEVAL_DOCUMENT</code>、検索クエリも同じものを使い回した</td><td>クエリ側の最適化が効かず再現率が静かに低下</td></tr>
+<tr><td><strong>次元の取り違え</strong></td><td><code>output_dimensionality</code> を後から変えた／正規化を忘れた</td><td>距離スケールが変わり閾値が無意味化</td></tr>
+</tbody>
+</table>
+
+対策は単純で、「ベクトル生成の設定を一箇所に固定し、モデル ID を明示的にピン留めする」ことに尽きます。`latest` のようなエイリアスを本番の格納・検索パスで使わないのが肝心です。
+
+```python
+# embedding_config.py — 生成設定を1箇所に固定する
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+# モデルIDはエイリアスではなく固定版を明示する。次元も固定し、
+# このモジュール以外からは embed を呼ばせない運用にする。
+EMBED_MODEL = "gemini-embedding-001"   # ← latest/exp を本番で使わない
+EMBED_DIM = 768
+
+def embed(text: str, *, is_query: bool) -> list[float]:
+    res = client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=text,
+        config={
+            # 格納とクエリで task_type を必ず出し分ける
+            "task_type": "RETRIEVAL_QUERY" if is_query else "RETRIEVAL_DOCUMENT",
+            "output_dimensionality": EMBED_DIM,
+        },
+    )
+    v = res.embeddings[0].values
+    # 768次元など 3072 未満を指定した場合、Gemini 側で正規化されない
+    # ことがあるため、コサイン前提なら自前で L2 正規化して揃える。
+    norm = sum(x * x for x in v) ** 0.5
+    return [x / norm for x in v] if norm else v
+```
+
+さらに、どの設定で作ったベクトルかを行に刻んでおくと、後から監査できます。`embedding` 列の隣に `embed_model` と `embed_dim` を持たせ、検索時に現行設定と一致しない行を検知できるようにしておくと、混在事故をその場で見つけられます。
+
+```sql
+ALTER TABLE documents ADD COLUMN embed_model TEXT;
+ALTER TABLE documents ADD COLUMN embed_dim INT;
+
+-- 現行設定と食い違うベクトルが紛れていないかを点検する
+SELECT embed_model, embed_dim, count(*)
+FROM documents
+GROUP BY 1, 2
+ORDER BY 3 DESC;
+-- 行が2種類以上に割れていたら、それが「鈍さ」の正体である可能性が高い
+```
+
+## 原因2: 距離演算子とインデックスの ops が噛み合っていない
+
+pgvector では、インデックスを作るときの演算子クラス（`vector_cosine_ops` / `vector_l2_ops` / `vector_ip_ops`）と、クエリで使う距離演算子（`<=>` コサイン / `<->` L2 / `<#>` 内積）が**一致していないと、そのインデックスは使われません**。使われないだけならまだしも、片方を直したつもりで取り違えると、順位が静かに変わります。
+
+```sql
+-- コサインで検索するなら、インデックスも必ず cosine_ops で作る
+CREATE INDEX idx_documents_embedding_hnsw
+ON documents USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 200);
+```
+
+噛み合っているかは、実際にインデックスが使われているかを `EXPLAIN` で確認するのが確実です。Index Scan ではなく Seq Scan が出ていたら、演算子の不一致か、後述の `ef_search` が効いていないかを疑います。
+
+```sql
+EXPLAIN ANALYZE
+SELECT id FROM documents
+ORDER BY embedding <=> '[...]'::vector
+LIMIT 10;
+-- "Index Scan using idx_documents_embedding_hnsw" が出ていれば一致
+-- "Seq Scan" なら演算子クラスの取り違えを最初に疑う
+```
+
+## 原因3: HNSW のパラメータと、削除行の蓄積
+
+HNSW は構築時の `m` / `ef_construction` と、検索時の `ef_search` で再現率と速度が決まります。運用で効くのは検索時の `ef_search` です。これは「探索の幅」で、上げれば再現率が上がり、その分だけ遅くなります。
+
+```sql
+-- セッション/トランザクション単位で探索幅を調整できる
+SET hnsw.ef_search = 100;   -- 既定 40。再現率が足りなければ段階的に上げる
+```
+
+ここで実務的に大事なのは、`ef_search` を勘で決めないことです。原因1で作った Recall@k 測定を使い、`ef_search` を 40 → 80 → 120 と振って、目標再現率（たとえば 98%）を満たす最小値を選びます。私の手元のデータでは、10万件規模で `ef_search = 100` あたりが再現率 99% と数 ms のレイテンシの折り合い点でした。再インデックス前後で再現率が 95% から 99% へ戻る、といった差はこの指標があって初めて見えます。データが変われば最適値も変わるので、これは「測って決める」前提の数字です。
+
+もう一つ、地味に効くのが**削除・更新行の蓄積**です。ドキュメントの入れ替えが多いテーブルでは、削除済みタプルや古いベクトルが HNSW グラフに残り、グラフの質が落ちて再現率がじわじわ下がります。対処は二段構えにしています。
+
+```sql
+-- 1) まず VACUUM で不要タプルを回収する（自動VACUUMが追いつかない場合）
+VACUUM ANALYZE documents;
+
+-- 2) 入れ替えが激しく再現率が戻らないなら、インデックスを貼り直す。
+--    本番では CONCURRENTLY で書き込みを止めずに作り直す。
+CREATE INDEX CONCURRENTLY idx_documents_embedding_hnsw_new
+ON documents USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 200);
+
+BEGIN;
+DROP INDEX idx_documents_embedding_hnsw;
+ALTER INDEX idx_documents_embedding_hnsw_new RENAME TO idx_documents_embedding_hnsw;
+COMMIT;
+```
+
+再インデックスは「月1回」のような固定スケジュールではなく、Recall@k がしきい値を割ったときに走らせるほうが無駄がありません。指標を持っているからこそ、こうした判断が勘から外れます。
+
+## 原因4: フィルタを足した瞬間に再現率が崩れる
+
+これは pgvector を本番に乗せて最初に驚いた箇所です。「カテゴリで絞り込んでから類似検索」のような、`WHERE` 句つきの近傍検索を入れると、フィルタの選択率が低いほど HNSW の再現率が急落します。
+
+理由は、HNSW がまずベクトル空間で近傍候補を集め、その後に `WHERE` を適用するためです。候補のほとんどがフィルタで落ちると、`LIMIT k` に届かないか、本来上位に来るべき行がそもそも候補に入らない、という事態が起きます。
+
+対処は選択率に応じて使い分けます。
+
+```sql
+-- 対処A: 候補を多めに集めてからフィルタ・整列する（中程度の選択率向け）
+SET hnsw.ef_search = 200;   -- 候補を広げ、フィルタ後も k 件残るようにする
+
+-- 対処B: フィルタ値が少数に固定なら partial index を分けて作る
+CREATE INDEX idx_docs_emb_news
+ON documents USING hnsw (embedding vector_cosine_ops)
+WHERE category = 'news';
+
+-- 対処C: pgvector 0.8+ の反復スキャンで、k 件埋まるまで探索を続けさせる
+SET hnsw.iterative_scan = strict_order;   -- 厳密な順序を保ったまま候補を追加探索
+```
+
+経験的には、フィルタの取りうる値が少数（数十まで）に限られるなら、この場合は partial index を推奨します。最も素直に効きます。値が無数にあるなら反復スキャン（`iterative_scan`）か、候補拡大（`ef_search` を上げる）で吸収します。いずれにせよ、フィルタを足したらフィルタ込みで Recall@k を測り直すのが鉄則です。フィルタなしの再現率は、フィルタありの再現率を保証しません。
+
+## モデルを乗り換えるときの「影の列」戦略
+
+Gemini のエンベディングモデルは更新されます。新モデルへ移ると再現率が上がることも多いのですが、移行は危険な瞬間でもあります。新旧のベクトルは別空間なので、全件を作り直すまでの間、新旧が混在すると検索が壊れます。
+
+私が取っているのは、本番列を触らずに「影の列」で作り直し、検証してから切り替える方法です。
+
+```sql
+-- 1) 影の列を追加（本番検索には使わない）
+ALTER TABLE documents ADD COLUMN embedding_v2 vector(768);
+
+-- 2) バックグラウンドで embedding_v2 を新モデルで埋めていく
+--    （バッチで少しずつ。完了まで本番は従来の embedding 列で検索を続ける）
+
+-- 3) embedding_v2 が全件埋まったら、その列で Recall@k を測って旧列と比較
+-- 4) 良ければ index を v2 に作り、検索クエリを embedding_v2 に切り替える
+-- 5) 安定を確認してから旧 embedding 列と index を落とす
+```
+
+全件再エンベディングはコストがかかるので、変更頻度の低いコーパスではバッチを夜間に分割し、レート制限に当てないよう間隔を空けます。切り替えを「一発の ALTER」にせず、影の列で検証期間を挟むだけで、移行起因の事故はほぼ防げます。
+
+## 運用に落とすときの最小チェックリスト
+
+最後に、ここまでを本番運用の点検項目として一枚にまとめておきます。
+
+- 格納とクエリで、モデル ID（固定版）・次元・正規化・task_type が一致しているか
+- `embed_model` / `embed_dim` 列で、混在ベクトルが紛れていないか
+- インデックスの演算子クラスと検索の距離演算子が一致し、`EXPLAIN` でインデックスが使われているか
+- Recall@k を週次で記録し、しきい値割れで再インデックス・`ef_search` 見直しが走るようになっているか
+- フィルタ付き検索を、フィルタ込みで再現率測定しているか
+- モデル移行は影の列＋検証期間を挟んでいるか
+
+セマンティック検索は、立ち上げるよりも「半年後も同じ精度で動かし続ける」ほうが難しい類の機能です。鈍さに気づける指標を一つ持っておくこと——結局のところ、それが一番効きました。同じように pgvector を本番で回している方の参考になれば幸いです。
