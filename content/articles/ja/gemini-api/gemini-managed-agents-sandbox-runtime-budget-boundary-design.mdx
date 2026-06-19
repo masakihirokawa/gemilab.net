@@ -1,0 +1,204 @@
+---
+title: "Managed Agents の請求はトークンだけでは読めない — サンドボックス稼働時間に予算境界を引く設計"
+slug: "gemini-managed-agents-sandbox-runtime-budget-boundary-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-19T12:00"
+author: "Gemini Lab"
+description: "公開プレビューの Managed Agents は、トークンに加えてサンドボックスの稼働時間でも課金されます。ハングした1実行が静かに予算を削る第二の課金軸を切り分け、壁時計上限・アイドル切断・同時実行の天井を動く Python で設計します。"
+tags: ["gemini-api", "managed-agents", "cost-management", "production", "automation", "agent-design"]
+highlights:
+  - "Managed Agents の請求がトークン課金の見積もりと合わない方が、サンドボックスの壁時計稼働という第二の課金軸を切り分け、費用が膨らむ箇所を特定できるようになります"
+  - "実行あたりの壁時計上限・アイドル時のサンドボックス自動切断・同時実行数の天井を、asyncio でそのまま動く Python のラッパとして手に入れられます"
+  - "稼働秒数を工程ごとに帰属させる JSONL 台帳の設計で、請求書を見る前に「どの自動化が時間を食っているか」を数字で言えるようになります"
+---
+
+ある朝、Managed Agents の請求の内訳を眺めていて、手が止まりました。
+
+トークンの消費量は、事前に見積もった範囲のほぼそのままでした。にもかかわらず、合計額が頭の中の数字と合いません。差分をたどっていくと、原因はトークンではなく、Google ホストのサンドボックスが立ち上がっていた「時間」のほうにありました。
+
+私自身、個人開発のかたわらで複数サイトのコンテンツ更新を自動で回しています。Managed Agents の公開プレビューを差し込んだのは、エージェントループの面倒を一段減らしたかったからでした。ところが、ひとつの実行がツール応答を待ったまま静かにハングし、サンドボックスは生きたまま 18 分ほど居座っていました。トークンは1円も増えていないのに、稼働秒数だけが積み上がっていたわけです。
+
+ここでお伝えしたいのは、Managed Agents の費用は **トークンと稼働時間という二つの軸** で動く、という前提に立った予算設計です。片方だけを見張っていると、もう片方の軸で静かに削られます。
+
+## Managed Agents の課金は二つの軸で動きます
+
+まず、何にお金がかかっているのかを分けて見ます。Managed Agents は、1回の呼び出しで Google ホストの隔離 Linux サンドボックスを起動し、その中で推論・ツール実行・コード実行・ファイル操作までを完結させます。便利さの裏側で、課金の対象も二つに増えます。
+
+<table>
+<thead>
+<tr><th>軸</th><th>何で決まるか</th><th>膨らむ典型例</th><th>従来の監視で気付けるか</th></tr>
+</thead>
+<tbody>
+<tr><td>トークン課金</td><td>入力・出力・思考トークン量</td><td>長いコンテキスト、冗長な再試行</td><td>気付ける（既存のコスト監視で追える）</td></tr>
+<tr><td>サンドボックス稼働時間</td><td>サンドボックスが生きていた壁時計秒数</td><td>ツール応答待ちのハング、アイドル放置、過剰な並列</td><td><strong>気付きにくい</strong></td></tr>
+</tbody>
+</table>
+
+トークン側は、これまで API を使ってきた感覚がそのまま効きます。問題は稼働時間側です。エージェントが「考え込んで止まっている」「外部 API の応答を待っている」「処理は終わったのにサンドボックスが畳まれていない」——こうした状態は、トークンを一切消費しないまま秒数だけを刻みます。
+
+私の手元では、ハングした1実行がサンドボックスを 18 分生かし、同じ朝に走った正常な実行の平均稼働が 40 秒前後だったので、たった1件の取りこぼしが正常実行 27 回ぶんの稼働に化けていました。費用そのものより、**この軸を見ていなかった**という事実のほうが、静かに効いてくる種類の怖さでした。
+
+## 予算境界は「実行あたりの壁時計上限」から引きます
+
+最初に引くべき境界は、1実行が生きていてよい最大の壁時計秒数です。トークンの上限ではなく、時間の上限です。
+
+考え方はシンプルです。実行を非同期に投げ、`asyncio.wait_for` で全体に締め切りをかけ、超えたらサンドボックスを明示的に切断する。ハングしても、上限の秒数で必ず畳まれる構造にします。
+
+```python
+import asyncio
+import time
+from dataclasses import dataclass
+
+@dataclass
+class RuntimeBudget:
+    max_wall_seconds: float = 180.0   # 1実行が生きてよい上限
+    idle_seconds: float = 45.0        # 進捗が止まったら畳むまでの猶予
+    max_concurrent: int = 2           # 同時に生かすサンドボックス数の天井
+
+class RuntimeBudgetError(Exception):
+    """壁時計上限・アイドル上限の超過を表します。"""
+
+async def run_with_wall_clock(client, *, model, instruction, budget):
+    """Managed Agents の1実行に壁時計の締め切りをかけます。
+
+    client.agents は公開プレビューの想定インターフェースです。
+    create_run / poll_run / cancel_run は手元の SDK 名に読み替えてください。
+    """
+    started = time.monotonic()
+    run = await client.agents.create_run(model=model, instruction=instruction)
+    try:
+        result = await asyncio.wait_for(
+            _poll_until_done(client, run.id, budget),
+            timeout=budget.max_wall_seconds,
+        )
+        return result, time.monotonic() - started
+    except asyncio.TimeoutError:
+        # ここを忘れるとサンドボックスが生きたまま秒数を刻み続けます
+        await client.agents.cancel_run(run.id)
+        raise RuntimeBudgetError(
+            f"run {run.id} が壁時計上限 {budget.max_wall_seconds}s を超えました"
+        )
+```
+
+ここで一番大切なのは `except` 節の `cancel_run` です。締め切りで `wait_for` を抜けても、サンドボックス自体は黙って生き続けます。明示的に切断して初めて、稼働秒数が止まります。私が最初に取りこぼしたのは、まさにこの一行でした。
+
+## 進捗が止まったサンドボックスは、終わりを待たずに畳みます
+
+壁時計上限だけだと、たとえば上限 180 秒に対して 30 秒で詰まった実行が、残り 150 秒を無駄に生き続けます。これを縮めるのが、アイドル切断です。
+
+エージェントが何らかの「進捗」を出すたびに最終更新時刻を記録し、一定時間それが動かなければハング扱いにして畳みます。進捗の単位は、ステップ完了・ツール呼び出し・出力チャンクのいずれでも構いません。手元のエージェントが観測できるものを使います。
+
+```python
+async def _poll_until_done(client, run_id, budget):
+    last_progress = time.monotonic()
+    last_step = -1
+    while True:
+        run = await client.agents.poll_run(run_id)
+        if run.completed_steps != last_step:
+            last_step = run.completed_steps      # 進捗があった
+            last_progress = time.monotonic()
+        if run.status == "succeeded":
+            return run.output
+        if run.status in ("failed", "cancelled"):
+            raise RuntimeBudgetError(f"run {run_id} が {run.status} で終了しました")
+        if time.monotonic() - last_progress > budget.idle_seconds:
+            await client.agents.cancel_run(run_id)
+            raise RuntimeBudgetError(
+                f"run {run_id} が {budget.idle_seconds}s 進捗なしのため切断しました"
+            )
+        await asyncio.sleep(1.5)
+```
+
+アイドル上限は、壁時計上限よりかなり短く取るのが実用的です。私は壁時計を工程の実測中央値の約3倍、アイドルをその実測中央値前後に置いています。正常な実行はアイドル上限の手前で必ず進捗を出すので畳まれず、本当に止まった実行だけが早く切れます。
+
+## 同時実行の天井で、稼働秒数の掛け算を止めます
+
+稼働時間課金が怖いのは、並列実行で **秒数が掛け算になる** ところです。サンドボックスは1実行に1つ起動するので、5本を同時に走らせれば、その間は5つぶんの秒数が同時に刻まれます。
+
+個人の予算規模だと、ここを無制限にするのは危険です。`asyncio.Semaphore` で同時に生かすサンドボックス数に天井をかけ、超えたぶんは順番待ちにします。
+
+```python
+async def run_batch(client, *, model, jobs, budget, ledger):
+    sem = asyncio.Semaphore(budget.max_concurrent)
+
+    async def _one(job):
+        async with sem:                       # 天井を超えたら待機
+            try:
+                output, secs = await run_with_wall_clock(
+                    client, model=model, instruction=job["instruction"], budget=budget
+                )
+                ledger.record(job["stage"], secs, status="ok")
+                return output
+            except RuntimeBudgetError as e:
+                ledger.record(job["stage"], budget.max_wall_seconds, status="killed")
+                return {"error": str(e)}
+
+    return await asyncio.gather(*[_one(j) for j in jobs])
+```
+
+スループットは多少落ちます。けれども、夜間バッチが想定外に膨らんだときに「最大でも同時 N 本ぶんの秒数しか積まれない」と言い切れることのほうが、個人開発では価値があります。上限は速度ではなく、安心して眠るための数字です。
+
+## 稼働秒数を工程ごとに帰属させる台帳
+
+ここまでの上限は「暴走を止める」仕組みでした。最後に必要なのは、「どの工程が時間を食っているか」を翌月の請求を待たずに言えるようにする台帳です。
+
+実行のたびに、工程名・稼働秒数・結果を1行の JSON として追記します。集計はあとからいくらでもできます。
+
+```python
+import json
+from collections import defaultdict
+from pathlib import Path
+
+class RuntimeLedger:
+    def __init__(self, path="runtime_ledger.jsonl"):
+        self.path = Path(path)
+
+    def record(self, stage, seconds, status):
+        line = {"ts": time.time(), "stage": stage,
+                "seconds": round(seconds, 2), "status": status}
+        with self.path.open("a") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+    def summary(self):
+        total = defaultdict(float)
+        killed = defaultdict(int)
+        for line in self.path.read_text().splitlines():
+            r = json.loads(line)
+            total[r["stage"]] += r["seconds"]
+            if r["status"] == "killed":
+                killed[r["stage"]] += 1
+        return {s: {"runtime_min": round(total[s] / 60, 1),
+                    "killed": killed[s]} for s in total}
+```
+
+この `summary()` を毎朝のログに吐くようにしてから、景色が変わりました。「画像整理の工程だけ稼働分が突出している」「特定の工程で killed が毎日1件出ている」といった事実が、請求書ではなく自分の台帳から先に見えるようになります。`killed` が定常的に出る工程は、上限の調整ではなく、その工程自体の設計を疑うべき合図です。
+
+## 公式ドキュメントには書かれていない運用上の勘所
+
+プレビューのドキュメントは機能の使い方を教えてくれますが、稼働時間という軸の守り方や、本番運用で踏みがちな落とし穴までは踏み込みません。手元で回して見えてきた注意点を、回避策とあわせて3つ残しておきます。
+
+1. `cancel_run` を呼んでも、切断が反映されるまでにわずかな遅延があります。台帳の稼働秒数は「クライアント側で測った壁時計」で記録しておくと、課金側の実測とのズレを後から照合でき、取りこぼしを回避できます。
+2. アイドル判定の「進捗」を出力チャンクだけに頼ると、長考するモデルでは誤って畳んでしまう落とし穴があります。ステップ完了やツール呼び出しなど、粒度の粗い進捗シグナルを併用するのが、本番運用での回避策です。
+3. 同時実行の天井は、サイトやプロジェクト単位ではなく **アカウント全体** でかけます。サイトごとに分けると、複数サイトが同じ朝に走った瞬間、合算でサンドボックスが増えて掛け算が戻ってきます。私はこの取り違えで一度、想定の倍の同時起動を許してしまいました。
+
+## 状況別に、どこから入れるか
+
+全部を一度に入れる必要はありません。手元の自動化の性格に合わせて、効く順に足していくのが現実的です。私はこの順で少しずつ入れることをお勧めします。
+
+<table>
+<thead>
+<tr><th>状況</th><th>まず入れる境界</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>単発・対話的に実行している</td><td>壁時計上限</td><td>ハング1件の取りこぼしを止めるだけで大半は防げます</td></tr>
+<tr><td>スケジュールで無人実行している</td><td>壁時計上限 + アイドル切断</td><td>見ていない時間帯ほど、止まった実行が長く生きます</td></tr>
+<tr><td>複数工程を夜間バッチで並列実行</td><td>上記 + 同時実行の天井</td><td>並列の秒数掛け算が、予算が一番崩れる経路だからです</td></tr>
+<tr><td>費用の内訳を説明できるようにしたい</td><td>稼働秒数の台帳</td><td>上限は守りで、台帳は次の設計判断の材料になります</td></tr>
+</tbody>
+</table>
+
+Managed Agents は、エージェントループの重たい部分を確かに引き受けてくれます。その引き受けと引き換えに、稼働時間という監視しづらい軸が一つ増えます。この軸に最初から境界を引いておけば、便利さを取りながら、請求書の前で青ざめずに済みます。
+
+まずは `cancel_run` を伴う壁時計上限を1本入れるところから、試していただければと思います。同じ自動化を回している方の、静かな安心につながれば幸いです。

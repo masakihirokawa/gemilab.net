@@ -1,0 +1,206 @@
+---
+title: "Your Managed Agents Bill Has a Second Axis: Drawing a Budget Boundary Around Sandbox Runtime"
+slug: "gemini-managed-agents-sandbox-runtime-budget-boundary-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-19T12:00"
+author: "Gemini Lab"
+description: "Managed Agents in public preview bills for tokens and for how long its Google-hosted sandbox stays alive. A single hung run quietly drains your budget on that second axis. Here is a working Python design for wall-clock caps, idle teardown, and a concurrency ceiling."
+tags: ["gemini-api", "managed-agents", "cost-management", "production", "automation", "agent-design"]
+highlights:
+  - "If your Managed Agents bill never matches your token estimate, you will learn to separate out the second billing axis — sandbox wall-clock runtime — and pinpoint exactly where the cost is leaking"
+  - "You get a per-run wall-clock cap, automatic idle teardown of the sandbox, and a concurrency ceiling, all as runnable asyncio Python you can drop in today"
+  - "A per-stage JSONL runtime ledger lets you say, in numbers and before the invoice arrives, which automation is eating your time budget"
+---
+
+One morning I was reading through a Managed Agents bill, and I stopped.
+
+Token consumption sat almost exactly where I had estimated it. And yet the total refused to line up with the figure in my head. Tracing the gap, the culprit was not tokens at all — it was the *time* the Google-hosted sandbox had spent alive.
+
+As an indie developer, I run content updates for several sites on a schedule alongside my own product work. I dropped the Managed Agents public preview into that pipeline to shave a layer off my own agent loop. Then one run quietly hung while waiting on a tool response, and the sandbox sat there, alive, for about 18 minutes. Not a single extra token was spent — only seconds of runtime, piling up.
+
+What I want to share here is a budgeting approach that starts from one premise: a Managed Agents bill moves along **two axes — tokens and runtime**. Watch only one, and the other erodes your budget in silence.
+
+## Managed Agents bills along two axes
+
+Start by separating what you are actually paying for. A single Managed Agents call spins up an isolated, Google-hosted Linux sandbox and runs reasoning, tool calls, code execution, and file operations inside it. The convenience comes with a second thing to meter.
+
+<table>
+<thead>
+<tr><th>Axis</th><th>Driven by</th><th>Where it balloons</th><th>Caught by usual monitoring?</th></tr>
+</thead>
+<tbody>
+<tr><td>Token cost</td><td>Input / output / thinking tokens</td><td>Long context, verbose retries</td><td>Yes — your existing cost tooling sees it</td></tr>
+<tr><td>Sandbox runtime</td><td>Wall-clock seconds the sandbox was alive</td><td>Hangs on tool waits, idling, over-parallelism</td><td><strong>Easy to miss</strong></td></tr>
+</tbody>
+</table>
+
+Your instincts from past API work carry over fine to the token side. The runtime side is the problem. An agent that is "thinking and stuck," "waiting on an external API," or "done but with a sandbox that never got torn down" accrues seconds while spending zero tokens.
+
+In my case, one hung run kept a sandbox alive for 18 minutes, while the healthy runs that same morning averaged around 40 seconds. A single missed teardown turned into the runtime of 27 normal runs. The scarier part was not the money — it was realizing I had **never been watching this axis at all**.
+
+## The budget boundary starts at a per-run wall-clock cap
+
+The first boundary to draw is the maximum wall-clock seconds a single run is allowed to stay alive. Not a token cap — a time cap.
+
+The idea is simple. Launch the run asynchronously, put a deadline on the whole thing with `asyncio.wait_for`, and explicitly tear the sandbox down if it overruns. Even when it hangs, it is guaranteed to fold at the cap.
+
+```python
+import asyncio
+import time
+from dataclasses import dataclass
+
+@dataclass
+class RuntimeBudget:
+    max_wall_seconds: float = 180.0   # ceiling on how long one run may live
+    idle_seconds: float = 45.0        # grace period once progress stalls
+    max_concurrent: int = 2           # ceiling on simultaneous live sandboxes
+
+class RuntimeBudgetError(Exception):
+    """Raised when a wall-clock or idle ceiling is exceeded."""
+
+async def run_with_wall_clock(client, *, model, instruction, budget):
+    """Put a wall-clock deadline on a single Managed Agents run.
+
+    client.agents reflects the public-preview surface; map
+    create_run / poll_run / cancel_run to your SDK's names.
+    """
+    started = time.monotonic()
+    run = await client.agents.create_run(model=model, instruction=instruction)
+    try:
+        result = await asyncio.wait_for(
+            _poll_until_done(client, run.id, budget),
+            timeout=budget.max_wall_seconds,
+        )
+        return result, time.monotonic() - started
+    except asyncio.TimeoutError:
+        # Skip this and the sandbox keeps billing seconds in silence
+        await client.agents.cancel_run(run.id)
+        raise RuntimeBudgetError(
+            f"run {run.id} exceeded wall-clock cap {budget.max_wall_seconds}s"
+        )
+```
+
+The single most important line here is `cancel_run` in the `except` block. When the deadline trips `wait_for`, the sandbox itself keeps living quietly. Only an explicit teardown stops the clock. That one line is exactly what I missed the first time.
+
+## Fold a stalled sandbox without waiting for the cap
+
+A wall-clock cap alone still wastes time. A run that jams after 30 seconds against a 180-second cap will sit out the remaining 150 seconds. Idle teardown closes that gap.
+
+Each time the agent emits some kind of "progress," record the last-update timestamp; if it does not move for a set interval, treat it as hung and fold it. Progress can be a completed step, a tool call, or an output chunk — whatever your agent can observe.
+
+```python
+async def _poll_until_done(client, run_id, budget):
+    last_progress = time.monotonic()
+    last_step = -1
+    while True:
+        run = await client.agents.poll_run(run_id)
+        if run.completed_steps != last_step:
+            last_step = run.completed_steps      # progress happened
+            last_progress = time.monotonic()
+        if run.status == "succeeded":
+            return run.output
+        if run.status in ("failed", "cancelled"):
+            raise RuntimeBudgetError(f"run {run_id} ended as {run.status}")
+        if time.monotonic() - last_progress > budget.idle_seconds:
+            await client.agents.cancel_run(run_id)
+            raise RuntimeBudgetError(
+                f"run {run_id} torn down after {budget.idle_seconds}s without progress"
+            )
+        await asyncio.sleep(1.5)
+```
+
+In practice, set the idle ceiling well below the wall-clock cap. I put the wall-clock cap at roughly 3x a stage's measured median runtime, and the idle ceiling around that same median. Healthy runs always emit progress before the idle ceiling, so they are never folded; only genuinely stuck runs get cut early.
+
+## A concurrency ceiling stops runtime from multiplying
+
+What makes runtime billing dangerous is that parallelism **multiplies the seconds**. Since each run gets its own sandbox, five concurrent runs mean five sandboxes metering seconds at once.
+
+At an individual's budget scale, leaving this unbounded is risky. Use an `asyncio.Semaphore` to cap how many sandboxes can be alive at once, and queue the overflow.
+
+```python
+async def run_batch(client, *, model, jobs, budget, ledger):
+    sem = asyncio.Semaphore(budget.max_concurrent)
+
+    async def _one(job):
+        async with sem:                       # wait once the ceiling is hit
+            try:
+                output, secs = await run_with_wall_clock(
+                    client, model=model, instruction=job["instruction"], budget=budget
+                )
+                ledger.record(job["stage"], secs, status="ok")
+                return output
+            except RuntimeBudgetError as e:
+                ledger.record(job["stage"], budget.max_wall_seconds, status="killed")
+                return {"error": str(e)}
+
+    return await asyncio.gather(*[_one(j) for j in jobs])
+```
+
+Throughput drops a little. But being able to say "a nightly batch can never accrue more than N sandboxes' worth of seconds at once" is worth more, for an indie setup, than raw speed. The ceiling is not a performance number — it is the number that lets you sleep.
+
+## A ledger that attributes runtime to each stage
+
+Everything above is about *stopping* runaways. The last piece is a ledger that lets you say which stage is eating time without waiting for next month's invoice.
+
+On each run, append the stage name, runtime seconds, and outcome as one line of JSON. You can aggregate however you like afterward.
+
+```python
+import json
+from collections import defaultdict
+from pathlib import Path
+
+class RuntimeLedger:
+    def __init__(self, path="runtime_ledger.jsonl"):
+        self.path = Path(path)
+
+    def record(self, stage, seconds, status):
+        line = {"ts": time.time(), "stage": stage,
+                "seconds": round(seconds, 2), "status": status}
+        with self.path.open("a") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+    def summary(self):
+        total = defaultdict(float)
+        killed = defaultdict(int)
+        for line in self.path.read_text().splitlines():
+            r = json.loads(line)
+            total[r["stage"]] += r["seconds"]
+            if r["status"] == "killed":
+                killed[r["stage"]] += 1
+        return {s: {"runtime_min": round(total[s] / 60, 1),
+                    "killed": killed[s]} for s in total}
+```
+
+Once I started dumping `summary()` into a morning log, the view changed. Facts like "only the image-organizing stage has runaway runtime" or "one stage produces a killed run every single day" surfaced from my own ledger before they ever reached an invoice. A stage that produces `killed` runs steadily is not a signal to loosen the cap — it is a signal to question that stage's design.
+
+## Operational notes the docs do not cover
+
+Preview docs teach you how the feature works, but not how to defend the runtime axis. A few things that only showed up once I ran it for real:
+
+First, even after `cancel_run`, there is a small delay before teardown takes effect. Record runtime seconds as the *client-side measured wall clock* in your ledger, so you can later reconcile it against what billing actually metered.
+
+Second, if idle detection leans only on output chunks, a model that thinks for a long stretch can be folded by mistake. Pair it with coarser progress signals — completed steps or tool calls — for stability.
+
+Third, apply the concurrency ceiling at the **account level**, not per site or per project. Split the ceiling per site and the moment several sites run on the same morning, the combined sandbox count climbs and the multiplication returns. I made exactly that mistake once and allowed twice the intended number of concurrent sandboxes.
+
+## Where to start, by situation
+
+You do not need all of this at once. Add boundaries in the order that pays off, matched to how your automation actually behaves.
+
+<table>
+<thead>
+<tr><th>Situation</th><th>Boundary to add first</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>One-off, interactive runs</td><td>Wall-clock cap</td><td>Stopping a single missed hang prevents most of the damage</td></tr>
+<tr><td>Unattended scheduled runs</td><td>Wall-clock cap + idle teardown</td><td>Stalled runs live longest exactly when no one is watching</td></tr>
+<tr><td>Parallel multi-stage nightly batch</td><td>The above + concurrency ceiling</td><td>Multiplied parallel seconds is where budgets break first</td></tr>
+<tr><td>Need to explain the cost breakdown</td><td>Runtime ledger</td><td>Caps are defense; the ledger feeds your next design decision</td></tr>
+</tbody>
+</table>
+
+Managed Agents genuinely takes the heavy part of the agent loop off your hands. In exchange, it adds one axis — runtime — that is hard to watch. Draw a boundary around that axis from the start, and you keep the convenience without going pale in front of an invoice.
+
+Start with a single wall-clock cap that includes `cancel_run`, and build from there. I hope it brings a quiet bit of reassurance to anyone running the same kind of automation.
