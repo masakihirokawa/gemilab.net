@@ -1,0 +1,220 @@
+---
+title: "Gemini のモデル非推奨を CI で先回りして止める仕組み"
+slug: "gemini-model-deprecation-ci-scanner-deadline-guard"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-20T10:45"
+author: "Gemini Lab"
+description: "ハードコードされた Gemini モデルIDを CI で走査し、シャットダウン期限が近いものを残り日数つきで検知して赤くする仕組みを、動くコードで組み立てます。"
+tags: ["Gemini API", "モデル非推奨", "CI", "運用自動化", "個人開発"]
+highlights:
+  - "シャットダウン期限を見落として本番パイプラインが突然壊れる、を二度と起こさない検知の仕組みを今日から動かせる"
+  - "models.list の存在確認と、自分で持つ期限レジストリを突き合わせる実装パターンをコピペで導入できる"
+  - "GitHub Actions と日次 cron の両方に同じスクリプトを差し込み、残り日数に応じて警告と失敗を出し分けられる"
+---
+
+6月25日に `gemini-3.1-flash-image-preview` と `gemini-3-pro-image-preview` が停止します。この一文を非推奨ページで見たとき、私が最初に困ったのは「移行手順」ではありませんでした。困ったのは、**自分が運営している複数のリポジトリのうち、どこでこの2つのモデルIDを参照しているのかを即答できなかった**ことです。
+
+個人開発で4つの技術ブログ（Dolice Labs）とモバイルアプリを並行して回していると、モデルIDは OGP 画像の生成スクリプト、記事内のサンプルコード、アプリ側の壁紙生成バッチと、あちこちに散らばります。1か所だけ古いIDが残っていて、停止当日に静かに 404 を返し始める——これが一番こわい壊れ方です。エラーは出るのに、出る場所が予想と違う。
+
+そこで私が用意したのは、**コードベースを走査してモデルIDを集め、停止期限が近いものを残り日数つきで CI に報告させる小さなガード**でした。移行作業そのものより、「移行し忘れを検知する仕組み」を先に持つほうが、結局は気持ちが楽になります。ここから先は、そのガードを動く Python で一緒に組み立てていきます。
+
+## なぜ「非推奨の見落とし」は個人開発で起きやすいのか
+
+大きなチームであれば、依存ライブラリのバージョン管理や SRE のダッシュボードで、こうした期限はどこかに記録されます。個人開発では、その記録が「自分の記憶」に置かれがちです。そして記憶は、3か月後のリリース直前に最も当てになりません。
+
+もう一つの理由は、**Gemini のモデルIDが文字列だから**です。`pip` の依存解決のように壊れたら即座にビルドが落ちるわけではなく、停止日まではそのまま動きます。テストも通ります。だからこそ、停止日を「カレンダー」ではなく「CI の合否」に変換しておく価値があります。人間がカレンダーを見るのを忘れても、CI は毎回見てくれます。
+
+私自身、2026年5月に `gemini-2.0-flash` 系の縮退を経験したとき、移行自体は一行の置き換えで済みました。けれど「どこを置き換えるか」を手で探す時間のほうが長く、しかも1か所取りこぼしていました。あの取りこぼしを CI で拾えていたら、と思ったのがこの仕組みの出発点です。
+
+## 仕組みの全体像 — 3つの部品
+
+組み立てるガードは、次の3部品からできています。役割を分けておくと、後で各部品を差し替えやすくなります。
+
+<table>
+<thead>
+<tr><th>部品</th><th>役割</th><th>入力 / 出力</th></tr>
+</thead>
+<tbody>
+<tr><td>スキャナ</td><td>リポジトリ内のモデルID参照を集める</td><td>ソースツリー → 参照リスト</td></tr>
+<tr><td>レジストリ</td><td>モデルごとの停止予定日を保持する</td><td>YAML/辞書 → 期限マップ</td></tr>
+<tr><td>判定器</td><td>残り日数を計算し、存在確認も行い、終了コードを決める</td><td>参照＋期限＋models.list → 合否</td></tr>
+</tbody>
+</table>
+
+ここで一番悩むのは「停止日をどこから取るか」です。結論から言うと、**停止日は API から確実には取れません**。`models.list` はモデルの存在や説明は返しますが、「いつ止まるか」を機械可読な形で常に返してくれるわけではありません。そこで、停止日だけは自分の小さなレジストリで持ち、`models.list` は「そのIDがまだ生きているかの存在確認」に使う、という役割分担にします。これが実運用でつまずかないための肝です。
+
+## ステップ1：コードベースからモデルIDを洗い出す
+
+まずは参照集めです。`re` で `gemini-*` 形式の文字列を拾います。コメントや Markdown のサンプルコードにも当てるため、拡張子は広めに取ります。
+
+```python
+# scan_models.py — リポジトリ内の Gemini モデルID参照を集める
+import re
+from pathlib import Path
+
+# gemini-2.5-flash / gemini-3-pro-image-preview / models/gemini-... を拾う
+MODEL_RE = re.compile(r"(?:models/)?(gemini-[a-z0-9][a-z0-9.\-]*)")
+
+# 走査対象。ロックファイルや生成物は除外する
+SCAN_EXT = {".py", ".ts", ".tsx", ".js", ".mjs", ".mdx", ".md", ".yaml", ".yml"}
+SKIP_DIRS = {"node_modules", ".git", ".next", "dist", "build"}
+
+def scan(root: str) -> dict[str, list[str]]:
+    """モデルID -> 出現したファイルパスの一覧"""
+    found: dict[str, list[str]] = {}
+    for path in Path(root).rglob("*"):
+        if not path.is_file() or path.suffix not in SCAN_EXT:
+            continue
+        if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for m in set(MODEL_RE.findall(text)):
+            found.setdefault(m, []).append(str(path))
+    return found
+
+if __name__ == "__main__":
+    import json, sys
+    result = scan(sys.argv[1] if len(sys.argv) > 1 else ".")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+```
+
+`set(MODEL_RE.findall(text))` で同一ファイル内の重複を畳んでから集計しているのがポイントです。これをしないと、同じIDを20回書いた記事が「20件の参照」として数えられ、ノイズになります。期待する出力はこんな形です。
+
+```json
+{
+  "gemini-2.5-flash": ["scripts/ogp.py", "content/articles/ja/gemini-api/foo.mdx"],
+  "gemini-3-pro-image-preview": ["scripts/wallpaper_batch.py"]
+}
+```
+
+この時点で、停止予定の `gemini-3-pro-image-preview` が `scripts/wallpaper_batch.py` にだけ残っている、という事実が見えます。手で grep するのと同じですが、次のステップで期限と突き合わせるための構造化されたデータになっているのが違いです。
+
+## ステップ2：稼働中のモデル一覧で「まだ生きているか」を確かめる
+
+次に、拾ったIDが本当に今もサービスされているかを `models.list` で確認します。存在しないIDは、停止済みか、あるいは単なるタイプミスです。どちらも検知したい対象です。
+
+```python
+# live_models.py — google-genai SDK で現在提供中のモデルIDを取得
+from google import genai
+
+def live_model_ids(api_key: str) -> set[str]:
+    client = genai.Client(api_key=api_key)
+    ids = set()
+    for m in client.models.list():
+        # name は "models/gemini-2.5-flash" の形式で返る
+        ids.add(m.name.removeprefix("models/"))
+    return ids
+
+if __name__ == "__main__":
+    import os
+    live = live_model_ids(os.environ["YOUR_API_KEY"])
+    print(f"提供中モデル数: {len(live)}")
+```
+
+`m.name.removeprefix("models/")` で、スキャナが拾う形式（プレフィックスなし）に正規化しておきます。ここを揃えておかないと、後の突き合わせで「同じモデルなのに一致しない」という地味なバグに半日溶かします。私はこれで一度溶かしました。
+
+## ステップ3：残り日数を突き合わせて CI を落とす
+
+最後に判定器です。自分で持つ期限レジストリ、スキャン結果、提供中モデルの3つを突き合わせます。レジストリは非推奨ページを見て手で更新する小さな辞書で十分です。これが「停止日の真実の置き場所」になります。
+
+```python
+# guard.py — 期限・参照・存在を突き合わせて終了コードを決める
+import sys
+from datetime import date
+
+# 非推奨ページを見て手で更新する。停止日(UTC)を ISO で持つ
+SHUTDOWN_REGISTRY = {
+    "gemini-3.1-flash-image-preview": "2026-06-25",
+    "gemini-3-pro-image-preview":     "2026-06-25",
+    "gemini-2.0-flash":               "2026-09-24",
+}
+
+# 残り日数のしきい値。運用の余裕に合わせて調整する
+WARN_DAYS = 30   # これ以下で警告（黄）
+FAIL_DAYS = 7    # これ以下で失敗（赤）
+
+def evaluate(found: dict[str, list[str]], live: set[str], today: date):
+    problems = []
+    for model, files in found.items():
+        deadline = SHUTDOWN_REGISTRY.get(model)
+        gone = model not in live
+        days = None
+        if deadline:
+            days = (date.fromisoformat(deadline) - today).days
+        # 判定: 存在しない or 期限切れ間近を拾う
+        if gone:
+            problems.append(("FAIL", f"{model} は提供一覧にありません（停止済み/誤記）", files))
+        elif days is not None and days <= FAIL_DAYS:
+            problems.append(("FAIL", f"{model} は残り {days} 日で停止します", files))
+        elif days is not None and days <= WARN_DAYS:
+            problems.append(("WARN", f"{model} は残り {days} 日で停止します", files))
+    return problems
+
+def main(found, live):
+    problems = evaluate(found, live, date.today())
+    exit_code = 0
+    for level, msg, files in sorted(problems, reverse=True):
+        mark = "🔴" if level == "FAIL" else "🟡"
+        print(f"{mark} [{level}] {msg}")
+        for f in files:
+            print(f"      └ {f}")
+        if level == "FAIL":
+            exit_code = 1
+    if not problems:
+        print("✅ 期限が近い・停止済みのモデル参照はありません")
+    sys.exit(exit_code)
+```
+
+しきい値を `WARN_DAYS` と `FAIL_DAYS` の2段にしているのには理由があります。1段だと「気づいた瞬間にはもう赤」になり、移行が緊急タスクに化けます。30日前から黄色で知らせ、7日前で初めて赤くする。こうすると、移行を「落ち着いてやれる作業」として予定に組み込めます。実際にこの2段構えにしてから、私の側では画像モデルの移行を停止の11日前に黄色で拾えて、慌てずに差し替えられました。
+
+判定器の出力はこうなります。
+
+```text
+🔴 [FAIL] gemini-3-pro-image-preview は残り 5 日で停止します
+      └ scripts/wallpaper_batch.py
+🟡 [WARN] gemini-2.0-flash は残り 96 日で停止します
+      └ scripts/ogp.py
+```
+
+## GitHub Actions と日次 cron への組み込み
+
+仕組みができたら、人間が忘れても回るところへ置きます。私は「push のたび」と「毎朝1回」の二重で走らせています。push 時は赤を出してマージを止め、毎朝の cron は黄色の段階で気づくためのものです。
+
+```yaml
+# .github/workflows/model-deprecation-guard.yml
+name: model-deprecation-guard
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 0 * * *"   # 毎日 09:00 JST（UTC 00:00）
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install google-genai
+      - run: python run_guard.py .
+        env:
+          YOUR_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+```
+
+`run_guard.py` は前述の3部品を呼び出すだけの薄いエントリポイントです。push トリガで `FAIL`（終了コード1）が出れば、その PR は赤くなってマージできません。停止日が近いモデルIDを新しく持ち込んだ瞬間に止まる、というのが狙いどおりの挙動です。
+
+なお cron だけにしないのは、**新しい古いIDが入ってくる経路を塞ぎたい**からです。毎朝のチェックは「既にあるもの」を見張りますが、その日の昼に古いIDを足したコードは翌朝まで素通りします。push トリガがあれば、持ち込みと同時に止まります。
+
+## つまずいた点と、運用で効いた工夫
+
+最初に作ったときは、スキャナがサンプルコード由来のIDまで全部「移行対象」として扱い、記事内の歴史的な記述（「かつて `gemini-1.5-pro` を使っていました」のような文）まで赤くしてしまいました。これは現実的ではありません。そこで、**レジストリに載っているモデルだけを判定対象にし、レジストリ外のIDは情報として表示するだけ**に変えました。停止日を持たないIDは、そもそも止める根拠がないからです。
+
+もう一つの工夫は、レジストリの更新自体を仕事に組み込むことです。週に一度、非推奨ページを開いて `SHUTDOWN_REGISTRY` に新しい期限を足す。この5分があるかないかで、ガードの価値はまるで変わります。仕組みは、それを支える運用習慣とセットでなければ形骸化します。手を動かして整え続けることが、結局は一番の近道だと感じています。
+
+期限つきの非推奨は、移行作業そのものより「いつ・どこで効くか」を可視化するほうが本質的に難しい問題です。同じ構造は Gemini に限らず、API キーのローテーション期限や証明書の有効期限にもそのまま使えます。判定器の `SHUTDOWN_REGISTRY` を差し替えるだけで、別の「期限を見張る仕組み」に転用できます。
+
+移行手順そのものに不安が残る方は、[Gemini API モデル非推奨・移行エラーの対処法](/articles/gemini-api/gemini-api-model-deprecation-migration-guide)も併せてご覧ください。本番でのモデル切り替えを無停止で行いたい場合は、[シャドートラフィックでモデル移行を検証する実装](/articles/gemini-advanced/gemini-api-shadow-traffic-model-migration-production)が参考になります。GA 直後のモデルへルーティングを寄せる設計は、[Gemini 3.5 Flash GA の段階ロールアウトとモデルルーター](/articles/gemini-api/gemini-35-flash-ga-staged-rollout-model-router-guide)にまとめてあります。
+
+まずは `scan_models.py` を自分のリポジトリのルートで一度走らせて、いま何種類のモデルIDが散らばっているかを数えてみてください。その数を知るところから、この仕組みは動き始めます。
