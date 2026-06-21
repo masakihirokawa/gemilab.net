@@ -2,12 +2,16 @@
 title: "Track Gemini API Costs in Production with usageMetadata — A Per-Request Logging Pattern That Reconciles With Your Bill"
 slug: "gemini-api-usage-metadata-cost-tracking-production"
 category: "gemini-api"
-level: "intermediate"
-premium: false
-date: "2026-04-28T20:30"
+level: "advanced"
+premium: true
+date: "2026-06-21T10:00"
 author: "Gemini Lab"
-description: "A practical pattern for capturing Gemini API's usageMetadata on every request so you can attribute spend by endpoint, user, and model — and reconcile against the Google Cloud bill at the end of the month. Covers cached and thoughts tokens, JSONL logging, and a daily budget alert."
+description: "A production pattern for capturing Gemini API's usageMetadata per request to attribute spend by endpoint, user, and model — hardened for the 3.5 Flash GA era where the default model can shift under you. Covers pricing keyed on resp.model_version and a nightly audit that flags model drift and unknown models before the invoice does."
 tags: ["gemini-api", "cost-management", "usage-metadata", "production", "python", "billing"]
+highlights:
+  - "Re-key cost attribution on resp.model_version (the model that actually served the request) so totals stay aligned with the bill even when the default model changes"
+  - "A nightly audit that raises on price-table-missing models instead of silently falling back to Pro pricing"
+  - "Track the share of responses served by a model other than the one requested, catching default-model swaps the day they happen"
 ---
 About six months into using the Gemini API in a side project, I opened a Google Cloud bill that was twice what I had budgeted for. Drilling into the console only got me as far as the daily aggregate — there was no way to see which endpoint, which user, or which model had eaten the budget. The real culprit, I realized, was that I had never bothered to record `usageMetadata` from each response.
 
@@ -198,7 +202,7 @@ if today_total_usd() > DAILY_BUDGET_USD:
 
 Setting the threshold to your monthly budget divided by 30 catches almost any runaway behavior the same day it happens. Since I added this guard, the number of times I've been surprised by an end-of-month bill has dropped to zero.
 
-If you want to go deeper, the broader cost-optimisation strategies live in [Gemini API Cost Optimisation — 7 Techniques With Real Code](/articles/gemini-api/gemini-api-cost-optimization), and the pricing math behind Context Caching is covered in [A Practical Guide to Cutting Costs With Gemini API Context Caching](/articles/gemini-api/gemini-api-context-caching-cost-optimization).
+If you want to go deeper, the pricing math behind Context Caching is covered in [A Practical Guide to Cutting Costs With Gemini API Context Caching](/articles/gemini-api/gemini-api-context-caching-cost-optimization).
 
 ## Loading logs into SQLite for ad-hoc queries
 
@@ -254,6 +258,105 @@ Two gotchas in the Node SDK that I've hit personally:
 
 - `usageMetadata` can be `undefined` on streaming responses until the final chunk. If you sum across chunks, only count it on the chunk where it appears
 - `cachedContentTokenCount` may be missing entirely (not zero) when caching isn't used; treat falsy values as zero rather than crashing on `undefined`
+
+## Your price table drifts silently when the default model changes
+
+Up to here we've keyed the price table on the `model` we *requested*. That matched the bill exactly for about six months — until Gemini 3.5 Flash reached general availability in June 2026 and, in some environments, the default model quietly shifted to that new tier. Concretely: a request made through an alias like `gemini-flash-latest` was actually served by a different model generation. As long as you aggregate by the requested name, that gap never appears in your logs.
+
+What you can trust is the model the response itself reports as having served the request. It lives in `resp.model_version` (Python SDK) and `resp.modelVersion` (Node SDK). Key your records on that, and your cost attribution stops drifting when the default moves underneath you.
+
+```python
+def call_gemini_logged(model: str, prompt: str, *, user_id: str, endpoint: str):
+    started = time.time()
+    resp = client.models.generate_content(model=model, contents=prompt)
+    um = resp.usage_metadata
+
+    record = {
+        "ts": time.time(),
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "user_id": user_id,
+        "endpoint": endpoint,
+        "requested_model": model,            # what you asked for (may be an alias)
+        "served_model": resp.model_version,  # what actually answered — price on this
+        "prompt": um.prompt_token_count,
+        "cached": um.cached_content_token_count or 0,
+        "candidates": um.candidates_token_count or 0,
+        "thoughts": um.thoughts_token_count or 0,
+        "tool_use": um.tool_use_prompt_token_count or 0,
+        "total": um.total_token_count,
+    }
+    with LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return resp
+```
+
+The cost calculation now reads `served_model`. One subtlety: `model_version` won't always match a price-table key like `gemini-2.5-flash` exactly. A small normalization step that matches on the generation prefix keeps minor suffix differences from slipping through — and matching longest-key-first stops `flash-lite` from being swallowed by `flash`.
+
+```python
+def resolve_price_key(served_model: str) -> str | None:
+    """Normalize a model_version to a PRICING key; return None if unknown."""
+    if not served_model:
+        return None
+    m = served_model.lower()
+    for key in sorted(PRICING, key=len, reverse=True):
+        if m.startswith(key) or key in m:
+            return key
+    return None
+
+def calc_usd(record: dict) -> float:
+    key = resolve_price_key(record.get("served_model") or record.get("requested_model"))
+    if key is None:
+        # don't fall back to Pro silently — surface it
+        raise KeyError(f"unknown model: {record.get('served_model')}")
+    p = PRICING[key]
+    input_billable = max(0, record["prompt"] - record.get("cached", 0))
+    return (
+        input_billable / 1_000_000 * p["input"]
+        + record.get("cached", 0) / 1_000_000 * p["cached"]
+        + record.get("candidates", 0) / 1_000_000 * p["output"]
+        + record.get("thoughts", 0) / 1_000_000 * p["thoughts"]
+    )
+```
+
+The original version "fell back to Pro pricing for unknown models, to stay on the safe side." During a period when the default keeps moving, that kindness backfires: on the first day a new tier becomes the default, every request is booked at Pro rates, your estimate balloons several-fold, and the real cost change is buried. Better to let an unknown model raise than to quietly substitute — you catch up to the correct price table far faster.
+
+## Audit the gap between logs and bill every night
+
+Once you record `served_model`, you no longer have to wait for month-end to watch how often a request was answered by a different model than you asked for. I run this audit as a nightly batch and only alert on drift and unknown models.
+
+```python
+import json
+from collections import Counter
+from datetime import datetime, timezone
+
+def audit_recent(days: int = 1) -> dict:
+    since = datetime.now(timezone.utc).timestamp() - days * 86400
+    drift = Counter()      # (requested, served) mismatches
+    unknown = Counter()    # served_model missing from PRICING
+    total = 0
+    with open("logs/gemini_usage.jsonl") as f:
+        for line in f:
+            rec = json.loads(line)
+            if rec["ts"] < since:
+                continue
+            total += 1
+            served = rec.get("served_model")
+            if resolve_price_key(served) is None:
+                unknown[served] += 1
+            if served and rec.get("requested_model") and \
+               resolve_price_key(served) != resolve_price_key(rec["requested_model"]):
+                drift[(rec["requested_model"], served)] += 1
+    return {"total": total, "drift": drift, "unknown": unknown}
+
+report = audit_recent(days=1)
+if report["unknown"]:
+    print("A model with no price-table entry is answering:", dict(report["unknown"]))
+if report["drift"]:
+    ratio = sum(report["drift"].values()) / max(report["total"], 1)
+    print(f"{ratio:.1%} of responses came from a different model than requested:", dict(report["drift"]))
+```
+
+Anything in `unknown` is the signal that a new default has arrived. Add one row to `PRICING` and the next day's totals line up with the bill again. The `drift` ratio sits at zero in normal times and spikes only on the day the default flips. As an indie developer running this across several small services, catching the change on the day it happens — rather than in next month's invoice — is exactly the kind of early warning that pays for itself.
 
 ## The smallest first step
 
