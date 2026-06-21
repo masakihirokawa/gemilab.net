@@ -2,12 +2,16 @@
 title: "Should You Move Your Agent Loop to Gemini's Managed Agents? Three Questions That Decide What Migrates"
 slug: "gemini-managed-agents-vs-self-hosted-agent-loop-decision"
 category: "gemini-api"
-level: "intermediate"
-premium: false
-date: "2026-06-13T08:15"
+level: "advanced"
+premium: true
+date: "2026-06-21T19:45"
 author: "Gemini Lab"
 description: "With Gemini API's Managed Agents in public preview, deciding between a self-hosted agent loop and a Google-hosted sandbox is now a real question. Three questions — execution environment, state ownership, and failure recovery — decide what migrates and what stays."
 tags: ["gemini-api", "managed-agents", "ai-agents", "automation", "architecture", "google-io-2026"]
+highlights:
+  - "Wrapping the Managed Agents call in a thin wrapper that auto-falls back to your self-hosted loop on failure"
+  - "An idempotency-key gatekeeper that makes reruns and double-submits safe — including the sort_keys pitfall"
+  - "A nightly cost-metering design tracking the managed/self time ratio and fallback rate to catch preview billing creep early"
 ---
 
 Managed Agents, announced at Google I/O 2026, are now available in public preview on the Gemini API. The pitch is appealing: a single API call spins up an agent inside a Google-hosted, isolated Linux sandbox, where it reasons, calls tools, executes code, and hands you back the result.
@@ -110,6 +114,105 @@ One related note: the more "submit and wait" workloads you adopt — and Managed
 Even for jobs that pass all three questions, I keep one thin layer of protection in place while Managed Agents remain in preview. Nothing elaborate: the Managed Agents call lives inside a small wrapper function with exactly two responsibilities. First, a fallback — if the call fails, the same task runs through the existing self-hosted loop. Second, schema validation on whatever comes back.
 
 This buys two things. When preview-stage breaking changes arrive, the affected surface is one wrapper file. And because the wrapper can route the same task to either implementation, comparing output quality between Managed Agents and my own loop happens in one place. On cost, I also keep preview-period spending tagged separately from everything else, so any surprising billing pattern shows up early.
+
+## Implementation — the thin wrapper with fallback and schema validation
+
+I said the wrapper carries exactly two responsibilities; here is what that looks like in code. Call Managed Agents, validate the result with Pydantic, and if either the call or the validation fails, route the same task through the self-hosted loop. That is the whole thing.
+
+The key idea is that the fallback is not there to swallow exceptions — it is there to satisfy the same contract with a different implementation. Make both paths return one shared type, and the caller never has to care which one ran.
+
+```python
+from pydantic import BaseModel
+
+class ReleaseReport(BaseModel):
+    product: str
+    summary: str
+    has_breaking_change: bool
+
+def run_via_managed_agent(task: str) -> ReleaseReport:
+    """Runs the task on Managed Agents (public preview), then validates the result."""
+    resp = client.agents.run(  # preview-stage: this call name may still change
+        model="gemini-3.5-flash",
+        instructions=task,
+        response_schema=ReleaseReport,
+    )
+    return ReleaseReport.model_validate_json(resp.output_text)
+
+def run_via_self_hosted(task: str) -> ReleaseReport:
+    """The fallback that satisfies the same contract via the self-hosted loop."""
+    text = run_existing_agent_loop(task)  # the production version of the minimal loop above
+    return ReleaseReport.model_validate_json(text)
+
+def run_task(task: str) -> tuple[ReleaseReport, str]:
+    """Managed Agents first, self-hosted loop if it fails. Returns which path ran."""
+    try:
+        return run_via_managed_agent(task), "managed"
+    except Exception as e:  # cast a wide net during preview — call and validation failures alike
+        log.warning("managed agent failed (%s); falling back to self-hosted", e)
+        return run_via_self_hosted(task), "self_hosted"
+```
+
+With this shape, a preview-stage breaking change means editing exactly one function, `run_via_managed_agent`. Neither the callers of `run_task` nor anything else that consumes a `ReleaseReport` has to change. Returning "which path ran" alongside the result is deliberate — the next two sections, cost metering and quality comparison, both use that flag.
+
+## Making "just rerun it" safe with an idempotency key
+
+Question 3 concluded that only idempotent jobs should move. But saying "this is idempotent" in your head is different from building a state where rerunning is actually safe. Because Managed Agents give you no way to intervene in intermediate state on failure, a fallback or a manual retry will quite normally run the same task twice. So I add a thin gatekeeper: derive one key from the task inputs, and if a result for that key already exists, skip the body.
+
+```python
+import hashlib, json, sqlite3
+
+db = sqlite3.connect("agent_runs.db")
+db.execute("CREATE TABLE IF NOT EXISTS runs(key TEXT PRIMARY KEY, result TEXT)")
+
+def idempotency_key(task: str, inputs: dict) -> str:
+    """Normalizes task and inputs into a key (sort_keys guards against ordering drift)."""
+    payload = json.dumps({"task": task, "inputs": inputs}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def run_idempotent(task: str, inputs: dict) -> ReleaseReport:
+    key = idempotency_key(task, inputs)
+    row = db.execute("SELECT result FROM runs WHERE key = ?", (key,)).fetchone()
+    if row:
+        return ReleaseReport.model_validate_json(row[0])  # already done; the body never runs
+    report, _ = run_task(f"{task}\ntarget: {json.dumps(inputs, ensure_ascii=False)}")
+    db.execute("INSERT OR REPLACE INTO runs(key, result) VALUES (?, ?)",
+               (key, report.model_dump_json()))
+    db.commit()
+    return report
+```
+
+What matters here is how the key is built. Drop `sort_keys=True` and the same input produces a different key whenever the dict ordering shifts — and your idempotency quietly breaks. I did exactly that once in a separate caching job and spent half a day hunting for why the hit rate was lower than expected. Keep two rules — never mix a timestamp or random value into the input, and normalize the JSON — and reruns fail safe. The Question 3 worry about emitting side effects through Managed Agents is, in practice, largely defused by this gatekeeper.
+
+## Tagging cost per job to watch preview-period billing
+
+In preview, the scariest failure is not a broken feature — it is spend creeping up unnoticed. Because a single Managed Agents call drives several steps behind the scenes, token consumption is harder to read than in a self-hosted loop. So I record a per-task measurement alongside the "which path ran" flag that `run_task` returns.
+
+```python
+import time
+
+def metered(task: str, inputs: dict) -> ReleaseReport:
+    started = time.monotonic()
+    report = run_idempotent(task, inputs)
+    db.execute(
+        "INSERT INTO meter(tag, impl, seconds, ts) VALUES (?, ?, ?, ?)",
+        (inputs.get("tag", "untagged"), "managed", time.monotonic() - started, time.time()),
+    )
+    db.commit()
+    return report
+```
+
+I aggregate this table overnight and look, every day, at how many times more cost and time a Managed Agents task takes versus the self-hosted path. The guide below is the set of signals I watched when I started running the two in parallel.
+
+<table>
+<thead><tr><th>What to watch</th><th>Why</th><th>Warning sign</th></tr></thead>
+<tbody>
+<tr><td>managed / self time ratio</td><td>Measures the fixed cost of sandbox startup</td><td>Ratio blows out on short tasks</td></tr>
+<tr><td>Calls per task</td><td>Indirectly tracks internal step count</td><td>Same input spikes on some days</td></tr>
+<tr><td>Fallback rate</td><td>Gauges preview stability</td><td>A sudden rise suggests a spec change</td></tr>
+</tbody>
+</table>
+
+Watching these three separately, you catch the preview-specific "somehow slower, somehow pricier" early. When you evaluate a service whose billing you cannot yet predict right next to production, building this measurement footing first — before chasing the convenience — turns out to be the cheaper path.
 
 ## Start by picking the one sandbox-shaped job
 

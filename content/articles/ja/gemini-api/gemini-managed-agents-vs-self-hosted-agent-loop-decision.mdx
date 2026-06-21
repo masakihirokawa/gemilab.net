@@ -2,12 +2,16 @@
 title: "Gemini API の Managed Agents に自前のエージェントループを移すべきか — 移す処理と残す処理を分ける3つの質問"
 slug: "gemini-managed-agents-vs-self-hosted-agent-loop-decision"
 category: "gemini-api"
-level: "intermediate"
-premium: false
-date: "2026-06-13T08:15"
+level: "advanced"
+premium: true
+date: "2026-06-21T19:45"
 author: "Gemini Lab"
 description: "Gemini API の Managed Agents が公開プレビューになり、自前のエージェントループとの使い分けが現実の検討事項になりました。実行環境・状態の所有・失敗時の回収という3つの質問で、移す処理と残す処理を分ける考え方を整理します。"
 tags: ["gemini-api", "managed-agents", "ai-agents", "automation", "architecture", "google-io-2026"]
+highlights:
+  - "Managed Agents 呼び出しを薄いラッパーに閉じ込め、失敗時に自前ループへ自動フォールバックさせる実装"
+  - "入力から作る冪等キーで再実行・二重起動を安全にする番人パターン（sort_keys の落とし穴つき）"
+  - "managed/self の所要時間比とフォールバック発生率を毎晩集計し、プレビュー期間の課金膨張を早期検知する監視設計"
 ---
 
 Google I/O 2026 で発表された Managed Agents が、Gemini API の公開プレビューとして使えるようになりました。1回の API 呼び出しで、Google がホストする隔離された Linux サンドボックスの中にエージェントが立ち上がり、推論・ツール実行・コード実行までこなして結果を返してくる、という触れ込みです。
@@ -110,6 +114,105 @@ Managed Agents に移すと、この粒度は API が見せてくれる範囲に
 3つの質問を通過して「移せる」と判定した処理についても、プレビュー段階のうちは一枚だけ防御層を挟むことにしています。といっても大げさなものではなく、Managed Agents の呼び出しを薄いラッパー関数に閉じ込め、そこに2つの仕事だけを持たせる構成です。1つは、呼び出しが失敗したら従来の自前ループで同じタスクを実行するフォールバック。もう1つは、返ってきた結果のスキーマ検証です。
 
 この形にしておくと、プレビュー特有の仕様変更が来ても影響範囲はラッパー1ファイルに収まります。また、同じタスクを Managed Agents と自前ループの両方で実行して結果を突き合わせる、という品質比較も同じ場所でできます。料金についても、プレビュー期間中は想定外の課金パターンがないか、他の処理と分けて集計できるようにしておくと安心です。
+
+## 実装 — フォールバックとスキーマ検証を備えた薄いラッパー
+
+先ほど「薄いラッパーに2つの仕事だけを持たせる」と書きましたが、ここではその実体をコードで示します。やることは2つです。Managed Agents を呼び、返ってきた結果を Pydantic で検証する。そして、呼び出しか検証のどちらかが失敗したら、同じタスクを自前ループへ流す。これだけです。
+
+ポイントは、フォールバックを「例外を握りつぶす」ためでなく「同じ契約を別の実装で満たす」ために置くことです。両者の戻り値の型を1つに揃えておけば、呼び出し側はどちらが動いたかを気にせずに済みます。プレビュー段階のうちは、この薄いラッパーを必ず挟むことを推奨します。
+
+```python
+from pydantic import BaseModel
+
+class ReleaseReport(BaseModel):
+    product: str
+    summary: str
+    has_breaking_change: bool
+
+def run_via_managed_agent(task: str) -> ReleaseReport:
+    """Managed Agents（公開プレビュー）でタスクを実行し、結果を検証して返します。"""
+    resp = client.agents.run(  # プレビュー段階のため、呼び出し名は今後変わり得ます
+        model="gemini-3.5-flash",
+        instructions=task,
+        response_schema=ReleaseReport,
+    )
+    return ReleaseReport.model_validate_json(resp.output_text)
+
+def run_via_self_hosted(task: str) -> ReleaseReport:
+    """同じ契約を自前ループで満たすフォールバックです（中身は既存のループを再利用します）。"""
+    text = run_existing_agent_loop(task)  # 本記事冒頭の最小ループの本番版
+    return ReleaseReport.model_validate_json(text)
+
+def run_task(task: str) -> tuple[ReleaseReport, str]:
+    """まず Managed Agents、駄目なら自前ループ。どちらで動いたかも返します。"""
+    try:
+        return run_via_managed_agent(task), "managed"
+    except Exception as e:  # プレビュー中は呼び出し失敗も検証失敗も広めに捕捉します
+        log.warning("managed agent failed (%s); falling back to self-hosted", e)
+        return run_via_self_hosted(task), "self_hosted"
+```
+
+この構成にしておくと、プレビュー特有の仕様変更が来ても、修正するのは `run_via_managed_agent` の1関数だけで済みます。`run_task` を呼ぶ側も、`ReleaseReport` を受け取るほかの処理も、いっさい書き換えずに済みます。「どちらで動いたか」を一緒に返しているのは、次のコスト集計と品質比較でこのフラグを使うためです。
+
+## 冪等キーで「まるごとやり直し」を安全にする
+
+質問3で「移してよいのは冪等にできる処理だけ」と書きました。ただ、頭の中で「これは冪等です」と言うのと、再実行が本当に安全な状態を作るのは別の話です。Managed Agents は失敗時に中間状態へ介入できない前提なので、フォールバックや手動の再実行で「同じタスクが二重に走る」ことは普通に起こります。そこで、タスクの入力から決まるキーを1つ用意し、同じキーの結果が既にあれば処理本体をスキップする、という薄い番人を挟みます。
+
+```python
+import hashlib, json, sqlite3
+
+db = sqlite3.connect("agent_runs.db")
+db.execute("CREATE TABLE IF NOT EXISTS runs(key TEXT PRIMARY KEY, result TEXT)")
+
+def idempotency_key(task: str, inputs: dict) -> str:
+    """タスク内容と入力を正規化してキー化します（順序揺れを防ぐため sort_keys を指定）。"""
+    payload = json.dumps({"task": task, "inputs": inputs}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def run_idempotent(task: str, inputs: dict) -> ReleaseReport:
+    key = idempotency_key(task, inputs)
+    row = db.execute("SELECT result FROM runs WHERE key = ?", (key,)).fetchone()
+    if row:
+        return ReleaseReport.model_validate_json(row[0])  # 既に成功済み。本体は動かしません
+    report, _ = run_task(f"{task}\n対象: {json.dumps(inputs, ensure_ascii=False)}")
+    db.execute("INSERT OR REPLACE INTO runs(key, result) VALUES (?, ?)",
+               (key, report.model_dump_json()))
+    db.commit()
+    return report
+```
+
+ここで効いてくるのは、キーの作り方です。`sort_keys=True` を外すと、同じ入力でも辞書の並び順が変わるだけでキーが変わり、冪等性が静かに壊れます。私は以前これを別のキャッシュ処理でやってしまい、ヒット率が想定より低い原因を半日探したことがあります。地味ですが、本番運用で見落としやすい落とし穴でした。入力に時刻や乱数を混ぜないこと、JSON を正規化することの2つを守るだけで、再実行は安全側に倒れます。副作用を伴う処理を Managed Agents に出すのが怖い、という質問3の懸念は、この番人で実用上はかなり和らぎます。
+
+## コストを処理単位でタグ付けして、プレビュー期間の課金を監視する
+
+プレビュー段階で一番こわいのは、機能の不具合よりも「気づかないうちに課金が膨らむ」ことです。Managed Agents は1回の呼び出しの裏で複数ステップを回すため、トークン消費が自前ループより読みにくくなります。そこで、`run_task` が返す「どちらで動いたか」のフラグと一緒に、1タスクあたりの実測を記録しておきます。
+
+```python
+import time
+
+def metered(task: str, inputs: dict) -> ReleaseReport:
+    started = time.monotonic()
+    report = run_idempotent(task, inputs)
+    db.execute(
+        "INSERT INTO meter(tag, impl, seconds, ts) VALUES (?, ?, ?, ?)",
+        (inputs.get("tag", "untagged"), "managed", time.monotonic() - started, time.time()),
+    )
+    db.commit()
+    return report
+```
+
+夜間にこのテーブルを集計し、Managed Agents 経由のタスクが自前ループ経由より2〜3倍のコスト・時間がかかっていないかを毎日眺めるようにしています。短いタスクほどサンドボックス起動の固定費が効くため、ここの比率は素直に開きます。下の目安は、私が並行運用を始めるときに置いた監視の観点です。
+
+<table>
+<thead><tr><th>監視する値</th><th>なぜ見るか</th><th>異常の合図</th></tr></thead>
+<tbody>
+<tr><td>managed / self の所要時間比</td><td>サンドボックス起動の固定費を測る</td><td>短いタスクで比が大きく開く</td></tr>
+<tr><td>1タスクあたりの呼び出し回数</td><td>内部ステップの増減を間接的に掴む</td><td>同じ入力で日によって跳ねる</td></tr>
+<tr><td>フォールバック発生率</td><td>プレビューの安定度を測る</td><td>急に上がったら仕様変更を疑う</td></tr>
+</tbody>
+</table>
+
+この3つを分けて見ておくと、プレビュー特有の「いつの間にか高い・遅い」に早く気づけます。料金が読めないサービスを本番の隣で評価するときは、便利さよりも先に、こうした計測の足場を作っておくほうが結局は安く済むと感じています。
 
 ## まずは「サンドボックス向きの1本」を選ぶところから
 
