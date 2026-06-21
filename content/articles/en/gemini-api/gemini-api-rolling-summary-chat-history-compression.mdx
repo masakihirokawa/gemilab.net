@@ -2,12 +2,16 @@
 title: "Compressing Gemini API Chat History with Rolling Summaries — Designing Chatbots That Survive Hundreds of Turns"
 slug: "gemini-api-rolling-summary-chat-history-compression"
 category: "gemini-api"
-level: "intermediate"
-premium: false
-date: "2026-04-27T11:30"
+level: "advanced"
+premium: true
+date: "2026-06-22T11:30"
 author: "Gemini Lab"
 description: "When a Gemini chatbot grows long enough, your bills balloon and one day a request hits the token ceiling. The rolling-summary pattern keeps long chats stable."
 tags: ["gemini-api", "chat", "history", "summary", "rolling-summary", "production"]
+highlights:
+  - "Turn a chatbot whose bill balloons and eventually hits the token ceiling into one whose input cost is bounded"
+  - "Pre-empt the three production-only pitfalls — default-model swaps, summaries dropping facts, and the double-compression race — with working code"
+  - "Encode the line between what is safe to summarize and what must never be summarized, so sessions stay stable across hundreds of turns"
 ---
 If you have shipped a Gemini-backed chatbot, you have probably seen the moment when one specific user starts getting silent failures while everyone else is fine. Dig into the logs and you find `Request contains too many tokens` repeating, and the cause turns out to be a chat history that simply got too long.
 
@@ -120,7 +124,134 @@ Second, hold critical facts in a structured memory layer outside the rolling sum
 - **Vector retrieval shines** when you want to recall only the parts of a long history that are relevant to the current question. Useful for conversations that span thousands of turns or where past chat needs to be queryable.
 - **Rolling summaries shine** for the typical single-thread chatbot that needs to keep going for days or weeks. The implementation cost-to-benefit ratio is the best of the three for that case.
 
-If you are debugging a token-limit error right now, the [Gemini API token-limit error guide](/en/articles/gemini-api/gemini-api-token-limit-exceeded-error-fix) lists the immediate fixes before you commit to a structural change like this one.
+If you are debugging a token-limit error right now, the [Gemini API token-limit error guide](/en/articles/gemini-api/gemini-api-max-tokens-truncation-continuation-recovery) lists the immediate fixes before you commit to a structural change like this one.
+
+## Pin the summarizer model — a default upgrade quietly changes how it summarizes
+
+On 2026-06-21 Gemini 3.5 Flash reached general availability, and default models across Google's products are being raised to newer tiers. The easy thing to miss here is code that names the **summarizer model only by generation**. Summarization is a behind-the-scenes step, not the conversation itself, so a silent model swap is hard to notice.
+
+On a side project I run as an indie developer, my summarization pipeline pinned only `gemini-2.5-flash` by generation. When it was automatically lifted to a higher tier, the summaries got longer and more detailed, input tokens crept up, and the bill grew. The output looked *better*, so I did not spot the cause until I read the invoice.
+
+The fix is simple: **pin the summarizer to a fully qualified, stable ID, and record which model actually served each request.** If the requested and served models diverge, you find out immediately.
+
+```python
+# Pin the summarizer by a stable ID, not just a generation name
+SUMMARY_MODEL = "gemini-2.5-flash"  # explicitly fix a verified, stable version
+
+def summarize_pinned(messages: list[types.Content]) -> tuple[str, str]:
+    """Return the summary text and the model that actually served it."""
+    transcript = "\n".join(
+        f"{m.role}: {m.parts[0].text}" for m in messages if m.parts
+    )
+    instruction = (
+        "Summarize the conversation below in 5-8 lines, keeping only what later "
+        "turns must not lose. Preserve proper nouns, numbers, and URLs verbatim.\n\n"
+        f"---\n{transcript}\n---"
+    )
+    resp = client.models.generate_content(
+        model=SUMMARY_MODEL,
+        contents=instruction,
+        config=types.GenerateContentConfig(temperature=0.2),
+    )
+    served = getattr(resp, "model_version", None) or SUMMARY_MODEL
+    if not served.startswith(SUMMARY_MODEL):
+        # A default-model swap was detected; log and alert here
+        print(f"[warn] summary model drift: requested={SUMMARY_MODEL} served={served}")
+    return resp.text, served
+```
+
+The expected behavior is that `served` always starts with `SUMMARY_MODEL`. The morning a warning appears there, it is a sign the default tier moved. You can then calmly decide whether to update the pinned ID or re-measure summary quality on the new tier — before the length and cost shift on you. The reason to log the served model, not just the requested one, is that trusting the requested name alone preserves the illusion that you "pinned it," and lets a quiet cost increase slip through.
+
+## Detect when the summary drops a fact, automatically
+
+Near the end of the article I suggested sampling summaries once a week. Once hundreds of sessions are live, manual sampling misses things. So I add a gate that **mechanically extracts the must-not-lose elements from the original transcript and checks whether they survived in the summary.**
+
+The idea is simple. Proper nouns, numbers, and URLs can be pulled with regular expressions. Count how many survive in the summary text, and if the retention ratio falls below a threshold, reject that summary and rebuild it (or move the facts into the structured-memory layer instead).
+
+```python
+import re
+
+URL_RE = re.compile(r"https?://[^\s)]+")
+NUM_RE = re.compile(r"\b\d[\d,\.]{2,}\b")           # reservation IDs, amounts, long numbers
+PROPER_RE = re.compile(r"[A-Z][a-zA-Z0-9_\-]{2,}")  # product names, IDs, code fragments
+
+def critical_tokens(text: str) -> set[str]:
+    """Extract the elements that must not be dropped."""
+    toks = set(URL_RE.findall(text)) | set(NUM_RE.findall(text)) | set(PROPER_RE.findall(text))
+    return {t for t in toks if t.lower() not in {"http", "https", "the"}}
+
+def retention_ratio(original: str, summary: str) -> float:
+    """How much of the original's critical content the summary kept, 0.0-1.0."""
+    must_keep = critical_tokens(original)
+    if not must_keep:
+        return 1.0
+    survived = sum(1 for t in must_keep if t in summary)
+    return survived / len(must_keep)
+
+def compress_with_gate(history: list[types.Content], min_retention: float = 0.9):
+    """Compression with a retention gate; falls back to verbatim when it fails."""
+    if len(history) <= KEEP_RECENT:
+        return history, 1.0
+    old, recent = history[:-KEEP_RECENT], history[-KEEP_RECENT:]
+    original = "\n".join(m.parts[0].text for m in old if m.parts)
+    summary, _ = summarize_pinned(old)
+    ratio = retention_ratio(original, summary)
+    if ratio < min_retention:
+        # Critical elements were lost -> keep more verbatim instead of trusting the summary
+        print(f"[warn] summary retention {ratio:.2f} < {min_retention}; keeping more verbatim")
+        return history[-(KEEP_RECENT * 2):], ratio
+    summary_msg = types.Content(
+        role="user",
+        parts=[types.Part.from_text(text=f"[Summary of the conversation so far]\n{summary}")],
+    )
+    return [summary_msg] + recent, ratio
+```
+
+After adding this gate, the "the reservation number the user gave ten turns ago vanished from the summary" class of bug essentially stopped for me. It is not a perfect extractor, but the value is in monitoring summary degradation every time through a single number. Start `min_retention` at 0.9, lower it if false positives are noisy, raise it if real facts slip through. The reason to favor a mechanical gate is that a summarizer's good intentions are not reproducible, and quality erosion accumulates quietly but reliably.
+
+## The double-compression race, and a structured memory layer that is never summarized
+
+Finally, two pitfalls that only appear in production. Both are invisible in a single-threaded local implementation and surface the moment concurrent requests arrive.
+
+The first is the **double-compression race.** Two requests for the same session arrive almost simultaneously, both see the history over the compression threshold, and `compress()` runs twice — producing a "summary of a summary" that thins the information further. The fix is a small guard that serializes compression per session.
+
+The second is turning the **structured memory layer** from the body of the article into actual code. Information that must never disappear — user profile, current task state — is never handed to the summarizer; you hold it as JSON in your application and inject it at the top of every prompt. Instead of relying on a retention ratio, you give it a physical place where it cannot be lost.
+
+```python
+import threading
+from collections import defaultdict
+
+_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+
+# Per-session "never drop" structured memory (a DB column works too)
+sticky_memory: dict[str, dict] = defaultdict(dict)
+
+def build_prompt(session_id: str, history: list[types.Content]) -> list[types.Content]:
+    """Pin structured memory at the top, then the compressed history."""
+    mem = sticky_memory[session_id]
+    header = types.Content(
+        role="user",
+        parts=[types.Part.from_text(
+            text="[Pinned session facts - not subject to summarization]\n" + str(mem)
+        )],
+    ) if mem else None
+    return ([header] if header else []) + history
+
+def chat_turn_safe(session_id: str, history, user_message):
+    history.append(types.Content(
+        role="user", parts=[types.Part.from_text(text=user_message)]))
+    # Serialize compression for the same session to avoid double compression
+    if count_tokens(history) > COMPRESS_THRESHOLD:
+        with _locks[session_id]:
+            if count_tokens(history) > COMPRESS_THRESHOLD:  # re-check after acquiring lock
+                history, _ = compress_with_gate(history)
+    prompt = build_prompt(session_id, history)
+    resp = client.models.generate_content(model="gemini-2.5-pro", contents=prompt)
+    history.append(resp.candidates[0].content)
+    return history, resp.text
+```
+
+The threshold is re-checked after `with _locks[session_id]` because another request may have finished compressing while this one waited for the lock (double-checked locking). It is unglamorous, but without it the lock fires uselessly and double compression slips back in. Keeping structured memory out of the summarizer follows the same line of thinking as the [long-term memory and session persistence](/en/articles/gemini-advanced/gemini-api-long-memory-session-persistence-chatbot-architecture) design. Summaries are a tool for cheaply folding away the information you are allowed to forget; the things you must never forget should not reach the summarizer at all. Drawing that line first makes the whole system far more stable in production.
 
 ## Before you ship it
 
