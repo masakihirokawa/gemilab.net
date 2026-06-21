@@ -2,12 +2,16 @@
 title: "Gemini API implicit caching が効かない・課金がおかしい — 原因別トラブルシューティング"
 slug: "gemini-api-implicit-caching-errors-troubleshooting"
 category: "gemini-api"
-level: "intermediate"
-premium: false
-date: "2026-05-08T09:15"
+level: "advanced"
+premium: true
+date: "2026-06-21T15:00"
 author: "Gemini Lab"
 description: "Gemini API の implicit caching が効かない、キャッシュヒット率が低い、コスト削減を期待したのに請求が変わらないといった問題を、原因別に整理して解決策をコード付きで紹介します。"
 tags: ["gemini-api", "implicit-caching", "context-caching", "コスト最適化", "トラブルシューティング", "python"]
+highlights:
+  - "暗黙キャッシュのヒット率を本番で継続監視し、回帰を検知する集計コード"
+  - "「固定に見えて固定でない」プレフィックスを特定し、ヒット率を安定させる設計"
+  - "implicit から explicit caching へ切り替える判断基準とコスト比較"
 ---
 Gemini 2.5 Pro を個人プロジェクトで使い始めて、最初の請求書を見たとき少し驚きました。ドキュメントに「implicit caching で最大75%削減」と書いてあったので期待していたのですが、そのメリットをほとんど享受できていなかったのです。
 
@@ -213,6 +217,154 @@ print(f"キャッシュヒット: {response.usage_metadata.cached_content_token_
 ```
 
 `inline_data`（バイト直接渡し）でも動作しますが、毎回同一バイト列を渡す必要があります。ファイルを Files API 経由でアップロードしておくと、URI が固定されてキャッシュが安定してヒットします。
+
+## 本番でキャッシュヒット率を継続監視する
+
+単発の `usage_metadata` 確認は最初の一歩としては十分ですが、実運用では「先週まで効いていたキャッシュが、いつの間にか効かなくなっている」という静かな劣化が一番こわい問題です。私自身、個人開発で複数のサイトに同じ生成パイプラインを使い回しているため、どこか一箇所のプロンプトを直した拍子に、別サイトのヒット率だけが落ちていた、という経験があります。
+
+そこで、リクエストごとの結果を集計し、直近のヒット率と「キャッシュなし換算でいくら損したか」をモデル別に出す小さな監視を挟んでいます。
+
+```python
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+
+NORMAL_RATE = 1.25 / 1_000_000  # Gemini 2.5 Pro 通常単価（2026年6月時点）
+CACHE_RATE = 0.31 / 1_000_000   # キャッシュ単価
+
+@dataclass
+class CacheMonitor:
+    window: int = 200
+    # モデル別に直近 window 件のヒット率を保持する
+    _recent: dict = field(default_factory=lambda: defaultdict(lambda: deque(maxlen=200)))
+
+    def record(self, model: str, meta) -> dict:
+        total = meta.prompt_token_count or 0
+        cached = meta.cached_content_token_count or 0
+        ratio = cached / total if total else 0.0
+        self._recent[model].append(ratio)
+
+        # キャッシュが効いていれば浮いたはずの差額
+        saved = cached * (NORMAL_RATE - CACHE_RATE)
+        return {"model": model, "ratio": ratio, "saved_usd": saved}
+
+    def hit_rate(self, model: str) -> float:
+        win = self._recent[model]
+        return sum(win) / len(win) if win else 0.0
+
+    def regressed(self, model: str, floor: float = 0.4) -> bool:
+        # 直近ウィンドウが十分たまってから判定する（初動の誤検知を避ける）
+        win = self._recent[model]
+        return len(win) >= self.window and self.hit_rate(model) < floor
+```
+
+呼び出し側ではこう使います。
+
+```python
+monitor = CacheMonitor()
+
+for item in items:
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=build_contents(item))
+    stat = monitor.record(GEMINI_MODEL, response.usage_metadata)
+    if monitor.regressed(GEMINI_MODEL):
+        # ログに残し、必要なら通知へ回す（ここで握りつぶさない）
+        print(f"⚠️ {GEMINI_MODEL} の暗黙キャッシュ ヒット率が低下: {monitor.hit_rate(GEMINI_MODEL):.1%}")
+```
+
+ヒット率を「率」で持っておくと、回帰の検知がぐっと楽になります。たとえば 2026年6月に Gemini 3.5 Flash が一般提供となり既定モデルが更新される局面では、モデル名を固定していないコードのヒット率だけが静かに落ちます。金額ではなく率を監視していると、こうした既定値の変化を早い段階で異常として拾えます。
+
+## 「固定に見えて固定でない」プレフィックスを潰す
+
+問題2でプレフィックスを先頭に置く話をしましたが、実際にハマるのはもう一歩奥です。**先頭に置いたつもりの固定部分が、毎回ほんの少しだけ違っている**ケースが、ヒット率を地味に削ります。暗黙キャッシュは先頭からの連続一致で判定されるため、プレフィックスの中に一文字でも可変要素が混ざると、そこから後ろは丸ごとキャッシュ対象外になります。
+
+私が実際にやってしまった典型が、システム指示の中に現在時刻を埋め込んでいた例です。
+
+```python
+from datetime import datetime
+import json
+
+# Before: 固定のつもりが、毎回変わってしまうプレフィックス
+def build_system_prompt_bad(rules: dict) -> str:
+    return (
+        f"現在時刻: {datetime.now().isoformat()}\n"  # 毎回変わる → 以降すべてキャッシュ外
+        f"設定: {json.dumps(rules, ensure_ascii=False)}\n"  # dict の順序揺れでも一致が崩れる
+        "あなたはシニアPythonエンジニアです。以下の規約に従ってください。"
+    )
+```
+
+このプレフィックスは、見た目は固定でも実際には毎回バイト列が変わるため、暗黙キャッシュはまずヒットしません。対策は「プレフィックスを決定的（deterministic）にする」ことです。
+
+```python
+# After: 可変要素を後ろへ追い出し、固定部分を決定的にする
+def build_system_prompt_good(rules: dict) -> str:
+    # キーをソートして JSON の順序揺れをなくす
+    settings = json.dumps(rules, ensure_ascii=False, sort_keys=True)
+    return (
+        "あなたはシニアPythonエンジニアです。以下の規約に従ってください。\n"
+        f"設定: {settings}"  # ソート済みなので毎回同一
+    )
+
+def build_contents(system_prompt: str, user_question: str, now_iso: str) -> list:
+    # 時刻のような可変情報は user 側（後ろ）へ。先頭の system は不変に保つ
+    return [
+        {"role": "system", "parts": [{"text": system_prompt}]},
+        {"role": "user", "parts": [{"text": f"参照時刻: {now_iso}\n{user_question}"}]},
+    ]
+```
+
+プレフィックスを壊しがちな可変要素は、だいたい次の3つに集約されます。
+
+<table>
+<thead><tr><th>混入しやすい可変要素</th><th>症状</th><th>対策</th></tr></thead>
+<tbody>
+<tr><td><strong>タイムスタンプ・乱数・UUID</strong></td><td>毎回バイト列が変わり全くヒットしない</td><td>可変情報は user パート（後ろ）へ移す</td></tr>
+<tr><td><strong>dict / set のシリアライズ順</strong></td><td>内容は同じなのに順序揺れで一致が崩れる</td><td><code>json.dumps(..., sort_keys=True)</code> で決定的に</td></tr>
+<tr><td><strong>ロケール依存の数値・日付整形</strong></td><td>環境差でプレフィックスが微妙に変わる</td><td>整形はプレフィックス外で行い、固定文字列のみ前置</td></tr>
+</tbody>
+</table>
+
+ヒット率が「ゼロではないが妙に低い」ときは、まずプレフィックスを実際にバイト列として2回ぶん書き出し、`diff` を取ってみてください。目では同じに見えても、差分が出ることがあります。
+
+## implicit から explicit caching へ切り替える判断
+
+暗黙キャッシュは設定不要で手軽ですが、「確実に効かせたい」「巨大な固定コーパスを何度も参照する」用途では、明示的な `CachedContent`（explicit caching）のほうが向いています。暗黙キャッシュはあくまでベストエフォートで、ヒットするかどうかを保証しないためです。
+
+判断の目安を表にまとめます。
+
+<table>
+<thead><tr><th>状況</th><th>向いている方式</th><th>理由</th></tr></thead>
+<tbody>
+<tr><td>短〜中程度のプロンプトを散発的に呼ぶ</td><td><strong>implicit</strong></td><td>設定不要。TTL 管理も不要で運用が軽い</td></tr>
+<tr><td>数万トークンの固定資料を高頻度で参照</td><td><strong>explicit</strong></td><td>確実にヒットし、TTL を自分で延長できる</td></tr>
+<tr><td>夜間バッチで同一コンテキストを連続使用</td><td><strong>explicit</strong></td><td>暗黙キャッシュの TTL 切れに左右されない</td></tr>
+<tr><td>プレフィックスが頻繁に変わる対話用途</td><td><strong>implicit</strong></td><td>固定化できないので明示キャッシュの利点が薄い</td></tr>
+</tbody>
+</table>
+
+explicit へ切り替える場合は、固定コーパスを一度だけキャッシュ化し、TTL を処理時間に合わせて設定します。
+
+```python
+from google.genai import types
+
+# 固定の参照資料を明示的にキャッシュする
+cache = client.caches.create(
+    model="gemini-2.5-pro",
+    config=types.CreateCachedContentConfig(
+        system_instruction="あなたは社内ドキュメントの回答アシスタントです。",
+        contents=[large_reference_corpus],  # 数万トークンの固定資料
+        ttl="3600s",  # バッチ全体が終わるまで十分な長さに
+    ),
+)
+
+# 以降のリクエストはキャッシュ名を指すだけで確実にヒットする
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents=[user_question],
+    config=types.GenerateContentConfig(cached_content=cache.name),
+)
+print(f"キャッシュヒット: {response.usage_metadata.cached_content_token_count}")
+```
+
+explicit caching はキャッシュ保持自体にもストレージ料金がかかります。「散発的な呼び出しなら implicit、高頻度・大容量・確実性が要るなら explicit」という線引きで考えると、無駄なく使い分けられます。個人開発での私の運用でも、対話系は implicit に任せ、夜間の一括分類のように同じ資料を何百回も参照する処理だけ explicit に寄せています。
 
 ## 全体を振り返って: 原因チェックリスト
 
