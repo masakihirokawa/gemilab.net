@@ -5,19 +5,19 @@ import { useLocale } from "next-intl";
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
     "FLASH — Gemini 3.5 Flashが一般提供（GA）に。エージェントやコーディングで持続的なフロンティア性能をうたいます",
-    "TIER — 3.1 Pro・3.1 Flash-Liteといった新ティアがアプリ・クラウド・業務ツールへ順次展開されています",
-    "PIXEL — 6月Pixel DropでGeminiの楽曲生成、AIによる動画・音楽作成、画面録画リアクションが追加されました",
-    "OMNI — 生成のGemini Omni、推論の3 Deep Think、調査のDeep Researchが並行して強化されています",
-    "LIVE — Gemini Liveのライブやりとりが、Android・検索・YouTube・各Googleアプリへ広がっています",
-    "ULTRA — Google AI Ultraは最上位アクセス・Deep Research・Veo 3動画・100万トークン文脈を提供します",
+    "AGENTS — Gemini APIにManaged Agentsがパブリックプレビュー。Googleホストの隔離Linuxサンドボックスで自律エージェントを実行できます",
+    "WEBHOOK — イベント駆動のWebhooksが追加され、Batch APIや長時間処理のポーリングを置き換えられます",
+    "SEARCH — File Searchがマルチモーダル対応に。gemini-embedding-2で画像も埋め込んで検索できます",
+    "SUNSET — gemini-3.1-flash-image-preview・3-pro-image-previewは6/25に停止予定です",
+    "ANTIGRAVITY — Antigravity Agentのマネージドエージェント（antigravity-preview-05-2026）がプレビュー提供されています",
   ],
   en: [
     "FLASH — Gemini 3.5 Flash is now generally available, billed as the most intelligent model for agentic and coding tasks",
-    "TIER — New tiers like 3.1 Pro and 3.1 Flash-Lite are rolling into apps, cloud products, and business tools",
-    "PIXEL — The June Pixel Drop adds Gemini music generation, AI video and music creation, and screen-recording reactions",
-    "OMNI — Gemini Omni (creation), 3 Deep Think (reasoning), and Deep Research (automation) all advance in parallel",
-    "LIVE — Gemini Live's real-time interaction is expanding across Android, Search, YouTube, and connected Google apps",
-    "ULTRA — Google AI Ultra offers top model access, Deep Research, Veo 3 video, and a 1M-token context window",
+    "AGENTS — Managed Agents arrive in public preview, running autonomous agents in Google-hosted isolated Linux sandboxes",
+    "WEBHOOK — Event-driven webhooks now replace polling for the Batch API and long-running operations",
+    "SEARCH — File Search goes multimodal, embedding and searching images via gemini-embedding-2",
+    "SUNSET — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on June 25",
+    "ANTIGRAVITY — The Antigravity Agent managed agent (antigravity-preview-05-2026) is available in public preview",
   ],
 };
 
