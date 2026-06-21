@@ -1,0 +1,213 @@
+---
+title: "Gemini の Maps Grounding が本番で静かに外れるとき — アトリビューション義務・課金の境界・不発時のフォールバックの運用メモ"
+slug: "gemini-maps-grounding-attribution-cost-fallback-field-notes"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-21T14:30"
+author: "Gemini Lab"
+description: "Gemini の Grounding with Google Maps を本番に載せた後で効いてくる落とし穴を運用視点でまとめます。グラウンディングの不発検知、アトリビューション表示の義務、課金が発生する境界、鮮度のずれに備えるフォールバックの実装です。"
+tags: ["gemini", "google-maps", "grounding", "vertex-ai", "location-ai", "python"]
+highlights:
+  - "grounding_metadata が空のまま返る『静かな不発』を検知し、位置情報の断りを添えて返すフォールバックの実装"
+  - "Maps ソースのアトリビューションを欠かさず描画するための抽出・描画パターンと、課金が発生する応答の数え方"
+  - "本番でレイテンシと鮮度のずれを吸収する、タイムアウト分離・キャッシュ境界・営業情報の再確認の運用設計"
+---
+
+Grounding with Google Maps をデモで動かすと、たいてい気持ちよく動きます。問題が出るのは、リリースして数日が経ち、ログを眺め始めてからです。回答は返ってくるのに地図情報が混ざっていない応答がぽつぽつ現れ、請求額は想定とずれ、ユーザーから「店の営業時間が違った」という報告が届く。どれもエラーにはならず、HTTP 200 のまま静かに起きます。
+
+ここでは、レストラン検索や周辺情報のアシスタントを本番に載せたあとで実際に効いてくる四つの論点を、運用側のコードとともに整理します。セットアップの手順そのものより、「動いているように見えて外れている」状態をどう捕まえるかに重心を置きます。対象は、Vertex AI 経由で Maps Grounding を一度は動かしたことのある中級〜上級のエンジニアです。
+
+なお、Maps Grounding は Vertex AI 経由でのみ動作し、通常の API キー認証の Gemini API では呼び出せません。対応モデルや料金の細目は更新が早いので、実装に入る前に [Vertex AI 生成 AI の料金](https://cloud.google.com/vertex-ai/generative-ai/pricing) と公式のツールドキュメントで最新の対応表を確認してください。本稿のコードは対応モデルを設定値として外に出し、差し替えやすくしてあります。
+
+## グラウンディングが「静かに不発する」のを検知する
+
+最初に作り込むべきは、地図情報が使われたかどうかの判定です。Gemini は、クエリを位置情報の問い合わせと判断したときだけ Maps を参照します。判断が外れると、モデルは自分の内部知識だけで答えを作り、それらしい店名を返してきます。これが一番こわい失敗で、応答は流暢なのに裏取りがされていません。
+
+判定の根拠は応答テキストではなく `grounding_metadata` に置きます。チャンクが一件も無ければ、その回答は地図に裏打ちされていないと見なします。
+
+```python
+# grounding_guard.py
+from dataclasses import dataclass
+
+@dataclass
+class GroundedResult:
+    text: str
+    sources: list[dict]
+    grounded: bool          # 地図ソースが1件以上付いたか
+    used_maps: bool         # 課金対象となる Maps 応答だったか
+
+def inspect(response) -> GroundedResult:
+    """応答から地図グラウンディングの有無を判定する。"""
+    sources: list[dict] = []
+    candidate = (response.candidates or [None])[0]
+    metadata = getattr(candidate, "grounding_metadata", None) if candidate else None
+
+    for chunk in getattr(metadata, "grounding_chunks", []) or []:
+        web = getattr(chunk, "web", None)
+        if web and getattr(web, "uri", None):
+            sources.append({
+                "title": getattr(web, "title", "") or "(無題)",
+                "uri": web.uri,
+                "place_id": getattr(web, "place_id", None),
+            })
+
+    grounded = len(sources) > 0
+    return GroundedResult(
+        text=response.text or "",
+        sources=sources,
+        grounded=grounded,
+        used_maps=grounded,
+    )
+```
+
+不発を検知したら、黙ってそのまま返さないことが肝心です。位置情報に裏打ちされていない旨を一言添えて返すか、用途によっては Places API の素朴な近接検索へ切り替えます。個人開発で位置情報アプリを運用している私自身も、ユーザーへ返す前にこの一言を必ず差し込む方針にしてから、「実在しない店を案内された」という種類の苦情がほぼ消えました。これは本番運用で最初に踏みがちな落とし穴で、流暢な誤答をそのまま信じてもらうより、断りを入れるほうがアプリへの信頼はむしろ上がります。
+
+```python
+def to_user_payload(result: GroundedResult) -> dict:
+    if result.grounded:
+        return {"answer": result.text, "sources": result.sources, "verified": True}
+    # 不発時: 地図裏付けが無いことを明示して返す
+    note = "（注：今回の回答は地図のリアルタイム情報で確認できていません。営業状況は各店舗で再確認してください。）"
+    return {"answer": f"{result.text}\n\n{note}", "sources": [], "verified": False}
+```
+
+不発はクエリの書き方にも左右されます。「カフェを教えて」のような抽象的な問いより、地名や施設名・「近くの」といった近接表現を含む問いのほうが地図参照が発火しやすい傾向があります。システムプロンプトで「場所を尋ねる問いには必ず地名か現在地を補ってから検索する」と促しておくと、不発率はある程度下げられます。ただしゼロにはならない前提で、上の検知層は残しておきます。
+
+## アトリビューションは「描画して初めて要件を満たす」
+
+Maps Grounding を使う以上、参照したソースのアトリビューション表示は任意ではなく要件です。`grounding_metadata` を取得しただけでは足りず、ユーザーが見る画面に実際に描画されて初めて満たされます。抽出はできているのに UI 側で捨てている、という取りこぼしが本番で一番起きやすい箇所です。
+
+```python
+# attribution.py
+import html
+
+def render_attribution(sources: list[dict]) -> str:
+    """Maps ソースを安全にエスケープして表示用 HTML に変換する。"""
+    if not sources:
+        return ""
+    items = "\n".join(
+        f'  <li><a href="{html.escape(s["uri"])}" target="_blank" '
+        f'rel="noopener noreferrer">{html.escape(s["title"])}</a></li>'
+        for s in sources
+    )
+    return (
+        '<div class="maps-attribution" '
+        'style="font-size:13px;color:#5f6368;margin-top:12px;">\n'
+        "  <span>情報提供元（Google Maps）:</span>\n"
+        f"  <ul style=\"margin:4px 0;padding-left:16px;\">\n{items}\n  </ul>\n"
+        "</div>"
+    )
+```
+
+`title` と `uri` は外部由来の文字列なので、必ずエスケープしてから埋め込みます。ここを生で渡すと、店名に紛れ込んだ記号でレイアウトが崩れたり、最悪の場合スクリプト混入の経路になります。
+
+実装上もう一つ意識したいのは、対話型 UI で地図ウィジェットを出すかテキストのリンクで済ませるかの選択です。チャット形式でユーザーに地図を触ってもらいたい場合はウィジェット連携を有効にし、サーバー側で要約だけを返すバッチ処理ではテキストのアトリビューションで足ります。要件の正確な範囲は更新されることがあるため、ウィジェットの扱いとアトリビューションのスタイル規定は公式ドキュメントで都度確認するのが安全です。要点は、メタデータを取得したら必ずレンダリングまで一本の経路でつなぐことです。
+
+## 課金が発生する「境界」を数える
+
+料金の見積もりがずれる主因は、「リクエストを送った回数」で数えてしまうことです。Maps Grounding の課金対象は、地図ソースが含まれた応答だけです。グラウンディングが不発に終わった応答（前述の `grounded=False`）には Maps の課金が乗りません。逆に言えば、地図参照が発火した応答の数を数えないと、本当のコストは見えません。
+
+<table>
+<thead>
+<tr><th>応答の種類</th><th>Maps 課金</th><th>モデルのトークン課金</th></tr>
+</thead>
+<tbody>
+<tr><td>地図ソース付き（grounded=True）</td><td><strong>発生する</strong></td><td>発生する</td></tr>
+<tr><td>不発（grounded=False）</td><td>発生しない</td><td>発生する</td></tr>
+<tr><td>例外で失敗</td><td>発生しない</td><td>原則発生しない</td></tr>
+</tbody>
+</table>
+
+そこで、コストの観測点は「送信数」ではなく「`used_maps` が真だった応答数」に置きます。日次の無料枠がある前提で、枠を超えた地図応答だけを単価で見積もると実態に近づきます。次のガードは、地図応答のカウントと、想定外の急増を検知するための素朴なカウンタです。
+
+```python
+# cost_meter.py
+import time
+from threading import Lock
+
+class MapsCostMeter:
+    """地図グラウンディングが発火した応答だけを数える。"""
+    def __init__(self, free_tier_per_day: int, price_per_1k_usd: float):
+        self.free = free_tier_per_day
+        self.unit = price_per_1k_usd
+        self._day = time.strftime("%Y-%m-%d")
+        self._grounded = 0
+        self._lock = Lock()
+
+    def record(self, result) -> None:
+        today = time.strftime("%Y-%m-%d")
+        with self._lock:
+            if today != self._day:      # 日付が変わったらリセット
+                self._day, self._grounded = today, 0
+            if getattr(result, "used_maps", False):
+                self._grounded += 1
+
+    def estimated_cost_usd(self) -> float:
+        billable = max(0, self._grounded - self.free)
+        return round(billable / 1000 * self.unit, 4)
+
+    def snapshot(self) -> dict:
+        return {"date": self._day, "grounded": self._grounded,
+                "estimated_usd": self.estimated_cost_usd()}
+```
+
+単価と無料枠は変わりうるので、定数で持たずに設定から注入します。私は当初、全リクエスト数でコストを見積もって過大に身構えていたのですが、ログを `used_maps` で絞り直したら、不発の比率が思ったより高く、実コストは見積もりの約55%にとどまりました。送信数と課金応答数は別物だという当たり前のことを、請求書で気づくのは避けたいところです。温度を下げて出力トークンを抑えるといったモデル側の節約より、まず「何が課金対象か」を正しく数えることを推奨します。
+
+## レイテンシと鮮度のずれを運用で吸収する
+
+最後は、エラーにならない二種類の劣化です。ひとつはレイテンシ。地図参照が挟まる応答は、内部知識だけの応答より明確に遅くなります。同期 API のタイムアウトを一律に短く切っていると、地図応答だけが間に合わずに失敗します。地図ありの経路は別系統として、長めのタイムアウトと、超過時に不発フォールバックへ落とす分岐を用意します。
+
+```python
+# resilient_search.py
+import concurrent.futures as cf
+from grounding_guard import inspect
+
+def search_with_budget(call_fn, *, timeout_s: float = 12.0):
+    """地図応答は遅いので専用タイムアウトを与え、超過時は不発扱いにする。"""
+    with cf.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(call_fn)
+        try:
+            response = future.result(timeout=timeout_s)
+        except cf.TimeoutError:
+            return {"answer": "", "sources": [], "verified": False, "timeout": True}
+    result = inspect(response)
+    return {
+        "answer": result.text,
+        "sources": result.sources,
+        "verified": result.grounded,
+        "timeout": False,
+    }
+```
+
+もうひとつは鮮度です。地図のデータはリアルタイムに近いとはいえ、営業時間や臨時休業は店舗側の更新に依存します。「今開いていますか」という問いに断定で答えると、外れたときの体験が悪い。営業状況に踏み込む回答には、最終確認を促す一文をシステムプロンプト側で必ず添えるようにしています。
+
+```python
+FRESHNESS_GUARD = (
+    "営業時間・定休日・臨時休業に言及する場合は、断定を避け、"
+    "『公式情報での再確認をおすすめします』という趣旨を必ず添えてください。"
+)
+```
+
+キャッシュを入れる場合は、座標と言語を含めた鍵で短い TTL に留めます。「近くの」を含むクエリは現在地で結果が変わるため、座標を鍵から外すと別の地点の結果を使い回してしまいます。鮮度が要のデータを長くキャッシュすると、コスト削減の代わりに体験を削ることになります。私自身の運用では、人気の定型クエリだけを数分のTTLで持ち、それ以外は都度問い合わせる折衷を推奨します。
+
+## 対応モデルの差し替えに備える
+
+Gemini はモデルの世代交代が速く、2026 年に入ってからも Flash 系の一般提供が進んでいます。Maps Grounding の対応モデルもこれに連動して変わるため、モデル ID を呼び出しのあちこちに直書きすると、対応表が更新されるたびに広範囲を直すことになります。私自身は、対応モデルを一箇所の設定値にまとめ、不発検知・コスト計測・タイムアウトの各層はモデルに依存しない形にしています。こうしておくと、新しい Flash ティアへ寄せる検証も、設定の一行差し替えと数日のログ観測だけで判断できます。
+
+```python
+# config.py
+GROUNDING = {
+    "model": "gemini-2.5-flash",   # 対応表は公式docsで都度確認して差し替える
+    "timeout_s": 12.0,
+    "free_tier_per_day": 500,      # 無料枠は変わりうるので設定で持つ
+    "price_per_1k_usd": 25.0,      # 単価も同様。定数で散らさない
+    "cache_ttl_s": 180,
+}
+```
+
+速度とコストの実測値は用途で変わります。対応表とともに、自分のクエリ分布での実測を一度取ってから本採用するのが堅い進め方です。
+
+## 次の一歩
+
+まずは既存の地図検索経路に、本稿の `inspect()` による不発検知と、`used_maps` を数えるコストメーターの二点だけ足してみてください。この二つを入れた状態で数日ログを取ると、自分のアプリで「地図が実際に発火している割合」と「本当の課金応答数」が初めて数字で見えます。そこが見えてから、アトリビューションの描画経路とタイムアウト分離を順に固めていくと、手戻りなく本番品質に寄せられます。
