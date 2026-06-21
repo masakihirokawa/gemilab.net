@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH — Gemini 3.5 Flashが一般提供（GA）に。エージェントやコーディングで持続的なフロンティア性能をうたいます",
-    "AGENTS — Gemini APIにManaged Agentsがパブリックプレビュー。Googleホストの隔離Linuxサンドボックスで自律エージェントを実行できます",
-    "WEBHOOK — イベント駆動のWebhooksが追加され、Batch APIや長時間処理のポーリングを置き換えられます",
-    "SEARCH — File Searchがマルチモーダル対応に。gemini-embedding-2で画像も埋め込んで検索できます",
-    "SUNSET — gemini-3.1-flash-image-preview・3-pro-image-previewは6/25に停止予定です",
-    "ANTIGRAVITY — Antigravity Agentのマネージドエージェント（antigravity-preview-05-2026）がプレビュー提供されています",
+    "MODEL — Gemini 3.5 FlashがGA。エージェント・コーディングで持続的なフロンティア性能を狙う最も賢いモデルです",
+    "AGENTS — Gemini APIにManaged Agentsがパブリックプレビュー。Googleホストの隔離Linuxサンドボックスで自律エージェントを構築できます",
+    "IMAGE — Nano Banana 2（Gemini 3.1 Flash Image）とNano Banana Pro（Gemini 3 Pro Image）がGAになりました",
+    "IMAGE — 動画→画像生成に対応。動画を文脈に渡しサムネイル・ポスター・インフォグラフィックを生成できます（3.1 Flash Image限定）",
+    "DEPRECATION — gemini-3.1-flash-image-previewとgemini-3-pro-image-previewは6/25に停止。GA版へ移行してください",
+    "STUDIO — Gemini 3はGeminiアプリ・AI Studio・Vertex AIで利用できます",
   ],
   en: [
-    "FLASH — Gemini 3.5 Flash is now generally available, billed as the most intelligent model for agentic and coding tasks",
-    "AGENTS — Managed Agents arrive in public preview, running autonomous agents in Google-hosted isolated Linux sandboxes",
-    "WEBHOOK — Event-driven webhooks now replace polling for the Batch API and long-running operations",
-    "SEARCH — File Search goes multimodal, embedding and searching images via gemini-embedding-2",
-    "SUNSET — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on June 25",
-    "ANTIGRAVITY — The Antigravity Agent managed agent (antigravity-preview-05-2026) is available in public preview",
+    "MODEL — Gemini 3.5 Flash is GA, Google's most intelligent model for sustained frontier performance on agentic and coding tasks",
+    "AGENTS — Managed Agents in the Gemini API enter public preview, running autonomous agents in Google-hosted isolated Linux sandboxes",
+    "IMAGE — Nano Banana 2 (Gemini 3.1 Flash Image) and Nano Banana Pro (Gemini 3 Pro Image) are now GA",
+    "IMAGE — Video-to-image generation arrives: pass a video as context to create thumbnails, posters, and infographics (3.1 Flash Image only)",
+    "DEPRECATION — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on June 25; migrate to GA",
+    "STUDIO — Gemini 3 is available across the Gemini app, AI Studio, and Vertex AI",
   ],
 };
 
