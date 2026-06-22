@@ -1,16 +1,20 @@
 ---
-title: "Gemini API × Google Cloud 本番環境エラー完全診断ガイド"
+title: "Gemini API × Google Cloud 本番エラーを層で切り分ける診断手順"
 slug: "gemini-api-google-cloud-production-error-diagnosis-guide"
 category: "gemini-api"
 level: "advanced"
-premium: false
-date: "2026-04-08T10:30"
+premium: true
+date: "2026-06-22T15:00"
 author: "Gemini Lab"
 description: "Gemini APIをGoogle Cloud本番環境で運用する際のエラーを体系的に診断。IAM権限・Vertex AI vs AI Studio・VPC・クォータ管理・サービスアカウント設定まで、実装コード付きで完全解説します。"
 tags: ["Gemini API", "Google Cloud", "Vertex AI", "IAM", "本番環境", "トラブルシューティング"]
+highlights:
+  - "本番特有のエラーを認証・ネットワーク・クォータ・モデル非推奨の4層に切り分ける診断フロー"
+  - "起動時 preflight で非推奨モデルを検知し、停止日をまたいでも後継へ自動フォールバックする実装"
+  - "IAM 最小権限・VPC-SC・クォータ超過の典型エラーを動くコードで一つずつ解消する手順"
 
 ---
-Gemini API をローカル開発環境で動かすのは比較的簡単ですが、Google Cloud の本番環境に移行すると、IAM 権限エラー・ネットワーク制限・クォータ超過・サービスアカウントの設定ミスなど、さまざまな問題に直面することがあります。
+個人開発で Dolice Labs の複数サイトを Google Cloud 上で回していると、ローカルでは何ごともなく動いていた Gemini API が、本番に出した途端に 403 や 429 を返して止まる——という場面に何度も出くわしてきました。私自身、IAM のロール一つ、サービスアカウントの鍵一つで半日を溶かした経験があり、そのたびに「エラー文字列から原因の層を一発で切り分ける手順」を手元に積み上げてきました。ここからは、本番特有のエラーを認証・ネットワーク・クォータ・モデル非推奨の層に分けて、診断ステップと動くコードで一つずつ潰していきます。
 
 ## Gemini API の2つのエントリーポイントと本番での選択基準
 
@@ -429,6 +433,78 @@ gcloud resource-manager org-policies describe \
 ```
 
 対処法は、管理者に依頼して対象リージョンを組織ポリシーの許可リストに追加してもらうか、ポリシーで許可されているリージョンに変更することです。
+
+## モデルの非推奨・GA 切り替えで噴き出すエラーを先回りで捕まえる
+
+本番でいちばん厄介なのは、自分のコードを一行も変えていないのに、ある日突然エラーが出る種類の障害です。その代表が、参照しているモデルの非推奨化と、GA への静かな切り替えです。たとえば 2026/06/25 には `gemini-3.1-flash-image-preview` と `gemini-3-pro-image-preview` が停止予定で、これらを直接名前で叩いているパイプラインは当日 `NOT_FOUND` で全滅します。3.5 Flash が GA になったタイミングでも、エイリアス越しに既定モデルが差し替わって、出力の粒度やコストが静かに変わることがあります。
+
+よくあるのは、モデル名をハードコードしたうえで例外を握りつぶしてしまう書き方です。
+
+```python
+import google.generativeai as genai
+
+genai.configure(api_key="YOUR_API_KEY")
+
+# モデル名をハードコード。停止・改名に弱い
+model = genai.GenerativeModel("gemini-3.1-flash-image-preview")
+
+def generate(prompt: str):
+    try:
+        return model.generate_content(prompt).text
+    except Exception:
+        # 原因の層が分からないまま握りつぶしてしまう
+        return None
+```
+
+これだと、なぜ落ちたのかがログから読み取れません。本番では、起動時にモデルの実在を確認し、非推奨・停止を検知したら明示的に後継へフォールバックする preflight を入れておくと、停止日をまたいでも沈黙の全滅を避けられます。
+
+```python
+import logging
+import google.generativeai as genai
+from google.api_core.exceptions import NotFound
+
+genai.configure(api_key="YOUR_API_KEY")
+log = logging.getLogger("gemini.preflight")
+
+# 非推奨モデル -> 後継モデルのフォールバック表（停止日付き）
+DEPRECATIONS = {
+    "gemini-3.1-flash-image-preview": ("gemini-3.5-flash", "2026-06-25"),
+    "gemini-3-pro-image-preview": ("gemini-3.5-flash", "2026-06-25"),
+}
+
+def resolve_model(requested: str) -> str:
+    """起動時に1回だけ実行。停止・改名を検知して後継へ寄せる。"""
+    target = requested
+    if requested in DEPRECATIONS:
+        successor, shutdown = DEPRECATIONS[requested]
+        log.warning("model %s は %s に停止予定。%s へフォールバックします",
+                    requested, shutdown, successor)
+        target = successor
+    # 実在確認：存在しなければ NotFound が飛ぶ
+    try:
+        genai.get_model(f"models/{target}")
+    except NotFound:
+        log.error("後継モデル %s も見つかりません。設定を確認してください", target)
+        raise
+    return target
+
+MODEL_NAME = resolve_model("gemini-3.1-flash-image-preview")
+model = genai.GenerativeModel(MODEL_NAME)
+
+def generate(prompt: str) -> str | None:
+    try:
+        resp = model.generate_content(prompt)
+    except NotFound:
+        log.error("実行時にモデルが消失しました。preflight をやり直してください")
+        raise
+    # 要求と応答のモデルがずれていないか毎回突き合わせる
+    used = getattr(resp, "model_version", MODEL_NAME)
+    if used != MODEL_NAME:
+        log.info("応答モデルが %s に切り替わりました（要求: %s）", used, MODEL_NAME)
+    return resp.text
+```
+
+押さえておきたいのは3点です。第一に、起動時の preflight で `NOT_FOUND` を握り、フォールバック表で後継モデルへ寄せること。第二に、応答に含まれる実際のモデル識別子をログに残し、要求と応答がずれていないかを毎回突き合わせること。第三に、停止日が判明している非推奨モデルは設定ファイルに期限付きで持ち、期限が来る前に CI で警告を出すことです。私自身、プレビュー機能に寄りかかったパイプラインで停止日に足をすくわれた経験があり、この preflight を入れてからは、非推奨の予告を見落としても本番が黙って全滅することはなくなりました。
 
 ## 全体を振り返って：本番環境 Gemini API エラー診断フロー
 
