@@ -1,0 +1,235 @@
+---
+title: "Gemini API のアプリで、無料ユーザーのコストが粗利を食う前に — ティア設計とコスト上限の実装メモ"
+slug: "gemini-api-freemium-margin-tier-routing-cost-ceiling-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-22T20:10"
+author: "Gemini Lab"
+description: "Gemini API を組み込んだアプリの粗利を守るには、回数制限ではなく『1ユーザーあたりの月次コスト天井』で設計します。ティア別モデルルーティング、KVでの実コスト計測、トークン膨張の潰し方を実装例で示します。"
+tags: ["gemini-api", "monetization", "freemium", "cost-optimization", "cloudflare-workers"]
+highlights:
+  - "ユーザーのティアに Flash-Lite / Flash / Pro を紐づけ、無料層のコストを構造的に上限化する実装"
+  - "Cloudflare Workers + KV でエッジで『1ユーザーあたり月次コスト天井』を判定し、API に到達する前に止める設計"
+  - "会話履歴のトークン膨張・長いシステムプロンプト・無限リトライという、粗利を静かに削る3つの穴の塞ぎ方"
+---
+個人開発でアプリを作っていると、AI 機能を載せた瞬間に必ず一度はつまずく場所があります。最初の月の請求書です。リクエストのたびにお金が出ていく、という従来のアプリにはなかった構造があらわれます。AdMob の広告収益とアプリ内課金で回してきた感覚のまま Gemini API を無制限に開放すると、ユーザーが増えるほど赤字が深くなる、ということが普通に起こります。
+
+やっかいなのは、赤字を作る主役が「無料ユーザー」だという点です。課金してくれる人のコストは売上で回収できますが、無料ユーザーが消費する API コストは、誰も払っていません。ここを設計で封じ込めないまま機能だけ磨いても、成長そのものが損失を拡大させます。
+
+ここでは、回数制限という入り口でつまずかないための考え方と、本番運用で効いた「1ユーザーあたりの月次コスト天井」をエッジで判定する実装を、効いた順にお伝えします。モデルは 2026 年 6 月時点で一般提供されている Gemini 3.5 Flash と、軽量ティアの Gemini 3.1 Flash-Lite、上位の Gemini 3.1 Pro を前提にしています。
+
+## まず「回数」で考えるのをやめる
+
+多くのアプリが採用する「1 日 3 回まで無料」という設計は、二重に間違っています。
+
+ひとつは収益の観点。ユーザーは 3 回を使い切った瞬間に離脱し、価値を体感する前にアンインストールします。もうひとつはコストの観点。1 回のリクエストが消費するトークンは、入力 200 トークンの軽い質問から、長い文書を丸ごと渡す数万トークンまで、平気で 100 倍ぶれます。回数で数えている限り、コストの実態は見えません。
+
+運用していて腑に落ちたのは、課金単位もコスト上限も「回数」ではなく、課金は体験の深さで、コスト管理は実消費（トークン＝お金）で、と分けて設計するということでした。同じ「要約」機能でも、無料は便利レベル、有料は仕事で使えるレベルにする。一方で守りは、ユーザーごとに積み上がった実コストで天井を引く。この二段構えが土台になります。
+
+## ティアにモデルを紐づけてコスト構造を決める
+
+価格の重い Pro と、軽い Flash-Lite を、ユーザーのティアに直接マッピングします。これだけで、無料ユーザーが増えてもコストは Flash-Lite の幅に収まり、有料ユーザーの増加がそのまま売上として効く構造になります。無料ユーザーへの投資（API コスト）が「将来の有料転換への先行費用」として上限つきで回る、という形です。
+
+<table>
+  <thead>
+    <tr><th>ティア</th><th>モデル</th><th>出力上限</th><th>思考予算</th><th>役割</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>free</td><td>gemini-3.1-flash-lite</td><td>1,024</td><td>0</td><td>価値の体感・転換の入口</td></tr>
+    <tr><td>pro</td><td>gemini-3.5-flash</td><td>8,192</td><td>低</td><td>日常的に使える品質</td></tr>
+    <tr><td>premium</td><td>gemini-3.1-pro</td><td>8,192</td><td>高</td><td>深い分析・最高品質</td></tr>
+  </tbody>
+</table>
+
+```python
+import os
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+# ティア → (モデル, 出力上限, 思考予算) の単一の正本。
+# 1か所にまとめておくと、価格改定やモデル更新を1行で追従できる。
+TIER_PROFILE = {
+    "free":    ("gemini-3.1-flash-lite", 1024, 0),
+    "pro":     ("gemini-3.5-flash",      8192, 2048),
+    "premium": ("gemini-3.1-pro",        8192, 8192),
+}
+
+async def analyze(content: str, user_tier: str) -> dict:
+    model, max_out, think = TIER_PROFILE.get(user_tier, TIER_PROFILE["free"])
+
+    # 無料は短いシステムプロンプト。長文プロンプトは全リクエストに乗る固定費なので、
+    # 無料層では意図的に削る（後述の「穴1」を参照）。
+    system = (
+        "要点を3つだけ、簡潔に述べてください。"
+        if user_tier == "free"
+        else "課題の根本原因・リスク・優先順位つきの改善案を、具体的に構造化して述べてください。"
+    )
+
+    config = types.GenerateContentConfig(
+        system_instruction=system,
+        max_output_tokens=max_out,
+        temperature=0.7,
+        thinking_config=types.ThinkingConfig(thinking_budget=think),
+    )
+    resp = await client.aio.models.generate_content(
+        model=model, contents=content, config=config,
+    )
+    # usage_metadata は実コスト計測の生命線。必ず拾って返す（次節で使う）。
+    u = resp.usage_metadata
+    return {
+        "text": resp.text,
+        "model": model,
+        "in_tokens": u.prompt_token_count,
+        "out_tokens": u.candidates_token_count,
+    }
+```
+
+ポイントは `usage_metadata` を必ず持ち帰ることです。推定ではなく実測のトークン数を握ることが、次の「コスト天井」を成立させます。
+
+## コストは「推定」より「実測」を積む
+
+料金は改定されます。記事に固定の単価を書いても、読む頃にはずれている可能性があります。だから設計側は、単価を一箇所の定数に逃がし、実測トークンに掛けて積み上げる形にします。最新の単価は必ず公式の料金ページで確認し、この定数だけを差し替えてください。
+
+```python
+# 100万トークンあたりの単価（USD）。★必ず公式の最新値に更新すること。
+# モデルごとに入力/出力で異なる。ここは「差し替えるための1点」。
+PRICE = {
+    "gemini-3.1-flash-lite": {"in": 0.10, "out": 0.40},
+    "gemini-3.5-flash":      {"in": 0.30, "out": 2.50},
+    "gemini-3.1-pro":        {"in": 1.25, "out": 10.00},
+}
+
+def estimate_cost_usd(model: str, in_tok: int, out_tok: int) -> float:
+    p = PRICE[model]
+    return (in_tok * p["in"] + out_tok * p["out"]) / 1_000_000
+```
+
+この `estimate_cost_usd` を 1 リクエストごとに呼び、ユーザー単位で月次に積みます。回数ではなく金額で積むので、軽い質問は天井に近づかず、重い処理ほど早く近づく、という直感に合った挙動になります。重い使い方をする少数のユーザーが粗利を溶かす、という典型的な事故を、自然に抑えられます。
+
+## エッジで「月次コスト天井」を判定する
+
+判定はオリジンに来る前、Cloudflare Workers のエッジで終わらせます。不正なリクエストや過剰利用を、Gemini API に届く前に止める。届かなければコストはゼロです。回数制限と違うのは、KV に積むのが「回数」ではなく「USD」だという点だけです。
+
+```typescript
+interface Budget {
+  spentUsd: number;   // 当月の累積コスト
+  resetAt: number;    // 翌月リセットの Unix(ms)
+}
+interface Env { BUDGET_KV: KVNamespace; }
+
+// ティア別の月次コスト天井（USD）。価格×想定利用から逆算する。
+const COST_CEILING: Record<string, number> = {
+  free: 0.15,   // 無料層は赤字幅を直接コントロールできる
+  pro: 3.00,    // 月額の範囲で粗利が残る上限
+  premium: 12.00,
+};
+
+async function withinBudget(
+  env: Env, userId: string, tier: string
+): Promise<{ ok: boolean; spent: number; ceiling: number }> {
+  const ceiling = COST_CEILING[tier] ?? COST_CEILING.free;
+  const key = `budget:${userId}`;
+  const now = Date.now();
+  const b = (await env.BUDGET_KV.get(key, "json")) as Budget | null;
+
+  // 当月分が無い／リセット時刻を過ぎていれば 0 から開始
+  const cur = b && b.resetAt > now ? b : { spentUsd: 0, resetAt: endOfMonth(now) };
+  return { ok: cur.spentUsd < ceiling, spent: cur.spentUsd, ceiling };
+}
+
+// 応答後に実コストを加算（usage_metadata から算出した値を渡す）
+async function addSpend(env: Env, userId: string, costUsd: number) {
+  const key = `budget:${userId}`;
+  const now = Date.now();
+  const b = (await env.BUDGET_KV.get(key, "json")) as Budget | null;
+  const cur = b && b.resetAt > now ? b : { spentUsd: 0, resetAt: endOfMonth(now) };
+  cur.spentUsd += costUsd;
+  await env.BUDGET_KV.put(key, JSON.stringify(cur), {
+    expirationTtl: Math.ceil((cur.resetAt - now) / 1000) + 86400,
+  });
+}
+
+function endOfMonth(now: number): number {
+  const d = new Date(now);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+}
+```
+
+天井に達したユーザーには、エラーではなくアップグレード導線を返すのが要点です。「今月の無料分を使い切りました。Pro にすると続けられます」という 429 は、残量が少ないほど強い転換ドライバーになります。守りの仕組みが、そのまま売上の入口になります。
+
+```typescript
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const { userId, tier } = await verifyJwt(req); // 実装は省略
+    const { ok, spent, ceiling } = await withinBudget(env, userId, tier);
+    if (!ok) {
+      return new Response(JSON.stringify({
+        error: "budget_exceeded",
+        message: "今月の利用上限に達しました。アップグレードで続けられます。",
+        spent, ceiling,
+      }), { status: 429, headers: { "Content-Type": "application/json" } });
+    }
+    // ここで Gemini API を呼び、戻りの実コストを addSpend で積む
+    return new Response("...", { status: 200 });
+  },
+};
+```
+
+KV は結果整合なので、超高頻度の同時アクセスでは天井をわずかに超えることがあります。私は「天井 × 0.95 でソフト警告、× 1.1 でハード遮断」の二段で運用し、多少の超過は許容しています。1 円単位の厳密さより、事故を防ぐことが目的だからです。
+
+## 粗利を静かに削る3つの穴
+
+ティアとコスト天井で大枠は守れます。残るのは、気づきにくいところでトークンを増やす「穴」です。運用で実際に塞いだ順に挙げます。
+
+**穴1：無料層に長いシステムプロンプトを使う。** システムプロンプトは毎リクエストの入力に必ず乗る固定費です。2,000 トークンの丁寧な指示を全ユーザーに使うと、リクエストが増えるほど純粋な固定コストが膨らみます。無料層は 300 トークン以内に削り、品質差は有料層の詳細プロンプトで出す。固定費を払う相手を、売上のある層に寄せる発想です。
+
+**穴2：会話履歴を全件送り続ける。** チャットで履歴を毎回まるごと送ると、会話が伸びるほど入力トークンが線形に増えます。50 往復で 1 リクエストの入力が数万トークン、ということが普通に起きます。直近 N 往復だけ詳細に保ち、それ以前は要約に圧縮するスライディングウィンドウで、トークンを一定の幅に収めます。
+
+```python
+def build_window(messages: list[dict], recent_turns: int = 8, summary: str = "") -> list[dict]:
+    """直近 recent_turns 往復のみ保持し、それ以前は要約で代替する。"""
+    start = len(messages) - recent_turns * 2  # 1往復 = 2メッセージ
+    if start <= 0:
+        return messages
+    recent = messages[start:]
+    if not summary:
+        return recent
+    head = {"role": "user", "parts": [{"text": f"[これまでの要約] {summary}"}]}
+    return [head] + recent
+```
+
+**穴3：エラー時に無限リトライする。** 指数バックオフのないリトライは、一時的な 503 で 1 ユーザーの 1 操作が 20〜30 回の課金リクエストに化けます。バックオフと回数上限、そしてリトライ対象のエラー種別の限定を必ず入れます。
+
+```python
+import asyncio, random
+from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
+
+async def call_with_backoff(coro_factory, max_retries: int = 3):
+    last = None
+    for attempt in range(max_retries):
+        try:
+            return await coro_factory()
+        except (ResourceExhausted, ServiceUnavailable) as e:
+            last = e
+            if attempt == max_retries - 1:
+                break
+            await asyncio.sleep(2 ** attempt + random.uniform(0, 1))  # jitter付き
+        except Exception as e:
+            raise RuntimeError(f"retry不可のエラー: {e}") from e  # それ以外は即中断
+    raise RuntimeError(f"リトライ上限超過: {last}")
+```
+
+## 価格はコストが下限を決める
+
+AI 機能を含むアプリの価格は、競合ではなく API コストが下限を決めます。1 ユーザーあたりの月次 API コストに、ストア手数料とインフラ費を乗せ、そこに粗利を残す。経験則として、想定コストの 10〜15 倍を最低価格に置くと、転換率の振れにも耐えられます。1 ユーザー月 3 ドルのコストなら、月額の下限はおおよそ 30〜45 ドル相当、という見方です。
+
+この式が成り立つのは、無料層を Flash-Lite で抑え、有料層のコストを Pro で売上から賄う、というティア設計が先にあるからです。全ユーザーに Pro を使わせていたら、同じ価格では粗利が消えます。価格は、コスト構造の上に乗る結果でしかありません。
+
+## 設計の最初に、コストを置く
+
+AI 機能の収益化でつまずく多くのケースは、コストを後回しにするところから始まります。まず機能を作って、課金は後で、という順番は、リクエストごとに金が出ていく構造とは相性が悪いのです。
+
+順番を逆にします。最初にティアとモデルの対応を決め、`usage_metadata` で実コストを積み、エッジで月次天井を引く。そのうえで、無料層の体験を磨いて転換へつなげる。守りを先に組んでから、攻めの体験を足す。この順番だけで、成長が損失ではなく利益に向きます。最初の一歩として、自分のアプリの「1,000 人が毎日使ったら月いくらか」を、実測単価で一度だけ計算してみてください。そこから設計を始めると、後で作り直す痛みがずいぶん小さくなります。
