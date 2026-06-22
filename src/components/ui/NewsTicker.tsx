@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MODEL — Gemini 3.5 FlashがGA。エージェント・コーディングで持続的なフロンティア性能を狙う最も賢いモデルです",
-    "AGENTS — Gemini APIにManaged Agentsがパブリックプレビュー。Googleホストの隔離Linuxサンドボックスで自律エージェントを構築できます",
-    "IMAGE — Nano Banana 2（Gemini 3.1 Flash Image）とNano Banana Pro（Gemini 3 Pro Image）がGAになりました",
-    "IMAGE — 動画→画像生成に対応。動画を文脈に渡しサムネイル・ポスター・インフォグラフィックを生成できます（3.1 Flash Image限定）",
-    "DEPRECATION — gemini-3.1-flash-image-previewとgemini-3-pro-image-previewは6/25に停止。GA版へ移行してください",
-    "STUDIO — Gemini 3はGeminiアプリ・AI Studio・Vertex AIで利用できます",
+    "MODEL — Gemini 3.5 Flashが一般提供開始。3.1 Proをほぼ全ベンチで上回りつつ4倍高速に動作します",
+    "AGENTS — Managed AgentsがGemini APIでパブリックプレビュー。Googleホストの隔離Linuxサンドボックスで自律エージェントを動かせます",
+    "SEARCH — File Searchがマルチモーダル検索に対応。gemini-embedding-2で画像をネイティブに埋め込み・検索できます",
+    "API — Batch APIや長時間処理向けにイベント駆動Webhooksが追加され、ポーリングを置き換えられます",
+    "STUDIO — Google AI Studioが自然言語からAndroidアプリを生成。Nano Bananaで画像も自動生成します",
+    "MIGRATION — Gemini CLIは6/18でEOL。Agentic 2.0 CLIへの移行が必要です（画像プレビュー2種は6/25停止）",
   ],
   en: [
-    "MODEL — Gemini 3.5 Flash is GA, Google's most intelligent model for sustained frontier performance on agentic and coding tasks",
-    "AGENTS — Managed Agents in the Gemini API enter public preview, running autonomous agents in Google-hosted isolated Linux sandboxes",
-    "IMAGE — Nano Banana 2 (Gemini 3.1 Flash Image) and Nano Banana Pro (Gemini 3 Pro Image) are now GA",
-    "IMAGE — Video-to-image generation arrives: pass a video as context to create thumbnails, posters, and infographics (3.1 Flash Image only)",
-    "DEPRECATION — gemini-3.1-flash-image-preview and gemini-3-pro-image-preview shut down on June 25; migrate to GA",
-    "STUDIO — Gemini 3 is available across the Gemini app, AI Studio, and Vertex AI",
+    "MODEL — Gemini 3.5 Flash is now generally available, beating 3.1 Pro on nearly all benchmarks while running 4x faster",
+    "AGENTS — Managed Agents arrive in the Gemini API in public preview, running autonomous agents in isolated Google-hosted Linux sandboxes",
+    "SEARCH — File Search adds multimodal search, natively embedding and searching images via gemini-embedding-2",
+    "API — Event-driven webhooks now replace polling for the Batch API and long-running operations",
+    "STUDIO — Google AI Studio builds Android apps from plain language and generates images on the fly with Nano Banana",
+    "MIGRATION — Gemini CLI reaches end-of-life on June 18; migrate to the Agentic 2.0 CLI (two image-preview models retire June 25)",
   ],
 };
 
