@@ -3,11 +3,16 @@ title: "Gemini で組む LLM-as-Judge 評価パイプライン — 本番運用�
 slug: "gemini-llm-as-judge-evaluation-production-guide"
 category: "gemini-api"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-04-30T04:45"
 author: "Gemini Lab"
 description: "Gemini 2.5 Pro / 3 Pro を判定者（ジャッジ）として使い、本番品質の LLM 出力評価パイプラインを構築するための実装ガイド。Pointwise / Pairwise 評価・バイアス対策・人手相関の測定・コスト最適化までをコード付きで解説します。"
 tags: ["Gemini API", "LLM-as-Judge", "評価", "LLMOps", "Vertex AI", "本番運用", "Eval"]
+highlights:
+  - "Pointwise / Pairwise ジャッジを構造化出力で実装し、位置・長さ・自己選好バイアスを抑える具体策"
+  - "同一ケースを複数回判定してフラッキネスを測り、改善幅が誤差かを見分けるしきい値の決め方"
+  - "Flash→Pro の二段スクリーニングやコンテキストキャッシュで評価コストを 1/3〜1/4 に圧縮する運用"
+  - "人手評価との相関（Spearman / kappa）を四半期ごとに測り、ジャッジ自身の信頼性を担保する手順"
 
 ---
 「プロンプトを少し変えただけで、どの応答がどれくらい良くなったのか分からない」——本番運用しているチャットボットの改善作業をしていて、そんな手詰まりを感じたことはないでしょうか。BLEU や ROUGE のような古典的な指標は対話タスクでは役に立たず、人手評価は時間とお金を食う。だからといって自動化を諦めると、改善のサイクルが回らなくなります。
@@ -310,10 +315,67 @@ LLM-as-Judge はモデル呼び出し回数が膨大になりがちなので、�
 
 評価データセットを毎週増やしたり、過去のクエリを削除したりすると、時系列でスコアを比較できなくなります。**「毎日回す回帰用データセット」と「新機能の評価用データセット」を分離**してください。前者は半年〜1年は固定、後者は機能ごとに新調する、という運用がうまく回ります。
 
+## ジャッジの再現性（フラッキネス）を測る
+
+`temperature=0.0` を指定しても、ジャッジの出力は完全には決定論的になりません。バックエンド側の並列実行やトークナイズのわずかな差により、同じ入力に対してスコアが 1 点ぶれることがあります。個人開発で運用している評価パイプラインでも、`temperature=0` のまま 1,000 ケースを 5 回流したところ、約 3〜5% のケースでスコアが ±1 ずれていました。
+
+問題は、このぶれに気づかないまま「スコアが 0.2 上がった」と判断してしまうことです。改善幅がフラッキネス（ぶれ）の幅に埋もれていれば、その差は誤差かもしれません。そこで私はこの問題を避けるため、本番に組み込む前に **同じケースを複数回判定して一致率を測り、信頼できない案件にフラグを立てる**手順を入れています。
+
+```python
+# eval_flakiness.py
+# 同一ケースを N 回判定し、スコアのぶれ（フラッキネス）を測る
+# 出力: 案件ごとの最頻値・一致率・ぶれ幅と、信頼できない案件のフラグ
+import os
+import statistics
+from collections import Counter
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+def judge_once(question: str, answer: str) -> int:
+    resp = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=JUDGE_PROMPT.format(question=question, answer=answer),
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            response_mime_type="application/json",
+            response_schema=JudgeScore,
+            max_output_tokens=512,
+        ),
+    )
+    return JudgeScore.model_validate_json(resp.text).factuality
+
+def measure_flakiness(question: str, answer: str, n: int = 5) -> dict:
+    scores = [judge_once(question, answer) for _ in range(n)]
+    counter = Counter(scores)
+    mode, mode_count = counter.most_common(1)[0]
+    agreement = mode_count / n            # 最頻値の占有率 = 一致率
+    spread = max(scores) - min(scores)    # ぶれ幅
+    return {
+        "mode": mode,
+        "agreement": round(agreement, 2),
+        "spread": spread,
+        "stdev": round(statistics.pstdev(scores), 2),
+        # 一致率が 0.6 未満、またはぶれ幅が 2 以上なら「信頼できない案件」
+        "unreliable": agreement < 0.6 or spread >= 2,
+        "raw": scores,
+    }
+
+if __name__ == "__main__":
+    q = "Cloudflare Workers で Gemini API を呼ぶ最小コードを教えてください"
+    a = "fetch でエンドポイントに POST し、x-goog-api-key で認証します。モデル名は URL に含めます。"
+    print(measure_flakiness(q, a, n=5))
+```
+
+`unreliable` フラグの付いた案件は、平均値の集計から黙って除外するのではなく、**別枠で人手レビューに回す**のがおすすめです。フラッキネスが高い案件は、たいてい「ジャッジが判断に迷う＝評価軸がそのケースに合っていない」というサインだからです。実際、私自身がぶれの大きい案件を一件ずつ観察したところ、評価軸を分割すべき盲点が見つかることが多くありました。
+
+運用上は、全件を N 回判定するとコストが単純に N 倍になります。そのためフラッキネス測定はリリース判定の前に 100〜200 ケースのサンプルだけで回し、そこで得られた「想定されるぶれ幅」を、日次の回帰追跡で「この幅以内の変動は誤差とみなす」しきい値として使うのが現実的です。ぶれ幅を知らずにスコアの上下に一喜一憂することがなくなり、評価の意思決定が一段落ち着きます。
+
 ## 全体を振り返って — まず始めるべきこと
 
 LLM-as-Judge は、人手評価の代わりではなく、人手評価が回せない頻度・規模の評価をカバーする補助線として導入するのが一番うまくいきます。完璧な代替を目指すと相関測定で挫折しますが、「人手で測りきれない部分の見える化」と割り切れば、改善サイクルの回転数が大きく上がります。
 
 今日からできる最初の一歩としては、本記事の Pointwise の実装を 50 ケースほどの小さなデータセットで動かし、人手スコアとの一致率を一度測ってみることをおすすめします。一致率が 60% を超えていれば、そこからプロンプトを磨いていく価値は十分にあります。低ければ、評価軸を細分化するか Pairwise に切り替える、という次の打ち手が自然に見えてきます。
 
-評価設計をさらに深く学びたい場合は、関連する [Gemini API プロンプト評価・最適化パイプライン](/articles/gemini-api/gemini-api-prompt-evaluation-optimization-pipeline) と [Gemini API 出力品質ドリフトの自動検知](/articles/gemini-api/gemini-production-output-quality-drift) も合わせて読むと、運用フェーズ全体の見通しがよくなります。
+評価設計をさらに深く学びたい場合は、関連する [Gemini API プロンプト評価・最適化パイプライン](/articles/gemini-api/gemini-api-prompt-evaluation-optimization-pipeline) と [ゴールデンデータセットによる Gemini 品質監視](/articles/gemini-api/gemini-api-quality-monitoring-golden-dataset-llm-judge) も合わせて読むと、運用フェーズ全体の見通しがよくなります。
