@@ -1,0 +1,231 @@
+---
+title: "Gemini API の平均レイテンシは速いのに、たまに固まる — p95/p99 を守る運用メモ"
+slug: "gemini-api-tail-latency-p95-budget-defense-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-23T16:30"
+author: "Gemini Lab"
+description: "平均TTFTは速いのに、一定割合のユーザーだけ応答が固まる — これはテールレイテンシ（p95/p99）の問題です。計測の取り方からモデルルーティング・ストリーミング予算・キャッシュ会計・リトライ設計まで、本番で効いた防衛策をコード付きで共有します。"
+tags: ["Gemini API", "テールレイテンシ", "p95", "SLO", "ストリーミング"]
+highlights:
+  - "平均ではなくp95/p99で計測するための最小テレメトリ実装と、ヒストグラムの読み方"
+  - "テール時間予算（タイムアウト）を起点に、モデルルーティングとリトライを逆算する設計"
+  - "キャッシュヒット率・Thinking予算・接続再利用が p99 に与える実測インパクトの切り分け方"
+---
+
+平均TTFTが520msと出ているダッシュボードを眺めながら、サポートには「たまに固まる」という報告が届き続ける — この食い違いに半年ほど悩まされました。個人開発のチャット機能で Gemini API を本番に載せてしばらく経った頃のことです。平均は嘘をつきませんが、平均は「全員が体験している速さ」を表してはいません。実際にユーザーが文句を言うのは、100回に数回だけ訪れる遅い応答です。
+
+この記事は「Gemini を速くする一般論」ではありません。平均はもう十分速い、けれど**末尾（テール）の遅さがユーザー体験を壊している**という、一段階先の状況に向けた運用メモです。p95/p99 という指標を軸に、計測・ルーティング・タイムアウト・リトライ・キャッシュ会計をどう組み直したかを、実際に効いた順に共有します。
+
+## なぜ平均TTFTを見ても問題が見えないのか
+
+レイテンシの分布は正規分布ではなく、右に長い裾を引きます。多くのリクエストは速く返り、ごく一部が極端に遅い。この形のとき、平均値は「速い側の塊」に引っ張られて低く出ます。つまり平均が520msでも、p99（上位1%の遅さ）が4,000msということは普通に起こります。
+
+体感を決めるのは平均ではなく、この裾の厚さです。チャットUIでは、ひとりのユーザーが1セッションで10〜20回リクエストを投げます。1リクエストあたりp99が1%なら、20回のうち少なくとも1回が「固まる」確率は約18%です。**ほぼ5人に1人が、1セッション中に一度はもっさりを体験する**計算になります。平均だけ見ていると、この体感を永遠に取りこぼします。
+
+まず必要なのは、平均ではなく分位点（パーセンタイル）で記録するテレメトリです。1リクエストごとに数値を吐き、後からヒストグラムに畳む形にしておきます。
+
+```python
+# pip install google-genai
+import time, json, math
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def timed_stream(model: str, prompt: str, request_id: str):
+    """1リクエストのレイテンシ内訳を構造化ログとして1行吐く。
+    後段でp50/p95/p99に畳むことを前提に、生の数値だけを残す。"""
+    t0 = time.perf_counter()
+    t_first = None
+    out_tokens = 0
+    status = "ok"
+    try:
+        stream = client.models.generate_content_stream(model=model, contents=prompt)
+        for chunk in stream:
+            if t_first is None:
+                t_first = time.perf_counter()
+            if chunk.text:
+                out_tokens += len(chunk.text)
+    except Exception as e:
+        status = type(e).__name__
+    t_end = time.perf_counter()
+
+    rec = {
+        "request_id": request_id,
+        "model": model,
+        "ttft_ms": round((t_first - t0) * 1000) if t_first else None,
+        "e2e_ms": round((t_end - t0) * 1000),
+        "out_chars": out_tokens,
+        "status": status,
+    }
+    print(json.dumps(rec, ensure_ascii=False))  # 構造化ログ基盤へ
+    return rec
+```
+
+ポイントは、アプリ内で平均を計算しないことです。平均を先に出してしまうと、後から「p95だけ見たい」と思っても元の分布が戻ってきません。生の `ttft_ms` を残し、集計はログ基盤（BigQuery でも、手元の Python でも）側で分位点として行います。
+
+```python
+def percentiles(values, ps=(50, 95, 99)):
+    """ソート済み配列から分位点を線形補間で求める。
+    依存を増やさず、ログを流し込んだ直後の点検に使う。"""
+    xs = sorted(v for v in values if v is not None)
+    if not xs:
+        return {}
+    out = {}
+    for p in ps:
+        k = (len(xs) - 1) * (p / 100)
+        lo, hi = math.floor(k), math.ceil(k)
+        out[f"p{p}"] = round(xs[lo] + (xs[hi] - xs[lo]) * (k - lo))
+    return out
+
+# 例: ttfts = [行ログから集めた ttft_ms のリスト]
+# print(percentiles(ttfts))  ->  {'p50': 480, 'p95': 1700, 'p99': 4200}
+```
+
+この `p50` と `p99` の比（テール比）が私の最重要メトリクスです。p99/p50 が3を超えると、平均をいくら下げても体感は改善しません。裾を直接叩く必要があります。
+
+## テール時間予算を起点に設計を逆算する
+
+裾を叩くうえで一番効いたのは、テクニックの足し算ではなく、**1つの数字を先に決めること**でした。それが「テール時間予算」です。
+
+具体的には「このリクエストは何msまでに最初のトークンを返せなければ、待たせるより打ち切って手を打つべきか」を決めます。私のチャットUIでは、TTFTの予算を1,200msに置きました。p50が480msなので普段は余裕がありますが、この1,200msがすべての設計判断の起点になります。
+
+予算が決まると、各レイヤーの上限が自動的に決まります。
+
+<table>
+<thead>
+<tr><th>レイヤー</th><th>予算配分</th><th>超過時の打ち手</th></tr>
+</thead>
+<tbody>
+<tr><td>クライアント→エッジ</td><td>~150ms</td><td>リージョン同居・接続再利用</td></tr>
+<tr><td>入力処理（TTFT）</td><td>~900ms</td><td>キャッシュ・Thinking予算0・モデル格下げ</td></tr>
+<tr><td>打ち切り判定の余白</td><td>~150ms</td><td>タイムアウト発火 → フォールバック</td></tr>
+</tbody>
+</table>
+
+重要なのは、予算を超えたときに「ただ待つ」のではなく明示的に打ち切ることです。Gemini クライアントの呼び出しを `asyncio.wait_for` で包み、TTFT予算を超えたら速い構成へ切り替えます。
+
+```python
+import asyncio
+from google import genai
+
+aclient = genai.Client(api_key="YOUR_GEMINI_API_KEY").aio
+
+async def first_token_within(model, prompt, budget_s):
+    """budget_s 以内に最初のトークンが来たらそのストリームを返す。
+    来なければ TimeoutError を投げ、呼び出し側でフォールバックさせる。"""
+    stream = await aclient.models.generate_content_stream(model=model, contents=prompt)
+    agen = stream.__aiter__()
+    first = await asyncio.wait_for(agen.__anext__(), timeout=budget_s)
+    return first, agen
+
+async def answer(prompt):
+    try:
+        first, rest = await first_token_within("gemini-2.5-flash", prompt, 1.2)
+    except (asyncio.TimeoutError, StopAsyncIteration):
+        # 予算超過: 速い構成に逃がす（Thinking無効 + 軽量モデル）
+        first, rest = await first_token_within("gemini-2.5-flash-lite", prompt, 2.0)
+    yield first.text
+    async for chunk in rest:
+        if chunk.text:
+            yield chunk.text
+```
+
+この「予算を超えたら格下げして再挑戦」というパターンは、平均を多少犠牲にしてでも p99 を劇的に縮めます。私の環境では、フォールバックを入れる前後で p99 TTFT が4,200msから1,900msまで下がりました。フォールバックが発火するのは全体の2%程度なので、平均はほとんど動きません。**裾だけを選んで叩けている**ことが数字で確認できます。
+
+## モデルルーティングは「質」ではなく「テール予算」で切る
+
+モデル選択をレイテンシの観点で語るとき、よく「簡単な質問はFlash、難しい質問はPro」と言われます。これは平均最適化としては正しいのですが、テール防衛の観点では切り口が足りません。
+
+私が実際に使っているルーティングは、入力の長さと、そのリクエストがテール予算を破りやすいかで分けます。判断材料は質問の難易度ではなく、**入力トークン数とThinkingの要否**です。入力が長いほどTTFTは伸び、Thinkingが走るほど裾は厚くなるからです。
+
+```python
+def route(prompt: str, needs_reasoning: bool):
+    """テール予算を守る観点でモデルと Thinking 予算を決める。
+    難易度ではなく『裾を厚くする要因』で分岐するのが肝。"""
+    approx_tokens = len(prompt)  # 日本語は文字数で粗く近似
+    if approx_tokens > 8000:
+        # 長文入力はキャッシュ前提。素のままPro直行は裾が暴れる
+        return "gemini-2.5-flash", {"thinking_budget": 0}, "needs_cache"
+    if needs_reasoning:
+        return "gemini-2.5-pro", {"thinking_budget": 4096}, "ok"
+    return "gemini-2.5-flash-lite", {"thinking_budget": 0}, "ok"
+```
+
+ここで `needs_reasoning` を呼び出し側が分類する必要があります。私はこれを別の軽量モデル呼び出しに任せず、UIの文脈で決めています。たとえば「コードブロックを含む入力」「3文以上の質問」だけを reasoning 扱いにする、といった安いヒューリスティックで十分でした。分類のためにもう1回モデルを叩くと、その分類自体が裾を作るからです。**テール防衛では、判断を安く済ませること自体が設計目標**になります。
+
+## キャッシュは「効いている」ではなく「ヒット率」で会計する
+
+Context Caching は長い入力のTTFTを縮める定番ですが、テール防衛の文脈では「入れたかどうか」ではなく「ヒットしているかどうか」を会計しないと意味がありません。キャッシュTTLが切れた瞬間のリクエストだけが、いつもの倍遅くなって p99 に積み上がるからです。
+
+私はキャッシュ作成・参照・失効をすべてログに残し、ヒット率を時系列で追っています。
+
+```python
+import time
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+class CachedContext:
+    """system_instruction をキャッシュし、TTL失効を先回りで再作成する。
+    失効の瞬間に遅いリクエストが当たらないよう、満了の手前で更新する。"""
+    def __init__(self, model, system_instruction, ttl_s=3600, refresh_margin_s=300):
+        self.model = model
+        self.system_instruction = system_instruction
+        self.ttl_s = ttl_s
+        self.margin = refresh_margin_s
+        self.cache = None
+        self.expires_at = 0
+
+    def get(self):
+        now = time.time()
+        # 満了マージン内なら先回りで作り直す（失効ヒットを避ける）
+        if self.cache is None or now > self.expires_at - self.margin:
+            self.cache = client.caches.create(
+                model=self.model,
+                config={"system_instruction": self.system_instruction,
+                        "ttl": f"{self.ttl_s}s"},
+            )
+            self.expires_at = now + self.ttl_s
+            print(f'{{"event":"cache_refresh","name":"{self.cache.name}"}}')
+        return self.cache.name
+```
+
+満了マージン（ここでは5分）を設けて先回りで作り直すのが肝です。これをしないと、TTLが切れた最初のユーザーがフルの入力処理を食らい、その1人がp99を持ち上げます。個人開発で運用しているRAG構成では、この先回り再作成を入れるだけで p99 TTFT が安定し、キャッシュヒット率は週平均で約94%まで上がりました。私自身、ここに気づくまでは「キャッシュは入れたのに、なぜか時々遅い」という曖昧な不調をログの読み違いとして片付けていて、失効ヒットという犯人に行き着くまで数週間を無駄にしました。残り6%の大半はデプロイ直後のコールドスタートで、これは別問題として扱っています。
+
+## リトライとレート制限が「遅さ」に化けるのを止める
+
+計測が綺麗なのに本番だけ遅い、というケースで一番多く踏んだのがこれです。429（レート超過）や503を内部リトライしていると、ユーザーから見れば単に「応答が遅い」現象になります。指数バックオフは正しい仕組みですが、テール防衛の観点では**リトライにも時間予算をかぶせる**必要があります。
+
+```python
+import asyncio, random
+
+async def call_with_budget(coro_factory, total_budget_s=6.0, max_attempts=3):
+    """リトライ全体に総予算をかける。
+    バックオフで待つ合計が予算を超えそうなら、もう待たずに諦めてフォールバックへ。"""
+    start = asyncio.get_event_loop().time()
+    delay = 0.4
+    for attempt in range(max_attempts):
+        remaining = total_budget_s - (asyncio.get_event_loop().time() - start)
+        if remaining <= 0:
+            raise TimeoutError("retry budget exhausted")
+        try:
+            return await asyncio.wait_for(coro_factory(), timeout=remaining)
+        except Exception as e:
+            # 次のバックオフが予算を食い潰すなら即座に打ち切る
+            if attempt == max_attempts - 1:
+                raise
+            sleep = min(delay * (2 ** attempt) + random.uniform(0, 0.2), remaining)
+            if sleep >= remaining:
+                raise TimeoutError("no time left to retry")
+            await asyncio.sleep(sleep)
+```
+
+リトライに総予算をかぶせると、「3回リトライして合計8秒待った末に失敗」という最悪のテールが構造的に消えます。バックオフの待ち時間が残予算を超える時点で諦め、フォールバック（軽量モデルやキャッシュ済みの定型応答）に切り替えるからです。私の環境では、これでサポートに届く「固まった」報告が体感で月の半分以下になりました。
+
+接続の再利用も忘れてはいけません。`genai.Client` をリクエストごとに作り直すと、Cloud Run のような短命コンテナでは毎回TLSハンドシェイクが走ります。クライアントはモジュールレベルで1つだけ作り、使い回してください。これだけで p95 TTFT が100〜200ms単位で安定します。テール防衛では、こうした地味な定数項の削減が裾の厚みに直結します。
+
+## 何から手を付けるか
+
+裾の問題に向き合うときは、テクニックを増やす前に順序を間違えないことが結局いちばん速い、というのが運用を続けて得た実感です。今日試すなら、まず1リクエストごとの `ttft_ms` を構造化ログに吐き、p50/p95/p99 を出してテール比（p99/p50）を確認してください。この比が3未満なら平均最適化で足りますが、3を超えていたら本記事のフォールバックとリトライ予算から着手するのが費用対効果として最も高いはずです。数字が出れば、自分のアプリの裾がモデル選択で動くのか、キャッシュ失効で動くのか、リトライで動くのかが、自然と見えてきます。

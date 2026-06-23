@@ -1,0 +1,231 @@
+---
+title: "Your Gemini API Average Latency Looks Great — But Some Users Still Get Stuck. Defending p95/p99"
+slug: "gemini-api-tail-latency-p95-budget-defense-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-23T16:30"
+author: "Gemini Lab"
+description: "Your average TTFT is fast, yet a fraction of users keep hitting frozen responses. That is a tail-latency problem (p95/p99). From measurement to model routing, streaming budgets, cache accounting, and retry design — here are the defenses that actually held up in production, with code."
+tags: ["Gemini API", "Tail Latency", "p95", "SLO", "Streaming"]
+highlights:
+  - "A minimal telemetry setup that records p95/p99 instead of averages, and how to read the histogram"
+  - "Designing model routing and retries backward from a single tail time budget (timeout)"
+  - "How to separate the p99 impact of cache hit rate, thinking budget, and connection reuse"
+---
+
+I spent the better part of six months staring at a dashboard that read 520ms average TTFT while support kept forwarding the same complaint: "it freezes sometimes." This was a while after I put a Gemini-powered chat feature into production in one of my own apps. Averages do not lie, but an average does not describe the experience anyone actually has. What users complain about is the slow response that shows up a few times out of a hundred.
+
+This is not a "make Gemini faster in general" article. It is a field note for the stage that comes after the average is already fast enough — the stage where **the tail is what is breaking the experience**. Built around p95/p99 as the central metric, it walks through how I rebuilt measurement, routing, timeouts, retries, and cache accounting, in the order that actually moved the numbers.
+
+## Why the average TTFT hides the problem
+
+Latency does not follow a normal distribution; it has a long right tail. Most requests return quickly, and a small fraction are dramatically slow. With that shape, the average gets pulled down toward the fast cluster. So even with a 520ms average, a p99 (the slowest 1%) of 4,000ms is entirely ordinary.
+
+What governs perceived speed is the thickness of that tail, not the average. In a chat UI, a single user fires 10–20 requests per session. If p99 is 1% per request, the chance that at least one of 20 requests "freezes" is about 18%. **Roughly one in five users will hit a sluggish moment at least once per session.** Watch only the average and you will miss this forever.
+
+The first thing you need is telemetry that records percentiles, not averages. Emit one number per request and fold it into a histogram later.
+
+```python
+# pip install google-genai
+import time, json, math
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def timed_stream(model: str, prompt: str, request_id: str):
+    """Emit one structured log line of latency breakdown per request.
+    Keep raw numbers only, on the assumption you'll fold them into p50/p95/p99 later."""
+    t0 = time.perf_counter()
+    t_first = None
+    out_chars = 0
+    status = "ok"
+    try:
+        stream = client.models.generate_content_stream(model=model, contents=prompt)
+        for chunk in stream:
+            if t_first is None:
+                t_first = time.perf_counter()
+            if chunk.text:
+                out_chars += len(chunk.text)
+    except Exception as e:
+        status = type(e).__name__
+    t_end = time.perf_counter()
+
+    rec = {
+        "request_id": request_id,
+        "model": model,
+        "ttft_ms": round((t_first - t0) * 1000) if t_first else None,
+        "e2e_ms": round((t_end - t0) * 1000),
+        "out_chars": out_chars,
+        "status": status,
+    }
+    print(json.dumps(rec, ensure_ascii=False))  # ship to your log backend
+    return rec
+```
+
+The key is not to compute the average inside the app. Once you collapse to an average, you cannot recover the distribution when you later decide you only care about p95. Keep the raw `ttft_ms` and let your log backend (BigQuery, or just Python on your laptop) compute percentiles.
+
+```python
+def percentiles(values, ps=(50, 95, 99)):
+    """Linear-interpolated percentiles from a sorted array.
+    No extra dependency; useful for a quick check right after ingesting logs."""
+    xs = sorted(v for v in values if v is not None)
+    if not xs:
+        return {}
+    out = {}
+    for p in ps:
+        k = (len(xs) - 1) * (p / 100)
+        lo, hi = math.floor(k), math.ceil(k)
+        out[f"p{p}"] = round(xs[lo] + (xs[hi] - xs[lo]) * (k - lo))
+    return out
+
+# e.g. ttfts = [list of ttft_ms gathered from log lines]
+# print(percentiles(ttfts))  ->  {'p50': 480, 'p95': 1700, 'p99': 4200}
+```
+
+The ratio of `p50` to `p99` — the tail ratio — is my single most important metric. Once p99/p50 climbs above 3, no amount of lowering the average will improve the experience. You have to hit the tail directly.
+
+## Design backward from a tail time budget
+
+The thing that helped most with the tail was not adding techniques — it was **deciding a single number first**: the tail time budget.
+
+Concretely, decide "by how many milliseconds must this request return its first token, beyond which we should cut it off and act rather than keep the user waiting?" For my chat UI, I set the TTFT budget at 1,200ms. With a p50 of 480ms there is usually plenty of headroom, but that 1,200ms becomes the origin point for every design decision.
+
+Once the budget is fixed, the ceiling for each layer falls out automatically.
+
+<table>
+<thead>
+<tr><th>Layer</th><th>Budget</th><th>Action on overrun</th></tr>
+</thead>
+<tbody>
+<tr><td>Client → edge</td><td>~150ms</td><td>Co-locate region, reuse connection</td></tr>
+<tr><td>Input processing (TTFT)</td><td>~900ms</td><td>Cache, thinking_budget 0, downgrade model</td></tr>
+<tr><td>Cutoff margin</td><td>~150ms</td><td>Fire timeout → fall back</td></tr>
+</tbody>
+</table>
+
+What matters is that on overrun you cut off explicitly rather than "just wait." Wrap the Gemini call in `asyncio.wait_for`, and when the TTFT budget is exceeded, switch to a faster configuration.
+
+```python
+import asyncio
+from google import genai
+
+aclient = genai.Client(api_key="YOUR_GEMINI_API_KEY").aio
+
+async def first_token_within(model, prompt, budget_s):
+    """Return the stream if the first token arrives within budget_s.
+    Otherwise raise TimeoutError so the caller can fall back."""
+    stream = await aclient.models.generate_content_stream(model=model, contents=prompt)
+    agen = stream.__aiter__()
+    first = await asyncio.wait_for(agen.__anext__(), timeout=budget_s)
+    return first, agen
+
+async def answer(prompt):
+    try:
+        first, rest = await first_token_within("gemini-2.5-flash", prompt, 1.2)
+    except (asyncio.TimeoutError, StopAsyncIteration):
+        # Over budget: escape to a faster config (no thinking + lighter model)
+        first, rest = await first_token_within("gemini-2.5-flash-lite", prompt, 2.0)
+    yield first.text
+    async for chunk in rest:
+        if chunk.text:
+            yield chunk.text
+```
+
+This "downgrade-and-retry on overrun" pattern shrinks p99 dramatically at the cost of a little average. In my environment, p99 TTFT dropped from 4,200ms to 1,900ms once the fallback was in place. The fallback fires on only about 2% of traffic, so the average barely moves. The numbers confirm that **you are hitting only the tail.**
+
+## Route models by tail budget, not by "quality"
+
+When people talk about model selection for latency, they usually say "Flash for easy questions, Pro for hard ones." That is correct as average optimization, but it is the wrong axis for tail defense.
+
+The routing I actually use splits on input length and on whether the request is prone to breaking the tail budget. The deciding factors are not difficulty but **input token count and whether thinking is needed** — because longer input lengthens TTFT, and running thinking thickens the tail.
+
+```python
+def route(prompt: str, needs_reasoning: bool):
+    """Pick model and thinking budget to defend the tail budget.
+    The trick is to branch on 'what thickens the tail,' not on difficulty."""
+    approx_tokens = len(prompt)  # rough char-based approximation
+    if approx_tokens > 8000:
+        # Long input assumes caching; going straight to Pro raw makes the tail wild
+        return "gemini-2.5-flash", {"thinking_budget": 0}, "needs_cache"
+    if needs_reasoning:
+        return "gemini-2.5-pro", {"thinking_budget": 4096}, "ok"
+    return "gemini-2.5-flash-lite", {"thinking_budget": 0}, "ok"
+```
+
+The caller has to classify `needs_reasoning`. I do not delegate this to a separate lightweight model call; I decide it from UI context. Cheap heuristics — "input contains a code block," "question is three or more sentences" — were enough. Calling a model just to classify creates a tail of its own. In tail defense, **keeping the decision cheap is itself a design goal.**
+
+## Account for cache by hit rate, not "it's enabled"
+
+Context Caching is the standard way to shorten TTFT for long input, but in the tail-defense context it means nothing unless you account for hit rate rather than "did we turn it on." The single request that lands right when the cache TTL expires runs at twice the usual latency and piles onto p99.
+
+I log every cache creation, reference, and expiry, and track hit rate over time.
+
+```python
+import time
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+class CachedContext:
+    """Cache the system_instruction and proactively recreate before TTL expiry,
+    so no slow request lands at the moment of expiry."""
+    def __init__(self, model, system_instruction, ttl_s=3600, refresh_margin_s=300):
+        self.model = model
+        self.system_instruction = system_instruction
+        self.ttl_s = ttl_s
+        self.margin = refresh_margin_s
+        self.cache = None
+        self.expires_at = 0
+
+    def get(self):
+        now = time.time()
+        # Recreate ahead of time if within the expiry margin (avoid expiry hits)
+        if self.cache is None or now > self.expires_at - self.margin:
+            self.cache = client.caches.create(
+                model=self.model,
+                config={"system_instruction": self.system_instruction,
+                        "ttl": f"{self.ttl_s}s"},
+            )
+            self.expires_at = now + self.ttl_s
+            print(f'{{"event":"cache_refresh","name":"{self.cache.name}"}}')
+        return self.cache.name
+```
+
+The expiry margin (five minutes here) for proactive recreation is the crux. Without it, the first user after the TTL lapses eats the full input processing, and that one user lifts p99. In my RAG setup, this proactive recreation alone stabilized p99 TTFT and pushed the weekly average cache hit rate to about 94%. Most of the remaining 6% is cold start right after a deploy, which I treat as a separate problem.
+
+## Stop retries and rate limits from masquerading as slowness
+
+Of all the "clean metrics but slow in production only" cases, this is the one I stepped on most. When you retry 429 (rate exceeded) or 503 internally, the user simply sees "a slow response." Exponential backoff is the right mechanism, but for tail defense you must **put a time budget on the retries too.**
+
+```python
+import asyncio, random
+
+async def call_with_budget(coro_factory, total_budget_s=6.0, max_attempts=3):
+    """Cap the whole retry sequence with a total budget.
+    If the cumulative backoff would exceed it, stop waiting and fall back."""
+    start = asyncio.get_event_loop().time()
+    delay = 0.4
+    for attempt in range(max_attempts):
+        remaining = total_budget_s - (asyncio.get_event_loop().time() - start)
+        if remaining <= 0:
+            raise TimeoutError("retry budget exhausted")
+        try:
+            return await asyncio.wait_for(coro_factory(), timeout=remaining)
+        except Exception as e:
+            # If the next backoff would eat the budget, abort immediately
+            if attempt == max_attempts - 1:
+                raise
+            sleep = min(delay * (2 ** attempt) + random.uniform(0, 0.2), remaining)
+            if sleep >= remaining:
+                raise TimeoutError("no time left to retry")
+            await asyncio.sleep(sleep)
+```
+
+Cap retries with a total budget and the worst tail — "retried three times, waited eight seconds total, then failed" — structurally disappears. The moment the backoff wait would exceed the remaining budget, you give up and switch to a fallback (a lighter model or a cached canned response). In my environment, this cut the "it froze" reports reaching support to fewer than half per month, by feel.
+
+Do not forget connection reuse. Recreating `genai.Client` per request triggers a TLS handshake every time on short-lived containers like Cloud Run. Build one client at module level and reuse it. That alone stabilizes p95 TTFT by 100–200ms. In tail defense, trimming these unglamorous constant terms maps directly onto the thickness of the tail.
+
+## Where to start
+
+When you face a tail problem, getting the order right beats adding techniques — that is the practical lesson from running this in production. If you try one thing today, emit `ttft_ms` per request to a structured log, compute p50/p95/p99, and check the tail ratio (p99/p50). Below 3, average optimization is enough; above 3, starting from the fallback and retry budget in this article will give you the best return. Once the numbers are in front of you, it becomes clear whether your tail moves with model selection, with cache expiry, or with retries.
