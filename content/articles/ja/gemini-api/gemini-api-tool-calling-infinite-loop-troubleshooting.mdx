@@ -2,12 +2,16 @@
 title: "Gemini APIのFunction Callingが無限ループする原因と止め方"
 slug: "gemini-api-tool-calling-infinite-loop-troubleshooting"
 category: "gemini-api"
-level: "intermediate"
-premium: false
-date: "2026-04-23T09:30"
+level: "advanced"
+premium: true
+date: "2026-06-24T10:17"
 author: "Gemini Lab"
-description: "Function Callingを組んでいたら、同じツールを何度も呼び続けて処理が終わらなくなる。そんなときに原因を特定し、最短で止めるための診断と対策をまとめました。"
+description: "Function Callingを組んでいたら、同じツールを何度も呼び続けて処理が終わらなくなる。そんなときに原因を特定し、最短で止めるための診断と対策をまとめました。デフォルトモデルの世代交代で再発するループの検知や、結果ベースのストール検出まで実装で示します。"
 tags: ["gemini", "function-calling", "troubleshooting", "agent"]
+highlights:
+  - "完全一致の重複検出に加え、引数が違っても結果が進まないループを返却値の指紋で検知する二段構えの停止条件"
+  - "Gemini 3.5 Flash GA で既定モデルが静かに入れ替わってもループ再発を平均ツール呼び出し回数で早期検知する番人"
+  - "停止条件をプロンプト・コード・ツール返却値の3層に埋め込み、上限到達時に沈黙させず最善の要約を返す設計"
 ---
 自作エージェントを動かしていたら、同じツールが何十回も呼ばれ続けてAPI利用料だけが静かに膨らんでいた——Function Callingを本格的に組み始めた方なら、一度はヒヤッとする場面ではないでしょうか。私も最初に小さな検索エージェントを書いたとき、`search_web` が延々と呼び出され、止めようとしても次のターンでまた同じツール呼び出しが返ってくる、という事態に直面しました。
 
@@ -147,9 +151,94 @@ def search_web(query: str) -> dict:
     }
 ```
 
-モデルはこの `status` フィールドを読んで、「`sufficient` なら要約フェーズに移る」という判断ができるようになります。System Instructionsで「`status` が `sufficient` になったら、それ以上ツールを呼ばずに回答してください」と一文添えると、ループが劇的に減ります。私の現場では、この工夫だけで平均ツール呼び出し回数が5.2回から1.8回に下がりました。
+モデルはこの `status` フィールドを読んで、「`sufficient` なら要約フェーズに移る」という判断ができるようになります。System Instructionsで「`status` が `sufficient` になったら、それ以上ツールを呼ばずに回答してください」と一文添えると、ループが劇的に減ります。私の現場では、この工夫だけで平均ツール呼び出し回数が5.2回から1.8回（約65%減）に下がりました。
 
 関連する実装パターンは [Gemini Function Callingの本番向け実装パターン](/articles/gemini-api/gemini-api-parallel-function-calling-production-patterns) や [Function Callingの全体像](/articles/gemini-api/gemini-api-function-calling-complete) にもまとめていますので、組み合わせてご覧いただくと理解が深まります。
+
+## デフォルトモデルが静かに変わるとループが再発する
+
+ここまでの対策を入れて安定していたループが、ある日また回り始めることがあります。コードもプロンプトも触っていないのに、です。原因の一つが、デフォルトモデルの世代交代です。2026年6月、Gemini 3.5 Flash が一般提供になり、環境によっては既定モデルとして有効化されました。モデル名を世代だけで指定していたり、SDK 任せで省略していたりすると、ツールを呼ぶ積極性や「いつ止まるか」の判断が、気づかないうちに別のモデルのものへ入れ替わります。
+
+私自身、個人開発で記事更新の自動化を回している中で、要約器の既定モデルが入れ替わってツール呼び出しの平均回数が増えた経験があります。停止条件そのものは正しくても、モデルが変われば「あと一回呼べば足りる」という判断の癖が変わるので、上限に張り付く頻度が上がるのです。そこで私は、ループを回すモデルは必ず明示的にピン留めし、応答の `model_version` を記録して「要求したモデル」と「実際に応答したモデル」がずれていないかを毎回確認するようにしています。
+
+```python
+# 目的: ループに使うモデルを固定し、要求≠応答のすり替わりを検知する
+REQUESTED_MODEL = "gemini-3.5-flash"  # 世代だけでなく明示的に固定する
+
+resp = client.models.generate_content(
+    model=REQUESTED_MODEL, contents=history,
+    config=types.GenerateContentConfig(tools=tools))
+
+served = getattr(resp, "model_version", None)
+if served and not served.startswith(REQUESTED_MODEL):
+    # 既定モデルの差し替えやエイリアス解決で別世代に振られた可能性
+    import logging
+    logging.warning("model drift: requested=%s served=%s", REQUESTED_MODEL, served)
+```
+
+さらに、停止条件が「効いているか」を一つの数字で見張っておくと安心です。1回の対話で何回ツールを呼んだかを `model_version` ごとに集計し、平均が普段より目立って増えたら、モデルの世代交代かプロンプトの劣化を疑う、という運用にしています。次の小さな番人を本番ログに仕込んでおくだけで、ループの再発を「課金が膨らんでから」ではなく「平均回数が動いた時点」で気づけます。
+
+```python
+# 目的: model_version ごとの平均ツール呼び出し回数を集計し、回帰を早期検知する
+from collections import defaultdict
+
+def tool_call_canary(rows: list[dict]) -> dict:
+    # rows: [{"model_version": str, "tool_calls": int}, ...] を当日分まとめて渡す
+    agg = defaultdict(list)
+    for r in rows:
+        agg[r["model_version"]].append(r["tool_calls"])
+    report = {}
+    for model, calls in agg.items():
+        avg = sum(calls) / len(calls)
+        report[model] = {
+            "runs": len(calls),
+            "avg_tool_calls": round(avg, 2),
+            "hit_cap_ratio": round(sum(c >= 8 for c in calls) / len(calls), 2),  # MAX_TURNS=8
+        }
+    return report
+```
+
+`hit_cap_ratio`（上限に張り付いた割合）が普段の数倍に跳ねていたら、それは停止条件が壊れたサインです。本番運用ではここが最初の落とし穴になり、課金が膨らんでから気づくことになりがちです。私はこの値を毎晩のログ集計に入れていて、モデルの既定が変わった週には実際にここが反応しました。停止条件を入れて終わりにせず、効き目を観測し続けることが、長く回す自動化では効いてきます。
+
+## 「引数は違うのに結果が進まない」ループを検知する
+
+先ほどの重複検出は「ツール名＋引数が完全一致」を数えるものでした。ところが本番で厄介なのは、モデルが引数をほんの少しずつ変えながら、実質的に同じ場所を回り続けるループです。`query="Gemini 最新"` の次に `query="Gemini 最新 アップデート"`、その次に `query="Gemini 最新情報"`——引数は毎回違うので完全一致では捕まりませんが、返ってくる結果はほとんど同じ。これは「会話は進んでいるのに、情報は1ミリも増えていない」状態です。
+
+対策は、引数ではなく**ツール返却値の中身が進んでいるか**を見ることです。直近数ターンの結果を正規化して比べ、新しい情報が出てこなくなったら「これ以上は無駄」と判断して打ち切ります。
+
+```python
+# 目的: 引数が違っても結果が進まないループを、返却値の変化量で検知する
+import hashlib, json
+
+def result_fingerprint(result: dict) -> str:
+    # 順序やノイズを排し、結果の「中身」だけを指紋化する
+    norm = json.dumps(result.get("results", result), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+recent = []          # 直近の結果指紋
+STALL_WINDOW = 3     # 連続して同じならストールとみなす
+
+# ループ内、ツール実行直後に:
+fp = result_fingerprint(result)
+recent.append(fp)
+recent = recent[-STALL_WINDOW:]
+if len(recent) == STALL_WINDOW and len(set(recent)) == 1:
+    # 引数は違っても結果が3回連続で不変 → 情報が増えていない
+    history.append(cand.content)
+    history.append(types.Content(role="user", parts=[types.Part.from_text(
+        text="検索を変えても新しい情報が得られていません。"
+             "今ある結果だけで結論をまとめてください。")]))
+    recent.clear()
+    continue
+```
+
+二段構えで押さえるべきは、次の3点です。
+
+1. 反復上限を入れて、まず「必ず終わる」状態を作る
+2. 完全一致の重複検出で「同じ引数の連打」を止める
+3. 結果指紋のストール検出で「違う引数で同じ場所を回る」のを止める
+
+完全一致の重複検出と、この結果ベースのストール検出は、片方だけでは漏れます。前者は「同じ引数の連打」を、後者は「微妙に違う引数で同じ場所を回る」のを捕まえる、補い合う関係です。両方を入れておくと、モデルが世代交代でループの癖を変えても、どちらかの網で止まります。個人開発でエージェントを長く回していて学んだのは、停止条件は一種類では足りない、ということでした。
 
 ## 「呼ばれない」問題とセットで監視する
 

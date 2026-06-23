@@ -2,12 +2,16 @@
 title: "Stopping Gemini API Function Calling Loops: Why They Happen and How to Break Them"
 slug: "gemini-api-tool-calling-infinite-loop-troubleshooting"
 category: "gemini-api"
-level: "intermediate"
-premium: false
-date: "2026-04-23T09:30"
+level: "advanced"
+premium: true
+date: "2026-06-24T10:17"
 author: "Gemini Lab"
-description: "Your tool-calling agent keeps invoking the same function and never finishes. Here is how to diagnose the loop and bake stop conditions into your prompt, code, and tool responses."
+description: "Your tool-calling agent keeps invoking the same function and never finishes. Here is how to diagnose the loop and bake stop conditions into your prompt, code, and tool responses — including catching regressions when the default model changes and detecting result-based stalls."
 tags: ["gemini", "function-calling", "troubleshooting", "agent"]
+highlights:
+  - "A two-layer stop condition: exact-match duplicate detection plus result-fingerprint stall detection for loops where args differ but progress does not"
+  - "A canary that catches loop regressions via average tool-call count even when the default model silently swaps to Gemini 3.5 Flash (GA)"
+  - "Stop conditions baked across prompt, code, and tool return values, returning the best available summary at the cap instead of going silent"
 ---
 You build a small agent, hit Run, and watch `search_web` get called over and over while your API bill ticks up in the corner. If you have ever shipped a Gemini Function Calling flow, you probably know that quiet moment of panic. I hit it the very first time I wired a search tool to Gemini — the model insisted there was just "one more query" to run, every single turn.
 
@@ -149,6 +153,85 @@ def search_web(query: str) -> dict:
 Pair that with a System Instructions line such as "Stop calling tools and write the final answer when `status` is `sufficient`" and the average number of tool calls drops fast. On one of my projects it went from 5.2 calls per session to 1.8 after this change alone.
 
 If you want to see how these pieces fit in a production-scale agent, I laid out the full pattern in [Gemini Function Calling production patterns for parallel calls](/en/articles/gemini-api/gemini-api-parallel-function-calling-production-patterns) and the broader picture in [the complete guide to Gemini Function Calling](/en/articles/gemini-api/gemini-api-function-calling-complete).
+
+## When the default model silently changes, loops come back
+
+A loop you stabilized with everything above can start spinning again one day — without your touching the code or the prompt. One common cause is a generational change in the default model. In June 2026, Gemini 3.5 Flash became generally available and, in some environments, was switched on as the default. If you specify the model only by generation, or omit it and let the SDK decide, the model's tool-calling eagerness and its sense of "when to stop" can quietly swap out for another model's.
+
+I run article-update automation as an indie developer, and I have watched a summarizer's default model swap underneath me and push the average tool-call count up. The stop conditions themselves were still correct, but when the model changes, so does its instinct for "one more call should do it" — and the frequency of pinning to the cap rises. So I now pin the loop's model explicitly and record the response's `model_version` every run, checking that "the model I asked for" and "the model that answered" still match.
+
+```python
+# Goal: pin the loop's model and detect a requested-vs-served swap
+REQUESTED_MODEL = "gemini-3.5-flash"  # pin explicitly, not just by generation
+
+resp = client.models.generate_content(
+    model=REQUESTED_MODEL, contents=history,
+    config=types.GenerateContentConfig(tools=tools))
+
+served = getattr(resp, "model_version", None)
+if served and not served.startswith(REQUESTED_MODEL):
+    # default-model swap or alias resolution may have routed you to another generation
+    import logging
+    logging.warning("model drift: requested=%s served=%s", REQUESTED_MODEL, served)
+```
+
+It also pays to watch whether your stop conditions are still working, with a single number. I aggregate how many tool calls each conversation made, grouped by `model_version`, and if the average climbs noticeably above normal I suspect a model generation change or prompt degradation. Drop this small canary into your production logs and you catch a regression at "the average moved," not at "the bill ballooned."
+
+```python
+# Goal: aggregate average tool-call count per model_version to catch regressions early
+from collections import defaultdict
+
+def tool_call_canary(rows: list[dict]) -> dict:
+    # rows: [{"model_version": str, "tool_calls": int}, ...] for the day
+    agg = defaultdict(list)
+    for r in rows:
+        agg[r["model_version"]].append(r["tool_calls"])
+    report = {}
+    for model, calls in agg.items():
+        avg = sum(calls) / len(calls)
+        report[model] = {
+            "runs": len(calls),
+            "avg_tool_calls": round(avg, 2),
+            "hit_cap_ratio": round(sum(c >= 8 for c in calls) / len(calls), 2),  # MAX_TURNS=8
+        }
+    return report
+```
+
+If `hit_cap_ratio` — the share of runs that pinned to the cap — jumps to several times its usual value, that is a sign your stop condition broke. I keep this in a nightly log rollup, and the week a default model changed under me, this is exactly the number that reacted. Don't stop at adding stop conditions; keep observing whether they still bite. For automation that runs for the long haul, that habit is what pays off.
+
+## Catching the "different args, no progress" loop
+
+The duplicate detection earlier counted exact matches of tool name plus arguments. The nastier production case, though, is a model that nudges its arguments slightly each turn while effectively circling the same spot. `query="Gemini latest"`, then `query="Gemini latest update"`, then `query="Gemini latest news"` — the arguments differ every time, so exact matching never catches it, yet the results come back almost identical. The conversation advances while the information does not move an inch.
+
+The fix is to watch whether the **tool return values** are progressing, not the arguments. Normalize and compare the last few results, and once no new information appears, decide that more calls are wasted and cut the loop.
+
+```python
+# Goal: catch loops where args differ but results stop progressing, via result change
+import hashlib, json
+
+def result_fingerprint(result: dict) -> str:
+    # strip ordering and noise; fingerprint only the "substance" of the result
+    norm = json.dumps(result.get("results", result), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+recent = []          # recent result fingerprints
+STALL_WINDOW = 3     # treat as stalled if identical this many times in a row
+
+# inside the loop, right after running the tool:
+fp = result_fingerprint(result)
+recent.append(fp)
+recent = recent[-STALL_WINDOW:]
+if len(recent) == STALL_WINDOW and len(set(recent)) == 1:
+    # args differ but results unchanged three times running -> no new information
+    history.append(cand.content)
+    history.append(types.Content(role="user", parts=[types.Part.from_text(
+        text="Changing the search is not yielding new information. "
+             "Please conclude using only the results you already have.")]))
+    recent.clear()
+    continue
+```
+
+Exact-match duplicate detection and this result-based stall detection each leak on their own. The former catches "the same arguments fired repeatedly"; the latter catches "slightly different arguments circling the same place." They complement each other, and with both in place, even if a model generation change alters the loop's habits, one of the two nets will stop it. The lesson from running agents for a long time as an indie developer is simple: one kind of stop condition is never enough.
 
 ## Monitor the opposite failure too
 
