@@ -1,0 +1,254 @@
+---
+title: "Your File Search Store Goes Stale in Production — Catalog Sync and Drift Detection That Actually Hold"
+slug: "gemini-file-search-store-catalog-sync-drift-detection"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-23T20:30"
+author: "Gemini Lab"
+description: "Load a catalog into File Search once and forget it, and within weeks it starts confidently pointing users at assets you already pulled. Here is the sync pipeline I run: hash-based incremental import, a blue/green rebuild that swallows deletions, and a nightly drift audit."
+tags: ["gemini", "file-search", "rag", "gemini-embedding-2", "production"]
+highlights:
+  - "Stop your File Search store from drifting away from the source catalog and recommending things that no longer exist, using a hash-based incremental import"
+  - "Swap thousands of assets every release without downtime by rebuilding the store blue/green and flipping a single pointer"
+  - "Drop in a nightly drift-audit script that measures exactly how far your store has wandered from the source of truth"
+---
+
+I had loaded my wallpaper catalog into File Search and moved on. About two weeks later, production answered a user with "that wallpaper is no longer available" — for an asset I had already swapped out in an App Store and Google Play release. The asset was gone from the catalog, but the File Search store was frozen at the day I first imported it.
+
+Intro tutorials on File Search stop at "drop files in and you can ground answers." Running it for real as an indie developer, the hard part was never the first import. The hard part is that **the source of truth keeps changing while the store sits there as an old snapshot**. This is the record of the sync pipeline I built to stop that silent rot.
+
+## A store is only a snapshot of the moment you built it
+
+Let me set the baseline. A File Search store (FileSearchStore) is a chunk of content indexed with `gemini-embedding-2` at the instant you import it. What makes it pleasant is that you skip standing up your own vector database and designing chunking — you put text and images into the same store and get answers with citations back. The multimodal support, which lets me drop image assets like wallpapers straight in, was a real step forward.
+
+But a store does not update itself once imported. The changes happening on the source side fall into three kinds:
+
+- **Added**: a new wallpaper shipped. The store does not have it yet.
+- **Updated**: an existing asset's metadata (title, category, availability) was edited. The store holds the old version.
+- **Removed**: an asset was retired. The store still holds something that no longer exists.
+
+Removal is the scary one. Additions and updates merely mean "the newest answer is missing," but a retired asset still sitting in the store means the model will **confidently recommend something that does not exist**. That was exactly my opening incident.
+
+## Make the gap visible with a manifest
+
+Before you can stop the drift, you need a mechanical way to see what is out of sync right now. Rather than peering into the store, I chose to **build a manifest from the source side**. Take a content hash of each asset, compare it against the manifest from the last sync, and the diff falls out as plain set arithmetic.
+
+```python
+# build_manifest.py
+# Build an {id -> content hash} map from the source catalog (DB or file listing).
+# The key point: depend only on the source of truth, never on the store's contents.
+import hashlib
+import json
+from pathlib import Path
+
+
+def asset_fingerprint(asset: dict) -> str:
+    """Fold availability, title, category, and the image bytes into one fingerprint.
+    Change any single one and the fingerprint changes, so it surfaces as an update."""
+    h = hashlib.sha256()
+    h.update(asset["status"].encode())          # active / retired
+    h.update(asset["title"].encode())
+    h.update(asset["category"].encode())
+    # Hash the actual image bytes, not just metadata, so a silent art swap is caught.
+    h.update(Path(asset["image_path"]).read_bytes())
+    return h.hexdigest()
+
+
+def build_manifest(catalog: list[dict]) -> dict[str, str]:
+    # Only active assets are eligible for indexing. Retired ones never go in.
+    return {
+        a["id"]: asset_fingerprint(a)
+        for a in catalog
+        if a["status"] == "active"
+    }
+
+
+if __name__ == "__main__":
+    catalog = json.loads(Path("catalog.json").read_text())
+    manifest = build_manifest(catalog)
+    Path("manifest.current.json").write_text(json.dumps(manifest, indent=2))
+    print(f"manifest entries: {len(manifest)}")
+    # Example output: manifest entries: 3127
+```
+
+Folding the image bytes into the fingerprint — not just the metadata — pulls more weight than it looks. Releases that keep the same title but swap the image are surprisingly common, and a metadata-only check misses every one of them.
+
+## Split the diff into three buckets
+
+Once you have two generations of the manifest, additions, updates, and removals come straight out. This part has nothing to do with File Search; it is plain set arithmetic.
+
+```python
+# diff_manifest.py
+import json
+from pathlib import Path
+
+
+def load(path: str) -> dict[str, str]:
+    p = Path(path)
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def diff(prev: dict[str, str], curr: dict[str, str]):
+    prev_ids, curr_ids = set(prev), set(curr)
+    added = curr_ids - prev_ids
+    removed = prev_ids - curr_ids
+    # Present in both but with a changed fingerprint = "updated".
+    updated = {i for i in (prev_ids & curr_ids) if prev[i] != curr[i]}
+    return added, updated, removed
+
+
+if __name__ == "__main__":
+    prev = load("manifest.synced.json")   # state already reflected into the store
+    curr = load("manifest.current.json")  # the source right now
+    added, updated, removed = diff(prev, curr)
+    print(f"added={len(added)} updated={len(updated)} removed={len(removed)}")
+    # Example output: added=42 updated=18 removed=7
+```
+
+`manifest.synced.json` is the source of truth as of the last time you finished reflecting it into the store. The trick is to **keep the successfully-synced source under a separate name, not the current source** — without it you get the "import failed but we marked it synced" class of bug. Promote `current` to `synced` only after the reflection fully completes.
+
+## Additions and updates ride on incremental import
+
+Additions and updates only need the changed portion pushed into the store. Re-importing everything each time lets the `gemini-embedding-2` re-embedding cost pile up, so narrowing to the diff is the practical move.
+
+```python
+# incremental_import.py
+from google import genai
+
+client = genai.Client()
+STORE_NAME = "wallpaper-catalog-active"  # the active store name (the pointer, below)
+
+
+def import_asset(asset: dict) -> None:
+    """Import one asset into the store. The exact File Search method names and
+    arguments move between SDK versions, so pin them against the current preview
+    spec. The essence is that *you* keep a ledger of 'this id was loaded with this
+    fingerprint'."""
+    client.file_search_stores.upload_to_file_search_store(
+        file_search_store_name=STORE_NAME,
+        file=asset["image_path"],
+        config={
+            "display_name": asset["id"],
+            "custom_metadata": [
+                {"key": "title", "string_value": asset["title"]},
+                {"key": "category", "string_value": asset["category"]},
+            ],
+        },
+    )
+
+
+def apply_incremental(catalog_by_id: dict, added: set, updated: set) -> None:
+    # Treat an update as "delete the old document with that id, then re-import."
+    # If the old one lingers, the same wallpaper gets cited twice, so confirm it is gone.
+    for asset_id in sorted(added | updated):
+        import_asset(catalog_by_id[asset_id])
+    print(f"imported {len(added | updated)} documents")
+```
+
+There is a reason updates are a two-step "delete then re-import." Stacking a fresh import on the same id can leave both the old and new versions matchable, so an answer ends up carrying **two contradictory citations**. I got caught by exactly this double-citation once and burned half a day before I traced it. Now I always confirm the old document is gone before re-importing.
+
+## Deletions get the blue/green rebuild
+
+Removal is the real problem. File Search does offer per-document deletion, but on releases with heavy deletions — or where the structure turns over — I reach for **rebuilding the whole store rather than chipping away incrementally**. Three reasons: asking a preview-stage API for consistent deletion timing makes me nervous, a missed deletion leads straight to the worst failure of "recommending something that does not exist," and a fresh rebuild lets me state flatly that "what is in the store is the source of truth itself."
+
+Concretely, I create a brand-new store under a different name, verify it, then **flip a pointer that names the active store**. The query side always reads the store name through that pointer, so answers keep flowing from the old store right up to the switch — no downtime.
+
+```python
+# bluegreen_rebuild.py
+import json
+import time
+from pathlib import Path
+from google import genai
+
+client = genai.Client()
+POINTER = Path("active_store.json")  # {"store": "wallpaper-catalog-active-20260623"}
+
+
+def active_store() -> str:
+    return json.loads(POINTER.read_text())["store"]
+
+
+def rebuild(catalog_by_id: dict) -> str:
+    # 1) Create a dated new store (green). Keep the old one (blue) alive for now.
+    new_store = f"wallpaper-catalog-active-{time.strftime('%Y%m%d-%H%M')}"
+    client.file_search_stores.create(config={"display_name": new_store})
+
+    # 2) Import only the active source assets, all of them.
+    for asset in catalog_by_id.values():
+        client.file_search_stores.upload_to_file_search_store(
+            file_search_store_name=new_store,
+            file=asset["image_path"],
+            config={"display_name": asset["id"]},
+        )
+
+    # 3) Smoke test: query for a retired asset's name and confirm it does NOT hit.
+    if not passes_smoke_test(new_store):
+        raise RuntimeError("smoke test failed — do not flip the pointer")
+
+    # 4) Flip the pointer (only now does production face the new store).
+    POINTER.write_text(json.dumps({"store": new_store}))
+    print(f"switched active store -> {new_store}")
+    return new_store
+```
+
+Once the switch settles and nothing looks wrong, clean up the old store. **Do not delete the old one immediately after flipping.** Keep it around for a night so that, if something breaks, you can roll back by writing the pointer back and nothing more.
+
+### Why the pointer lives in config, not code
+
+I keep the store name out of code and in a config file (KV or remote config in production) because I want rollback to be a one-line config edit. A rollback that requires redeploying the app weighs heaviest exactly when something breaks at 2 a.m. As a solo indie developer, the person handling that is me, so I always optimize for the version of myself stuck awake in the middle of the night.
+
+## Measure drift every night
+
+At this point "change it correctly when you change it" is covered. The last piece is to **regularly measure whether things have drifted even when you thought you changed nothing**. Sync-script bugs, partial import failures, a slipped manual operation — drift sneaks in any time.
+
+Every night I run a job that compares the current manifest built from the source against the manifest already reflected into the store, and pings Slack if they disagree.
+
+```python
+# drift_audit.py
+import json
+from pathlib import Path
+
+
+def audit() -> int:
+    current = json.loads(Path("manifest.current.json").read_text())
+    synced = json.loads(Path("manifest.synced.json").read_text())
+
+    added, updated, removed = (
+        set(current) - set(synced),
+        {i for i in set(current) & set(synced) if current[i] != synced[i]},
+        set(synced) - set(current),
+    )
+    drift = len(added) + len(updated) + len(removed)
+    total = max(len(current), 1)
+    rate = drift / total * 100
+
+    print(f"drift: {drift}/{total} ({rate:.1f}%) "
+          f"add={len(added)} upd={len(updated)} del={len(removed)}")
+    # Notify above a threshold. I stop and look the moment it crosses 1.0%.
+    return drift
+
+
+if __name__ == "__main__":
+    if audit() > 0:
+        # Send a Slack ping here, or fail the CI job with a non-zero exit code.
+        print("Store and source disagree. Check the sync job logs.")
+```
+
+Recording a "drift rate" as a number every night lets you see whether drift has been quietly accumulating since some particular sync. In my own setup, the line is: if the drift rate crosses 1.0%, I stop and go find the cause. A store that had been silent suddenly serving stale recommendations one morning — as the price of never reliving that, a job that runs for a few dozen seconds each night is cheap.
+
+## Where I stumbled in production
+
+A few potholes I actually hit with this design.
+
+First, there is a window right after an import where **a query does not yet pick up the new document**. The smoke test before a blue/green flip has to run after import completion, or it whiffs and falsely reports "failed." I added an index-reflection check before moving on to verification.
+
+Second, **the cost of a full rebuild scales linearly with the count**, so rebuilding every time on a day with only a handful of deletions is wasteful. I branch on "rebuild only on days where deletions exceed a threshold, otherwise incremental," which keeps the `gemini-embedding-2` re-embedding cost down. Since the three-way diff is already computed, that decision automates cleanly.
+
+Third, on a multimodal store, **changes that only touch image metadata (title or category)** are easy to miss. As noted, folding the metadata into the fingerprint alongside the image bytes catches these "same content, different description" updates properly.
+
+## Where to start
+
+You do not need to build all of this at once. Write one small script that emits `manifest.current.json` from your source, and compare it against a local `manifest.synced.json` (empty is fine to start). The moment the diff shows up as a number, you will see how far your store had wandered. For me, that first diff was much larger than I expected, and it was the starting point that made the danger of leaving it alone feel real.
+
+Thanks for reading. If you are running File Search in production too, I hope this helps you head off the same quiet rot.

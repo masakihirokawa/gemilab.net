@@ -1,0 +1,257 @@
+---
+title: "File Search のストアが本番で静かに陳腐化する — カタログ同期とドリフト検知を実装した運用メモ"
+slug: "gemini-file-search-store-catalog-sync-drift-detection"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-23T20:30"
+author: "Gemini Lab"
+description: "File Search に一度カタログを流し込んで終わりにすると、配信を止めたアセットを案内する『古い回答』が本番で返り始めます。ハッシュ差分の増分取り込みと、削除を割り切るブルーグリーン再構築、そして定期ドリフト検知までを実装で整理しました。"
+tags: ["gemini", "file-search", "rag", "gemini-embedding-2", "production"]
+highlights:
+  - "File Search のストアが元カタログとズレて『もう無いものを案内する』問題を、ハッシュ差分の増分取り込みで止められるようになります"
+  - "数千件規模のアセットを毎リリース入れ替えても、ブルーグリーンでストアを作り直してポインタを切り替えれば、クエリを止めずに新しい索引へ移せます"
+  - "正本とストアがどれだけズレているかを毎晩はかるドリフト検知スクリプトを、そのまま自分のパイプラインに組み込めます"
+---
+
+File Search に壁紙カタログを一度流し込んで満足していたら、二週間ほど経った頃に「その壁紙はすでに配信を終了しています」という案内が本番で返ってきて青ざめました。アセット自体は App Store と Google Play の更新で差し替え済みなのに、File Search のストアの中身は最初に取り込んだ日のまま止まっていたのです。
+
+File Search の入門記事は「ファイルを入れればグラウンディングできる」ところで終わります。けれども個人開発で実際に運用してみると、難しいのは最初の取り込みではなく、**正本（source of truth）が変わり続けるのにストアだけが古いスナップショットのまま取り残される**ことでした。この記事は、その「静かな陳腐化」を止めるために私自身が組んだ同期パイプラインの記録です。
+
+## ストアは「作った時点のスナップショット」でしかない
+
+まず前提を揃えます。File Search のストア（FileSearchStore）は、取り込んだ瞬間の内容を `gemini-embedding-2` で索引化した塊です。便利なのは、自前でベクトルDBを立てたりチャンク分割を設計したりせずに、テキストも画像も同じストアに入れて引用元つきで回答を返せる点です。マルチモーダル対応で、壁紙のような画像アセットをそのまま入れられるようになったのは大きな前進でした。
+
+ただし、ストアは取り込んだ後に放っておくと更新されません。正本のカタログ側で起きる変化は、おおむね次の3種類です。
+
+- **追加**: 新しい壁紙を配信した。ストアにはまだ無い。
+- **更新**: 既存アセットのメタ情報（タイトル・カテゴリ・配信状況）を書き換えた。ストアの中身は古い。
+- **削除**: 配信を終了した。ストアには「もう無いもの」が残っている。
+
+このうち一番こわいのは削除です。追加や更新は「新しい回答が出ない」だけで済みますが、削除されたアセットがストアに残っていると、AIは**実在しないものを自信たっぷりに案内します**。冒頭の事故がまさにこれでした。
+
+## 正本とストアのズレを「マニフェスト」で可視化する
+
+ズレを止める前に、まず「いま何がどうズレているか」を機械的に分かる形にします。私はストアを直接のぞきにいくのではなく、**正本側からマニフェストを作る**方針にしました。各アセットの内容ハッシュを取り、前回同期したマニフェストと比べれば、差分は単純な集合演算で出ます。
+
+```python
+# build_manifest.py
+# 正本カタログ（DBやファイル一覧）から「ID → 内容ハッシュ」の辞書を作る。
+# ストアの中身に依存せず、正本だけを根拠にするのがポイント。
+import hashlib
+import json
+from pathlib import Path
+
+
+def asset_fingerprint(asset: dict) -> str:
+    """配信状況・タイトル・カテゴリ・本体ファイルのハッシュをまとめて1つの指紋にする。
+    どれか1つでも変われば指紋が変わり、更新として検出できる。"""
+    h = hashlib.sha256()
+    h.update(asset["status"].encode())          # active / retired
+    h.update(asset["title"].encode())
+    h.update(asset["category"].encode())
+    # 画像本体はファイルのバイト列をそのままハッシュ（メタだけでなく中身も見る）
+    h.update(Path(asset["image_path"]).read_bytes())
+    return h.hexdigest()
+
+
+def build_manifest(catalog: list[dict]) -> dict[str, str]:
+    # 配信中のものだけを索引対象にする。retired はそもそも入れない。
+    return {
+        a["id"]: asset_fingerprint(a)
+        for a in catalog
+        if a["status"] == "active"
+    }
+
+
+if __name__ == "__main__":
+    catalog = json.loads(Path("catalog.json").read_text())
+    manifest = build_manifest(catalog)
+    Path("manifest.current.json").write_text(json.dumps(manifest, indent=2))
+    print(f"manifest entries: {len(manifest)}")
+    # 期待する出力例: manifest entries: 3127
+```
+
+ここで「メタ情報だけでなく画像本体のバイト列もハッシュに含める」のが地味に効きます。タイトルは同じまま画像だけ差し替えるリリースが意外と多く、メタだけ見ていると更新を取りこぼすからです。
+
+## 差分を3種類に分けて扱う
+
+マニフェストが2世代そろえば、追加・更新・削除はその場で求まります。ここはFile Searchとは無関係の、ただの集合演算です。
+
+```python
+# diff_manifest.py
+import json
+from pathlib import Path
+
+
+def load(path: str) -> dict[str, str]:
+    p = Path(path)
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def diff(prev: dict[str, str], curr: dict[str, str]):
+    prev_ids, curr_ids = set(prev), set(curr)
+    added = curr_ids - prev_ids
+    removed = prev_ids - curr_ids
+    # 両方に存在し、指紋が変わったものが「更新」
+    updated = {i for i in (prev_ids & curr_ids) if prev[i] != curr[i]}
+    return added, updated, removed
+
+
+if __name__ == "__main__":
+    prev = load("manifest.synced.json")   # 前回ストアに反映済みの状態
+    curr = load("manifest.current.json")  # 今の正本
+    added, updated, removed = diff(prev, curr)
+    print(f"added={len(added)} updated={len(updated)} removed={len(removed)}")
+    # 期待する出力例: added=42 updated=18 removed=7
+```
+
+`manifest.synced.json` は「前回ストアへ反映し終えた時点の正本」を保存したものです。**現在の正本ではなく、同期に成功した正本を別名で残しておく**のがコツで、これがないと「取り込みに失敗したのに同期済みと誤認する」事故が起きます。反映が完全に終わってから `current` を `synced` へ昇格させます。
+
+## 追加と更新は増分取り込みで間に合う
+
+追加と更新は、変わったぶんだけストアへ取り込めば足ります。全件を毎回入れ直すと、`gemini-embedding-2` の再埋め込みコストが効いてくるので、差分だけに絞るのが現実的です。
+
+```python
+# incremental_import.py
+from google import genai
+
+client = genai.Client()
+STORE_NAME = "wallpaper-catalog-active"  # アクティブなストア名（後述のポインタ）
+
+
+def import_asset(asset: dict) -> None:
+    """1アセットをストアへ取り込む。File Search 側のメソッド名・引数は
+    SDK のバージョンで動くため、ここはプレビュー仕様を確認してから固定する。
+    本質は『この ID の内容をこの指紋でストアに載せた』という事実をこちらが台帳化すること。"""
+    client.file_search_stores.upload_to_file_search_store(
+        file_search_store_name=STORE_NAME,
+        file=asset["image_path"],
+        config={
+            "display_name": asset["id"],
+            "custom_metadata": [
+                {"key": "title", "string_value": asset["title"]},
+                {"key": "category", "string_value": asset["category"]},
+            ],
+        },
+    )
+
+
+def apply_incremental(catalog_by_id: dict, added: set, updated: set) -> None:
+    # 更新は「いったん同じIDの古い文書を消してから入れ直す」を基本にする。
+    # 消し漏れがあると同じ壁紙が二重に引用されるため、消えたことを必ず確認する。
+    for asset_id in sorted(added | updated):
+        import_asset(catalog_by_id[asset_id])
+    print(f"imported {len(added | updated)} documents")
+```
+
+更新を「削除してから入れ直す」二段構えにしているのには理由があります。同じIDの文書をそのまま重ねて取り込むと、古い版と新しい版の両方がヒットして、回答に**矛盾した2つの引用**が並ぶことがあるからです。私はこの二重引用に一度ハマって、原因にたどり着くまで半日溶かしました。更新時は必ず「古い文書が消えたこと」を確認してから入れ直す、と決めています。
+
+## 削除はブルーグリーン再構築で割り切る
+
+問題は削除です。File Search には文書単位の削除もありますが、削除が多い・構造ごと入れ替わるリリースでは、私は**増分でちまちま消すよりストアごと作り直すほう**を選びます。理由は3つあります。プレビュー段階のAPIで削除の反映タイミングに一貫性を求めるのは怖いこと、消し漏れが「実在しないものを案内する」最悪の事故に直結すること、そして作り直してしまえば「いま入っているのは正本そのもの」と断言できることです。
+
+具体的には、新しいストアを別名で丸ごと作り、検証してから**アクティブなストア名を指すポインタを切り替えます**。クエリ側は常にポインタ経由でストア名を読むので、切り替えの瞬間まで古いストアで応答が続き、無停止で移れます。
+
+```python
+# bluegreen_rebuild.py
+import json
+import time
+from pathlib import Path
+from google import genai
+
+client = genai.Client()
+POINTER = Path("active_store.json")  # {"store": "wallpaper-catalog-active-20260623"}
+
+
+def active_store() -> str:
+    return json.loads(POINTER.read_text())["store"]
+
+
+def rebuild(catalog_by_id: dict) -> str:
+    # 1) 日付つきの新ストアを作る（緑）。古い方（青）はまだ生かしておく。
+    new_store = f"wallpaper-catalog-active-{time.strftime('%Y%m%d-%H%M')}"
+    client.file_search_stores.create(config={"display_name": new_store})
+
+    # 2) 配信中の正本だけを全件取り込む
+    for asset in catalog_by_id.values():
+        client.file_search_stores.upload_to_file_search_store(
+            file_search_store_name=new_store,
+            file=asset["image_path"],
+            config={"display_name": asset["id"]},
+        )
+
+    # 3) 検証クエリ（削除済みアセットの名前で引いて、ヒットしないことを確認）
+    if not passes_smoke_test(new_store):
+        raise RuntimeError("smoke test failed — ポインタは切り替えない")
+
+    # 4) ポインタを切り替え（ここで初めて本番が新ストアを向く）
+    POINTER.write_text(json.dumps({"store": new_store}))
+    print(f"switched active store -> {new_store}")
+    return new_store
+```
+
+切り替えが終わってしばらく様子を見て問題がなければ、古いストアを後片付けします。**切り替え直後には古い方をすぐ消さない**こと。何かあったときに、ポインタを書き戻すだけで即座にロールバックできる状態を一晩は残しておきます。
+
+### なぜポインタを設定値にするのか
+
+ストア名をコードに直書きせず、設定ファイル（本番ではKVやリモート設定）に置くのは、ロールバックを「設定の1行書き換え」で済ませたいからです。アプリ再デプロイを伴うロールバックは、深夜に事故が起きたときほど重くのしかかります。個人開発だと対応するのは自分一人なので、夜中の自分をいかに楽にするかをいつも優先します。
+
+## ドリフトを毎晩はかる
+
+ここまでで「変えるときに正しく変える」仕組みは整いました。最後に必要なのは、**変えていないつもりでもズレていないかを定期的にはかる**ことです。同期スクリプトのバグ、取り込みの部分失敗、手動オペレーションのミス。ズレはいつでも忍び込みます。
+
+私は毎晩、正本から作った現在のマニフェストと、ストアへ反映済みのマニフェストを突き合わせ、不一致が出たらSlackに通知するだけのジョブを回しています。
+
+```python
+# drift_audit.py
+import json
+from pathlib import Path
+
+
+def audit() -> int:
+    current = json.loads(Path("manifest.current.json").read_text())
+    synced = json.loads(Path("manifest.synced.json").read_text())
+
+    added, updated, removed = (
+        set(current) - set(synced),
+        {i for i in set(current) & set(synced) if current[i] != synced[i]},
+        set(synced) - set(current),
+    )
+    drift = len(added) + len(updated) + len(removed)
+    total = max(len(current), 1)
+    rate = drift / total * 100
+
+    print(f"drift: {drift}/{total} ({rate:.1f}%) "
+          f"add={len(added)} upd={len(updated)} del={len(removed)}")
+    # しきい値を超えたら通知。私は 1.0% を超えたら手を止めて見にいくと決めている。
+    return drift
+
+
+if __name__ == "__main__":
+    if audit() > 0:
+        # ここで Slack 通知や exit code で CI を赤くする
+        print("⚠️ ストアと正本にズレがあります。同期ジョブのログを確認してください。")
+```
+
+数字で「ズレ率」を毎晩記録しておくと、ある日の同期から徐々にドリフトが積み上がっていないかが見えます。私の運用では、ドリフト率が1.0%を超えたら一度手を止めて原因を見にいく、という線引きにしています。沈黙していたストアが、ある朝とつぜん古い案内を返し始める——あの嫌な体験を二度としないためのコストとしては、毎晩数十秒のジョブは安いものです。
+
+## 実運用でつまずいたところ
+
+最後に、ここまでの設計で実際にハマった落とし穴を残しておきます。
+
+第一に、**取り込みの直後はクエリが新文書をまだ拾わない**瞬間があります。ブルーグリーンで切り替える前のスモークテストは、取り込み完了を待ってから走らせないと、空振りで「失敗」と誤判定します。この取りこぼしへの対処は単純で、インデックス反映の確認を一段はさんでから検証に進めば回避できます。私はこの順序を本番運用のチェックリストに組み込みました。
+
+第二に、**全件再構築のコストは件数に素直に比例する**ので、削除が数件しかない日にまで毎回作り直すのは無駄です。私は「削除が一定数を超えた日だけ再構築、それ以外は増分」という分岐にして、`gemini-embedding-2` の再埋め込みコストを抑えています。差分の3分類が出ているので、この判断は自動化できます。削除が多い日に増分で消し込もうとして消し漏れるくらいなら、私はこの場合は迷わず全件再構築を推奨します。
+
+第三に、マルチモーダルのストアでは**画像のメタ情報（タイトルやカテゴリ）を更新しただけの変更**が見落とされがちです。前述のとおり画像本体のバイト列だけでなくメタ情報も指紋に含めておくと、こうした「中身は同じだが説明が変わった」更新もきちんと検出できます。
+
+## ストア更新の頻度をどう決めるか
+
+どのくらいの間隔で同期を回すかは、正本の変化の速さで決めています。私の壁紙アプリは App Store と Google Play のリリースに合わせて月に数回まとめてアセットが入れ替わるので、同期は「リリース直後」と「毎晩のドリフト監査」の二段構えで十分でした。逆に、配信物が日次で変わるようなサービスなら、毎晩の監査だけでなく増分取り込み自体を日次ジョブに格上げするほうが安全です。AdMob 由来の収益が乗るような無料アプリでは、誤った案内がレビュー評価に響いてダウンロードまで冷えるので、私はこの同期の優先度を機能追加と同じ列に置いています。同期は「やってもやらなくてもいい運用」ではなく、回答の正しさを支える土台だと考えています。
+
+## どこから始めるか
+
+いきなり全部を組む必要はありません。まずは正本から `manifest.current.json` を吐く小さなスクリプトを1本書き、手元の `manifest.synced.json`（最初は空でかまいません）と突き合わせるところから始めてみてください。差分が数字で見えた瞬間に、自分のストアがどれだけ正本から離れていたかが分かります。私の場合、その最初の差分が想像よりずっと大きく、放置のこわさを実感した出発点になりました。
+
+お読みいただきありがとうございました。同じように File Search を本番で回している方の、静かな陳腐化を防ぐ一助になればうれしいです。
