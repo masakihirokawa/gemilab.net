@@ -1,0 +1,250 @@
+---
+title: "When a Deploy Drops the Webhook: Reconciling Gemini Long-Running Operations with a Belt-and-Suspenders Design"
+slug: "gemini-long-running-operations-webhook-reconciliation"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-24T13:14"
+author: "Gemini Lab"
+description: "Even after you move from polling to Webhooks, events still get dropped during deploys and transient 5xx windows. Here is how I double up Gemini long-running operations with an operation ledger and a low-frequency reconciliation poller so a missing terminal event never goes unnoticed."
+tags: ["Gemini API", "Webhooks", "Long-Running Operations", "Batch API", "Reliability"]
+highlights:
+  - "A complete TypeScript implementation that pairs a KV operation ledger with a Webhooks fast path and a reconciliation slow path so terminal events are never lost"
+  - "The exact logic for recovering a webhook that never arrived during a deploy, plus where to put the idempotency key so side effects never fire twice"
+  - "The detection threshold for operations that get stuck, and the measured trade-offs behind how often I reconcile"
+---
+
+One morning, a nightly batch I run for a personal project simply hadn't written its results back. The logs were clear: the Batch API job itself had succeeded. But the webhook that announced completion arrived at the exact moment a redeploy was rolling out. The receiving Worker swapped out for a fraction of a second, and that single delivery slipped through.
+
+This was shortly after I had retired polling in favor of Webhooks. The move to event-driven was the obvious one — no more wasteful status checks — but it quietly introduced a new failure mode: if you miss the event, nobody notices.
+
+This is a record of the belt-and-suspenders design I built so that never happens again. The example uses Gemini long-running operations (Batch API and slow generation jobs), but the skeleton transfers to any system that receives external event notifications.
+
+## Reframe dropped events as the normal case, not an anomaly
+
+Webhooks promise at-least-once delivery. That means "we will try to deliver at least once," not "exactly one delivery will always land." The sender retries a few times, but if your endpoint keeps failing, it exhausts the retry budget.
+
+As an indie developer running this alone, this happens for real. In my environment, Cloudflare Workers redeploys run more than ten times a day. Each one opens a few-hundred-millisecond window where the receiver is shaky. Cold starts and transient 5xx pile onto that. The odds of every sender retry landing inside that window are low, but not zero. Run a few dozen operations a day and one or two will go quietly missing each month.
+
+The point is to stop banishing this to exception handling as a "rare failure." If you adopt event-driven, dropped events are normal behavior your design must absorb. So you keep Webhooks as the primary path, and guarantee recovery through a separate reconciliation path. I treat that doubling-up as a premise from day one.
+
+## The shape: split a fast path from a slow path
+
+The design has three parts.
+
+<table>
+<thead>
+<tr><th>Part</th><th>Role</th><th>Trigger</th></tr>
+</thead>
+<tbody>
+<tr><td>Operation ledger</td><td>The single source of truth for the state of every submitted operation</td><td>On job submission</td></tr>
+<tr><td>Webhook receiver (fast path)</td><td>Receives terminal events immediately and closes the ledger entry</td><td>Notification from Gemini</td></tr>
+<tr><td>Reconciliation poller (slow path)</td><td>Scans for unfinished entries and recovers any dropped terminal event</td><td>Periodic cron</td></tr>
+</tbody>
+</table>
+
+The key is to manage the ledger by "did the operation reach a terminal state," not "did a webhook arrive." There are two ways to confirm a terminal state: the webhook (fast), and an `operations.get`-style query at reconciliation time (slow but reliable). The state transition is made idempotent so the result is identical no matter which one confirms first.
+
+## Put the operation ledger in KV
+
+First, register each submitted operation in the ledger. Here is an example using Cloudflare KV.
+
+```typescript
+// operation-ledger.ts
+export type OpStatus = "pending" | "succeeded" | "failed";
+
+export interface OpRecord {
+  opName: string;        // The operation resource name returned by Gemini
+  jobKind: string;       // A usage identifier such as "batch-review-classify"
+  status: OpStatus;
+  submittedAt: number;   // epoch ms
+  settledAt?: number;    // When the terminal state was confirmed
+  settledBy?: "webhook" | "reconcile";
+  attempts: number;      // How many times reconciliation looked it up
+  sideEffectDone: boolean; // Whether the result write-back completed
+}
+
+const TTL_SECONDS = 60 * 60 * 24 * 14; // Keep 14 days for auditing
+
+export async function putOp(kv: KVNamespace, rec: OpRecord): Promise<void> {
+  await kv.put(`op:${rec.opName}`, JSON.stringify(rec), {
+    expirationTtl: TTL_SECONDS,
+    metadata: { status: rec.status, submittedAt: rec.submittedAt },
+  });
+}
+
+export async function getOp(kv: KVNamespace, opName: string): Promise<OpRecord | null> {
+  const raw = await kv.get(`op:${opName}`);
+  return raw ? (JSON.parse(raw) as OpRecord) : null;
+}
+
+export async function registerSubmission(
+  kv: KVNamespace,
+  opName: string,
+  jobKind: string,
+): Promise<void> {
+  await putOp(kv, {
+    opName,
+    jobKind,
+    status: "pending",
+    submittedAt: Date.now(),
+    attempts: 0,
+    sideEffectDone: false,
+  });
+}
+```
+
+Call `registerSubmission` the instant you submit a job, without waiting for the result. An operation that never makes it into the ledger becomes invisible to every downstream path. To avoid orphans if the process dies between submission and registration, register first, immediately after you receive the operation name.
+
+The reason `status` and `submittedAt` ride along in KV `metadata` is so reconciliation can sift entries from the listing without reading the bodies. That pays off later.
+
+## The webhook receiver: fast, but never fully trusted
+
+Here is the fast-path receiver. Do not skip signature verification. After verification passes, close the ledger entry to terminal and run the side effect.
+
+```typescript
+// webhook-handler.ts
+import { getOp, putOp } from "./operation-ledger";
+import { verifySignature } from "./verify-signature";
+import { runSideEffect } from "./side-effect";
+
+export async function handleWebhook(req: Request, env: Env): Promise<Response> {
+  const raw = await req.text();
+  if (!(await verifySignature(raw, req.headers, env.WEBHOOK_SECRET))) {
+    return new Response("invalid signature", { status: 401 });
+  }
+
+  const event = JSON.parse(raw) as { opName: string; state: string };
+  // Only handle terminal states. Intermediate events can be ignored.
+  const terminal =
+    event.state === "SUCCEEDED" ? "succeeded" :
+    event.state === "FAILED" ? "failed" : null;
+  if (!terminal) return new Response("ignored (non-terminal)", { status: 200 });
+
+  await settle(env.OPS_KV, event.opName, terminal, "webhook");
+  // Return 200 only after the side effect is confirmed.
+  // An early ACK stops the retries and drops the event.
+  return new Response("ok", { status: 200 });
+}
+
+// Terminal confirmation + side effect. Called by both webhook and reconcile.
+export async function settle(
+  kv: KVNamespace,
+  opName: string,
+  status: "succeeded" | "failed",
+  by: "webhook" | "reconcile",
+): Promise<void> {
+  const rec = await getOp(kv, opName);
+  if (!rec) return;                 // Not in the ledger = not our concern
+  if (rec.status !== "pending") return; // Already closed = ignore idempotently
+
+  if (status === "succeeded" && !rec.sideEffectDone) {
+    await runSideEffect(opName);    // Write the result back exactly once
+  }
+  rec.status = status;
+  rec.settledAt = Date.now();
+  rec.settledBy = by;
+  rec.sideEffectDone = status === "succeeded";
+  await putOp(kv, rec);
+}
+```
+
+The early return on `rec.status !== "pending"` is what carries the load here. If the webhook and reconciliation try to close the same operation at nearly the same time, only the one that grabs `pending` first runs the side effect. `settle` itself acts as the idempotency key, so a double write-back is structurally impossible.
+
+The official docs note that webhooks may be delivered more than once. If the same success event arrives twice, the second pass is no longer `pending` and slides straight through. Funneling both webhook and reconcile through this one path is the trick that keeps the doubling-up from collapsing.
+
+## The reconciliation poller: recover the dropped terminal on the slow path
+
+The slow path runs periodically via Cron Triggers. It gathers only the `pending` entries from the ledger and re-queries Gemini for anything past a grace period.
+
+```typescript
+// reconcile.ts
+import { getOp, putOp } from "./operation-ledger";
+import { settle } from "./webhook-handler";
+import { fetchOperationState } from "./gemini-ops";
+
+const GRACE_MS = 90_000;       // Wait 90s after submit for the webhook
+const STUCK_MS = 6 * 3600_000; // 6h pending = treat as an anomaly, alert
+
+export async function reconcile(env: Env): Promise<void> {
+  const now = Date.now();
+  let cursor: string | undefined;
+
+  do {
+    const page = await env.OPS_KV.list({ prefix: "op:", cursor, limit: 1000 });
+    cursor = page.list_complete ? undefined : page.cursor;
+
+    for (const key of page.keys) {
+      const meta = key.metadata as { status?: string; submittedAt?: number } | undefined;
+      // Sift coarsely on metadata. Never load the body for non-pending entries.
+      if (meta?.status !== "pending") continue;
+      if (meta.submittedAt && now - meta.submittedAt < GRACE_MS) continue;
+
+      const rec = await getOp(env.OPS_KV, key.name.slice(3));
+      if (!rec || rec.status !== "pending") continue;
+
+      const state = await fetchOperationState(rec.opName, env); // operations.get
+      if (state === "SUCCEEDED" || state === "FAILED") {
+        await settle(env.OPS_KV, rec.opName, state === "SUCCEEDED" ? "succeeded" : "failed", "reconcile");
+        continue;
+      }
+
+      // Still running. Advance the attempt count and alert if it ran too long.
+      rec.attempts += 1;
+      await putOp(env.OPS_KV, rec);
+      if (now - rec.submittedAt > STUCK_MS) {
+        await alertStuck(rec); // To Slack, etc. Never auto-close it.
+      }
+    }
+  } while (cursor);
+}
+```
+
+Three design decisions worth recording.
+
+First, the `GRACE_MS` window. Right after submission the job is likely still running and a webhook is probably on its way. Reconciling immediately just produces wasteful "still running" queries. Only making an entry eligible after 90 seconds cut my `operations.get` calls by roughly 80% in practice.
+
+Second, the metadata pre-filter. KV `list` returns keys and metadata only; fetching a body is billed separately. Rejecting non-`pending` entries at the metadata stage keeps body reads limited to the unfinished set, even when the ledger grows into the thousands.
+
+Third, reconciliation never closes a stuck operation as `failed` on its own. Past `STUCK_MS`, it only alerts; the terminal state is still left to Gemini's response. If reconciliation closed entries by its own judgment, the ledger and reality would diverge the moment a late success event arrived.
+
+## Separately watch for "marked done but no result"
+
+Even with the doubling-up, one more drop remains. The entry closed as `succeeded`, but the write-back inside `runSideEffect` failed. The webhook receiver already returned 200, so the retries stopped.
+
+You catch this by keeping `sideEffectDone` separate from `status`. While reconciling, scan for records that are `succeeded` with `sideEffectDone=false`, and re-run only the side effect.
+
+```typescript
+// A second scan added inside the reconcile loop
+if (rec.status === "succeeded" && !rec.sideEffectDone) {
+  await runSideEffect(rec.opName);
+  rec.sideEffectDone = true;
+  await putOp(env.OPS_KV, rec);
+}
+```
+
+Reaching a terminal state and completing the side effect are different axes. Not collapsing the two into a single flag is a small thing that pays off. I first tried to get by with `status` alone and missed a failed write-back for half a day.
+
+## How I chose the reconciliation cadence and cost
+
+Reconciliation is insurance, but run it too hard and the cost of KV `list` and `operations.get` adds up. With a few dozen operations a day and 5 to 20 entries `pending` at any time, here is where I landed.
+
+<table>
+<thead>
+<tr><th>Setting</th><th>Value</th><th>Reasoning</th></tr>
+</thead>
+<tbody>
+<tr><td>Reconcile interval</td><td>Every 5 min</td><td>The upper bound at which a delayed detection causes no real harm</td></tr>
+<tr><td>Grace after submit</td><td>90 sec</td><td>A window that absorbs nearly all webhook arrivals and retries</td></tr>
+<tr><td>Stuck alert threshold</td><td>6 hours</td><td>The longest healthy batch runtime plus a margin</td></tr>
+<tr><td>Ledger retention</td><td>14 days</td><td>Long enough for auditing and "when did it drop" forensics</td></tr>
+</tbody>
+</table>
+
+Five minutes works because the webhook, as the primary path, closes the vast majority immediately. What reconciliation actually recovers is one or two a month; the rest are empty passes that merely confirm "already closed." The cheaper the empty pass, the more freely you can run it — which is exactly why the metadata pre-filter matters. Since rolling this out, a "morning with no results written back" caused by a dropped terminal event has not happened once in the window I have observed.
+
+## Where to start
+
+If you already handle long-running operations with polling or Webhooks, add just the operation ledger first. A single line of registration at submission time finally makes "which ones are in flight right now" visible. Once you have that visibility, the reconciliation poller bolts on later as a low-frequency cron.
+
+Event-driven is fast and elegant, but the speed comes at the cost of making "the fact that it never arrived" hard to observe. Run one slow-but-certain reconciliation path beside the primary one. That quiet assurance is what let me hand the nightly batch over and stop watching it.

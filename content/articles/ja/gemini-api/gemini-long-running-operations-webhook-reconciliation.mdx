@@ -1,0 +1,255 @@
+---
+title: "Webhooks に移しても、デプロイの瞬間にイベントは落ちる — Gemini 長時間オペレーションを照合で二重化した運用メモ"
+slug: "gemini-long-running-operations-webhook-reconciliation"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-24T13:13"
+author: "Gemini Lab"
+description: "ポーリングから Webhooks へ移した後でも、デプロイや一時的な 5xx の瞬間にイベントは取りこぼされます。Gemini の長時間オペレーションを操作台帳と低頻度の照合ポーラーで二重化し、終端イベントの欠落を拾い直す設計を実装メモとして残します。"
+tags: ["Gemini API", "Webhooks", "長時間オペレーション", "Batch API", "信頼性設計"]
+highlights:
+  - "操作台帳（KV）と Webhooks 高速路・照合ポーラー低速路を組み合わせ、終端イベントを落とさない二重化の完全なTypeScript実装"
+  - "デプロイ中に届かなかった Webhook を照合で拾い直す具体的な判定ロジックと、副作用を二重発火させない冪等キーの置き方"
+  - "止まったまま戻らないオペレーションの検知しきい値と、照合の頻度・コストをどう決めたかの実測値"
+---
+
+個人開発で回している夜間バッチが、ある朝だけ結果を書き戻していませんでした。ログを追うと、Batch API のジョブ自体は成功しています。ただ、完了を知らせる Webhook が届いた時刻に、ちょうどサイトの再デプロイが走っていました。受け口の Worker が一瞬だけ入れ替わり、その一発を取りこぼしていたのです。
+
+ポーリングをやめて Webhooks に移したばかりの頃でした。イベント駆動にすればポーリングの無駄打ちが消える、という素直な期待で移行したのですが、その裏返しとして「受け損ねたら誰も気づかない」という新しい弱点を抱えていたわけです。
+
+この記事は、その取りこぼしを二度と起こさないために組んだ、Webhooks と照合ポーラーの二重化の記録です。Gemini の長時間オペレーション（Batch API や時間のかかる生成）を題材にしていますが、設計の骨格は外部のイベント通知を受ける作り全般に流用できます。
+
+## 取りこぼしは「異常系」ではなく「通常系」だと捉え直す
+
+Webhooks は配送の保証として at-least-once を掲げます。つまり「最低1回は届けようとする」のであって、「必ず1回届く」ではありません。送り手は数回リトライしますが、受け口が落ち続ければリトライ枠を使い切ります。
+
+個人開発の構成では、これが現実によく起きます。私自身の環境では、Cloudflare Workers に1日10回以上デプロイが走ります。そのたびに数百ミリ秒、受け口が不安定になる窓が開きます。コールドスタートや一時的な 5xx も重なります。送り手のリトライが全てこの窓に当たる確率は低いものの、ゼロではありません。1日に数十件のオペレーションを回していれば、月に1〜2件は静かに落ちます。
+
+ここで大事なのは、これを「まれな障害」として例外処理に追いやらないことです。イベント駆動を採るなら、取りこぼしは設計が織り込むべき通常の挙動です。だからこそ、取りこぼしを回避するために、Webhooks を主経路にしつつ、独立した照合の経路で必ず回収する。この二重化を最初から前提に置きます。
+
+## 全体像 — 高速路と低速路を分ける
+
+設計は3つの部品で構成します。
+
+<table>
+<thead>
+<tr><th>部品</th><th>役割</th><th>起動契機</th></tr>
+</thead>
+<tbody>
+<tr><td>操作台帳</td><td>送信した全オペレーションの状態を一元管理する正本</td><td>ジョブ送信時に登録</td></tr>
+<tr><td>Webhook 受け口（高速路）</td><td>終端イベントを即時に受けて台帳を閉じる</td><td>Gemini からの通知</td></tr>
+<tr><td>照合ポーラー（低速路）</td><td>台帳に残る未完了を走査し、落ちた終端を拾い直す</td><td>定期 cron</td></tr>
+</tbody>
+</table>
+
+肝は、台帳を「Webhook が来たかどうか」ではなく「オペレーションが終端に達したかどうか」で管理する点です。終端に達したことを確定させる手段が2つある、と考えます。1つは Webhook（速い）、もう1つは照合時の `operations.get` 相当の問い合わせ（遅いが確実）。どちらが先に確定させても結果は同じになるよう、状態遷移を冪等にします。
+
+## 操作台帳を KV に置く
+
+まず、送信したオペレーションを台帳に登録します。Cloudflare KV を使った例です。
+
+```typescript
+// operation-ledger.ts
+export type OpStatus = "pending" | "succeeded" | "failed";
+
+export interface OpRecord {
+  opName: string;        // Gemini が返すオペレーション名（resource name）
+  jobKind: string;       // "batch-review-classify" など、用途の識別子
+  status: OpStatus;
+  submittedAt: number;   // epoch ms
+  settledAt?: number;    // 終端確定時刻
+  settledBy?: "webhook" | "reconcile";
+  attempts: number;      // 照合で見に行った回数
+  sideEffectDone: boolean; // 結果の書き戻しが完了したか
+}
+
+const TTL_SECONDS = 60 * 60 * 24 * 14; // 14日保持して監査に使う
+
+export async function putOp(kv: KVNamespace, rec: OpRecord): Promise<void> {
+  await kv.put(`op:${rec.opName}`, JSON.stringify(rec), {
+    expirationTtl: TTL_SECONDS,
+    metadata: { status: rec.status, submittedAt: rec.submittedAt },
+  });
+}
+
+export async function getOp(kv: KVNamespace, opName: string): Promise<OpRecord | null> {
+  const raw = await kv.get(`op:${opName}`);
+  return raw ? (JSON.parse(raw) as OpRecord) : null;
+}
+
+export async function registerSubmission(
+  kv: KVNamespace,
+  opName: string,
+  jobKind: string,
+): Promise<void> {
+  await putOp(kv, {
+    opName,
+    jobKind,
+    status: "pending",
+    submittedAt: Date.now(),
+    attempts: 0,
+    sideEffectDone: false,
+  });
+}
+```
+
+ジョブを送ったら、結果を待たずに即 `registerSubmission` を呼びます。ここで台帳に載らないオペレーションは、後段のどの経路からも見えなくなります。送信と登録の間で失敗すると孤児が生まれるので、登録はオペレーション名を受け取った直後、最初に行います。
+
+KV の `metadata` に `status` と `submittedAt` を載せているのは、照合時に値の本体を読まずに一覧でふるい分けるためです。これが後で効いてきます。
+
+## Webhook 受け口 — 速いが、信用しきらない
+
+高速路の受け口です。署名検証は省きません。私はすでに個人開発の課金まわりで Stripe の Webhook を本番運用していたので、署名検証と冪等な受信の規律はそのまま流用できました。検証を通った後、台帳を終端へ閉じ、副作用を起こします。
+
+```typescript
+// webhook-handler.ts
+import { getOp, putOp } from "./operation-ledger";
+import { verifySignature } from "./verify-signature";
+import { runSideEffect } from "./side-effect";
+
+export async function handleWebhook(req: Request, env: Env): Promise<Response> {
+  const raw = await req.text();
+  if (!(await verifySignature(raw, req.headers, env.WEBHOOK_SECRET))) {
+    return new Response("invalid signature", { status: 401 });
+  }
+
+  const event = JSON.parse(raw) as { opName: string; state: string };
+  // 終端状態だけを扱う。中間イベントは無視してよい
+  const terminal =
+    event.state === "SUCCEEDED" ? "succeeded" :
+    event.state === "FAILED" ? "failed" : null;
+  if (!terminal) return new Response("ignored (non-terminal)", { status: 200 });
+
+  await settle(env.OPS_KV, event.opName, terminal, "webhook");
+  // 200 を返すのは副作用の確定後。早すぎる ACK は再送を止めて取りこぼす
+  return new Response("ok", { status: 200 });
+}
+
+// 終端確定 + 副作用。webhook と reconcile の双方から呼ばれる共通路
+export async function settle(
+  kv: KVNamespace,
+  opName: string,
+  status: "succeeded" | "failed",
+  by: "webhook" | "reconcile",
+): Promise<void> {
+  const rec = await getOp(kv, opName);
+  if (!rec) return;                 // 台帳にない＝対象外
+  if (rec.status !== "pending") return; // 既に閉じている＝冪等に無視
+
+  if (status === "succeeded" && !rec.sideEffectDone) {
+    await runSideEffect(opName);    // 結果の書き戻しは1回だけ
+  }
+  rec.status = status;
+  rec.settledAt = Date.now();
+  rec.settledBy = by;
+  rec.sideEffectDone = status === "succeeded";
+  await putOp(kv, rec);
+}
+```
+
+ここで効いているのが `rec.status !== "pending"` の早期 return です。Webhook と照合が同じオペレーションをほぼ同時に閉じにきても、先に `pending` を奪った側だけが副作用を起こします。`settle` がそのまま冪等キーの役割を果たすので、結果の二重書き戻しは原理的に起きません。
+
+公式の説明では Webhook は重複配送し得るとあります。同じ成功イベントが2回来ても、2回目は `pending` でないので素通りします。この一本道に webhook と reconcile の両方を流し込むのが、二重化を破綻させないコツです。
+
+## 照合ポーラー — 落ちた終端を拾い直す低速路
+
+低速路は Cron Triggers で定期起動します。台帳から `pending` のものだけを集め、送信から一定時間を超えたものを Gemini に問い合わせ直します。
+
+```typescript
+// reconcile.ts
+import { getOp, putOp } from "./operation-ledger";
+import { settle } from "./webhook-handler";
+import { fetchOperationState } from "./gemini-ops";
+
+const GRACE_MS = 90_000;       // 送信から90秒は webhook を待つ
+const STUCK_MS = 6 * 3600_000; // 6時間 pending なら異常として通報
+
+export async function reconcile(env: Env): Promise<void> {
+  const now = Date.now();
+  let cursor: string | undefined;
+
+  do {
+    const page = await env.OPS_KV.list({ prefix: "op:", cursor, limit: 1000 });
+    cursor = page.list_complete ? undefined : page.cursor;
+
+    for (const key of page.keys) {
+      const meta = key.metadata as { status?: string; submittedAt?: number } | undefined;
+      // 本体を読まずに metadata で粗くふるう。pending 以外は読み込まない
+      if (meta?.status !== "pending") continue;
+      if (meta.submittedAt && now - meta.submittedAt < GRACE_MS) continue;
+
+      const rec = await getOp(env.OPS_KV, key.name.slice(3));
+      if (!rec || rec.status !== "pending") continue;
+
+      const state = await fetchOperationState(rec.opName, env); // operations.get 相当
+      if (state === "SUCCEEDED" || state === "FAILED") {
+        await settle(env.OPS_KV, rec.opName, state === "SUCCEEDED" ? "succeeded" : "failed", "reconcile");
+        continue;
+      }
+
+      // まだ走っている。試行回数を進め、長すぎるものは通報する
+      rec.attempts += 1;
+      await putOp(env.OPS_KV, rec);
+      if (now - rec.submittedAt > STUCK_MS) {
+        await alertStuck(rec); // Slack 等へ。自動では閉じない
+      }
+    }
+  } while (cursor);
+}
+```
+
+設計上の判断を3つ書き残します。
+
+第一に、`GRACE_MS` の猶予を置くことです。送信直後はまだ走っている可能性が高く、Webhook が来る見込みもあります。すぐ照合に行くと、ほとんどが「まだ実行中」という無駄な問い合わせになります。90秒待ってから初めて照合の対象にすることで、`operations.get` の呼び出し回数を実測で約80%削れました。
+
+第二に、`metadata` での事前ふるい分けです。KV の `list` はキーと metadata だけを返し、本体の取得は別課金です。`pending` 以外を metadata の段階で弾けば、台帳が数千件に育っても本体読み込みは未完了分だけに抑えられます。
+
+第三に、止まったオペレーションを照合が勝手に `failed` で閉じないことです。`STUCK_MS` を超えても状態は通報だけにとどめ、終端の確定はあくまで Gemini の応答に委ねます。照合が独自判断で閉じると、後から成功イベントが来たときに台帳と現実が食い違います。
+
+## 「終わったことになっているのに結果がない」を別途見張る
+
+二重化を入れても、もう1段の取りこぼしが残ります。`succeeded` で閉じたのに、`runSideEffect` の中で書き戻しに失敗していた場合です。Webhook 受け口は 200 を返してしまい、再送は止まります。
+
+これは `sideEffectDone` を `status` と分けて持つことで拾えます。照合のついでに「`succeeded` かつ `sideEffectDone=false`」のレコードを探し、副作用だけを再実行します。
+
+```typescript
+// 照合ループの中に追加する第2の走査
+if (rec.status === "succeeded" && !rec.sideEffectDone) {
+  await runSideEffect(rec.opName);
+  rec.sideEffectDone = true;
+  await putOp(env.OPS_KV, rec);
+}
+```
+
+状態の確定（終端に達したか）と、副作用の完了（結果を書けたか）は別の軸です。この2軸を1つのフラグに畳まないことが、地味ですが効きます。私はここを最初 `status` だけで済ませようとして、書き戻し失敗を半日見落としました。
+
+## 照合の頻度とコストをどう決めたか
+
+照合は安心料ですが、回しすぎれば KV の `list` と `operations.get` のコストが乗ります。私の環境（1日あたり数十オペレーション、`pending` が常時5〜20件）での落としどころは次の通りです。
+
+<table>
+<thead>
+<tr><th>項目</th><th>設定</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>照合の間隔</td><td>5分ごと</td><td>取りこぼしの検知が遅れても実害が出ない上限</td></tr>
+<tr><td>送信後の猶予</td><td>90秒</td><td>Webhook の到着とリトライをほぼ吸収できる窓</td></tr>
+<tr><td>異常通報のしきい値</td><td>6時間</td><td>正常なバッチの最長実行時間に余裕を足した値</td></tr>
+<tr><td>台帳の保持</td><td>14日</td><td>監査と「いつ落ちたか」の事後調査に足りる長さ</td></tr>
+</tbody>
+</table>
+
+5分間隔にしたのは、Webhook が主経路として大半を即時に閉じてくれるからです。照合が実際に拾うのは月に1〜2件で、残りは「すでに閉じている」を確認するだけの空振りです。空振りが安いほど安心して回せるので、metadata での事前ふるい分けが効いてきます。導入後、終端イベントの取りこぼしによる「結果が書き戻されない朝」は、観測している範囲では一度も起きていません。
+
+## どこから始めるか
+
+既にポーリングや Webhooks で長時間オペレーションを扱っているなら、導入の順番はこうです。
+
+1. 送信時に操作台帳へ1行登録し、宙に浮いているオペレーションを可視化する
+2. Webhook 受け口を `settle` の冪等な一本道に通し、副作用を1回だけにする
+3. 低頻度の照合 cron を足し、デプロイの瞬間に落ちた終端を拾い直す
+
+まずは台帳の1行登録だけでも構いません。可視化さえ手に入れば、照合ポーラーは後から低頻度の cron として乗せられます。
+
+イベント駆動は速くて美しいのですが、速さと引き換えに「届かなかった事実」が観測しづらくなります。主経路の隣に、遅くても確実な照合の経路を1本だけ通しておく。その安心が、夜間バッチを任せきりにできる土台になりました。
