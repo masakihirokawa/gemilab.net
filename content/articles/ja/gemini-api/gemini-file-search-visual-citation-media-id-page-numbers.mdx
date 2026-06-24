@@ -1,0 +1,210 @@
+---
+title: "File Searchの回答に「何ページの、どの図か」まで添える ― 視覚引用メタデータで出典を検証可能にする"
+slug: "gemini-file-search-visual-citation-media-id-page-numbers"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-24T19:53"
+author: "Gemini Lab"
+description: "File Search の grounding metadata に media_id と page_numbers が加わり、回答のどの一文がどのページ・どの図に基づくのかを辿れるようになりました。PDFと画像を混ぜた参照データで、検証可能な引用UIを組み立てるまでを実装で整理します。"
+tags: ["gemini", "file-search", "grounding", "gemini-api", "rag"]
+highlights:
+  - "回答に出典は付くのに『どのページ・どの図か』までは示せず信頼性で詰まっていた構成を、page_numbers と media_id で文単位の検証可能な引用に作り替えられます"
+  - "grounding_supports と grounding_chunks を突き合わせて、回答の各文に正確なページ番号と図版サムネイルを紐づける描画ロジックをコピペで導入できます"
+  - "メタデータが欠落したチャンクへのフォールバックや、同一ページの引用重複の畳み方など、本番で必ず当たる穴の塞ぎ方まで持ち帰れます"
+---
+
+参照データに PDF を入れて File Search に答えさせると、これまでも「出典: 設計書.pdf」までは返せました。けれど読者や同僚に「本当にそう書いてある?」と聞かれたとき、47ページある PDF のどこを見ればいいのかは答えられませんでした。私自身、個人開発で運用しているアプリのヘルプ参照データで何度もこの壁に当たり、結局スクリーンショットを手作業で貼っていました。
+
+2026年6月24日、File Search の grounding metadata に `media_id`（視覚引用）と `page_numbers` が追加され、この手作業が要らなくなりました。回答のどの一文が、どのページの、どの図に基づくのかを、API のレスポンスだけで辿れます。ここでは、PDF と画像を混ぜた参照データに対して、文単位で「ページ番号 + 図版サムネイル」を添える引用レイヤーを組み立てるところまでを、実装で残していきます。
+
+## 何が変わったのか ― grounding metadata の新しい2フィールド
+
+これまでの grounding metadata は、おおまかに言えば「回答はこのチャンク群に基づいています」というチャンク単位の情報でした。新しく加わったのは、その粒度を一段細かくする2つのフィールドです。
+
+<table>
+  <thead>
+    <tr><th>フィールド</th><th>付く場所</th><th>意味</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>page_numbers</strong></td><td>各 grounding chunk の retrieved_context</td><td>そのチャンクが PDF の何ページ目に由来するか（複数ページにまたがる場合は配列）</td></tr>
+    <tr><td><strong>media_id</strong></td><td>各 grounding chunk の retrieved_context</td><td>視覚引用の識別子。図版・スクリーンショットなど画像由来のチャンクで、どの画像が根拠かを指す</td></tr>
+  </tbody>
+</table>
+
+ポイントは、これらが `grounding_supports`（回答テキストのどの区間がどのチャンクに支えられているか）と組み合わさることです。`grounding_supports` の各エントリは「回答の何文字目から何文字目までが、どのチャンク番号に基づくか」を持っています。チャンク番号から `page_numbers` と `media_id` を引けば、回答の一文ごとに「○○.pdf の12ページ、図3」まで遡れます。
+
+## レスポンスの構造を先に掴む
+
+実装に入る前に、何を相手にするのかを確認します。File Search を有効にした `generate_content` のレスポンスには、`candidates[0].grounding_metadata` がぶら下がります。中身を整理するとこうなります。
+
+```python
+# grounding_metadata の概念構造（実際のレスポンスを整形したもの）
+{
+  "grounding_chunks": [
+    {
+      "retrieved_context": {
+        "title": "design-spec.pdf",
+        "text": "認証トークンの有効期限は既定で3600秒です…",
+        "page_numbers": [12],          # ← 新フィールド
+        "media_id": None               # テキストチャンクなので None
+      }
+    },
+    {
+      "retrieved_context": {
+        "title": "onboarding-flow.png",
+        "text": "ログイン画面の遷移図",
+        "page_numbers": None,
+        "media_id": "media/abc123"     # ← 新フィールド（画像由来）
+      }
+    }
+  ],
+  "grounding_supports": [
+    {
+      "segment": {"start_index": 0, "end_index": 58, "text": "トークンの有効期限は3600秒です。"},
+      "grounding_chunk_indices": [0],
+      "confidence_scores": [0.94]
+    }
+  ]
+}
+```
+
+`grounding_supports[i].grounding_chunk_indices` が `grounding_chunks` の添字を指しています。この対応さえ押さえれば、あとは文と出典を結ぶだけです。
+
+## 文単位で「ページ + 図」を引く描画ロジック
+
+ここが記事の核です。回答テキストを `grounding_supports` の区間で区切り、各区間にページ番号と画像参照を付与する関数を作ります。実運用でそのまま使えるよう、メタデータ欠落への防御も最初から入れています。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def build_cited_answer(response):
+    """回答を文区間ごとに分解し、各区間に検証可能な出典を付ける。"""
+    cand = response.candidates[0]
+    meta = getattr(cand, "grounding_metadata", None)
+    answer_text = cand.content.parts[0].text
+
+    # メタデータが無い＝grounding されていない回答。出典なしで返す
+    if meta is None or not getattr(meta, "grounding_supports", None):
+        return [{"text": answer_text, "citations": []}]
+
+    chunks = meta.grounding_chunks or []
+    segments = []
+
+    for sup in meta.grounding_supports:
+        seg = sup.segment
+        citations = []
+        for idx in sup.grounding_chunk_indices:
+            if idx >= len(chunks):
+                continue  # 添字ずれの防御
+            ctx = chunks[idx].retrieved_context
+            citations.append({
+                "title": ctx.title,
+                "pages": getattr(ctx, "page_numbers", None),   # 例: [12]
+                "media_id": getattr(ctx, "media_id", None),    # 例: "media/abc123"
+            })
+        segments.append({
+            "text": answer_text[seg.start_index:seg.end_index],
+            "citations": _dedupe_citations(citations),
+        })
+    return segments
+
+
+def _dedupe_citations(citations):
+    """同一ファイル・同一ページの引用を1つに畳む。"""
+    seen, out = set(), []
+    for c in citations:
+        key = (c["title"], tuple(c["pages"] or []), c["media_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+```
+
+この関数を通すと、回答が次のような構造になります。
+
+```python
+# build_cited_answer の出力例
+[
+  {
+    "text": "トークンの有効期限は3600秒です。",
+    "citations": [{"title": "design-spec.pdf", "pages": [12], "media_id": None}]
+  },
+  {
+    "text": "ログイン後の遷移は次の図の通りです。",
+    "citations": [{"title": "onboarding-flow.png", "pages": None, "media_id": "media/abc123"}]
+  }
+]
+```
+
+文ごとに「design-spec.pdf の12ページ」「onboarding-flow.png の図」が紐づきました。あとはこれを描画するだけです。
+
+## media_id から実際の図版を取り出す
+
+`media_id` は文字列の識別子であって、画像そのものではありません。サムネイルを表示するには、File Search ストアからその媒体を取得する一手間が要ります。図版を実際に見せられるかどうかが、引用の説得力を大きく左右します。
+
+```python
+def resolve_media_thumbnail(client, media_id):
+    """media_id から表示用の画像バイト列を取得する。失敗時は None。"""
+    if not media_id:
+        return None
+    try:
+        # ストアに保存された媒体を取得（取得APIはストア構成に依存）
+        media = client.files.get(name=media_id)
+        return media  # ファイル参照。UI 側で <img> の src に変換する
+    except Exception as e:
+        # 媒体が期限切れ・削除済みのケースは珍しくない
+        print(f"media resolve failed for {media_id}: {e}")
+        return None
+```
+
+なぜ try/except で囲うのか、という理由が実運用では重要です。参照データを更新すると古い `media_id` は失効します。回答生成と描画の間に数秒のラグがあるだけで「画像が見つからない」が起きます。ここで例外を握りつぶしてテキスト引用にフォールバックしておかないと、引用UI全体が落ちます。私は最初これを甘く見て、ストア再構築の直後だけ図版が真っ白になる不具合を出しました。私はこの場面では、media_id が解決できないときは黙ってテキスト引用へ落とす設計を推奨します。図版が出ないことより、UI ごと落ちることのほうが読者の信頼を削るからです。
+
+## PDF のページ番号を読者の導線に変える
+
+`page_numbers` はただ表示するだけでも価値がありますが、PDF ビューアのページアンカーに繋ぐと一気に実用的になります。多くのビューアは URL フラグメント `#page=12` でページを開けます。
+
+```python
+def page_anchor_url(base_pdf_url, page_numbers):
+    """page_numbers を PDF ビューアの該当ページURLに変換する。"""
+    if not page_numbers:
+        return base_pdf_url
+    # 配列の先頭ページにジャンプ。範囲は別途レンジ表示する
+    return f"{base_pdf_url}#page={page_numbers[0]}"
+
+# 使用例
+url = page_anchor_url("https://example.com/docs/design-spec.pdf", [12])
+# → "https://example.com/docs/design-spec.pdf#page=12"
+```
+
+ここまで揃うと、回答の各文の脇に「design-spec.pdf p.12 ↗」というリンクが並びます。読者はクリック一つで根拠の段落へ飛べます。出典を「示す」段階から、出典を「検証させる」段階へ進めるのが、この2フィールドの本当の意味だと感じています。
+
+## 本番で必ず当たる落とし穴と対処
+
+実装そのものより、運用で削られる時間のほうが長いものです。私が File Search のヘルプ参照を運用していて踏んだ穴を、対処とともに残します。
+
+<table>
+  <thead>
+    <tr><th>症状</th><th>原因</th><th>対処</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>一部の文に出典が付かない</td><td>その区間は grounding_supports に含まれない（モデルの一般知識による補完）</td><td>出典なし区間は視覚的に区別する。捏造ではなく「参照データ外の補足」と明示する</td></tr>
+    <tr><td>page_numbers が None のまま</td><td>テキスト抽出時にページ境界が取れない PDF（スキャン画像など）</td><td>取り込み時に OCR + ページ付与を済ませる。media_id 側のページ画像で代替する</td></tr>
+    <tr><td>同じページが何度も引用される</td><td>1ページから複数チャンクが retrieve される</td><td>ページ単位で dedupe する（上記 _dedupe_citations）</td></tr>
+    <tr><td>media_id が解決できない</td><td>参照データ更新で旧媒体が失効</td><td>try/except でテキスト引用にフォールバック。再生成を促す</td></tr>
+  </tbody>
+</table>
+
+とくに最初の行は信頼性の根幹です。すべての文に出典が付くわけではない、という前提を UI で正直に見せることが、かえって読者の信頼を得ます。全文に無理やり出典を貼ると、参照データ外の一般論にまで「出典: ○○.pdf」が付いてしまい、それこそ検証で破綻します。
+
+## どこまで自分の参照データに合うか
+
+この仕組みが効くのは、ページ構造を持つドキュメント（PDF・スライド）や、図版を根拠として見せたい参照データです。逆に、短いテキストスニペットだけのストアでは `page_numbers` も `media_id` も付かず、従来のチャンク引用と変わりません。導入前に、自分のストアがどの媒体で構成されているかを一度棚卸しすると無駄がありません。
+
+画像を混ぜたマルチモーダルなストア設計そのものは、[テキストとスクリーンショットを1つの File Search に統合する実装](/articles/gemini-api/gemini-file-search-embedding2-text-image-unified-grounding)で扱っています。出典付き回答の検証パイプライン全体を組みたい場合は、[出典付きRAGの引用生成と検証パイプライン](/articles/gemini-api/gemini-rag-citation-source-attribution-production-guide)が土台になります。RAG を組まずに File Search だけで自社データ回答を作る基本は、[Gemini File Search APIで自社データに基づく応答を構築する](/articles/gemini-api/gemini-file-search-api-grounding)にまとめてあります。
+
+まずは手元の PDF を1つ File Search に入れ、`build_cited_answer` を通して `page_numbers` が返るかを確かめてみてください。返ってきたページ番号が本文と一致していれば、あなたの参照データはもう「検証可能な引用」を出せる状態にあります。
