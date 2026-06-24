@@ -1,0 +1,166 @@
+---
+title: "When Gemini API Quietly Dies on the Edge from Subrequest Limits — Field Notes on Budgeting What's Left"
+slug: "gemini-edge-subrequest-budget-instrumentation-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-24T11:30"
+author: "Gemini Lab"
+description: "Running Gemini API on Cloudflare Workers is calm until traffic rises or a tool chain deepens, and then it fails on the subrequest limit. Here are the instrumentation patterns I use to measure per-request consumption and treat it as a budget, drawn from the sites I run as an indie developer."
+tags: ["gemini-api", "cloudflare-workers", "edge-runtime", "subrequest", "observability"]
+highlights:
+  - "A BudgetedFetch wrapper that measures and surfaces the subrequests a single request actually spends"
+  - "A diagnostic routine that isolates what tool chains, SDK auto-retries, and logging consume beneath the surface"
+  - "A design for degrading gracefully before you hit the ceiling, using budget allocation and waitUntil batching"
+---
+
+A Gemini API endpoint that had been stable in production for weeks started returning "Too many subrequests," but only during a busier window of the day. The logs showed the usual single call to Gemini. Yet the Workers subrequest count had climbed past 50. After moving the sites I run as an indie developer onto Cloudflare Workers, this invisible-until-busy ceiling caught me twice. The first time cost me half a day; the second, instrumentation caught it in five minutes. The difference was whether I treated subrequests as "something to fix when it errors" or as "a budget each request carries."
+
+This is a working note on turning that budget mindset into code. Memorizing the threshold number matters far less than being able to measure how many subrequests your own request actually spends — that capability keeps paying off long after the incident.
+
+## Why it never reproduces locally
+
+Cloudflare Workers caps the total number of outbound connections a single request can issue — `fetch`, the Cache API, KV, D1, R2, reaching a Durable Object, and so on. At the time of writing that is 50 on Free and 1,000 on Workers Standard. Your call to Gemini counts as one of them, naturally.
+
+The trap is that connections you didn't explicitly write are counted too. Run Next.js on Workers and a cache-miss ASSETS fetch becomes a subrequest. Ship access logs from middleware and that's one per request. You think you're calling Gemini once, but the framework and surrounding work can silently stack 20 to 30 connections behind it.
+
+Your local dev server has no such ceiling, so `wrangler dev` won't reproduce it. To observe production-equivalent behavior you need `wrangler dev --remote`; to watch live traffic you need `wrangler tail`. Diagnosis starts by getting those in place.
+
+## Count what's left before you swap models on a hunch
+
+Seeing the error, the first instinct is to switch to a lighter model. But the subrequest ceiling has nothing to do with model weight. The first move is to learn, as a number, how many connections one request actually spends. Open `wrangler tail`, push real traffic through, and watch outbound connections per user action. That's where you finally notice the gap: "my code only fetches once, but I'm seeing 25."
+
+In my experience the sources collapse into three. The first is Function Calling chain depth: each time the model calls a tool, takes the result, and calls another, a new round trip is added. A depth-5 chain, with the external APIs the tools hit, easily reaches double digits. The second is SDK auto-retry: `@google/genai` quietly retries on 429 or 503, so three attempts can be billed inside the one request the user sees. The third is the small, easy-to-miss per-request sends — logs, metrics, config fetches.
+
+## Carry the remaining budget around — the BudgetedFetch pattern
+
+Once you can count, the next step is a mechanism that measures and stops at the same time. The one thing I create at the top of every endpoint is a fetch wrapper holding a per-request budget. It makes consumption visible and lets me intervene before the ceiling.
+
+```ts
+// A subrequest budget tied to the lifetime of one request. Workers spins
+// up a fresh instance per request, so the state is safely scoped here.
+class SubrequestBudget {
+  private used = 0;
+  constructor(private readonly limit: number) {}
+
+  // Always call before spending. Returns false when nothing is left,
+  // so the caller can degrade instead of overrunning the ceiling.
+  reserve(cost = 1): boolean {
+    if (this.used + cost > this.limit) return false;
+    this.used += cost;
+    return true;
+  }
+
+  get remaining(): number {
+    return this.limit - this.used;
+  }
+
+  snapshot() {
+    return { used: this.used, limit: this.limit };
+  }
+}
+
+// A fetch that spends the budget. If reserve fails, turn it into an
+// explicit error before touching the network (no silent ceiling breach).
+function makeBudgetedFetch(budget: SubrequestBudget) {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    if (!budget.reserve(1)) {
+      throw new BudgetExceededError(budget.snapshot());
+    }
+    return fetch(input, init);
+  };
+}
+
+class BudgetExceededError extends Error {
+  constructor(public readonly state: { used: number; limit: number }) {
+    super(`subrequest budget exhausted (${state.used}/${state.limit})`);
+    this.name = "BudgetExceededError";
+  }
+}
+```
+
+The point is to make `reserve` the gate right before going to the network. The `Too many subrequests` that Workers throws is hard to localize and harder to clean up after. Stop on your own budget first, and the phase where you ran dry stays in `state`, so you can hand the user a clear "that request got too complex; please narrow it and try again." That is far easier to operate than a silent 500.
+
+Set the initial budget to "what I'm allowed to use" after subtracting what the framework consumes behind the scenes. Even on Standard (ceiling 1,000) I assume a 200 framework reservation and seed the budget at an effective 800. Leaning on Function Calling under the Free ceiling of 50 hits a wall soon enough, so I avoid it in production.
+
+## Stop tool chains by budget, not by depth
+
+The Google AI SDK has no built-in tool-loop control, so you write the loop yourself. The common version cuts off at a maximum loop count, but I prefer tying it to the budget. The chain hits external APIs along the way, so watching what's left fits reality better than counting turns.
+
+```ts
+async function runToolLoop(
+  ai: GoogleGenAI,
+  budget: SubrequestBudget,
+  initialMessages: Content[],
+  tools: Tool[],
+): Promise<string> {
+  let messages = [...initialMessages];
+
+  // Continue only while there's room for one model round trip plus a tool.
+  while (budget.remaining >= 3) {
+    if (!budget.reserve(1)) break; // reserve the model call
+    const response = await ai.models.generateContent({
+      model: "gemini-3.1-pro",
+      contents: messages,
+      config: { tools },
+    });
+
+    const calls = response.functionCalls ?? [];
+    if (calls.length === 0) return response.text ?? "";
+
+    for (const call of calls) {
+      if (!budget.reserve(1)) {
+        // No budget left for tool execution → close with what we have
+        return summarizePartial(messages);
+      }
+      const result = await executeTool(call); // spends one external call
+      messages.push({
+        role: "user",
+        parts: [{ functionResponse: { name: call.name, response: result } }],
+      });
+    }
+  }
+  return summarizePartial(messages);
+}
+```
+
+The "3" in `while (budget.remaining >= 3)` is the safety margin for one model round trip, one tool call, and one closing call. Stopping by remaining budget means deep and shallow chains share the same accounting, and you always land just short of the ceiling. Returning `summarizePartial` — "here's what we figured out" — instead of throwing at cutoff makes the degradation one notch gentler.
+
+## Push small sends outside the budget with waitUntil
+
+Sends that have nothing to do with the correctness of the response — logs, metrics, notifications — should not be counted against the request's budget. With Workers' `ctx.waitUntil()` you can continue work in the background after returning the response. On my sites, changing middleware log shipping from "immediately, every request" to "batched once at the end via waitUntil" alone dropped the average subrequests per request from 18 to 6 — without touching a single thing about the Gemini response.
+
+```ts
+export default {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const budget = new SubrequestBudget(800);
+    const logs: LogEvent[] = [];
+
+    const response = await handleRequest(req, env, budget, logs);
+
+    // Flush logs in aggregate, off the budget, without slowing perceived speed
+    ctx.waitUntil(flushLogs(env, logs, budget.snapshot()));
+    return response;
+  },
+};
+```
+
+Attaching `budget.snapshot()` to the log pays off too. You gain a distribution of "which request used how many," and the shape of near-ceiling requests — a particular tool, a particular input length — starts to show. A lot of my recurrence prevention rests on watching that distribution.
+
+## Read the budget distribution as an operational metric
+
+Once instrumentation is in, subrequests turn from a one-off error into a time series you can monitor. What I watch is not the average but the upper percentile. An average of 6 with a p99 of 45 means a Free ceiling of 50 could be struck at any time. My rule of thumb: once p99 climbs past 70% of the ceiling, move either the tool-chain cutoff condition or the plan tier.
+
+This is where the `snapshot()` I attached to logs earns its keep. Aggregate the `used` distribution daily and surface the endpoint-and-tool pairs that dominate the top. It usually converges to one of two things: "a specific tool triggers the chain," or "SDK retries grow only when the input is long." Get to where you can describe the cause in words, and the fix is just adjusting numbers in the budget logic above.
+
+It's also worth noting that options like Google's Managed Agents now push the agent loop onto the platform side. Move tool execution and planning into a Google-managed sandbox and the Workers-side subrequests compress to the one or two at the entrance. When chains run deep and budget management gets heavy, keeping your own loop thin while offloading the heavy part is a split worth considering. Observability gets harder to keep, though, so for now I keep the entrance instrumentation in my own hands.
+
+## What I clear before shipping
+
+Finally, the items I always run through before shipping a new Workers endpoint. Less a checklist than a gate for heading off ceiling incidents.
+
+I first walk the production-equivalent ceiling with `wrangler dev --remote`, then confirm the real per-request spend as a number with `wrangler tail`. Next I check that the Function Calling cutoff is implemented by "remaining budget," not "turn count." Are logs and metrics outside `waitUntil` — that is, outside the budget? Do I understand the SDK's auto-retry well enough not to retry twice over the budget? And is `budget.snapshot()` riding along in the logs so I can chase p99 afterward?
+
+The Edge Runtime is one of the tighter constraints in serverless. It feels cramped at first, but once carrying subrequests as a budget becomes a habit, the design naturally drifts toward shedding wasted round trips. I've come to see the constraint not as an annoying wall but as a good guardrail.
+
+Start by opening `wrangler tail` and counting how many fetches your endpoint spends on one request. The moment the number is visible, the order of what to fix quietly comes into view.

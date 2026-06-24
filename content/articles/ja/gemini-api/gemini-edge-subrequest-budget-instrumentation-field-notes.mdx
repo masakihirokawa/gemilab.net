@@ -1,0 +1,167 @@
+---
+title: "Gemini API を Edge に載せると subrequest 上限で静かに落ちる — 残量を計装して守る運用メモ"
+slug: "gemini-edge-subrequest-budget-instrumentation-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-24T11:30"
+author: "Gemini Lab"
+description: "Gemini API を Cloudflare Workers で運用していると、平常時は問題ないのに負荷やツール連鎖が深まった瞬間だけ subrequest 上限で落ちます。残量をリクエスト単位で計測し、予算として守るための計装パターンと実装を、個人開発で運用しているサイト群の知見からまとめます。"
+tags: ["gemini-api", "cloudflare-workers", "edge-runtime", "subrequest", "observability"]
+highlights:
+  - "1リクエストが消費する subrequest を実測し、予算として可視化する BudgetedFetch ラッパーの実装"
+  - "Function Calling の連鎖・SDK 自動リトライ・ログ送信が水面下で消費する分を切り分ける診断手順"
+  - "上限に当たる前に劣化させる（degrade gracefully）ための予算配分と waitUntil バッチ化の設計"
+---
+
+本番に出してしばらく安定していた Gemini API のエンドポイントが、ある日のアクセス増加の時間帯だけ「Too many subrequests」を返し始める。ログを見ても Gemini への呼び出しは普段どおり1回。けれど Workers のサブリクエスト計上は 50 を超えている——個人開発で運用しているサイト群を Cloudflare Workers に寄せたあと、私はこの「平常時は見えない上限」に二度刺されました。一度目は原因に半日、二度目は計装が効いて 5 分でした。差を分けたのは、subrequest を「エラーが出たら直すもの」ではなく「リクエストごとに残量を持つ予算」として扱えていたかどうかです。
+
+この記事は、その予算という見方を実装に落とすための運用メモです。閾値の数字を覚えるより、自分のアプリが1リクエストで実際に何件消費しているかを測れる状態を先に作るほうが、長く効きます。
+
+## なぜローカルでは絶対に出ないのか
+
+Cloudflare Workers は、1つのリクエスト処理の中で外部へ発行できる接続（`fetch`、Cache API、KV、D1、R2、Durable Objects への到達など）の総数に上限を持ちます。執筆時点で Free は 50、Workers Standard は 1,000 です。Gemini API への呼び出しも、当然このうちの1件として数えられます。
+
+つまずきやすいのは、自分が明示的に書いた `fetch` 以外も計上される点です。Next.js を Workers 上で動かしていれば、キャッシュミス時の ASSETS 取得がサブリクエストになります。ミドルウェアでアクセスログを外部に飛ばしていれば、それも毎回1件です。Gemini を1回叩いているつもりでも、フレームワークと周辺処理が裏で 20〜30 件を黙って積み上げていることは珍しくありません。
+
+ローカルの開発サーバーはこの上限を持たないため、`wrangler dev` でも再現しません。本番相当で観測するには `wrangler dev --remote`、稼働中の実トラフィックを見るには `wrangler tail` が要ります。診断はここを整えるところから始めます。
+
+## 推測でモデルを変える前に、残量を数える
+
+エラーを見ると、まずモデルを軽いものに替えたくなります。けれど subrequest 上限はモデルの重さとは無関係です。最初にやるべきは、1リクエストが実際に何件消費しているかを数値で掴むこと。`wrangler tail` を開いて実トラフィックを流し、1操作あたりの外向き接続数を観察します。「自分のコードは1回しか fetch していないはずなのに 25 件出ている」というギャップに、ここで初めて気づけます。
+
+数えるべき発生源は、私の経験では次の3つに集約されます。
+
+ひとつ目は Function Calling の連鎖深度です。モデルがツールを呼び、その結果を受けてまた別のツールを呼ぶたびに、新しい往復が1件ずつ積まれます。深さ5の連鎖なら、ツール実行の外部 API も合わせて二桁に届きます。ふたつ目は SDK の自動リトライ。`@google/genai` は 429 や 503 を受けると静かに再試行するので、ユーザーから見える1リクエストの内側で3回ぶんが計上されることがあります。みっつ目は、ログ・メトリクス・設定取得のような「小さくて気づきにくい」毎リクエストの送信です。
+
+## 残量を持ち回る — BudgetedFetch の実装
+
+数え方が分かったら、次は「測りながら止める」仕組みにします。私が各エンドポイントの先頭で1つだけ作るのが、リクエスト単位の予算を持つ fetch ラッパーです。これで消費が可視化され、上限に当たる前に判断を差し込めるようになります。
+
+```ts
+// 1リクエストの寿命に紐づく subrequest 予算。Workers は
+// リクエストごとに新しいインスタンスを生成するため、ここで状態を閉じ込める。
+class SubrequestBudget {
+  private used = 0;
+  constructor(private readonly limit: number) {}
+
+  // 消費前に必ず呼ぶ。残量が無ければ false を返し、呼び出し側で劣化させる。
+  reserve(cost = 1): boolean {
+    if (this.used + cost > this.limit) return false;
+    this.used += cost;
+    return true;
+  }
+
+  get remaining(): number {
+    return this.limit - this.used;
+  }
+
+  snapshot() {
+    return { used: this.used, limit: this.limit };
+  }
+}
+
+// 予算を消費しながら外部に出る fetch。reserve に失敗したら
+// ネットワークに出る前に明示的なエラーへ変える（暗黙の上限超過を防ぐ）。
+function makeBudgetedFetch(budget: SubrequestBudget) {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    if (!budget.reserve(1)) {
+      throw new BudgetExceededError(budget.snapshot());
+    }
+    return fetch(input, init);
+  };
+}
+
+class BudgetExceededError extends Error {
+  constructor(public readonly state: { used: number; limit: number }) {
+    super(`subrequest budget exhausted (${state.used}/${state.limit})`);
+    this.name = "BudgetExceededError";
+  }
+}
+```
+
+肝心なのは、`reserve` を「ネットワークに出る直前の関所」にすることです。Workers が投げる `Too many subrequests` は処理のどこで発生するか読みにくく、後始末も難しい。自分の予算で先に止めれば、どのフェーズで枯渇したかが `state` に残り、ユーザーには「いまは要求が複雑すぎたので、条件を絞って再度お試しください」という分かりやすい応答を返せます。沈黙して 500 を返すより、はるかに運用しやすくなります。
+
+予算の初期値は、フレームワークが裏で使う分を引いた「自分が使ってよい枠」にします。私は Standard プラン（上限 1,000）でも、フレームワーク予約を 200 とみなして実効 800 を初期値に置いています。Free の 50 で Function Calling を多用するのは、早晩壁に当たるので本番では避けています。
+
+## ツール連鎖は深さではなく予算で止める
+
+Google AI SDK にはツールループの組み込み制御が無いので、ループは自前で書きます。よくある実装は「最大ループ数」で打ち切る形ですが、私は予算と連動させるほうを好みます。連鎖の途中で外部 API も叩くため、回数より残量で見るほうが実態に合うからです。
+
+```ts
+async function runToolLoop(
+  ai: GoogleGenAI,
+  budget: SubrequestBudget,
+  initialMessages: Content[],
+  tools: Tool[],
+): Promise<string> {
+  let messages = [...initialMessages];
+
+  // モデル1往復 + ツール実行ぶんの余白を残せる間だけ続ける。
+  while (budget.remaining >= 3) {
+    if (!budget.reserve(1)) break; // モデル呼び出しぶんを確保
+    const response = await ai.models.generateContent({
+      model: "gemini-3.1-pro",
+      contents: messages,
+      config: { tools },
+    });
+
+    const calls = response.functionCalls ?? [];
+    if (calls.length === 0) return response.text ?? "";
+
+    for (const call of calls) {
+      if (!budget.reserve(1)) {
+        // ツール実行ぶんの残量が無い → ここまでの文脈で締める
+        return summarizePartial(messages);
+      }
+      const result = await executeTool(call); // 外部 API 1件を消費
+      messages.push({
+        role: "user",
+        parts: [{ functionResponse: { name: call.name, response: result } }],
+      });
+    }
+  }
+  return summarizePartial(messages);
+}
+```
+
+`while (budget.remaining >= 3)` の「3」は、モデル1往復とツール1件、締めの1件を残すための安全余白です。残量で止めると、深い連鎖でも浅い連鎖でも同じ予算観で扱え、上限の手前で確実に着地できます。打ち切り時に例外を投げず `summarizePartial` で「ここまで分かったこと」を返す設計にしておくと、ユーザー体験の劣化が一段なだらかになります。
+
+## 小さな送信は waitUntil で予算の外に出す
+
+ログ・メトリクス・通知のような、レスポンスの正しさに関係しない送信は、リクエストの予算に含めるべきではありません。Workers の `ctx.waitUntil()` を使えば、レスポンスを返したあとにバックグラウンドで処理を継続できます。私自身のサイト群では、ミドルウェアからのログ送信を「毎リクエスト即時」から「終了時に1回まとめて waitUntil で送信」へ変えただけで、1リクエストあたりの平均 subrequest が 18 から 6 まで下がりました。Gemini の応答そのものは1件も触っていないのに、です。
+
+```ts
+export default {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const budget = new SubrequestBudget(800);
+    const logs: LogEvent[] = [];
+
+    const response = await handleRequest(req, env, budget, logs);
+
+    // 体感速度を落とさず、予算に乗せずにログを集約送信する
+    ctx.waitUntil(flushLogs(env, logs, budget.snapshot()));
+    return response;
+  },
+};
+```
+
+`budget.snapshot()` をログに添えておくのも効きます。後から「どのリクエストが何件使ったか」を分布で見られるようになり、上限に近いリクエストの傾向（特定のツール、特定の入力長）が見えてきます。インシデントの再発防止は、この分布の観測に多くを負っています。
+
+## 予算分布を運用指標として読む
+
+計装が入ると、subrequest は単発のエラーから「監視できる時系列」に変わります。私が見ているのは平均ではなく上側のパーセンタイルです。平均 6 件でも p99 が 45 件なら、Free 上限 50 にいつ刺さってもおかしくありません。p99 が上限の 7 割を超え始めたら、ツール連鎖の打ち切り条件かプラン移行のどちらかを動かす、というのを目安にしています。
+
+ここで効いてくるのが、先ほどログに添えた `snapshot()` です。`used` の分布を日次で集計し、上位を占めるエンドポイントとツールの組を洗い出す。たいていは「特定の1ツールが連鎖を引き起こしている」か「入力が長い時だけ SDK リトライが増えている」のどちらかに収束します。原因が言葉で説明できる状態まで持っていければ、対処は前述の予算ロジックの数字をいじるだけで済みます。
+
+なお、Google の Managed Agents のようにエージェントループをプラットフォーム側に寄せる選択肢も増えてきました。ツール実行と計画を Google 管理のサンドボックスに移せれば、Workers 側の subrequest は入口の1〜2件に圧縮できます。連鎖が深く予算管理が重くなってきたら、自前ループを薄く保ったまま重い部分を外に出す——という棲み分けも検討に値します。ただし観測性は自分で確保しづらくなるので、私は当面、入口の計装は手元に残す方針です。
+
+## 本番に出す前に通す確認
+
+最後に、私が新しい Workers エンドポイントを出す前に必ず通している項目です。チェックリストというより、上限事故をほぼ未然に潰すための関所です。
+
+まず `wrangler dev --remote` で本番相当の上限下を踏み、`wrangler tail` で1リクエストの実消費を数値で確認します。次に Function Calling の打ち切りを「回数」ではなく「残量」で実装できているかを見ます。ログとメトリクスは `waitUntil` の外（=予算の外）に出ているか。SDK の自動リトライを把握し、予算と二重に再試行していないか。そして `budget.snapshot()` がログに乗り、p99 を後から追える状態になっているか。
+
+Edge Runtime はサーバレスの中でも特に制約のきつい環境です。最初は窮屈に感じますが、subrequest を予算として持つ習慣がつくと、むしろ無駄な往復を削ぎ落とすクリーンな設計へ自然と寄っていきます。私はこの制約を、面倒な壁ではなく良いガードレールだと感じるようになりました。
+
+まずは `wrangler tail` を開き、自分のエンドポイントが1リクエストで何件 fetch しているかを数えるところから始めてみてください。数字が見えた瞬間に、直すべき場所の順番も静かに見えてきます。
