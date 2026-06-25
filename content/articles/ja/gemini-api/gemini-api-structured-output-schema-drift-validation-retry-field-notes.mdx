@@ -1,0 +1,189 @@
+---
+title: "Gemini API の構造化出力が本番で静かにスキーマから外れるとき — 検証と再試行を計測する運用メモ"
+slug: "gemini-api-structured-output-schema-drift-validation-retry-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-25T16:15"
+author: "Gemini Lab"
+description: "response_schema を指定しても、Gemini の構造化出力は本番で時折スキーマからずれます。失敗を握りつぶさず計測し、finish_reason で原因を切り分け、エラーを差し戻して再試行する。実運用で安定させた検証パイプラインのメモです。"
+tags: ["gemini-api", "structured-output", "pydantic", "validation", "production", "reliability"]
+highlights:
+  - "構造化出力の失敗を「例外」ではなく「失敗率」として計測し、しきい値で警告を出す計装の入れ方"
+  - "finish_reason・空テキスト・スキーマ逸脱を切り分け、原因別にリトライ方針を変える分岐の実装"
+  - "エラー内容をプロンプトに差し戻す『修正付き再試行』と、Union/strict/深いネストで踏んだ地雷の回避策"
+---
+
+`response_schema` を指定したのに、本番のログに `ValidationError` が点々と残る。再現させようとローカルで同じプロンプトを何十回叩いても、きれいに通る。けれど数千リクエストに一度くらい、`rating` が `int` のはずなのに `"9点"` という文字列で返り、後段の集計が落ちている——。
+
+構造化出力は「ほぼ守られる」けれど「必ず守られる」わけではありません。やっかいなのは、この逸脱が静かに起きることです。例外で派手に落ちてくれれば気づけますが、`try/except` で握りつぶしていると、失敗が `null` や既定値にすり替わって、データだけが少しずつ濁っていきます。
+
+ここでは、構造化出力を本番で安定させるために私が落ち着いた考え方を、動くコードとともに整理します。要点は3つです。失敗を例外ではなく「失敗率」として計測すること。原因を `finish_reason` で切り分けること。そして、ただ再試行するのではなく、エラーをモデルに差し戻して直させること。公式ドキュメントが「対応しています」と書く機能を、運用に耐える形にするまでの距離を埋めるメモだと思ってください。
+
+## 「動くコード」と「落ちないコード」は別物
+
+まず、基本形は素直です。Pydantic v2 のモデルを `response_schema` に渡し、返ってきた JSON を `model_validate_json` でパースします。
+
+```python
+import os
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+class ReviewSummary(BaseModel):
+    product_name: str = Field(description="製品名")
+    rating: int = Field(description="1〜5の整数評価", ge=1, le=5)
+    summary: str = Field(description="120文字以内の要約")
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents="このレビューを要約してください: ……",
+    config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=ReviewSummary,
+    ),
+)
+review = ReviewSummary.model_validate_json(resp.text)
+```
+
+これはデモとしては完璧で、社内でも「ちゃんと型で返ってくる」と評判が良いはずです。問題は、このコードが「正常系しか想定していない」ことにあります。`resp.text` が `None` になる経路、スキーマからわずかにずれた JSON が返る経路、安全フィルターが途中で止める経路——どれも本番では現実に起きます。デモで一度動いたことと、無人で何万回も回って落ちないことの間には、はっきりした距離があります。
+
+## 失敗を例外ではなく「率」で持つ
+
+最初にやるべきは、ハンドリングの精緻化ではなく計測です。構造化出力の失敗率がそもそも 0.1% なのか 5% なのかで、打つ手はまったく変わります。私はまず、成功・失敗を素通りで記録するだけの薄い計装を入れます。
+
+```python
+from dataclasses import dataclass, field
+from collections import Counter
+import time
+
+@dataclass
+class StructuredOutputMetrics:
+    total: int = 0
+    success: int = 0
+    failures: Counter = field(default_factory=Counter)  # 原因別
+
+    def record_success(self):
+        self.total += 1
+        self.success += 1
+
+    def record_failure(self, reason: str):
+        self.total += 1
+        self.failures[reason] += 1
+
+    @property
+    def failure_rate(self) -> float:
+        return 0.0 if self.total == 0 else 1 - self.success / self.total
+
+    def report(self) -> str:
+        top = ", ".join(f"{k}={v}" for k, v in self.failures.most_common(5))
+        return f"rate={self.failure_rate:.3%} n={self.total} [{top}]"
+
+METRICS = StructuredOutputMetrics()
+```
+
+ポイントは、失敗を一括りにせず原因別の `Counter` で持つことです。「`finish_reason` が `MAX_TOKENS` で切れた」のと「JSON は完全だが `rating` が範囲外だった」のとでは、まったく別の対処になります。これを混ぜて「失敗 3%」とだけ記録すると、どこを直せばいいのか永遠に分かりません。私は1時間ごとにこの `report()` をログへ吐き、`failure_rate` が普段の3倍を超えたら通知が飛ぶようにしています。モデルのバージョンが切り替わった日や、プロンプトをいじった直後に、この数字が静かに跳ねることがあるからです。
+
+## finish_reason で原因を切り分ける
+
+`resp.text` をいきなり触る前に、レスポンスがそもそも「完走したのか」を確認します。構造化出力が壊れる原因の多くは、Pydantic にたどり着く前の段階にあります。
+
+```python
+def extract_text(resp) -> str:
+    """finish_reason と空テキストを切り分けて、原因をラベル付きで返す"""
+    if not resp.candidates:
+        raise StructuredError("no_candidates")
+
+    cand = resp.candidates[0]
+    fr = cand.finish_reason.name if cand.finish_reason else "UNKNOWN"
+
+    if fr == "MAX_TOKENS":
+        # 出力が長すぎて途中で切れた → JSON は必ず壊れている
+        raise StructuredError("max_tokens")
+    if fr == "SAFETY":
+        raise StructuredError("safety_block")
+    if fr != "STOP":
+        raise StructuredError(f"finish_{fr.lower()}")
+
+    if not resp.text:
+        raise StructuredError("empty_text")
+
+    return resp.text
+
+
+class StructuredError(Exception):
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+```
+
+`MAX_TOKENS` で切れているのにスキーマ逸脱として再試行しても無駄です。この場合は `max_output_tokens` を上げるか、出力を分割する方向に進むべきで、同じプロンプトを叩き直しても結果は変わりません。`SAFETY` も同様で、再試行ではなく入力側の見直しが要ります。`finish_reason` を最初の分岐に据えると、「再試行して意味がある失敗」と「再試行しても無駄な失敗」をきれいに分けられます。これが分かれているだけで、リトライ予算の無駄打ちがぐっと減ります。
+
+## ただ再試行せず、エラーを差し戻す
+
+スキーマには合っているが値がおかしい、あるいは JSON が微妙に崩れている——この種の失敗は、同じプロンプトをそのまま投げ直すより、何が悪かったかをモデルに伝えたほうが圧倒的に通りやすくなります。Pydantic の `ValidationError` は人間にもモデルにも読める説明を持っているので、それをそのまま次のプロンプトに差し戻します。
+
+```python
+import json
+from typing import Type, TypeVar
+from pydantic import BaseModel, ValidationError
+
+T = TypeVar("T", bound=BaseModel)
+
+def generate_structured(prompt: str, model_class: Type[T],
+                        model: str = "gemini-2.5-flash",
+                        max_retries: int = 3) -> T:
+    current = prompt
+    for attempt in range(max_retries):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=current,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=model_class,
+                ),
+            )
+            text = extract_text(resp)          # finish_reason 分岐
+            obj = model_class.model_validate_json(text)
+            METRICS.record_success()
+            return obj
+
+        except StructuredError as e:
+            METRICS.record_failure(e.reason)
+            if e.reason in ("max_tokens", "safety_block"):
+                raise                          # 再試行しても無駄な失敗は即時中断
+        except (ValidationError, json.JSONDecodeError) as e:
+            METRICS.record_failure("validation")
+            # ★ エラー内容を差し戻して「直してもらう」
+            current = (
+                f"{prompt}\n\n"
+                f"前回の出力は次の理由で不正でした。これを修正し、"
+                f"スキーマに厳密に従った JSON だけを返してください:\n{e}"
+            )
+        time.sleep(1.5 * (attempt + 1))        # 指数バックオフ（レート制限対策も兼ねる）
+
+    raise StructuredError("exhausted_retries")
+```
+
+「修正付き再試行」は体感で効きます。私の運用では、素の再試行だと2回目も同じ失敗を繰り返すことが多かったのに対し、`ValidationError` の本文を差し戻すと、ほとんどが2回目で通るようになりました。モデルは「`rating` は1〜5の整数である」という制約を、最初のプロンプトでは見落としても、失敗を具体的に指摘されると素直に直してくれます。一方で `max_tokens` と `safety_block` は早期に `raise` して再試行ループから抜けます。直らない失敗にリトライ予算を溶かさないためです。
+
+## 踏んでから気づく地雷
+
+ここからは、ドキュメントには大きく書かれていないのに本番でぶつかる落とし穴です。どれも私が一度はまったものです。
+
+**Union 型はスキーマ変換で崩れやすい。** `Union[str, int]` のような型は JSON Schema の `anyOf` に変換されますが、Gemini はこれを安定して解釈してくれません。型は1つに絞り、「値がないかもしれない」は `Optional[str] = None` で表現し、数値は別フィールドに分けるのが無難でした。曖昧さをスキーマに残すほど、逸脱の確率は上がります。
+
+**Pydantic の `strict=True` は LLM 相手だと裏目に出る。** 厳格モードでは `"85"` を `int` に入れた瞬間に弾かれます。ところが LLM は数値をしばしば文字列で返すので、強制変換(coercion)を許す既定の挙動のほうが現実に合います。型の純度より、通る確率を優先する場面です。
+
+**ネストは2階層までに畳む。** 3階層を超えると、Gemini が構造を「解釈」して勝手にフラット化したり、フィールド名を言い換えたりし始めます。深い木を1回で取ろうとせず、フラットなモデルにするか、2回のコールに割るほうが結果が安定しました。
+
+**Enum で逃げ道を塞ぐ。** 自由記述の `str` を許すと、`"positive"` のつもりが `"Positive"` や `"ポジティブ"` で返ってきます。`str, Enum` を継承させて許可値を列挙すると、想定外の文字列が入り込む余地そのものを消せます。
+
+個人開発で壁紙アプリのレビューを Gemini で分類していたとき、私自身この `strict=True` で半日溶かしたことがあります。ローカルのテストデータでは整数しか来ないので素通りし、本番でだけ実ユーザーのレビューに引っぱられて文字列の評価値が混じり、集計バッチが夜中に静かに止まっていました。失敗率の計装を入れていなかったので、気づいたのは翌朝のデータの欠けからでした。私はこの一件以来、構造化出力には必ず「率の計測」と「原因別のカウント」を先に仕込むようにしています。
+
+## まず入れるべき一手
+
+新しく構造化出力を本番に載せるなら、リトライ設計より先に、成功・失敗を原因別に数える計装を1つだけ入れてみてください。失敗率が見えると、`finish_reason` 分岐を足すべきか、`strict` を外すべきか、ネストを畳むべきかが、推測ではなく数字で決まります。直す場所が分かってから、この記事のリトライ関数を重ねれば十分間に合います。

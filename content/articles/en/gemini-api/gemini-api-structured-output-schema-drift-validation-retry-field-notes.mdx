@@ -1,0 +1,187 @@
+---
+title: "When Gemini's Structured Output Quietly Drifts From Your Schema — Field Notes on Measuring Validation and Retries"
+slug: "gemini-api-structured-output-schema-drift-validation-retry-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-25T16:15"
+author: "Gemini Lab"
+description: "Even with response_schema set, Gemini's structured output occasionally drifts in production. Stop swallowing failures, measure them, split causes by finish_reason, and feed errors back for a corrected retry. Field notes from stabilizing a validation pipeline."
+tags: ["gemini-api", "structured-output", "pydantic", "validation", "production", "reliability"]
+highlights:
+  - "How to instrument structured-output failures as a rate, not an exception, and alert on a threshold"
+  - "Branching on finish_reason vs. empty text vs. schema drift so retry policy fits the actual cause"
+  - "A corrected-retry pattern that feeds the error back, plus the Union/strict/deep-nesting landmines to avoid"
+---
+
+You set `response_schema`, yet the production logs keep showing scattered `ValidationError`s. You try to reproduce it locally, fire the same prompt fifty times, and every one parses cleanly. But roughly once in a few thousand requests, `rating` — which is supposed to be an `int` — comes back as the string `"9 points"`, and the downstream aggregation falls over.
+
+Structured output is *mostly* honored, not *always* honored. What makes it nasty is how quietly the drift happens. If it threw a loud exception you'd notice; but wrapped in a `try/except`, the failure gets swapped for a `null` or a default, and your data slowly turns murky instead.
+
+This is how I eventually settled on running structured output in production, with code you can lift. Three ideas carry the weight: treat failures as a *rate*, not an exception; split the cause with `finish_reason`; and instead of blindly retrying, hand the error back to the model and let it fix itself. Think of it as closing the gap between a feature the docs call "supported" and something that actually survives unattended traffic.
+
+## "It runs" and "it doesn't fall over" are different claims
+
+The happy path is simple. Pass a Pydantic v2 model as `response_schema`, then parse the returned JSON with `model_validate_json`.
+
+```python
+import os
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+class ReviewSummary(BaseModel):
+    product_name: str = Field(description="product name")
+    rating: int = Field(description="integer rating 1-5", ge=1, le=5)
+    summary: str = Field(description="summary under 120 chars")
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents="Summarize this review: ...",
+    config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=ReviewSummary,
+    ),
+)
+review = ReviewSummary.model_validate_json(resp.text)
+```
+
+As a demo this is flawless, and your team will rightly say "look, it comes back typed." The trouble is that it only models the happy path. The route where `resp.text` is `None`, the route where slightly-off JSON comes back, the route where a safety filter cuts it short — all of them are real in production. There's a clear distance between a demo that worked once and a job that runs tens of thousands of times unattended without breaking.
+
+## Hold failure as a rate, not an exception
+
+The first move isn't smarter handling — it's measurement. Whether your structured-output failure rate is 0.1% or 5% completely changes what you should do about it. So I start with a thin layer that just records success and failure, nothing clever.
+
+```python
+from dataclasses import dataclass, field
+from collections import Counter
+
+@dataclass
+class StructuredOutputMetrics:
+    total: int = 0
+    success: int = 0
+    failures: Counter = field(default_factory=Counter)  # by cause
+
+    def record_success(self):
+        self.total += 1
+        self.success += 1
+
+    def record_failure(self, reason: str):
+        self.total += 1
+        self.failures[reason] += 1
+
+    @property
+    def failure_rate(self) -> float:
+        return 0.0 if self.total == 0 else 1 - self.success / self.total
+
+    def report(self) -> str:
+        top = ", ".join(f"{k}={v}" for k, v in self.failures.most_common(5))
+        return f"rate={self.failure_rate:.3%} n={self.total} [{top}]"
+
+METRICS = StructuredOutputMetrics()
+```
+
+The key is not lumping failures together — keep a per-cause `Counter`. "Cut off because `finish_reason` was `MAX_TOKENS`" and "JSON was complete but `rating` was out of range" call for entirely different fixes. Blend them into a single "3% failure" number and you'll never know where to look. I dump this `report()` to logs hourly and page myself when `failure_rate` jumps past three times its baseline — because the day a model version flips, or right after I touch the prompt, that number quietly spikes.
+
+## Split the cause with finish_reason
+
+Before you touch `resp.text` at all, confirm the response actually *finished*. Most structured-output breakage happens before Pydantic ever sees the text.
+
+```python
+class StructuredError(Exception):
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+def extract_text(resp) -> str:
+    """Separate finish_reason and empty text, returning a labeled cause."""
+    if not resp.candidates:
+        raise StructuredError("no_candidates")
+
+    cand = resp.candidates[0]
+    fr = cand.finish_reason.name if cand.finish_reason else "UNKNOWN"
+
+    if fr == "MAX_TOKENS":
+        # Output was too long and got cut → JSON is guaranteed broken
+        raise StructuredError("max_tokens")
+    if fr == "SAFETY":
+        raise StructuredError("safety_block")
+    if fr != "STOP":
+        raise StructuredError(f"finish_{fr.lower()}")
+
+    if not resp.text:
+        raise StructuredError("empty_text")
+
+    return resp.text
+```
+
+Retrying a `MAX_TOKENS` cutoff as if it were schema drift is wasted effort. There you should raise `max_output_tokens` or split the output; re-firing the same prompt won't change a thing. `SAFETY` is the same — it needs an input rethink, not a retry. Putting `finish_reason` at the front of your branching cleanly separates "failures worth retrying" from "failures retrying can't fix," and that alone cuts a lot of wasted retry budget.
+
+## Don't just retry — feed the error back
+
+Schema-shaped but wrong values, or slightly malformed JSON — this kind of failure clears far more easily if you tell the model what went wrong than if you resend the same prompt. Pydantic's `ValidationError` carries an explanation that's readable to both humans and models, so hand it straight back in the next prompt.
+
+```python
+import json, time
+from typing import Type, TypeVar
+from pydantic import BaseModel, ValidationError
+
+T = TypeVar("T", bound=BaseModel)
+
+def generate_structured(prompt: str, model_class: Type[T],
+                        model: str = "gemini-2.5-flash",
+                        max_retries: int = 3) -> T:
+    current = prompt
+    for attempt in range(max_retries):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=current,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=model_class,
+                ),
+            )
+            text = extract_text(resp)          # finish_reason branch
+            obj = model_class.model_validate_json(text)
+            METRICS.record_success()
+            return obj
+
+        except StructuredError as e:
+            METRICS.record_failure(e.reason)
+            if e.reason in ("max_tokens", "safety_block"):
+                raise                          # abort failures retrying can't fix
+        except (ValidationError, json.JSONDecodeError) as e:
+            METRICS.record_failure("validation")
+            # Feed the error back and ask for a fix
+            current = (
+                f"{prompt}\n\n"
+                f"Your previous output was invalid for this reason. Fix it and "
+                f"return only JSON that strictly follows the schema:\n{e}"
+            )
+        time.sleep(1.5 * (attempt + 1))        # exponential backoff (also rate-limit friendly)
+
+    raise StructuredError("exhausted_retries")
+```
+
+The corrected retry is noticeably effective. In my runs, a plain retry would often repeat the same failure on the second attempt, whereas feeding back the `ValidationError` body got most cases through on the second try. The model may overlook "`rating` is an integer from 1 to 5" in the first prompt, but pointed at the specific failure, it tends to comply. Meanwhile `max_tokens` and `safety_block` raise early and leave the loop, so retry budget isn't burned on failures that won't heal.
+
+## Landmines you only learn by stepping on them
+
+These are the pitfalls the docs don't shout about but you hit in production. I've tripped over each at least once.
+
+**Union types break in schema conversion.** A type like `Union[str, int]` converts to JSON Schema's `anyOf`, which Gemini doesn't interpret reliably. Narrow to one type, express "may be absent" as `Optional[str] = None`, and split numbers into their own field. The more ambiguity you leave in the schema, the higher the drift rate.
+
+**Pydantic's `strict=True` backfires against an LLM.** In strict mode, dropping `"85"` into an `int` is rejected on the spot. But LLMs frequently return numbers as strings, so the default coercing behavior fits reality better. This is a place to favor pass-rate over type purity.
+
+**Fold nesting down to two levels.** Past three levels, Gemini starts "interpreting" the structure — flattening it on its own or renaming fields. Rather than grabbing a deep tree in one call, a flat model or two calls came out far more stable.
+
+**Close the escape hatches with Enum.** Allow a free-form `str` and your intended `"positive"` comes back as `"Positive"` or a translated variant. Inheriting `str, Enum` to enumerate the allowed values removes the room for unexpected strings entirely.
+
+As an indie developer classifying wallpaper-app reviews with Gemini, I lost half a day to exactly this `strict=True` trap. My local test data only ever contained integers, so it sailed through, and only in production did real user reviews pull in string-valued ratings, quietly stalling the aggregation batch overnight. I hadn't instrumented the failure rate, so I only noticed from the gap in the next morning's data. Since then I always wire up rate measurement and per-cause counts *before* anything else on structured output.
+
+## The one move to make first
+
+If you're putting structured output into production, before any retry design, add just one thing: instrumentation that counts success and failure by cause. Once the failure rate is visible, whether to add a `finish_reason` branch, drop `strict`, or fold the nesting becomes a decision driven by numbers instead of guesswork. Layer the retry function from this article on once you know where to fix — it'll be in time.
