@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEPRECATION — 画像プレビューモデル2種が本日6/25に停止。利用中の自動化・スクリプトは本日中の移行が必須です",
-    "GA — 入れ替わりでgemini-3.1-flash-imageとgemini-3-pro-imageがネイティブ画像モデルの正式版になりました",
-    "MEDIA — 動画→画像生成に対応。動画を文脈として渡し高品質なサムネイル等を生成できます（3.1 flash image限定）",
-    "AUDIO — Gemini 3.1 Flash TTSプレビューが追加。低コストで表情豊か、制御しやすい音声合成です",
-    "MODEL — Gemini 3.5 Flashは一般提供済み。3.1 Proをほぼ全ベンチで上回りつつ4倍高速に動作します",
-    "SEARCH — File Searchはマルチモーダル検索に対応。gemini-embedding-2で画像をネイティブに埋め込み・検索できます",
+    "MODEL — Gemini 3.5 Flashが一般提供。3.1 Proをほぼ全ベンチで上回りつつ高速に動きます",
+    "API — Interactions APIがGAに到達。Geminiモデルとエージェントを扱う主要APIになりました",
+    "AGENTS — Managed Agentsが公開プレビュー。Googleホストの隔離Linuxサンドボックスで自律エージェントを動かせます",
+    "COST — Project Spend Capsでプロジェクト単位のGemini API月額上限を設定できます",
+    "SHEETS — Gemini in Sheetsが周辺データを解析し、数式エラーをワンクリックで診断・修正します",
+    "STUDIO — Google AI Studioが刷新され、スターターアプリのギャラリーが拡充されました",
   ],
   en: [
-    "DEPRECATION — The two image preview models shut down today, June 25; automations using them must migrate immediately",
-    "GA — In their place, gemini-3.1-flash-image and gemini-3-pro-image are now the generally available native image models",
-    "MEDIA — Video-to-image generation arrives: pass a video as context to create high-quality thumbnails (3.1 flash image only)",
-    "AUDIO — Gemini 3.1 Flash TTS preview lands: a low-cost, expressive, steerable text-to-speech model",
-    "MODEL — Gemini 3.5 Flash is GA, beating 3.1 Pro on nearly every benchmark while running about 4x faster",
-    "SEARCH — File Search now supports multimodal search, embedding and searching images natively via gemini-embedding-2",
+    "MODEL — Gemini 3.5 Flash is generally available, beating 3.1 Pro on nearly all benchmarks while running faster",
+    "API — The Interactions API reaches GA as the primary way to work with Gemini models and agents",
+    "AGENTS — Managed Agents enter public preview, running autonomous agents in Google-hosted isolated Linux sandboxes",
+    "COST — Project Spend Caps let you set a monthly dollar limit on Gemini API usage per project",
+    "SHEETS — Gemini in Sheets diagnoses and fixes formula errors in one click by analyzing surrounding data",
+    "STUDIO — Google AI Studio gets a developer-first refresh with an expanded gallery of starter apps",
   ],
 };
 
