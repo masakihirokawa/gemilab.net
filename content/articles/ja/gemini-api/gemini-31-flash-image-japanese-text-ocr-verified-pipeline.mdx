@@ -1,0 +1,205 @@
+---
+title: "Gemini 3.1 Flash Image で日本語テキスト入り画像を安定生成する ― OCR検証ゲート付きパイプライン"
+slug: "gemini-31-flash-image-japanese-text-ocr-verified-pipeline"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-26T04:52"
+author: "Gemini Lab"
+description: "プレビュー停止後の GA 版 gemini-3.1-flash-image で、画像内の日本語テキストが崩れる問題に向き合います。生成→OCR検証→再生成／合成フォールバックの二段構えを、動くコードと無人運用のリトライ設計まで含めて記録しました。"
+tags: ["gemini", "gemini-api", "画像生成", "nano-banana", "ocr", "個人開発"]
+highlights:
+  - "生成画像の日本語が文字化けして困っていた人が、OCR一致率でゲートする検証コードを今日コピペで動かせる"
+  - "gemini-3.1-flash-image での生成→読み戻し検証→Pillow合成フォールバックの二段構えを、判定しきい値ごと実装で入手できる"
+  - "無人運用でリトライが暴走しないよう、1枚あたりの概算コストと再試行上限から月額の上限を逆算して設計できる"
+---
+
+個人開発で壁紙アプリやブログのサムネイルを自動生成していると、ある日とても地味な壁にぶつかります。背景や構図はきれいなのに、画像の中に入れたかった「今週の更新」「無料配布中」といった日本語の文字が、微妙に崩れているのです。一文字だけ別の漢字になっていたり、濁点が消えていたり、二行目が判読できなかったり。遠目には気づかず、拡大して初めて気づく類のずれです。
+
+2026年6月25日にプレビュー版の `gemini-3.1-flash-image-preview` と `gemini-3-pro-image-preview` が停止し、入れ替わりで GA 版の `gemini-3.1-flash-image`（Flash Image）と `gemini-3-pro-image`（Pro Image）が正式提供になりました。テキスト描画は世代を追うごとに着実に良くなっています。それでも「無人で回して、出てきた画像をそのまま公開する」という運用では、たまの文字化けが必ず事故になります。私自身、この一枚の崩れを人手で目視していた時期があり、自動化の意味が半分なくなっていました。
+
+そこでたどり着いたのが、生成しただけで信用せず、出てきた画像を一度モデルに読み戻させて文字の一致を確認し、ダメなら作り直すか合成に切り替える、という二段構えでした。以下では、その検証ゲート付きパイプラインを、判定しきい値とリトライ設計まで含めて記録します。
+
+## プレビュー停止後の前提：どのモデルで文字を描くか
+
+まず描画を担当するモデルを決めます。GA 版の二つは、文字の正確さと速度・コストのバランスが異なります。私の用途（壁紙アプリの告知バナーやブログ OGP のように、短い日本語を数行入れる）での体感を、目安として整理します。
+
+<table>
+<thead>
+<tr><th>観点</th><th>gemini-3.1-flash-image（Flash Image）</th><th>gemini-3-pro-image（Pro Image）</th></tr>
+</thead>
+<tbody>
+<tr><td>短い日本語テキストの正確さ</td><td>実用域。数行までは安定</td><td>より高い。多行・小さめの文字でも崩れにくい</td></tr>
+<tr><td>1枚あたりの速度</td><td>速い（数秒オーダー）</td><td>やや遅い</td></tr>
+<tr><td>1枚あたりの概算コスト</td><td>低い</td><td>Flash の数倍</td></tr>
+<tr><td>動画→画像生成</td><td>対応（gemini-3.1-flash-image 限定）</td><td>非対応</td></tr>
+<tr><td>無人・大量生成の主力</td><td><strong>こちらを既定に</strong></td><td>失敗時の作り直し用に温存</td></tr>
+</tbody>
+</table>
+
+個人的には、主力を Flash Image に置き、後述する検証で2回続けて落ちた画像だけ Pro Image に格上げして作り直す、という使い分けが費用対効果の面で一番しっくりきました。最初から Pro Image で全枚数を回すと、崩れにくくはなりますがコストが Flash の数倍に膨らみ、無人運用の意味が薄れます。文字の正確さは「全部を高級モデルで」ではなく「怪しいものだけ格上げ」で取りにいくのが現実的だと考えています。
+
+## 文字を「描かせる」プロンプトの組み立て方
+
+テキスト入り画像で最初に効くのは、プロンプトの書き方です。私が安定させるために守っているのは三点です。
+
+### 入れたい文字列を「コピーすべき文字列」として明示する
+
+説明文の中に紛れ込ませるのではなく、描いてほしい文字をそのまま、変更不可の引用として渡します。「タイトルとして〜という雰囲気の文字を」という曖昧な指示は、モデルに言い換えや誤変換の余地を与えます。
+
+### 文字数・行数・配置を数値で固定する
+
+「中央に大きく」ではなく「上から25%の位置に1行、最大8文字」のように、レイアウトを数値で縛ると崩れが減ります。長い文・多行はそれだけで失敗率が上がるため、文字情報はできるだけ短く保ちます。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+MODEL_FAST = "gemini-3.1-flash-image"
+MODEL_STRONG = "gemini-3-pro-image"
+
+def build_prompt(headline: str) -> str:
+    # 描いてほしい文字を「一字一句そのまま」という制約として渡す
+    return (
+        "縦長(9:16)のシンプルな告知バナー画像を生成してください。\n"
+        "落ち着いた藍色の背景に、やわらかな和紙のテクスチャ。\n"
+        f"画像の上から25%の位置に、次の文字を一字一句そのまま、横書き1行で大きく描く: 「{headline}」\n"
+        "・文字は最大10文字。装飾フォントは避け、可読性の高いゴシック体。\n"
+        "・指定した文字以外の文字、英数字、ロゴ、署名は一切描かない。\n"
+        "・濁点・半濁点・小書き文字を省略しない。"
+    )
+
+def generate_image(model: str, headline: str) -> bytes:
+    resp = client.models.generate_content(
+        model=model,
+        contents=build_prompt(headline),
+        config=types.GenerateContentConfig(response_modalities=["Image"]),
+    )
+    for part in resp.candidates[0].content.parts:
+        if part.inline_data and part.inline_data.mime_type.startswith("image/"):
+            return part.inline_data.data  # PNG バイト列
+    raise RuntimeError("画像パートが返りませんでした")
+```
+
+「指定した文字以外は描かない」という否定の指示は、英字の署名や謎のロゴが勝手に入り込むのを抑えるのに効きます。和文では特に、頼んでもいないアルファベットが装飾として混入しやすいので、私はこの一行をほぼ毎回入れています。
+
+## 生成しただけでは信用できない：OCR検証ゲートを挟む
+
+ここが今回の肝です。出てきた画像を、もう一度モデルに「何と書いてありますか」と尋ねて読み戻させ、意図した文字列と突き合わせます。専用の OCR ライブラリを足してもよいのですが、私はマルチモーダルに強い `gemini-3.5-flash` に読ませる方法を選びました。和文の手書き風や装飾文字でも素直に拾ってくれて、依存も増えません。
+
+読み戻した文字列と元の文字列を、空白や約物を除いて比較し、文字単位の一致率を出します。完全一致だけを合格にすると、句読点ひとつのゆらぎで落ちすぎるので、私はしきい値を一致率で持たせています。
+
+```python
+import re
+from difflib import SequenceMatcher
+
+def read_back_text(image_bytes: bytes) -> str:
+    resp = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            "この画像に描かれている日本語の文字だけを、装飾やレイアウトの説明を一切付けず、"
+            "読める通りにそのまま出力してください。文字が無ければ空文字を返してください。",
+        ],
+    )
+    return resp.text.strip()
+
+def normalize(s: str) -> str:
+    # 比較を安定させるため空白・約物を除去
+    return re.sub(r"[\s、。・「」!！?？,.\-]", "", s)
+
+def char_match_ratio(expected: str, actual: str) -> float:
+    e, a = normalize(expected), normalize(actual)
+    if not e:
+        return 1.0
+    return SequenceMatcher(None, e, a).ratio()
+
+# しきい値：私は 0.9 を合格ラインにしています
+PASS_RATIO = 0.9
+```
+
+実運用で見えてきたのは、一致率0.9を境にすると、人間が拡大して見て「これは出せない」と感じる崩れのほとんどがちょうど弾かれる、という肌感です。0.8まで緩めると一字違いがすり抜け、0.95まで厳しくすると問題ない約物のゆらぎで作り直しが頻発しました。ここは扱う文言の長さで多少前後するので、自分のデータで一度キャリブレーションすることをお勧めします。
+
+## 崩れたら作り直す／合成に切り替える二段構え
+
+検証で落ちたときの動きを設計します。やみくもに作り直すとコストが読めなくなるので、私は段階を決めています。
+
+1. Flash Image で生成し、OCR検証にかける。
+2. 落ちたら同じ Flash Image でもう一度だけ作り直す（プロンプトは固定、乱数のゆらぎに賭ける）。
+3. それでも落ちたら Pro Image に格上げして作り直す。
+4. Pro Image でも落ちたら、文字なしの背景だけを生成し、テキストは Pillow でコードから合成する。
+
+最後の合成フォールバックが効きます。背景画像の生成はモデルに任せ、肝心の文字だけは自分のフォントで確実に焼き込むので、もう絶対に文字化けしません。告知文のように「正確さが命」の文字こそ、最終的にはコード側で描くのが安全だと考えています。
+
+```python
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
+
+def composite_text(bg_bytes: bytes, headline: str, font_path: str) -> bytes:
+    img = Image.open(BytesIO(bg_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype(font_path, size=int(img.width * 0.09))
+    bbox = draw.textbbox((0, 0), headline, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = (img.width - tw) // 2
+    y = int(img.height * 0.25)
+    # 視認性のための薄い影
+    draw.text((x + 2, y + 2), headline, font=font, fill=(0, 0, 0))
+    draw.text((x, y), headline, font=font, fill=(255, 255, 255))
+    out = BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+def produce_banner(headline: str, font_path: str) -> bytes:
+    attempts = [
+        (MODEL_FAST, False), (MODEL_FAST, False), (MODEL_STRONG, False),
+    ]
+    for model, _ in attempts:
+        img = generate_image(model, headline)
+        actual = read_back_text(img)
+        ratio = char_match_ratio(headline, actual)
+        print(f"{model}: 読み戻し='{actual}' 一致率={ratio:.2f}")
+        if ratio >= PASS_RATIO:
+            return img
+    # 最終手段：文字なし背景＋コード合成
+    bg_prompt = "藍色と和紙テクスチャの縦長(9:16)背景。文字・ロゴ・署名は一切描かない。"
+    bg = client.models.generate_content(
+        model=MODEL_FAST, contents=bg_prompt,
+        config=types.GenerateContentConfig(response_modalities=["Image"]),
+    ).candidates[0].content.parts[0].inline_data.data
+    return composite_text(bg, headline, font_path)
+```
+
+## 無人運用でのコストとリトライ上限の設計
+
+二段構えは安心ですが、リトライは費用に直結します。私が無人パイプラインを組むとき必ず先に決めるのは、1枚あたりの上限コストです。
+
+ざっくり、Flash Image の生成1回を基準コスト1とすると、最悪ケース（Flash×2回＋Pro×1回＋検証の読み戻し×3回＋背景生成1回）で、1枚あたりの想定コストは基準の数倍になります。検証の読み戻しは `gemini-3.5-flash` のテキスト出力なので画像生成より桁違いに安く、コストの主役はあくまで画像生成側です。Pro Image は Flash の数倍なので、格上げの回数こそが月額を左右します。
+
+そこで、月に2,000枚を生成する想定なら、「Pro 格上げに到達する割合が全体の10%を超えたらアラートを出す」という上限を置いています。経験的に、プロンプトと文言設計がまともなら格上げ到達は数%に収まります。10%を超えるときは、たいてい文言が長すぎるか、行数を欲張りすぎているサインです。リトライ回数を増やして力技で通すより、入力の文字数を削るほうが、結果的にコストも品質も改善しました。
+
+料金の絶対額はモデル改定で変わるため、公式の最新の課金ページで1枚あたりの単価を確認し、上の「基準の数倍」に当てはめて月額の上限を逆算してください。私は壁紙アプリの AdMob 収益から逆算して、図版生成費が利益を圧迫しない範囲に収まるよう、この上限を毎月見直しています。
+
+## つまずきやすい点（本番で見えてきたこと）
+
+無人で回していて、ログを見返して気づいた落とし穴をいくつか残します。
+
+### 読み戻しモデルが「親切に」言い換えてくる
+
+検証用のプロンプトで「読める通りにそのまま」と強く縛らないと、`gemini-3.5-flash` が気を利かせて誤字を正しい表記に直して返すことがあります。すると、画像は崩れているのに一致率が高く出て、ゲートをすり抜けます。読み戻しは「描画されている字をそのまま写す」タスクであって「正しい日本語を推測する」タスクではない、と明示するのが対処です。
+
+### 約物・空白のゆらぎで落ちすぎる
+
+正規化で句読点や空白を落としておかないと、「無料配布中！」と「無料配布中」のような実質同じ表記が不一致になります。比較前の `normalize()` は地味ですが、合格率の安定に一番効きました。
+
+### preview 時代のモデル名がコードに残っている
+
+`-preview` サフィックス付きのモデル名は6月25日に停止済みです。古いスクリプトやサンプルをコピーしてくると、ある日突然エラーで止まります。Dolice Labs で運用している生成系は、停止日の前にモデル名を GA 版へ一括置換しておきました。期限付きの非推奨は、見落とすと無人運用が静かに死ぬので、移行先を前もって決めておくのが安全です。
+
+## まとめ：次の一歩
+
+もし今、生成画像の文字化けを目視で弾いているなら、まずは `read_back_text()` と `char_match_ratio()` の二つだけを既存の生成処理の後ろに差し込んでみてください。しきい値0.9で落ちた枚数をログに出すだけでも、自分のデータで「どのくらい崩れているのか」が数字で見えるようになります。合成フォールバックや Pro 格上げは、その数字を見てから足すかどうかを決めれば十分です。
+
+検証ゲートを一つ挟むだけで、無人生成は「たまに事故る仕組み」から「事故ったら自分で気づいて直す仕組み」に変わります。私自身、この一段を入れてから図版の目視確認をやめられました。同じように画像の文字で消耗している方の役に立てば嬉しいです。

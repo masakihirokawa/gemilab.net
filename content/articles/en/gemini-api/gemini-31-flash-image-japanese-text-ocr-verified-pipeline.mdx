@@ -1,0 +1,202 @@
+---
+title: "Reliable Text-in-Image with Gemini 3.1 Flash Image — an OCR-Verified Pipeline"
+slug: "gemini-31-flash-image-japanese-text-ocr-verified-pipeline"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-26T04:52"
+author: "Gemini Lab"
+description: "After the preview shutdown, the GA gemini-3.1-flash-image still occasionally garbles text baked into images. Here is a generate -> read-back-verify -> regenerate/composite pipeline, with working code and an unattended retry budget."
+tags: ["gemini", "gemini-api", "image-generation", "nano-banana", "ocr", "indie-dev"]
+highlights:
+  - "If garbled text in generated images keeps biting you, you can drop in an OCR match-ratio gate today and copy-paste the verification code"
+  - "You'll get the full two-stage pattern for gemini-3.1-flash-image: generate, read back with a vision model, and fall back to Pillow compositing, thresholds included"
+  - "You can size a monthly cost ceiling for unattended runs by reasoning from per-image cost and a capped retry budget instead of guessing"
+---
+
+When you automate image generation as an indie developer — banners for a wallpaper app, OGP thumbnails for a blog — you eventually hit a quietly maddening wall. The composition looks great, but the Japanese line you wanted baked into the image, something like "Free this week," comes out subtly wrong. One character swapped for a similar one, a diacritic dropped, the second line illegible. You don't notice at a glance; you notice when you zoom in.
+
+On June 25, 2026 the preview models `gemini-3.1-flash-image-preview` and `gemini-3-pro-image-preview` were shut down, and the GA versions `gemini-3.1-flash-image` (Flash Image) and `gemini-3-pro-image` (Pro Image) took their place. Text rendering keeps getting better with each generation. Even so, in an unattended setup — spin it up, publish whatever comes out — the occasional garble is guaranteed to become an incident. I spent a while eyeballing that one bad frame by hand, which defeated half the point of automating.
+
+What I landed on is a two-stage approach: don't trust the output, read the image back with a model to confirm the characters, and if it fails, either regenerate or switch to compositing. This article records that verification-gated pipeline, thresholds and retry design included.
+
+## After the shutdown: which model should draw the text
+
+First, pick the model that draws. The two GA options trade text accuracy against speed and cost differently. Here is my rough feel for my use case (a few short Japanese characters on wallpaper-app announcement banners and blog OGP images).
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>gemini-3.1-flash-image (Flash Image)</th><th>gemini-3-pro-image (Pro Image)</th></tr>
+</thead>
+<tbody>
+<tr><td>Accuracy of short Japanese text</td><td>Production-usable; stable up to a few lines</td><td>Higher; holds up on multi-line, smaller text</td></tr>
+<tr><td>Speed per image</td><td>Fast (seconds)</td><td>Somewhat slower</td></tr>
+<tr><td>Approx. cost per image</td><td>Low</td><td>A few times Flash</td></tr>
+<tr><td>Video-to-image</td><td>Supported (gemini-3.1-flash-image only)</td><td>Not supported</td></tr>
+<tr><td>Workhorse for unattended bulk runs</td><td><strong>Make this the default</strong></td><td>Reserve for regeneration on failure</td></tr>
+</tbody>
+</table>
+
+Personally, defaulting to Flash Image and only promoting an image to Pro Image after it fails verification twice in a row gave me the best cost-effectiveness. Running every image through Pro Image from the start reduces garbling but inflates cost to several times Flash, which undercuts the point of unattended runs. I think the realistic way to win on text accuracy is "promote only the suspicious ones," not "use the premium model for everything."
+
+## How to prompt the model to actually draw the text
+
+The first lever for text-in-image is how you prompt. Three rules I keep:
+
+### Pass the target string as text to copy verbatim
+
+Don't bury it inside a description; hand over the exact characters as an unchangeable quote. A vague "a title that feels like ~" leaves room for paraphrasing and mis-conversion.
+
+### Pin character count, line count, and placement with numbers
+
+Instead of "large in the center," constrain layout numerically: "one line at 25% from the top, max 8 characters." Long or multi-line text raises the failure rate on its own, so keep the text payload short.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+MODEL_FAST = "gemini-3.1-flash-image"
+MODEL_STRONG = "gemini-3-pro-image"
+
+def build_prompt(headline: str) -> str:
+    # Pass the desired characters as a verbatim, do-not-alter constraint
+    return (
+        "Generate a simple vertical (9:16) announcement banner image.\n"
+        "Calm indigo background with a soft washi-paper texture.\n"
+        f"At 25% from the top, draw EXACTLY these characters, one horizontal line, large: '{headline}'\n"
+        "- Max 10 characters. Avoid decorative fonts; high-legibility gothic.\n"
+        "- Draw NO other characters, no alphanumerics, no logo, no signature.\n"
+        "- Do not omit diacritics or small kana."
+    )
+
+def generate_image(model: str, headline: str) -> bytes:
+    resp = client.models.generate_content(
+        model=model,
+        contents=build_prompt(headline),
+        config=types.GenerateContentConfig(response_modalities=["Image"]),
+    )
+    for part in resp.candidates[0].content.parts:
+        if part.inline_data and part.inline_data.mime_type.startswith("image/"):
+            return part.inline_data.data  # PNG bytes
+    raise RuntimeError("No image part returned")
+```
+
+The negative instruction "draw no other characters" helps suppress stray English signatures and random logos that creep in. With Japanese in particular, unrequested alphabet tends to sneak in as decoration, so I include this line almost every time.
+
+## Don't trust the output: insert an OCR verification gate
+
+This is the crux. Take the image and ask a model again, "what does this say," read it back, and compare against the intended string. You could add a dedicated OCR library, but I read it back with the multimodal-strong `gemini-3.5-flash`. It handles decorative Japanese gracefully and adds no dependency.
+
+Compare the read-back string against the original, stripping whitespace and punctuation, and compute a per-character match ratio. Requiring an exact match fails too often over a single punctuation wobble, so I gate on a ratio.
+
+```python
+import re
+from difflib import SequenceMatcher
+
+def read_back_text(image_bytes: bytes) -> str:
+    resp = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            "Output ONLY the Japanese characters drawn in this image, exactly as they appear, "
+            "with no description of style or layout. Return an empty string if there is no text.",
+        ],
+    )
+    return resp.text.strip()
+
+def normalize(s: str) -> str:
+    # Drop whitespace and punctuation to stabilize the comparison
+    return re.sub(r"[\s、。・!?,.\-]", "", s)
+
+def char_match_ratio(expected: str, actual: str) -> float:
+    e, a = normalize(expected), normalize(actual)
+    if not e:
+        return 1.0
+    return SequenceMatcher(None, e, a).ratio()
+
+# Threshold: I use 0.9 as the pass line
+PASS_RATIO = 0.9
+```
+
+What I saw in practice: a 0.9 cutoff happens to reject almost exactly the garbles that, on zooming in, a human would call unpublishable. Loosening to 0.8 let single-character errors slip through; tightening to 0.95 triggered frequent regenerations over harmless punctuation wobble. This shifts a bit with the length of the text you handle, so I recommend calibrating once on your own data.
+
+## Two-stage fallback: regenerate, then composite
+
+Design what happens on failure. Regenerating blindly makes cost unpredictable, so I fixed the stages:
+
+1. Generate with Flash Image and run the OCR gate.
+2. On failure, regenerate once more with the same Flash Image (fixed prompt, betting on RNG variance).
+3. Still failing, promote to Pro Image and regenerate.
+4. If Pro Image also fails, generate a text-free background and composite the text from code with Pillow.
+
+That last composite fallback is the safety net. The model handles the background while the critical characters are burned in with my own font, so garbling becomes impossible. For text where accuracy is everything, like an announcement line, I think it's safest to ultimately draw it on the code side.
+
+```python
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
+
+def composite_text(bg_bytes: bytes, headline: str, font_path: str) -> bytes:
+    img = Image.open(BytesIO(bg_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype(font_path, size=int(img.width * 0.09))
+    bbox = draw.textbbox((0, 0), headline, font=font)
+    tw = bbox[2] - bbox[0]
+    x = (img.width - tw) // 2
+    y = int(img.height * 0.25)
+    draw.text((x + 2, y + 2), headline, font=font, fill=(0, 0, 0))  # subtle shadow
+    draw.text((x, y), headline, font=font, fill=(255, 255, 255))
+    out = BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+def produce_banner(headline: str, font_path: str) -> bytes:
+    attempts = [MODEL_FAST, MODEL_FAST, MODEL_STRONG]
+    for model in attempts:
+        img = generate_image(model, headline)
+        actual = read_back_text(img)
+        ratio = char_match_ratio(headline, actual)
+        print(f"{model}: read_back='{actual}' ratio={ratio:.2f}")
+        if ratio >= PASS_RATIO:
+            return img
+    # Last resort: text-free background + code composite
+    bg_prompt = "Vertical (9:16) indigo washi-texture background. Draw no text, logo, or signature."
+    bg = client.models.generate_content(
+        model=MODEL_FAST, contents=bg_prompt,
+        config=types.GenerateContentConfig(response_modalities=["Image"]),
+    ).candidates[0].content.parts[0].inline_data.data
+    return composite_text(bg, headline, font_path)
+```
+
+## Sizing cost and retry limits for unattended runs
+
+The two-stage design is reassuring, but retries map directly to cost. The first thing I fix when wiring an unattended pipeline is the per-image ceiling.
+
+Roughly, if one Flash Image generation is baseline cost 1, the worst case (Flash x2 + Pro x1 + read-back x3 + one background generation) puts a single image at several times baseline. The read-backs are text output from `gemini-3.5-flash`, orders of magnitude cheaper than image generation, so the cost lead is still image generation. Pro Image is several times Flash, so the number of promotions is what moves your monthly bill.
+
+So at an assumed 2,000 images per month, I set a ceiling: "alert if the share reaching Pro promotion exceeds 10%." Empirically, with sane prompts and copy, promotion stays at a few percent. When it crosses 10%, it's usually a sign the text is too long or you got greedy with line count. Trimming the input character count improved both cost and quality more than forcing things through with extra retries.
+
+Absolute prices change with model revisions, so check the current per-image rate on the official billing page and plug it into the "several times baseline" figure to back-calculate your monthly ceiling. I back this out from the AdMob revenue of my wallpaper app and revisit the ceiling monthly so image-generation spend never eats into the margin.
+
+## Gotchas (what surfaced in production)
+
+A few traps I caught by re-reading logs from unattended runs.
+
+### The read-back model "helpfully" paraphrases
+
+If you don't strongly constrain the verification prompt with "exactly as they appear," `gemini-3.5-flash` sometimes corrects a typo into the right spelling and returns that. The image is garbled but the ratio comes out high, slipping past the gate. The fix is to state explicitly that read-back is a "transcribe the drawn glyphs" task, not a "guess correct Japanese" task.
+
+### Punctuation and whitespace wobble fails too often
+
+Without dropping punctuation and spaces in normalization, effectively identical strings mismatch. The humble `normalize()` before comparison did the most for a stable pass rate.
+
+### Preview-era model names linger in code
+
+Model names with the `-preview` suffix were shut down on June 25. Copy an old script or sample and one day it just stops with an error. For the generation jobs we run at Dolice Labs, I bulk-replaced model names with the GA versions before the shutdown date. A dated deprecation, if missed, quietly kills an unattended pipeline, so decide the migration target ahead of time.
+
+## Wrapping up: your next step
+
+If you're currently rejecting garbled text by eye, start by dropping just `read_back_text()` and `char_match_ratio()` behind your existing generation step. Even logging how many images fail at threshold 0.9 turns "how often does it garble" into a number on your own data. Whether to add the composite fallback or Pro promotion is a decision you can make after seeing that number.
+
+A single verification gate turns unattended generation from "occasionally breaks" into "notices and fixes itself when it breaks." I personally stopped eyeballing my images once I added this one layer. If you're also worn down by text in generated images, I hope this helps.
