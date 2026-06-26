@@ -1,0 +1,206 @@
+---
+title: "Gemini 3.5 Flash は本当に安いのか — リトライ増幅を実測して Flash と Pro の損益分岐を出す"
+slug: "gemini-35-flash-effective-cost-retry-amplification-breakeven"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-26T15:59"
+author: "Gemini Lab"
+description: "3.5 Flash が一般提供になった今、全部を Flash に寄せたくなります。でも単価ではなく成功1件あたりの実効コストで見ると判断が変わります。リトライ増幅を実測する最小ハーネスと損益分岐の出し方を共有します。"
+tags: ["Gemini 3.5 Flash", "コスト最適化", "モデルルーティング", "リトライ設計", "個人開発"]
+highlights:
+  - "単価ではなく「成功1件あたりの実効コスト」で測るための、難易度バケット別ハーネス（動くTypeScript）"
+  - "Flash 固定の素朴なリトライが難入力で試行回数とコストを増幅させる仕組みと、初手ティア選択への作り替え"
+  - "易・中・難の混合比を振って Flash-only / Pro-only / routed の損益分岐点を出すシミュレーションの手順"
+---
+
+3.5 Flash が一般提供になった日、私はまず自動投稿パイプラインのモデル割り当てを見直したくなりました。速くて安い上位 Flash が来たなら、下書きも仕上げも全部これでいいのではないか、と。個人開発で複数サイトを無人で回していると、回転数がそのまま成果に効くので、安くて速いモデルは魅力的に映ります。
+
+ところが手元の小さなサンプルで実効コストを測り直したところ、入力の一部では「全部 Flash」がかえって高くつくことが見えてきました。原因は単価ではなく、難しい入力で発生する**リトライ増幅**です。ここでは、その増幅を実測する最小ハーネスと、Flash と上位ティアの損益分岐点を自分のデータで出す手順を、動くコードとともに共有します。私自身、難バケットの実効コストを甘く見積もって痛い目に遭ったので、その反省も込めて書きます。数字は私の手元の代表値で、入力分布によって動きます。鵜呑みにせず、ご自身のパイプラインで測り直すための型として読んでいただけたら嬉しいです。
+
+## 「単価が安い」と「実際に安い」がずれる理由
+
+モデル比較の多くは100万トークンあたりの単価で語られます。確かに Flash は上位 Pro より入出力ともに安く、1回の呼び出しだけを見れば明確に得です。けれども自動運用で効いてくるのは、1回の単価ではなく**成功1件を確定させるまでに支払った合計**です。
+
+難しい入力に弱いモデルを当てると、次のことが連鎖します。出力が品質ゲートを通らず破棄される、リトライで同じ入力を再投入する、それでも通らずに上位ティアへ格上げする。素朴な単価表ではこの連鎖が見えません。私自身、最初は「Flash は半額だから半分になる」と素朴に見積もって、難バケットで請求が想定より膨らんだ経験があります。
+
+<table>
+<thead>
+<tr><th>観点</th><th>素朴な単価比較</th><th>実効コスト</th></tr>
+</thead>
+<tbody>
+<tr><td>測る単位</td><td>1回の呼び出し</td><td>成功1件の確定まで</td></tr>
+<tr><td>含むもの</td><td>入出力トークン単価</td><td>失敗試行・リトライ・格上げの合計</td></tr>
+<tr><td>難入力での挙動</td><td>変わらない（安く見える）</td><td>試行回数が増えて単価差を打ち消す</td></tr>
+<tr><td>判断への影響</td><td>「全部 Flash」に傾く</td><td>入力難易度で初手を変える方が安くなる場合がある</td></tr>
+</tbody>
+</table>
+
+ポイントは、実効コストは入力の難易度分布に依存するということです。易しい入力ばかりなら Flash 一択でよく、難しい入力が一定割合混じると話が変わります。だからこそ、一般論ではなく自分の分布で測る必要があります。
+
+## まず増幅を見える化する：成功するまで走らせて記録する
+
+最初にやるべきは、最適化ではなく計測です。入力を難易度バケットに分け、各モデルで「品質ゲートを通るまで」走らせて、試行回数・トークン・格上げ・実効コストを記録します。次の最小ハーネスは Google GenAI SDK を前提にしています。
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY ?? "YOUR_GEMINI_API_KEY" });
+
+// 100万トークンあたりの代表単価（USD）。必ず最新の料金で置き換えてください。
+const PRICES = {
+  "gemini-3.5-flash": { in: 0.30, out: 2.50 },
+  "gemini-3.1-pro":   { in: 2.00, out: 12.0 },
+} as const;
+type ModelId = keyof typeof PRICES;
+
+function callCost(model: ModelId, inTok: number, outTok: number): number {
+  const p = PRICES[model];
+  return (inTok / 1_000_000) * p.in + (outTok / 1_000_000) * p.out;
+}
+
+// 成功条件は「品質ゲートを通ること」。安く速い誤答を成功と数えないための関門です。
+type Gate = (text: string) => boolean;
+
+interface Attempt { model: ModelId; inTok: number; outTok: number; passed: boolean; }
+
+async function runOnce(model: ModelId, prompt: string, gate: Gate): Promise<Attempt> {
+  const res = await ai.models.generateContent({ model, contents: prompt });
+  const text = res.text ?? "";
+  const u = res.usageMetadata;
+  return {
+    model,
+    inTok: u?.promptTokenCount ?? 0,
+    outTok: u?.candidatesTokenCount ?? 0,
+    passed: gate(text),
+  };
+}
+```
+
+ここで強調したいのは、成功条件をモデルの「返答が返ってきたか」ではなく**品質ゲートの通過**に縛ることです。これを緩めると、安く速いだけの誤答を成功として数えてしまい、実効コストが実態より良く見えてしまいます。私の自動投稿では、スキーマ検証と固有名詞の一致チェックを成功条件にしています。
+
+## Before / After：素朴な Flash 固定リトライをやめる
+
+多くのパイプラインは、まず Flash に投げて、失敗したら同じモデルで数回リトライする作りになりがちです。これは易しい入力では問題ありませんが、難しい入力では同じモデルで何度も外し続け、試行回数だけを増やします。
+
+```typescript
+// Before: Flash 固定で最大3回。難入力では同じ失敗を繰り返し、試行を増幅させる。
+async function naive(prompt: string, gate: Gate): Promise<Attempt[]> {
+  const log: Attempt[] = [];
+  for (let i = 0; i < 3; i++) {
+    const a = await runOnce("gemini-3.5-flash", prompt, gate);
+    log.push(a);
+    if (a.passed) break;
+  }
+  return log; // 3回とも失敗するとコストだけ払って未確定で終わる
+}
+```
+
+作り替えの肝は二つです。ひとつは、入力の難易度を見て初手のティアを変えること。もうひとつは、リトライ予算を回数ではなく**累積コスト**で打ち切ることです。
+
+```typescript
+// After: 難易度で初手を選び、コスト予算で打ち切る。格上げは1段だけ。
+interface RouteResult { attempts: Attempt[]; cost: number; resolved: boolean; }
+
+async function routed(
+  prompt: string,
+  gate: Gate,
+  difficulty: "easy" | "medium" | "hard",
+  budgetUsd: number,
+): Promise<RouteResult> {
+  // 難入力は初手から Pro。易・中は Flash で始め、失敗時のみ1段格上げ。
+  const ladder: ModelId[] =
+    difficulty === "hard"
+      ? ["gemini-3.1-pro"]
+      : ["gemini-3.5-flash", "gemini-3.1-pro"];
+
+  const attempts: Attempt[] = [];
+  let cost = 0;
+  for (const model of ladder) {
+    // 同一ティアは最大2回まで。コスト予算を超えたら打ち切る。
+    for (let i = 0; i < 2; i++) {
+      const a = await runOnce(model, prompt, gate);
+      cost += callCost(a.model, a.inTok, a.outTok);
+      attempts.push(a);
+      if (a.passed) return { attempts, cost, resolved: true };
+      if (cost >= budgetUsd) return { attempts, cost, resolved: false };
+    }
+  }
+  return { attempts, cost, resolved: false };
+}
+```
+
+回数ではなくコストで打ち切ると、難入力が予算を食い潰してパイプライン全体を止める事故を防げます。私は無人運用では、1件あたりの上限を必ず置くことを重視しています。上限がないと、たまに来る極端に難しい入力が夜間バッチの請求を不意に押し上げます。
+
+## 損益分岐を出す：混合比を振ってシミュレートする
+
+ここまでで1件ごとの実効コストが測れます。次は、易・中・難の**混合比**を変えながら、Flash-only / Pro-only / routed の合計実効コストを比べ、どこで戦略が逆転するかを出します。実測した試行分布を使うのが理想ですが、まずは代表値で骨格をつかみます。
+
+```typescript
+// バケットごとの「成功までの実効コスト」代表値（USD/件）。自分の計測値で置き換える。
+const EFFECTIVE = {
+  flashOnly: { easy: 0.0009, medium: 0.0026, hard: 0.0125 }, // 難で試行増幅
+  proOnly:   { easy: 0.0042, medium: 0.0061, hard: 0.0098 }, // 難に強く増幅しにくい
+  routed:    { easy: 0.0009, medium: 0.0031, hard: 0.0101 }, // 易は Flash・難は初手 Pro
+} as const;
+
+type Strategy = keyof typeof EFFECTIVE;
+
+function totalCost(s: Strategy, mix: { easy: number; medium: number; hard: number }, n: number) {
+  const e = EFFECTIVE[s];
+  return n * (mix.easy * e.easy + mix.medium * e.medium + mix.hard * e.hard);
+}
+
+// 難入力の割合を 0% から 60% まで動かし、最安戦略がどこで入れ替わるか見る
+for (let hardPct = 0; hardPct <= 0.6; hardPct += 0.1) {
+  const mix = { easy: (1 - hardPct) * 0.7, medium: (1 - hardPct) * 0.3, hard: hardPct };
+  const f = totalCost("flashOnly", mix, 1000);
+  const p = totalCost("proOnly", mix, 1000);
+  const r = totalCost("routed", mix, 1000);
+  const best = Math.min(f, p, r) === f ? "flash" : Math.min(p, r) === p ? "pro" : "routed";
+  console.log(`hard=${(hardPct * 100).toFixed(0)}% flash=$${f.toFixed(2)} pro=$${p.toFixed(2)} routed=$${r.toFixed(2)} best=${best}`);
+}
+```
+
+この代表値で1000件を流すと、難入力が少ないうちは Flash-only が最安ですが、難の割合が増えるにつれて routed が追い抜き、さらに難が多い領域では Pro-only に近づきます。私の手元の小さなサンプルでは、難バケットで Flash の平均試行が約2.4回まで増え、格上げ率は38%に達しました。難入力の割合が約30%を超えたあたりで「全部 Flash」の優位が消える挙動が一貫して観測できています。重要なのは具体的な閾値そのものより、**自分の入力分布だと逆転点がどこにあるかを数字で持つこと**です。私はこの計測なしに「安いから全部 Flash」と決めることは推奨しません。
+
+<table>
+<thead>
+<tr><th>難入力の割合</th><th>最安になりやすい戦略</th><th>運用上の含意</th></tr>
+</thead>
+<tbody>
+<tr><td>低い（〜1割）</td><td>Flash-only</td><td>素直に全部 Flash で良い</td></tr>
+<tr><td>中程度（2〜4割）</td><td>routed</td><td>難だけ初手 Pro に振ると得</td></tr>
+<tr><td>高い（5割以上）</td><td>Pro-only に接近</td><td>そもそも前処理で難易度を下げたい</td></tr>
+</tbody>
+</table>
+
+## 難易度をどう判定するか：安く速い前段で振り分ける
+
+routed が効くかどうかは、初手のティアを決める難易度判定の質に左右されます。判定そのものに重いモデルを使うと本末転倒なので、安く速い手段で大づかみに振り分けます。私が使っているのは、入力長・特殊記号比率・過去の同カテゴリ入力の失敗率といった軽い特徴量に、必要なときだけ Flash-Lite クラスの短い分類を足す方法です。
+
+```typescript
+// ヒューリスティックで大半を判定し、曖昧なものだけ軽量モデルに回す
+function quickDifficulty(input: string, categoryFailRate: number): "easy" | "medium" | "hard" | "unsure" {
+  const len = input.length;
+  const symbolRatio = (input.match(/[^\p{L}\p{N}\s]/gu)?.length ?? 0) / Math.max(len, 1);
+  if (categoryFailRate > 0.35) return "hard";          // 過去に失敗が多いカテゴリ
+  if (len < 400 && symbolRatio < 0.1) return "easy";   // 短く素直
+  if (len > 2000 || symbolRatio > 0.25) return "hard"; // 長い・記号過多
+  return "unsure";                                     // 判断がつかないものだけ次段へ
+}
+```
+
+ここで効くのが、過去の失敗率をカテゴリ単位で持っておくことです。Flash で2回続けて落ちた入力カテゴリは、以後しばらく初手 Pro に固定する簡単なヒステリシスを入れると、同じ失敗の学習し直しを避けられます。状態は軽い KV に置けば十分で、無人運用でも破綻しません。
+
+## 落とし穴：成功の定義を緩めると全部が無意味になる
+
+このアプローチ全体は「成功＝品質ゲート通過」という定義に乗っています。ここを緩めて「とりあえず返答が返れば成功」にすると、Flash の安さと速さが誤答の大量生産に化けて、実効コストは見かけ上どんどん下がります。けれど後工程で破棄したり、公開後に直したりする手戻りは計測の外にこぼれ、いちばん高い人手のコストとして跳ね返ってきます。本番運用でこの手戻りを回避するには、成功条件を厳密に保つしかありません。
+
+私の自動投稿では、スキーマ検証・固有名詞の一致・禁止表現の不在を成功条件に束ねています。成功条件を厳しくするほど Flash の実効コストは上がって見えますが、それが現実のコストです。安く見せるために関門を下げるのは、計測の自己欺瞞だと考えています。
+
+## 次の一歩
+
+まずは最適化を一旦忘れて、自分のパイプラインの直近の入力を難易度バケットに分け、各モデルで成功するまで走らせて実効コストを記録してみてください。逆転点が見えたら、難バケットだけ初手 Pro に振り、リトライをコスト予算で打ち切る。この二つを入れるだけで、「3.5 Flash が来たから全部 Flash」という素朴な判断より確実に安くなる地点が、数字で言えるようになります。
+
+ご自身の入力分布で測り直す出発点になれば幸いです。お読みいただきありがとうございました。

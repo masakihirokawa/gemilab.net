@@ -1,0 +1,209 @@
+---
+title: "Is Gemini 3.5 Flash Actually Cheaper? Measuring Retry Amplification to Find the Flash vs Pro Break-Even"
+slug: "gemini-35-flash-effective-cost-retry-amplification-breakeven"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-26T16:00"
+author: "Gemini Lab"
+description: "Now that 3.5 Flash is generally available, it is tempting to route everything to it. But once you measure effective cost per success instead of per-call price, the decision changes. Here is a small harness to measure retry amplification and find the break-even."
+tags: ["Gemini 3.5 Flash", "Cost Optimization", "Model Routing", "Retry Design", "Indie Development"]
+highlights:
+  - "A difficulty-bucketed harness (working TypeScript) that measures effective cost per success, not per call"
+  - "Why naive Flash-only retries amplify attempts and cost on hard inputs, and how to switch to first-attempt tier selection"
+  - "How to sweep the easy/medium/hard mix to find the break-even between Flash-only, Pro-only, and routed strategies"
+---
+
+The day 3.5 Flash reached general availability, the first thing I wanted to do was revisit the model assignments in my automated publishing pipeline. If a faster, cheaper upper-Flash had arrived, why not use it for both drafting and finishing? As an indie developer running several sites unattended, throughput translates directly into results, so a model that is cheap and fast looks irresistible.
+
+But when I re-measured effective cost on a small sample, I found that for a slice of my inputs, "all Flash" was actually more expensive. The cause is not the per-token price. It is **retry amplification** on hard inputs. In this article I share a minimal harness for measuring that amplification, and a procedure for finding the break-even point between Flash and an upper tier using your own data. The numbers here are representative values from my own runs and will shift with your input distribution, so please read them as a template for measuring rather than a verdict to copy.
+
+## Why "cheap per call" and "actually cheap" diverge
+
+Most model comparisons are framed around price per million tokens. Flash is indeed cheaper than upper Pro on both input and output, and for a single call it is clearly the better deal. But what matters in automated operation is not the price of one call. It is **the total you pay to resolve one success**.
+
+When you point a weak-on-hard-inputs model at a difficult task, a chain reaction follows: the output fails the quality gate and is discarded, a retry resubmits the same input, and when that still fails you escalate to an upper tier. A naive price table hides this chain. I myself first estimated "Flash is half the price, so the bill halves," and then watched the hard bucket inflate my charges beyond what I expected.
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>Naive per-call comparison</th><th>Effective cost</th></tr>
+</thead>
+<tbody>
+<tr><td>Unit measured</td><td>One call</td><td>Resolving one success</td></tr>
+<tr><td>What it includes</td><td>Input/output token price</td><td>Failed attempts, retries, escalations</td></tr>
+<tr><td>Behavior on hard inputs</td><td>Unchanged (looks cheap)</td><td>Attempt count rises and cancels the price gap</td></tr>
+<tr><td>Effect on decision</td><td>Leans toward "all Flash"</td><td>Varying the first tier by difficulty can be cheaper</td></tr>
+</tbody>
+</table>
+
+The key point is that effective cost depends on your input difficulty distribution. If inputs are all easy, Flash-only is the answer. Once a steady fraction of hard inputs is mixed in, the story changes. That is exactly why you need to measure your own distribution rather than rely on general claims.
+
+## First, make the amplification visible
+
+The first thing to do is measurement, not optimization. Split inputs into difficulty buckets, run each model "until it passes the quality gate," and record attempts, tokens, escalations, and effective cost. The minimal harness below assumes the Google GenAI SDK.
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY ?? "YOUR_GEMINI_API_KEY" });
+
+// Representative price per million tokens (USD). Always replace with current pricing.
+const PRICES = {
+  "gemini-3.5-flash": { in: 0.30, out: 2.50 },
+  "gemini-3.1-pro":   { in: 2.00, out: 12.0 },
+} as const;
+type ModelId = keyof typeof PRICES;
+
+function callCost(model: ModelId, inTok: number, outTok: number): number {
+  const p = PRICES[model];
+  return (inTok / 1_000_000) * p.in + (outTok / 1_000_000) * p.out;
+}
+
+// Success means "passes the quality gate." This is the gate that stops you
+// from counting cheap, fast wrong answers as successes.
+type Gate = (text: string) => boolean;
+
+interface Attempt { model: ModelId; inTok: number; outTok: number; passed: boolean; }
+
+async function runOnce(model: ModelId, prompt: string, gate: Gate): Promise<Attempt> {
+  const res = await ai.models.generateContent({ model, contents: prompt });
+  const text = res.text ?? "";
+  const u = res.usageMetadata;
+  return {
+    model,
+    inTok: u?.promptTokenCount ?? 0,
+    outTok: u?.candidatesTokenCount ?? 0,
+    passed: gate(text),
+  };
+}
+```
+
+I want to stress one thing here: tie the success condition to **passing the quality gate**, not to "did a response come back." Loosen this and you start counting cheap, fast wrong answers as successes, which makes effective cost look better than it really is. In my own publishing pipeline, schema validation and a proper-noun match check are part of the success condition.
+
+## Before / After: stop pinning retries to Flash
+
+Many pipelines first call Flash and, on failure, retry a few times with the same model. That is fine for easy inputs, but on hard inputs it keeps missing with the same model and only inflates the attempt count.
+
+```typescript
+// Before: Flash only, up to 3 times. On hard inputs it repeats the same
+// failure and amplifies attempts.
+async function naive(prompt: string, gate: Gate): Promise<Attempt[]> {
+  const log: Attempt[] = [];
+  for (let i = 0; i < 3; i++) {
+    const a = await runOnce("gemini-3.5-flash", prompt, gate);
+    log.push(a);
+    if (a.passed) break;
+  }
+  return log; // If all 3 fail, you paid the cost and still resolved nothing.
+}
+```
+
+The redesign has two pillars. One is choosing the first tier based on the difficulty of the input. The other is capping the retry budget by **cumulative cost** rather than by attempt count.
+
+```typescript
+// After: pick the first tier by difficulty and stop on a cost budget.
+// Escalate only one step.
+interface RouteResult { attempts: Attempt[]; cost: number; resolved: boolean; }
+
+async function routed(
+  prompt: string,
+  gate: Gate,
+  difficulty: "easy" | "medium" | "hard",
+  budgetUsd: number,
+): Promise<RouteResult> {
+  // Hard inputs start on Pro. Easy/medium start on Flash, escalating one step on failure.
+  const ladder: ModelId[] =
+    difficulty === "hard"
+      ? ["gemini-3.1-pro"]
+      : ["gemini-3.5-flash", "gemini-3.1-pro"];
+
+  const attempts: Attempt[] = [];
+  let cost = 0;
+  for (const model of ladder) {
+    // At most 2 tries per tier. Stop once the cost budget is exceeded.
+    for (let i = 0; i < 2; i++) {
+      const a = await runOnce(model, prompt, gate);
+      cost += callCost(a.model, a.inTok, a.outTok);
+      attempts.push(a);
+      if (a.passed) return { attempts, cost, resolved: true };
+      if (cost >= budgetUsd) return { attempts, cost, resolved: false };
+    }
+  }
+  return { attempts, cost, resolved: false };
+}
+```
+
+Stopping by cost rather than attempt count prevents a hard input from eating the budget and stalling the whole pipeline. What I prioritize in unattended operation is always placing a per-item ceiling. Without one, the occasional extreme input quietly inflates an overnight batch bill.
+
+## Find the break-even: sweep the mix and simulate
+
+By now you can measure effective cost per item. Next, vary the **mix** of easy/medium/hard and compare total effective cost for Flash-only, Pro-only, and routed to see where the strategies flip. Using your measured attempt distribution is ideal, but representative values are enough to get the skeleton.
+
+```typescript
+// Representative "effective cost to success" per bucket (USD/item). Replace with your measurements.
+const EFFECTIVE = {
+  flashOnly: { easy: 0.0009, medium: 0.0026, hard: 0.0125 }, // amplifies on hard
+  proOnly:   { easy: 0.0042, medium: 0.0061, hard: 0.0098 }, // strong on hard, little amplification
+  routed:    { easy: 0.0009, medium: 0.0031, hard: 0.0101 }, // Flash for easy, Pro-first for hard
+} as const;
+
+type Strategy = keyof typeof EFFECTIVE;
+
+function totalCost(s: Strategy, mix: { easy: number; medium: number; hard: number }, n: number) {
+  const e = EFFECTIVE[s];
+  return n * (mix.easy * e.easy + mix.medium * e.medium + mix.hard * e.hard);
+}
+
+// Sweep the hard fraction from 0% to 60% and see where the cheapest strategy changes.
+for (let hardPct = 0; hardPct <= 0.6; hardPct += 0.1) {
+  const mix = { easy: (1 - hardPct) * 0.7, medium: (1 - hardPct) * 0.3, hard: hardPct };
+  const f = totalCost("flashOnly", mix, 1000);
+  const p = totalCost("proOnly", mix, 1000);
+  const r = totalCost("routed", mix, 1000);
+  const best = Math.min(f, p, r) === f ? "flash" : Math.min(p, r) === p ? "pro" : "routed";
+  console.log(`hard=${(hardPct * 100).toFixed(0)}% flash=$${f.toFixed(2)} pro=$${p.toFixed(2)} routed=$${r.toFixed(2)} best=${best}`);
+}
+```
+
+Running 1000 items through these representative values, Flash-only is cheapest while hard inputs are scarce, but as the hard fraction grows, routed overtakes it, and in the hard-heavy region it converges toward Pro-only. On my own small sample, the average Flash attempt count rose in the hard bucket, and past a certain fraction the advantage of "all Flash" consistently broke down. What matters is not the exact threshold but **having a number for where the crossover sits given your input distribution**.
+
+<table>
+<thead>
+<tr><th>Hard input fraction</th><th>Strategy that tends to be cheapest</th><th>Operational implication</th></tr>
+</thead>
+<tbody>
+<tr><td>Low (up to ~10%)</td><td>Flash-only</td><td>Just route everything to Flash</td></tr>
+<tr><td>Medium (20-40%)</td><td>routed</td><td>Send only hard inputs to Pro first</td></tr>
+<tr><td>High (50%+)</td><td>Approaches Pro-only</td><td>Reduce difficulty in preprocessing instead</td></tr>
+</tbody>
+</table>
+
+## How to judge difficulty: route with a cheap, fast front stage
+
+Whether routing helps depends on the quality of the difficulty judgment that picks the first tier. Using a heavy model for the judgment itself defeats the purpose, so sort roughly with cheap, fast means. What I use is light features such as input length, special-character ratio, and the past failure rate of the same input category, adding a short Flash-Lite-class classification only when needed.
+
+```typescript
+// Decide most cases by heuristic; only ambiguous ones go to a lightweight model.
+function quickDifficulty(input: string, categoryFailRate: number): "easy" | "medium" | "hard" | "unsure" {
+  const len = input.length;
+  const symbolRatio = (input.match(/[^\p{L}\p{N}\s]/gu)?.length ?? 0) / Math.max(len, 1);
+  if (categoryFailRate > 0.35) return "hard";          // category with many past failures
+  if (len < 400 && symbolRatio < 0.1) return "easy";   // short and plain
+  if (len > 2000 || symbolRatio > 0.25) return "hard"; // long or symbol-heavy
+  return "unsure";                                     // send only the genuinely unclear ones onward
+}
+```
+
+What pays off here is keeping the past failure rate per category. For an input category that fails Flash twice in a row, a simple hysteresis that pins it to Pro-first for a while avoids relearning the same failure. A light KV store is enough to hold this state, and it does not break under unattended operation.
+
+## The trap: loosen the definition of success and it all becomes meaningless
+
+This whole approach rests on the definition "success equals passing the quality gate." Loosen it to "success if any response comes back," and Flash's low price and speed turn into mass production of wrong answers, while effective cost appears to keep dropping. But the rework you do later, discarding outputs downstream or fixing them after publishing, spills outside the measurement and comes back as the most expensive cost of all: human time.
+
+In my publishing pipeline, the success condition bundles schema validation, proper-noun matching, and the absence of banned phrasing. The stricter you make the success condition, the higher Flash's effective cost looks, but that is the real cost. Lowering the gate to make things look cheap is, in my view, self-deception in measurement.
+
+## Next step
+
+Set optimization aside for a moment and split your pipeline's recent inputs into difficulty buckets, run each model until success, and record effective cost. Once you can see the crossover, send only the hard bucket to Pro first and cap retries by cost budget. Adding just these two things lets you state, with numbers, the point at which you beat the naive "3.5 Flash is here, so use Flash for everything" decision.
+
+I hope this gives you a starting point for re-measuring with your own input distribution. Thank you for reading.
