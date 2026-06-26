@@ -1,0 +1,189 @@
+---
+title: "When Gemini's Safety Filter Silently Drops Legitimate Output — Field Notes on Catching False Positives Without Turning Everything Off"
+slug: "gemini-safety-filter-false-positive-instrumentation-graded-recovery-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-26T13:30"
+author: "Gemini Lab"
+description: "Field notes on handling Gemini API false positives in production without disabling every category. Separating input blocks from output blocks, instrumenting per-category false-positive rates, and recovering by relaxing only the offending category."
+tags: ["gemini-api", "safety-filter", "production", "observability", "error-handling"]
+highlights:
+  - "A logging design that decides, in one line, whether the prompt or the output was blocked"
+  - "Instrumentation that measures per-category false-positive rates so you loosen thresholds from data, not from a hunch"
+  - "A recovery function that relaxes only the offending category instead of flipping everything to OFF"
+---
+
+Most safety-filter questions are about how to switch everything off. In production the painful case is the opposite: you can't turn it all off, you don't want to, and yet legitimate requests still get dropped now and then — quietly. Often you notice late. The call comes back with `finishReason` set to `SAFETY`, and the moment you read `response.text` an exception fires, leaving the user staring at an empty card.
+
+As an indie developer, I run four technical blogs on an automated publishing pipeline, and an unattended batch ran straight into this. A small fragment of a code snippet or an error message I'd handed over as source material leaned toward `DANGEROUS_CONTENT`, and generation stopped midway. With no human watching, nobody noticed until I read the logs the next morning. These notes are a record of the mechanism I built so that, instead of "set every category to OFF and move on," I could pick out the false positives and fall back to the safe side.
+
+## First, pin down which side blocked it — in one line
+
+The safety filter inspects both the input (prompt) and the output (generated result). These two have entirely different causes and fixes, yet in the logs they both read as "blocked," which is the awkward part. The first thing to do is record, mechanically and every time, which side failed.
+
+When the input is blocked, no candidate is produced and the detail lives in `prompt_feedback.block_reason`. When the output is blocked, a candidate exists but `finish_reason` becomes `SAFETY` and the body is empty. With the newer `google-genai` SDK, the split looks like this:
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def classify_block(resp):
+    """Return where the block happened: input / output / none."""
+    pf = getattr(resp, "prompt_feedback", None)
+    if pf and getattr(pf, "block_reason", None):
+        return "INPUT_BLOCKED", str(pf.block_reason)
+
+    if not resp.candidates:
+        # Rare: zero candidates and no prompt_feedback either
+        return "NO_CANDIDATE", "unknown"
+
+    cand = resp.candidates[0]
+    if cand.finish_reason == types.FinishReason.SAFETY:
+        return "OUTPUT_BLOCKED", "SAFETY"
+
+    return "OK", str(cand.finish_reason)
+```
+
+Run this immediately after every production generation call and write the `INPUT_BLOCKED` / `OUTPUT_BLOCKED` result straight into a log field. That alone lets you count "fix the prompt" cases and "revisit the output threshold" cases separately later. In my experience, logs that skip this distinction can only ever say "blocks are up" — which gives you nothing to act on.
+
+## Make false positives visible as a per-category rate
+
+Decide threshold changes by gut feeling and you'll usually either loosen too far or freeze and do nothing. What you actually need is measured data: which category, at what probability, contributes how much to the blocks.
+
+Each candidate and the prompt feedback carry `safety_ratings`, where every element holds `category`, `probability` (`NEGLIGIBLE` / `LOW` / `MEDIUM` / `HIGH`), and `blocked` (boolean). Flatten that into structured logs and aggregate by category.
+
+```python
+from collections import Counter
+
+def extract_ratings(resp):
+    """Flatten input-side and output-side safety_ratings."""
+    rows = []
+    pf = getattr(resp, "prompt_feedback", None)
+    if pf and getattr(pf, "safety_ratings", None):
+        for r in pf.safety_ratings:
+            rows.append(("input", str(r.category), str(r.probability), bool(r.blocked)))
+    for cand in (resp.candidates or []):
+        for r in (cand.safety_ratings or []):
+            rows.append(("output", str(r.category), str(r.probability), bool(r.blocked)))
+    return rows
+
+def summarize(logged_rows):
+    """Surface per-category false-positive tendencies from accumulated rows."""
+    blocked = Counter()
+    medium_plus = Counter()
+    for _side, cat, prob, was_blocked in logged_rows:
+        if was_blocked:
+            blocked[cat] += 1
+        if prob in ("MEDIUM", "HIGH"):
+            medium_plus[cat] += 1
+    return blocked, medium_plus
+```
+
+The point here is to watch not only the `blocked` count but also the distribution of `MEDIUM` ratings — the ones that stop short of a block but sit near the line. If `MEDIUM` is piling up in one category, that category is a reserve army: holding for now, but one slight shift in input away from dropping. Sudden spikes in production usually happen the moment that reserve crosses the threshold. Keep it as a rate and you'll see it coming before it becomes an incident.
+
+Note that `probability` is a safety-policy likelihood, not a measure of whether the output is correct. Read "it's `LOW`, so the content must be fine" and you'll misjudge. The filter is looking at policy fit, not factual accuracy.
+
+## Don't flee to OFF on everything — loosen only the offending category
+
+The easiest move when a block appears is to set all four categories to `OFF`. I don't recommend it in production, for two reasons. First, in unattended operation it removes the last guard for the case where the model really does emit something inappropriate. Second, `OFF` (fully disabling the filter) isn't always available depending on the key and environment, so it becomes a breeding ground for code that breaks across environments.
+
+The realistic path is to loosen only the offending category that your instrumentation identified, by one step. Here's what the thresholds mean:
+
+<table>
+<thead>
+<tr><th>Threshold</th><th>Behavior</th><th>Where it fits in production</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>BLOCK_LOW_AND_ABOVE</strong></td><td>Blocks low risk and up (strictest)</td><td>Only where over-blocking is acceptable, e.g. kids' contexts</td></tr>
+<tr><td><strong>BLOCK_MEDIUM_AND_ABOVE</strong></td><td>Blocks medium and up (default)</td><td>A sensible starting point for most general use</td></tr>
+<tr><td><strong>BLOCK_ONLY_HIGH</strong></td><td>Blocks only high risk</td><td>The landing spot for a category that produced false positives</td></tr>
+<tr><td><strong>OFF</strong></td><td>Disables the filter for that category</td><td>Avoid as a rule; if used, keep it to verification</td></tr>
+</tbody>
+</table>
+
+In code, hold a project-wide default and override only the categories you want to relax. The new SDK's `types.SafetySetting` gives you type safety, which causes fewer accidents than raw strings.
+
+```python
+DEFAULT_THRESHOLD = types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE
+ALL_CATEGORIES = [
+    types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+    types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+    types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+    types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+]
+
+def build_safety(relaxed: dict | None = None):
+    """Override the threshold only for the categories passed in `relaxed`."""
+    relaxed = relaxed or {}
+    return [
+        types.SafetySetting(
+            category=cat,
+            threshold=relaxed.get(cat, DEFAULT_THRESHOLD),
+        )
+        for cat in ALL_CATEGORIES
+    ]
+```
+
+Call `build_safety({types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: types.HarmBlockThreshold.BLOCK_ONLY_HIGH})` to drop just the offending category to `BLOCK_ONLY_HIGH`, leaving the other three at the default. That is the smallest unit of "rescue the false positive while staying on the safe side."
+
+## Graded recovery — add context before you loosen
+
+Before touching a threshold, there's one more step. Many output blocks happen because the prompt never states the purpose or role, so the model errs cautious. Declare the use in `system_instruction`, and only relax the offending category if it still drops — in that order — and the number of times you touch thresholds at all goes down.
+
+```python
+def graded_generate(client, prompt, *, model="gemini-3.5-flash"):
+    """Try: add context -> relax only the offending category -> give up to a fallback."""
+    sys = ("You are an editing assistant for technical documents. "
+           "Answer accurately and neutrally, from an academic and practical standpoint.")
+
+    # 1st: default thresholds + declared purpose
+    resp = client.models.generate_content(
+        model=model, contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=sys,
+            safety_settings=build_safety(),
+        ),
+    )
+    state, _ = classify_block(resp)
+    if state == "OK":
+        return resp.text
+
+    # 2nd: if the output was blocked, relax only the offending category
+    if state == "OUTPUT_BLOCKED":
+        offending = pick_offending_category(resp)  # see below
+        if offending is not None:
+            resp = client.models.generate_content(
+                model=model, contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=sys,
+                    safety_settings=build_safety(
+                        {offending: types.HarmBlockThreshold.BLOCK_ONLY_HIGH}
+                    ),
+                ),
+            )
+            if classify_block(resp)[0] == "OK":
+                return resp.text
+
+    # 3rd: input block, or still blocked after relaxing -> no relaxation, fallback
+    return None  # caller returns a fixed fallback message
+
+
+def pick_offending_category(resp):
+    """Pick one category that contributed to the block from safety_ratings."""
+    for cand in (resp.candidates or []):
+        for r in (cand.safety_ratings or []):
+            if bool(getattr(r, "blocked", False)):
+                return r.category
+    return None
+```
+
+The key decision here is to never relax thresholds on an input block (`INPUT_BLOCKED`). If the input itself touches policy, loosening the output threshold is the wrong lever — it risks letting through exactly what should be stopped. Input blocks are not candidates for relaxation; treat them as a prompt-design problem or a refusal. Returning `None` at the third stage, so the caller responds with a fixed "I can't answer this," is far safer than forcing it through.
+
+## A minimal check before it goes live
+
+Finally, the things I always confirm before putting this in production. I `grep` for any `generate_content` calls that aren't going through `build_safety()` — a single default-dependent call means behavior there is unreadable. I make sure the `classify_block` result (`INPUT_BLOCKED` / `OUTPUT_BLOCKED` / `OK`) lands in a structured log field, so I can eyeball per-category block rates and `MEDIUM` rates weekly. And if anything uses `OFF`, I check that it's confined to verification and hasn't leaked into a production path.
+
+The safety filter isn't the enemy; for an unattended pipeline it's closer to a last safety net. Turn it all off and the false positives vanish — but so does the net. Identify the offending category from measurement, relax it by one step, and still refuse anything where the input itself crosses the line. Holding that boundary is, I've come to feel, what separates an automated pipeline you can run with peace of mind from one you can't. If you're carrying an unattended pipeline of your own, I hope these notes help.

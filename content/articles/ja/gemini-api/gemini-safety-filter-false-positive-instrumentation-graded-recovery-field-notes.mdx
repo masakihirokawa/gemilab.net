@@ -1,0 +1,197 @@
+---
+title: "Gemini API のセーフティフィルタが正当な応答を黙って落とすとき — 全切りせず誤検知だけを救う運用メモ"
+slug: "gemini-safety-filter-false-positive-instrumentation-graded-recovery-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-26T13:30"
+author: "Gemini Lab"
+description: "本番のGemini APIで正当なプロンプトがSAFETYでブロックされる誤検知を、全カテゴリ無効化に逃げずに扱う運用メモ。入力ブロックと出力ブロックの切り分け、誤検知率の計装、カテゴリ別の段階的リカバリまでを実装で整理します。"
+tags: ["gemini-api", "safety-filter", "production", "observability", "error-handling"]
+highlights:
+  - "入力ブロック（prompt_feedback）と出力ブロック（finish_reason=SAFETY）を最初の1行で切り分けるログ設計"
+  - "誤検知率をカテゴリ別に集計し、緩めてよい閾値を勘ではなく実測で決める計装コード"
+  - "全カテゴリOFFに逃げず、原因カテゴリだけを段階的に緩めて安全側に倒すリカバリ関数"
+---
+
+セーフティフィルタの相談で一番多いのは「どう全部切るか」ですが、本番で困るのはたいてい逆です。全部は切れない、切りたくない、それでも正当なリクエストが時々黙って落ちる。落ちたことに気づくのも遅れる。`finishReason` が `SAFETY` で返り、`response.text` を読もうとした瞬間に例外が飛んで、ユーザーには空のカードだけが残ります。
+
+私自身、個人開発の傍らで4つの技術ブログを自動投稿で回している関係で、無人で走るバッチがこれに引っかかったことがあります。題材として渡したコード断片やエラーメッセージのごく一部が `DANGEROUS_CONTENT` 寄りに判定され、生成が途中で止まる。人がいないので、翌朝ログを見るまで誰も気づきません。このメモは、そのとき「全カテゴリ OFF にして終わり」にせず、誤検知だけを拾って安全側に戻すために組んだ仕組みの記録です。
+
+## まず「どちらでブロックされたか」を1行で確定する
+
+セーフティフィルタは入力（プロンプト）と出力（生成結果）の両方を見ます。この二つは原因も対処もまったく別物なのに、ログでは同じ「ブロックされた」に見えてしまうのが厄介な点です。最初にやるべきは、どちらで落ちたかを毎回機械的に記録することです。
+
+入力でブロックされた場合は候補（candidate）が一つも生成されず、情報は `prompt_feedback.block_reason` に入ります。出力でブロックされた場合は候補は生成されますが、`finish_reason` が `SAFETY` になり本文が空になります。新しい `google-genai` SDK では、この切り分けは次のように書けます。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def classify_block(resp):
+    """ブロックの発生箇所を入力/出力/なしで返す"""
+    pf = getattr(resp, "prompt_feedback", None)
+    if pf and getattr(pf, "block_reason", None):
+        return "INPUT_BLOCKED", str(pf.block_reason)
+
+    if not resp.candidates:
+        # 候補ゼロかつ prompt_feedback も無いレアケース
+        return "NO_CANDIDATE", "unknown"
+
+    cand = resp.candidates[0]
+    if cand.finish_reason == types.FinishReason.SAFETY:
+        return "OUTPUT_BLOCKED", "SAFETY"
+
+    return "OK", str(cand.finish_reason)
+```
+
+この関数を本番の生成呼び出しの直後に必ず通し、`INPUT_BLOCKED` か `OUTPUT_BLOCKED` かをそのままログのフィールドにします。これだけで、後から「入力プロンプトを直すべき案件」と「出力側の閾値を見直すべき案件」を混ぜずに数えられるようになります。経験上、この区別をしていないログは「ブロックが多い」までしか言えず、次の一手が打てません。
+
+## 誤検知を「カテゴリ別の率」で見えるようにする
+
+閾値を緩めるかどうかを勘で決めると、たいてい緩めすぎるか、怖くて何もできないかのどちらかに振れます。判断材料は、どのカテゴリが、どのくらいの確率で、どれだけブロックに寄与しているかという実測値です。
+
+各候補とプロンプトフィードバックには `safety_ratings` が付き、要素ごとに `category`・`probability`（`NEGLIGIBLE` / `LOW` / `MEDIUM` / `HIGH`）・`blocked`（真偽）が入ります。これをそのまま構造化ログに落とし、カテゴリ別に集計します。
+
+```python
+from collections import Counter
+
+def extract_ratings(resp):
+    """入力側・出力側の safety_ratings を平坦化して返す"""
+    rows = []
+    pf = getattr(resp, "prompt_feedback", None)
+    if pf and getattr(pf, "safety_ratings", None):
+        for r in pf.safety_ratings:
+            rows.append(("input", str(r.category), str(r.probability), bool(r.blocked)))
+    for cand in (resp.candidates or []):
+        for r in (cand.safety_ratings or []):
+            rows.append(("output", str(r.category), str(r.probability), bool(r.blocked)))
+    return rows
+
+def summarize(logged_rows):
+    """蓄積した rows からカテゴリ別の誤検知傾向を出す"""
+    blocked = Counter()
+    medium_plus = Counter()
+    for _side, cat, prob, was_blocked in logged_rows:
+        if was_blocked:
+            blocked[cat] += 1
+        if prob in ("MEDIUM", "HIGH"):
+            medium_plus[cat] += 1
+    return blocked, medium_plus
+```
+
+ここで重要なのは、`blocked` の件数だけでなく `MEDIUM` 止まり（ブロックには至らないが境界に近い）の分布も一緒に見ることです。`MEDIUM` が特定カテゴリに偏って積み上がっているなら、そのカテゴリは「いまは耐えているが、入力がわずかに変われば落ちる」予備軍です。本番で突然ブロックが増える事故は、たいていこの予備軍が閾値をまたいだ瞬間に起きます。率で持っておくと、事故になる前に気づけます。
+
+なお `probability` はあくまで安全方針上の確からしさであって、出力内容の正しさとは別物です。ここを取り違えて「`LOW` だから内容も安全」と読むと判断を誤ります。フィルタが見ているのは方針適合であって事実性ではありません。
+
+## 全カテゴリ OFF に逃げない — 緩めるのは原因カテゴリだけ
+
+ブロックが出たときに最も簡単なのは、4カテゴリすべてを `OFF` にすることです。ですが、これは本番では勧めません。理由は二つあります。一つは、無人運用ではモデルが本当に不適切な出力をしたときの最後の歯止めまで外れること。もう一つは、`OFF`（フィルタ完全無効）はそもそもキーや環境によって使えないことがあり、コードが環境差で壊れる温床になることです。
+
+現実的なのは、計装で特定した原因カテゴリだけを一段緩める方針です。閾値の意味を整理しておきます。
+
+<table>
+<thead>
+<tr><th>閾値</th><th>挙動</th><th>本番での使いどころ</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>BLOCK_LOW_AND_ABOVE</strong></td><td>低リスク以上を全てブロック（最も厳しい）</td><td>子ども向け等、過剰検知を許容できる用途のみ</td></tr>
+<tr><td><strong>BLOCK_MEDIUM_AND_ABOVE</strong></td><td>中程度以上をブロック（既定）</td><td>多くの一般用途の初期値</td></tr>
+<tr><td><strong>BLOCK_ONLY_HIGH</strong></td><td>高リスクのみブロック</td><td>誤検知が出た原因カテゴリを一段緩める着地点</td></tr>
+<tr><td><strong>OFF</strong></td><td>そのカテゴリのフィルタを無効化</td><td>原則使わない。使うなら検証用に限定</td></tr>
+</tbody>
+</table>
+
+実装では、既定をプロジェクト共通で持ち、緩めたいカテゴリだけを上書きします。新 SDK の `types.SafetySetting` を使うと型で守られるので、文字列直書きより事故が減ります。
+
+```python
+DEFAULT_THRESHOLD = types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE
+ALL_CATEGORIES = [
+    types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+    types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+    types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+    types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+]
+
+def build_safety(relaxed: dict | None = None):
+    """relaxed に渡したカテゴリだけ閾値を上書きする"""
+    relaxed = relaxed or {}
+    return [
+        types.SafetySetting(
+            category=cat,
+            threshold=relaxed.get(cat, DEFAULT_THRESHOLD),
+        )
+        for cat in ALL_CATEGORIES
+    ]
+```
+
+`build_safety({types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: types.HarmBlockThreshold.BLOCK_ONLY_HIGH})` のように、原因カテゴリ一つだけを `BLOCK_ONLY_HIGH` に落とす。他の三つは既定のまま残す。これが「安全側を保ったまま誤検知を救う」最小単位です。
+
+## 段階的リカバリ — 緩める前に文脈を足す
+
+閾値を緩める前に、もう一段やれることがあります。出力ブロックの多くは、プロンプトに用途や立場が書かれておらず、モデルが安全側に倒した結果です。`system_instruction` で用途を宣言し、それでも落ちる場合に限って原因カテゴリを一段緩める、という順序にすると、閾値をいじる回数そのものが減ります。
+
+```python
+def graded_generate(client, prompt, *, model="gemini-3.5-flash"):
+    """文脈付与 → 原因カテゴリのみ緩和 → 諦めて代替文、の順に試す"""
+    sys = ("あなたは技術文書の編集アシスタントです。"
+           "学術・実務の観点から、正確で中立的な説明を返してください。")
+
+    # 1st: 既定の閾値 + 用途宣言
+    resp = client.models.generate_content(
+        model=model, contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=sys,
+            safety_settings=build_safety(),
+        ),
+    )
+    state, _ = classify_block(resp)
+    if state == "OK":
+        return resp.text
+
+    # 2nd: 出力ブロックなら、原因カテゴリだけを一段緩める
+    if state == "OUTPUT_BLOCKED":
+        offending = pick_offending_category(resp)  # 下記参照
+        if offending is not None:
+            resp = client.models.generate_content(
+                model=model, contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=sys,
+                    safety_settings=build_safety(
+                        {offending: types.HarmBlockThreshold.BLOCK_ONLY_HIGH}
+                    ),
+                ),
+            )
+            if classify_block(resp)[0] == "OK":
+                return resp.text
+
+    # 3rd: 入力ブロック、または緩めても駄目なら緩和せず代替文
+    return None  # 呼び出し側で定型のフォールバック文を返す
+
+
+def pick_offending_category(resp):
+    """ブロックに寄与したカテゴリを safety_ratings から1つ選ぶ"""
+    for cand in (resp.candidates or []):
+        for r in (cand.safety_ratings or []):
+            if bool(getattr(r, "blocked", False)):
+                return r.category
+    return None
+```
+
+この設計のポイントは、入力ブロック（`INPUT_BLOCKED`）では閾値を緩めない、と決めていることです。入力そのものが方針に触れているなら、出力側の閾値を緩めても筋が悪く、むしろ本当に止めるべきものを通してしまいます。入力ブロックは緩和の対象ではなく、プロンプト設計か拒否の対象として扱います。3段目で `None` を返し、呼び出し側が「この内容にはお答えできません」と定型で返すのは、無理に通すよりずっと安全です。
+
+## 本番に置くときの最小チェック
+
+本番へ載せるときに私が必ず確認している点を、個人的に重視している順に挙げておきます。
+
+1. `build_safety()` を呼ばずに `generate_content` している箇所が残っていないかを `grep` で確認します。既定依存の呼び出しが一つでもあると、そこだけ挙動が読めなくなります。
+2. `classify_block` の戻り値（`INPUT_BLOCKED` / `OUTPUT_BLOCKED` / `OK`）を必ず構造化ログのフィールドに出し、カテゴリ別のブロック率と `MEDIUM` 率を週次で眺められるようにします。
+3. `OFF` を使っている箇所があるなら、それが検証用に限定され本番経路に紛れていないかを確認します。本番経路では `OFF` を使わない設計を推奨します。
+
+## 緩めた判断は測り直す
+
+閾値をいじったら、いじりっぱなしにしないことも大切です。私の無人バッチでは、原因カテゴリを一段だけ緩めたことで、`OUTPUT_BLOCKED` の誤検知率がおおよそ4%から0.5%程度まで下がりました。一方で、緩めたカテゴリの `HIGH` レーティングが増えていないかは、同じログで継続して見ています。誤検知を1件減らす代わりに、本当に止めるべき出力を1件通してしまっては本末転倒だからです。
+
+セーフティフィルタは敵ではなく、無人で回す処理にとってはむしろ最後の安全網です。全部切ってしまえば誤検知は消えますが、同時にその網も消えます。原因カテゴリだけを実測で見極めて一段だけ緩める、それでも入力側が触れているものは通さない——この線引きを保てるかどうかが、自動運用を安心して回せるかの分かれ目だと感じています。同じように無人のパイプラインを抱えている方の参考になれば幸いです。
