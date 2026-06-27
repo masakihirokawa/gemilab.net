@@ -1,0 +1,178 @@
+---
+title: "Stopping Runaway Costs Twice: Project Spend Caps Plus an App-Side Soft Limit"
+slug: "gemini-api-spend-cap-soft-governor-unattended-pipeline"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-27T12:00"
+author: "Gemini Lab"
+description: "Pairing Gemini API Project Spend Caps (a monthly USD ceiling) with an app-side soft circuit breaker that trips before the hard cap. Includes a working Python and sqlite daily cost ledger."
+tags: ["Gemini API", "Cost Management", "Spend Caps", "Automation", "Operations"]
+highlights:
+  - "How to assign a monthly USD ceiling per project with Project Spend Caps so a runaway loop can't bleed your budget"
+  - "A daily cost ledger in Python and sqlite, with a soft circuit breaker that trips before the hard cap"
+  - "Routing preprocessing to gemini-flash-latest and capping thinking budget to lower your baseline cost"
+---
+
+One morning, before I had even made coffee, I opened the Gemini API dashboard and my hand froze for a second. The automated publishing pipeline I run unattended overnight had fired several times more requests than I expected. The cause was mundane: an external API was intermittently returning 5xx, and the retry logic I had written was dutifully hammering it again and again. The bill never became serious, but it left a quiet mark on me. Running something unattended means keeping a path open through which costs can quietly pile up while you are not watching.
+
+Project Spend Caps, which reached general availability on June 26, 2026, speaks directly to that anxiety. You can set a monthly USD ceiling on Gemini API usage per project, and it stays in force until you change or disable it. Even so, a hard ceiling alone is not enough — that has been my honest experience as an indie developer running several apps and blogs unattended in parallel. In this piece I want to leave behind a two-layer design: Project Spend Caps as the foundation, with an app-side soft limit layered just inside it that quietly slows things down before the hard cap ever fires.
+
+## Where costs actually spike in unattended runs
+
+Costs spike, almost always, during the hours when nobody is watching. And the causes are few enough to count on one hand.
+
+First, retry storms. If you fire requests again immediately on a transient 429 or 5xx without exponential backoff, every failure becomes another call, and the volume swells in minutes. My own near-miss was exactly this.
+
+Second, model misrouting. If you point a heavy model at light preprocessing such as background lookups or tagging, your per-request unit cost multiplies for no reason. Output tokens are priced higher than input, so casually letting a model return long responses adds up too.
+
+Third, loops that never settle. In agentic flows that keep retrying "once more if it isn't enough," a loose stop condition spawns near-infinite round trips. When you run autonomous execution like Managed Agents unattended, this is the scariest pitfall of all.
+
+None of these surface in normal testing. They bare their teeth only in production, in the hours while you sleep. That is exactly why you need a ceiling on cost itself, in a layer separate from the correctness of your code.
+
+## What Project Spend Caps protect, and what they don't
+
+The role of Project Spend Caps is clear. Once monthly spend tied to a project reaches the USD amount you set, further billable requests are stopped. It works like a credit card limit — a last line of defense.
+
+But a hard ceiling has an inherent limitation. The moment the cap is reached, in-flight work is rejected uniformly. A half-assembled article and a batch that was halfway done are stopped without distinction. From the app's point of view, calls suddenly start returning errors past a certain moment in time.
+
+In other words, a hard cap exists to prevent disaster, not to decelerate gracefully. As the cap approaches near month-end, it cannot make the judgment to let important jobs through while deferring trivial ones. Filling that gap is the job of the soft limit we build next.
+
+## Why hold a soft limit yourself
+
+I draw a second line a little inside the hard ceiling, roughly at the 80% mark. I call this inner line the soft limit, and it plays three roles.
+
+The first is deceleration. When the soft limit is touched, I stop new heavy calls and either switch to a lighter model or push the job to the next day. The second is visibility. Keeping "what percentage of the monthly budget am I at" in my own logs lets me notice anomalies without opening a dashboard. The third is checkpointing. If I save progress before stopping, I can resume from where I left off the next day.
+
+Because the soft limit lives in app-side code, it can behave according to job priority instead of stopping everything uniformly like the hard cap. That is its single biggest advantage.
+
+## Implementing the cost governor
+
+The implementation fits into a surprisingly small space. There are only three things to do: hold a pricing table, record consumption in a ledger, and check the limit around each call.
+
+First, hold the unit price per model in USD per million tokens. Always confirm the concrete numbers on the official pricing page; here I show only the structure.
+
+```python
+# pricing.py — overwrite the rates with the latest values from the official pricing page
+# Unit: USD / 1,000,000 tokens
+PRICING = {
+    "gemini-flash-latest": {"in": 0.10, "out": 0.40},   # 3.5 Flash (GA)
+    "gemini-pro-latest":   {"in": 1.25, "out": 5.00},   # Pro tier
+}
+
+def estimate_cost(model: str, in_tokens: int, out_tokens: int) -> float:
+    p = PRICING[model]
+    return (in_tokens * p["in"] + out_tokens * p["out"]) / 1_000_000
+```
+
+Next, a ledger that accumulates daily spend in sqlite. Dividing the monthly cap by the number of days into a rough daily target makes it easier to avoid an end-of-month rush.
+
+```python
+# ledger.py
+import sqlite3, datetime
+
+class CostLedger:
+    def __init__(self, db="cost.db", monthly_cap_usd=40.0, soft_ratio=0.8):
+        self.db = db
+        self.monthly_cap = monthly_cap_usd
+        self.soft_cap = monthly_cap_usd * soft_ratio
+        with sqlite3.connect(self.db) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS spend("
+                      "ts TEXT, model TEXT, usd REAL, request_id TEXT UNIQUE)")
+
+    def _month_key(self):
+        # Aggregate on a fixed timezone. Raw UTC shifts the day boundary and drops today's spend
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+        return now.strftime("%Y-%m")
+
+    def month_to_date(self) -> float:
+        with sqlite3.connect(self.db) as c:
+            cur = c.execute("SELECT COALESCE(SUM(usd),0) FROM spend "
+                            "WHERE substr(ts,1,7)=?", (self._month_key(),))
+            return float(cur.fetchone()[0])
+
+    def record(self, model: str, usd: float, request_id: str):
+        # A UNIQUE request_id prevents double-counting on retries
+        ts = datetime.datetime.now().isoformat()
+        with sqlite3.connect(self.db) as c:
+            try:
+                c.execute("INSERT INTO spend VALUES(?,?,?,?)",
+                          (ts, model, usd, request_id))
+            except sqlite3.IntegrityError:
+                pass  # this request_id is already recorded; ignore silently
+
+    def status(self) -> str:
+        mtd = self.month_to_date()
+        if mtd >= self.monthly_cap:
+            return "HARD"
+        if mtd >= self.soft_cap:
+            return "SOFT"
+        return "OK"
+```
+
+Finally, a circuit breaker that consults the ledger before letting a call through. Past the soft limit, it rejects heavy work or drops to a lighter model.
+
+```python
+# governor.py
+from pricing import estimate_cost
+from ledger import CostLedger
+
+ledger = CostLedger(monthly_cap_usd=40.0, soft_ratio=0.8)
+
+class BudgetExceeded(Exception):
+    pass
+
+def guarded_generate(client, model, contents, request_id, priority="normal"):
+    state = ledger.status()
+    if state == "HARD":
+        raise BudgetExceeded("Monthly hard cap reached; halting.")
+    if state == "SOFT" and priority != "high":
+        # Inside the soft limit, drop lower-priority jobs to a lighter model
+        model = "gemini-flash-latest"
+
+    resp = client.models.generate_content(model=model, contents=contents)
+    usage = resp.usage_metadata
+    usd = estimate_cost(model, usage.prompt_token_count,
+                        usage.candidates_token_count)
+    ledger.record(model, usd, request_id)
+    return resp
+```
+
+Two details matter here: guarding `request_id` with a UNIQUE constraint, and aggregating on a fixed timezone. The former prevents double-counting from retries; the latter prevents dropping today's spend at the day boundary. Both are things I fixed only after stepping on them.
+
+## Lowering your baseline cost with model routing
+
+The soft limit is insurance. If you also lower your everyday unit cost, you touch the limit far less often. This is where gemini-flash-latest — 3.5 Flash, which reached GA in June 2026 — earns its keep.
+
+In my setup, all preprocessing such as lookups, summaries, and tagging goes to 3.5 Flash, and I escalate to a higher model only where final assembly or real judgment is needed. Preprocessing runs many times, so shifting it to a lighter model alone changes the shape of the monthly cost. Escalating to a heavy model is usually needed for only a small fraction of requests.
+
+On top of that, I cap how much budget goes to reasoning with thinking budget. Handing a thick thinking budget to routine work that needs no deep reasoning only stretches output tokens and pushes the unit cost up. I keep thinking minimal for batch preprocessing and open the budget only for design-level decisions.
+
+## How to distribute caps across projects
+
+Because Project Spend Caps apply per project, I split each app and blog into its own project and assign a separate USD ceiling to each. That way a runaway in one project stops there and doesn't spill into the rest of my operations.
+
+A good starting cap is the typical month's actuals plus about a 20% margin. Set it exactly at actuals and a small traffic bump rejects healthy jobs; leave too much margin and the cap stops working as insurance.
+
+<table>
+<thead>
+<tr><th>Project</th><th>Typical month (example)</th><th>Hard cap</th><th>Soft cap (80%)</th></tr>
+</thead>
+<tbody>
+<tr><td>Publishing pipeline</td><td>$28</td><td>$40</td><td>$32</td></tr>
+<tr><td>In-app assist feature</td><td>$15</td><td>$24</td><td>$19</td></tr>
+<tr><td>Testing / experiments</td><td>$5</td><td>$10</td><td>$8</td></tr>
+</tbody>
+</table>
+
+I deliberately set a lower cap on the experiments project, because the place where you try new prompts is exactly where unexpected loops are born. I keep it fully separate from the production systems of the apps I monetize through AdMob, so a failed experiment never eats into the production budget.
+
+## Adjustments that surfaced in operation
+
+After running this two-layer setup for a few months, I adjusted a few things.
+
+1. The soft ratio. I started at 90%, but there was too little headroom to the hard cap and deceleration sometimes came too late. 80% is where I settle now.
+2. The alert threshold. Firing a notification the instant the soft limit is touched means it rings daily near month-end and you stop noticing. I changed it to notify once, only on the first day the soft limit is touched.
+3. Ledger backups. If the sqlite file is lost, the month's tally resets to zero and the cap temporarily stops working. Copying it somewhere once a day avoids this pitfall.
+
+A cost ceiling, once drawn, rarely enters your mind day to day. Yet it keeps working quietly in the hours nobody is watching, stopping a near-miss before it happens. Start by picking one process you run unattended and drawing a single Project Spend Cap across it. Having run this alongside a ledger myself, I have come to feel that this small precaution is what buys a quiet night's sleep. Thank you for reading.
