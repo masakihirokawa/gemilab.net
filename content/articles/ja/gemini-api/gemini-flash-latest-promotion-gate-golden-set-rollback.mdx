@@ -1,0 +1,254 @@
+---
+title: "gemini-flash-latest が 3.5 Flash に切り替わっても深夜に事故らない『昇格ゲート』の設計"
+slug: "gemini-flash-latest-promotion-gate-golden-set-rollback"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-28T10:00"
+author: "Gemini Lab"
+description: "gemini-flash-latest のような可変エイリアスは GA のたびに中身が差し替わり、無人で回している自動処理の前提を静かに崩します。自前の役割→固定モデルID の間接層と、ゴールデンセットで4指標を測る受け入れハーネス、しきい値での昇格・自動ロールバックまでを実装コード付きで共有します。"
+tags: ["gemini-api", "本番運用", "モデル切替", "python", "コスト管理", "回帰テスト"]
+highlights:
+  - "gemini-flash-latest の自動切替で出力形式やコストが静かに変わっても、本番に届く前に止められる『昇格ゲート』を今日から自分のパイプラインに組み込めるようになる"
+  - "スキーマ適合率・旧モデルとの判定一致率・p95レイテンシ・1コールあたりコストの4指標を、自分のゴールデンセットで測る受け入れハーネスのコードを手に入れられる"
+  - "新モデルへの切替を『当日に気づく』のではなく『通すか戻すかを数値で決める』運用へ移行でき、無人の自動処理を安心して回せるようになる"
+---
+
+「昨夜の自動分類だけ、なぜか JSON が壊れて半分スキップされている」— ある朝のログを見てそう気づいたとき、私は前日に `gemini-flash-latest` の実体が新しい GA モデルへ差し替わっていたことに後から気づきました。コードは一行も変えていません。変わったのは、エイリアスが指す先のモデルだけです。
+
+`gemini-flash-latest` のような可変エイリアスは便利です。常に「いちばん新しい Flash」を指してくれるので、モデル名を追い続けなくて済みます。ところが、無人で回している自動処理にとっては、この「いつの間にか中身が変わる」性質がそのままリスクになります。出力スキーマの癖、空応答の頻度、レイテンシ、そして 1 コールあたりのコスト。そのどれかが静かにずれても、エラーにはなりません。ただ結果の質だけが落ちて、月末の請求書か、翌朝のログで気づくことになります。
+
+個人開発で、AdMob の収益で回している複数のアプリの運用補助を Gemini に任せていると、この「静かな切替」はいちばん怖い種類の障害です。誰も画面を見ていない時間帯に、前提が一つだけ抜け替わる。ここでは私が自分のパイプラインに入れている、新モデルを本番に通す前に数値で合否を出す「昇格ゲート」の作り方を共有します。
+
+## まず可変エイリアスを本番の自動処理から外す
+
+最初にやるべきことは、コードの中で `gemini-flash-latest` を直接呼ぶのをやめることです。代わりに「役割（role）」と「実際に呼ぶ固定モデルID」を分ける薄い間接層を一枚はさみます。本番が参照するのは役割名だけ、固定IDは設定ファイル側に置きます。
+
+この設計の肝は、各役割に対して `prod`（いま本番で使っている固定ID）と `candidate`（次に評価したい新しいGA版の固定ID）の二つのスロットを持たせることです。昇格とは、ゲートを通った `candidate` の値を `prod` スロットへ書き写す操作にすぎません。ロールバックは、その逆です。
+
+```python
+# model_registry.py — 役割→固定モデルID の間接層
+import json
+from pathlib import Path
+
+REGISTRY_PATH = Path("config/model_registry.json")
+
+# 設定ファイルの中身（例）:
+# {
+#   "review_triage":   {"prod": "gemini-2.5-flash", "candidate": "gemini-3.5-flash"},
+#   "wallpaper_tag":   {"prod": "gemini-2.5-flash", "candidate": "gemini-3.5-flash"}
+# }
+
+def load_registry() -> dict:
+    return json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+
+def model_for(role: str, slot: str = "prod") -> str:
+    """本番コードは必ずこの関数経由でモデルIDを取得する。
+    -latest を直接書かないことで『静かな切替』の入口を塞ぐ。"""
+    reg = load_registry()
+    if role not in reg:
+        raise KeyError(f"未登録の役割: {role}")
+    model_id = reg[role].get(slot)
+    if not model_id:
+        raise ValueError(f"{role} に {slot} スロットがありません")
+    return model_id
+```
+
+これだけで「いつ・どの役割が・どのモデルに変わったか」が設定ファイルの差分として git の履歴に残ります。可変エイリアスを使っていると、この履歴がどこにも残らないのが本当の問題でした。固定IDに寄せておけば、`gemini-flash-latest` の GA 切替は「自動で適用される事故」ではなく「自分が `candidate` に新IDを置いて評価を始める起点」に変わります。
+
+## 昇格ゲートが測る4つの指標
+
+新モデルを「速くなった」「賢くなった」という体感で通すと、自動処理では足をすくわれます。無人で回す前提なら、合否は次の4つの数値で決めます。いずれも自分のワークロードの代表サンプル（ゴールデンセット）に対して測ります。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>測り方</th><th>なぜ自動処理で効くか</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>スキーマ適合率</td><td>response_schema で要求した JSON が、そのままパースできた割合</td><td>パイプラインの下流は構造化出力前提。ここが落ちると静かにスキップ・欠損が出る</td></tr>
+    <tr><td>判定一致率</td><td>同じ入力に対する candidate と prod のラベル一致率</td><td>「壊れてはいないが結論が変わった」を捕まえる。回帰の本体はここ</td></tr>
+    <tr><td>p95 レイテンシ</td><td>応答時間の95パーセンタイル</td><td>夜間バッチの総処理時間とタイムアウト設計に直結する</td></tr>
+    <tr><td>1コールあたりコスト</td><td>usage_metadata のトークン数 × 単価表</td><td>同じ仕事でも新モデルで単価が変わることがある。請求が動く前に見る</td></tr>
+  </tbody>
+</table>
+
+ここで「LLM as a judge で品質を採点する」方式をあえて主指標にしていない点を補足します。判定一致率を prod 基準で測るのは、私の用途（アプリレビューの分類、壁紙アセットのタグ付け）では「以前と同じ仕事を、以前と同じ結論で、安く速くこなせるか」が問いだからです。新しい正解を発見したいのではなく、既存の自動処理を壊さずに乗り換えたい。目的が違えば主指標も変わります。品質の絶対評価を足したい場合は、別途 [ゴールデンデータセットと LLM ジャッジで品質を継続監視する仕組み](/articles/gemini-api/gemini-api-quality-monitoring-golden-dataset-llm-judge) を併走させると役割分担がきれいになります。
+
+## ゴールデンセットは自分のワークロードから作る
+
+ゲートの信頼性は、ゴールデンセットが本番の入力をどれだけ代表しているかで決まります。汎用ベンチマークではなく、自分のパイプラインに実際に流れてくる入力を 50〜200 件ほど抜き出して JSONL にします。私の場合はアプリレビュー分類の役割なら、実際に届いたレビュー文（ネガ・ポジ・要望・スパムが混ざるよう層化して抽出）を素材にしています。
+
+```python
+# golden/review_triage.jsonl の各行（例）
+# {"id": "r001", "input": "起動時に毎回広告が出て使いにくい", "expect_label": "complaint"}
+# {"id": "r002", "input": "壁紙の追加ありがとうございます！毎日使ってます", "expect_label": "praise"}
+# {"id": "r003", "input": "ダークモードに対応してほしいです", "expect_label": "request"}
+```
+
+`expect_label` は「絶対の正解」ではなく「prod が現状こう判定していて、それで運用が回っている」という基準値です。ここを神話化しないのがコツで、candidate と prod が両方とも `expect_label` と違っても、互いに一致していれば「方針が一貫して変わった」とわかります。逆に candidate だけがずれていれば、それが乗り換えで失うものです。
+
+## 受け入れハーネスを実装する
+
+4指標をゴールデンセット全件で測る本体です。`google-genai` SDK の安定したインターフェースだけで書けます。コストはモデルごとの単価表を設定として外に出し、コード内に料金をハードコードしません（単価は変わるため、自分の請求条件で埋める前提にします）。
+
+```python
+# acceptance_harness.py
+import json, time, statistics
+from pathlib import Path
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # GEMINI_API_KEY は環境変数から
+
+# 1,000トークンあたりの単価（USD）。実際の料金は自分の請求条件で埋める。
+PRICE_TABLE = {
+    "gemini-2.5-flash": {"in": 0.0000, "out": 0.0000},
+    "gemini-3.5-flash": {"in": 0.0000, "out": 0.0000},
+}
+
+RESPONSE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    required=["label"],
+    properties={
+        "label": types.Schema(
+            type=types.Type.STRING,
+            enum=["complaint", "praise", "request", "spam"],
+        )
+    },
+)
+
+def call_once(model_id: str, text: str):
+    """1コールを実行し、(ラベル, スキーマ適合, レイテンシ秒, コストUSD) を返す。"""
+    started = time.perf_counter()
+    try:
+        resp = client.models.generate_content(
+            model=model_id,
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=RESPONSE_SCHEMA,
+                temperature=0.0,  # 評価は決定的に寄せる
+            ),
+        )
+    except Exception as e:
+        return None, False, time.perf_counter() - started, 0.0
+    latency = time.perf_counter() - started
+
+    schema_ok, label = False, None
+    try:
+        data = json.loads(resp.text)
+        label = data["label"]
+        schema_ok = label in {"complaint", "praise", "request", "spam"}
+    except Exception:
+        schema_ok = False
+
+    um = resp.usage_metadata
+    price = PRICE_TABLE.get(model_id, {"in": 0.0, "out": 0.0})
+    cost = (um.prompt_token_count / 1000) * price["in"] \
+         + ((um.candidates_token_count or 0) / 1000) * price["out"]
+    return label, schema_ok, latency, cost
+
+def evaluate(model_id: str, golden: list[dict]) -> dict:
+    labels, schema_hits, latencies, costs = [], 0, [], []
+    for row in golden:
+        label, schema_ok, latency, cost = call_once(model_id, row["input"])
+        labels.append(label)
+        schema_hits += 1 if schema_ok else 0
+        latencies.append(latency)
+        costs.append(cost)
+    n = len(golden)
+    latencies.sort()
+    p95 = latencies[min(int(n * 0.95), n - 1)] if n else 0.0
+    return {
+        "model": model_id,
+        "labels": labels,
+        "schema_rate": schema_hits / n if n else 0.0,
+        "p95_latency": p95,
+        "avg_cost": statistics.mean(costs) if costs else 0.0,
+    }
+
+def agreement(a: list, b: list) -> float:
+    """同位置のラベル一致率。None（呼び出し失敗）は不一致扱い。"""
+    if not a:
+        return 0.0
+    hits = sum(1 for x, y in zip(a, b) if x is not None and x == y)
+    return hits / len(a)
+```
+
+`temperature=0.0` にしているのは、評価のたびに結果が揺れると合否が運任せになるからです。本番の温度が高い役割でも、ゲートでは決定的側に寄せて「モデルの素の振る舞い」を比べます。`resp.usage_metadata` から入出力トークンを取れる点が地味に重要で、ここを記録しておくと請求書と突き合わせる別の仕組みにもそのまま使えます。トークン記録の本番パターンは [usageMetadata でリクエスト単位のコストを記録する実装](/articles/gemini-api/gemini-api-usage-metadata-cost-tracking-production) に詳しくまとめています。
+
+## しきい値で昇格・ロールバックを自動で決める
+
+測った数値を、あらかじめ決めたしきい値に当てます。ここが本番運用での落とし穴で、しきい値を緩めすぎると新モデルの劣化を素通りさせ、締めすぎると永遠に昇格できません。私が使っている基準はおおむね次のとおりですが、重要な役割ほど判定一致率のしきい値を高めに設定することを推奨します。
+
+<table>
+  <thead>
+    <tr><th>条件</th><th>しきい値（例）</th><th>外れたときの扱い</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>スキーマ適合率</td><td>0.99 以上</td><td>不合格（下流が壊れる）</td></tr>
+    <tr><td>prod との判定一致率</td><td>0.95 以上</td><td>不合格（結論が変わりすぎ）</td></tr>
+    <tr><td>p95 レイテンシ</td><td>prod の 1.3 倍以内</td><td>不合格（夜間枠を超える）</td></tr>
+    <tr><td>1コールあたりコスト</td><td>prod 以下、または許容増分内</td><td>要承認（自動昇格はしない）</td></tr>
+  </tbody>
+</table>
+
+```python
+# promote.py — ゲート判定と registry の書き換え
+import json
+from pathlib import Path
+from acceptance_harness import evaluate, agreement
+from model_registry import load_registry, REGISTRY_PATH
+
+def run_gate(role: str, golden_path: str) -> bool:
+    golden = [json.loads(l) for l in Path(golden_path).read_text(encoding="utf-8").splitlines() if l.strip()]
+    reg = load_registry()
+    prod_id = reg[role]["prod"]
+    cand_id = reg[role]["candidate"]
+
+    prod = evaluate(prod_id, golden)
+    cand = evaluate(cand_id, golden)
+    agree = agreement(prod["labels"], cand["labels"])
+
+    checks = {
+        "schema_rate":  cand["schema_rate"] >= 0.99,
+        "agreement":    agree >= 0.95,
+        "p95_latency":  cand["p95_latency"] <= prod["p95_latency"] * 1.3,
+        "cost_ok":      cand["avg_cost"] <= prod["avg_cost"] * 1.05,
+    }
+    print(f"[{role}] {cand_id}  適合率={cand['schema_rate']:.3f} "
+          f"一致率={agree:.3f} p95={cand['p95_latency']:.2f}s "
+          f"コスト比={cand['avg_cost'] / (prod['avg_cost'] or 1):.2f}")
+    for name, ok in checks.items():
+        print(f"  {'✅' if ok else '❌'} {name}")
+
+    if all(checks.values()):
+        # 昇格: candidate を prod スロットへ書き写す
+        reg[role]["prod"] = cand_id
+        REGISTRY_PATH.write_text(json.dumps(reg, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[{role}] 昇格しました → prod = {cand_id}")
+        return True
+
+    print(f"[{role}] 不合格。prod = {prod_id} のまま据え置きます")
+    return False
+```
+
+昇格は設定ファイルの 1 行を書き換えるだけなので、git にコミットすれば「いつ・どの根拠で・どのモデルへ上げたか」が記録として残ります。ロールバックも同じ仕組みで、`prod` を直前の固定IDへ戻して再デプロイすれば、可変エイリアスのように「気づいたら戻せない」状態にはなりません。重要な役割では、昇格後の最初の数時間だけ candidate と prod を影で並走させ、実トラフィックでの一致率を見てから古いIDを捨てる、という慎重な運用にすることもあります。
+
+## 外側のガードレールとして Project Spend Caps を併用する
+
+昇格ゲートはあくまで「品質と振る舞い」を守る内側の仕組みです。コストの暴発に対しては、もう一段外側に Gemini API のプロジェクト単位の月額上限（Project Spend Caps）を置いておくと、評価ハーネス自体が想定外にトークンを食ったときの最終的な止血になります。内側で 1 コールあたりコストを見て、外側でプロジェクト総額を構造的に止める。二重化しておくと、無人で回す自動処理でも費用の最悪ケースが読めます。
+
+この考え方は、コストを後追いで分析する [既定モデルの静かな差し替えを検知する仕組み](/articles/gemini-api/gemini-api-default-model-pinning-silent-upgrade-detection-production) と相補的です。検知は「変わったことに気づく」ためのもの、昇格ゲートは「変えるかどうかを自分で決める」ためのもの。両方あると、可変エイリアスの利便性を捨てずに、本番の前提だけは自分の手元に握っておけます。
+
+## 次の一手
+
+導入はこの順で進めると無理がありません。
+
+1. 役割を一つだけ選び、本番コードの `gemini-flash-latest` 直書きを `model_for(role)` 経由へ置き換える
+2. 直近の実入力を 50 件ほど抜き出して JSONL のゴールデンセットにする（完璧でなくてかまいません）
+3. 受け入れハーネスを回し、4 指標としきい値で `candidate` の合否を出す
+
+ここまで用意できれば、次に GA 通知が来たときには「体感で通す」のではなく「数値で通すか戻すか決める」側に立てます。
+
+私自身、最初は可変エイリアスの手軽さを手放すのが惜しく感じました。けれど、誰も見ていない時間帯に前提が一つ抜け替わる怖さを一度味わってからは、固定IDと昇格ゲートのほうが結局は速く眠れる、と感じています。同じように無人の自動処理を抱えている方の参考になれば幸いです。
