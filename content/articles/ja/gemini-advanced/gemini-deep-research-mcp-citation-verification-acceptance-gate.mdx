@@ -1,0 +1,283 @@
+---
+title: "Gemini Deep Research のレポートを鵜呑みにしない — MCP連携時に引用元を機械検証してから取り込む受け入れゲート"
+slug: "gemini-deep-research-mcp-citation-verification-acceptance-gate"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-27T16:00"
+author: "Gemini Lab"
+description: "Deep ResearchがMCPで自前データに繋がった今、返ってきたレポートを自動取り込みする前に、引用が信頼ソースへ解決できるかを機械検証する受け入れゲートを実装します。許可リスト・根拠カバレッジ率・却下理由の記録まで動くコードで設計します。"
+tags: ["Gemini", "Deep Research", "MCP", "File Search", "検証"]
+highlights:
+  - "Deep Research の grounding メタデータ（doc_id / media_id / page_numbers）を構造で受け取り、信頼ソースへの解決可否で判定する具体実装"
+  - "File Search 文書IDと許可ドメインの許可リスト照合、根拠カバレッジ率（初期しきい値 0.85）による縮退ロジック"
+  - "却下理由（doc_id_not_allowed / media_unresolvable / domain_not_allowed）をSQLiteに記録し毎晩見直す運用設計"
+---
+
+2026年6月27日の更新で、Deep Research の新版が MCP サーバー連携と File Search に対応しました。これまで公開情報を広く調べてくれる機能だったものが、自前のデータストアや手元の MCP ツールを「根拠」として参照できるようになった、という変化です。個人開発で運用の自動化を回している立場からすると、これは素直に嬉しい更新でした。自分のドキュメントやログを根拠に調べ物をさせて、その結果をそのまま下書きパイプラインに流せそうに見えるからです。
+
+ただ、実際に組み込もうとして最初に立ち止まったのは「返ってきたレポートを、本当にそのまま取り込んでよいのか」という点でした。Deep Research の出力は引用つきの散文です。引用がついていると一見もっともらしく読めますが、その引用が本当に自分の信頼しているソースに解決できるのか、それとも外部の出所不明なページや、実体のない参照に紐づいているのかは、文面を眺めただけでは判別できません。無人で取り込む構成では、ここが抜けると「もっともらしいが根拠の怪しい文章」が静かに蓄積していきます。
+
+以下では、Deep Research のレポートを自動取り込みする手前に挟む「受け入れゲート」を実装します。中身は、引用を構造で取り出し、信頼ソースの許可リストへ解決できるかを確かめ、根拠カバレッジ率がしきい値を下回ったら取り込みを止める、という3段構えです。ゲートのコアは外部 API の形に依存しない素の検証ロジックなので、Deep Research の SDK が細部で変わっても作り直さずに済みます。
+
+## そのまま信じてしまう構成の、どこが危ういのか
+
+Deep Research を MCP に繋ぐと、調査の根拠として「自分の File Search ストアの文書」と「外部 Web」の両方が混ざり得ます。レポート本文には主張があり、その主張に引用が添えられます。問題は、引用の出所が三種類に分かれることです。ひとつは自分の信頼ソース（許可リストに載っている File Search の文書 ID や自分が許可したドメイン）。ふたつめは外部の知らないドメイン。みっつめは、解決しようとしても実体に辿り着けない引用です。
+
+無人取り込みで事故るのは、二番目と三番目が混じったまま「引用あり＝信頼できる」と扱ってしまうときです。とくに三番目は厄介で、引用が形式上は付いているのに、その media_id やページ番号、URL が実際のソースに解決できない、というケースが混ざります。人がレビューしていれば「これは出典が変だ」と気づきますが、自動化ではそのまま通ります。
+
+ですから受け入れゲートで確かめたいのは、レポートの読みやすさでも文章の長さでもなく、たったひとつ「個々の引用が、信頼できるソースへ実際に解決できるか」です。これを主張ごとに集計し、解決できた割合（根拠カバレッジ率）で取り込みの可否を決めます。
+
+## レポートを構造で受け取る
+
+検証を機械でやるには、まず引用を散文から取り出して構造にする必要があります。Deep Research を Interactions API 経由で呼ぶときは、ツールとして自分の MCP コネクタと File Search を渡し、出力に grounding メタデータを含めて受け取る形になります。下記はリクエストの骨格です。フィールド名は2026年6月の changelog に沿っていますが、利用中の SDK バージョンに合わせて微調整してください。検証の本体は次節以降の純粋なロジックなので、ここが多少変わってもゲートは作り直しになりません。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+# Deep Research を「自前データ優先」で走らせる骨格
+# - 自分の MCP サーバーと File Search を根拠ソースとして渡す
+op = client.interactions.create(
+    model="gemini-flash-latest",  # 3.5 Flash GA。下調べ用途は速度とコストが効く
+    agent="deep-research",
+    input="社内の運用ログを根拠に、今月の自動投稿の失敗傾向をまとめてください",
+    tools=[
+        types.Tool(file_search=types.FileSearch(
+            file_search_store_names=["projects/me/locations/global/fileSearchStores/ops-logs"],
+        )),
+        types.Tool(mcp=types.McpConnector(
+            server_url="https://mcp.example.internal/ops",
+            allowed_tools=["search_runs", "get_run"],
+        )),
+    ],
+    config=types.InteractionConfig(
+        include_grounding_metadata=True,  # 引用を構造で受け取る
+        background=True,                  # 長時間処理は webhook で受ける
+    ),
+)
+```
+
+ここで大切なのは `include_grounding_metadata=True` です。これがないと、引用は本文中の脚注的な表現としてしか得られず、機械検証が一気に難しくなります。構造化された引用が取れれば、後段は素直なデータ処理になります。
+
+受け取り側では、レポートを「主張（claim）」と「その主張に紐づく引用（citations）」の配列として正規化します。引用は出所の種類によって持っている情報が違うので、共通の形に寄せておきます。
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Citation:
+    kind: str                       # "file_search" | "web" | "mcp"
+    doc_id: str | None = None       # File Search の文書 ID
+    media_id: str | None = None     # 視覚引用の media_id
+    page_numbers: list[int] = field(default_factory=list)
+    url: str | None = None          # web / mcp の出所 URL
+
+@dataclass
+class Claim:
+    text: str
+    citations: list[Citation]
+
+def normalize_report(grounding) -> list[Claim]:
+    claims: list[Claim] = []
+    for seg in grounding.segments:
+        cites = []
+        for c in seg.citations:
+            cites.append(Citation(
+                kind=c.source_type,
+                doc_id=getattr(c, "document_id", None),
+                media_id=getattr(c, "media_id", None),
+                page_numbers=list(getattr(c, "page_numbers", []) or []),
+                url=getattr(c, "uri", None),
+            ))
+        claims.append(Claim(text=seg.text, citations=cites))
+    return claims
+```
+
+この `normalize_report` を通すと、レポートが「主張と引用のリスト」という、検証しやすい形になります。ここから先は外部 API に触れません。
+
+## 受け入れゲートの中身：許可リストと根拠カバレッジ
+
+ゲートの判定は二段です。まず引用ひとつひとつを「信頼ソースに解決できるか」で評価し、次に主張ごとに「少なくともひとつ信頼できる引用があるか」を見て、その割合を全体のカバレッジ率にします。
+
+信頼ソースの許可リストは、File Search の文書 ID 集合と、許可ドメインの集合の二本立てにします。File Search 由来の引用は doc_id が許可集合にあるか、かつ媒体引用なら media_id が実在へ解決できるかを確かめます。Web/MCP 由来の引用は URL のドメインが許可集合にあるかを見ます。
+
+```python
+from urllib.parse import urlparse
+
+class TrustResolver:
+    def __init__(self, allowed_doc_ids: set[str], allowed_domains: set[str], media_exists):
+        self.allowed_doc_ids = allowed_doc_ids
+        self.allowed_domains = allowed_domains
+        self.media_exists = media_exists  # media_id -> bool（実在解決の関数）
+
+    def resolve(self, c: Citation) -> tuple[bool, str]:
+        if c.kind == "file_search":
+            if not c.doc_id or c.doc_id not in self.allowed_doc_ids:
+                return False, "doc_id_not_allowed"
+            if c.media_id and not self.media_exists(c.media_id):
+                return False, "media_unresolvable"
+            return True, "ok"
+        if c.kind in ("web", "mcp"):
+            if not c.url:
+                return False, "missing_url"
+            host = (urlparse(c.url).hostname or "").lower()
+            if not any(host == d or host.endswith("." + d) for d in self.allowed_domains):
+                return False, "domain_not_allowed"
+            return True, "ok"
+        return False, "unknown_source_type"
+```
+
+カバレッジ率は「信頼できる引用を最低ひとつ持つ主張の数 ÷ 引用を持つべき主張の数」で出します。一般論や前置きのような引用不要の文まで分母に入れると率が不当に下がるので、引用が付いている、あるいは事実主張として引用が要るとモデルが判断した主張だけを対象にします。
+
+```python
+def evaluate(claims: list[Claim], resolver: TrustResolver) -> dict:
+    reasons: dict[str, int] = {}
+    grounded = 0
+    checkable = 0
+    for cl in claims:
+        if not cl.citations:
+            continue  # 引用不要の文は分母に入れない
+        checkable += 1
+        ok_here = False
+        for c in cl.citations:
+            ok, why = resolver.resolve(c)
+            if ok:
+                ok_here = True
+            else:
+                reasons[why] = reasons.get(why, 0) + 1
+        if ok_here:
+            grounded += 1
+    coverage = grounded / checkable if checkable else 0.0
+    return {
+        "coverage": round(coverage, 3),
+        "grounded": grounded,
+        "checkable": checkable,
+        "reject_reasons": reasons,
+    }
+```
+
+最後に、しきい値で取り込みの可否を決めます。合格なら取り込み、不合格なら隔離（quarantine）して人のレビュー待ちにします。捨てずに隔離するのは、しきい値の調整に使える失敗例を残しておきたいからです。
+
+```python
+def gate(report_id: str, claims, resolver, threshold: float = 0.85) -> dict:
+    res = evaluate(claims, resolver)
+    res["report_id"] = report_id
+    res["decision"] = "accept" if res["coverage"] >= threshold else "quarantine"
+    return res
+```
+
+## Before / After：素の取り込みとゲート経由の取り込み
+
+違いがいちばん出るのは取り込み口です。素の構成は、レポートが返ってきたら本文をそのまま次工程へ渡します。
+
+```python
+# Before：引用の中身を見ずに取り込む
+report = fetch_report(op)
+ingest(report.text)   # もっともらしさだけで通過してしまう
+```
+
+ゲートを挟むと、取り込みの前に必ず根拠の解決可否で足切りが入ります。
+
+```python
+# After：受け入れゲートを通してから取り込む
+report = fetch_report(op)
+claims = normalize_report(report.grounding)
+decision = gate(report.id, claims, resolver, threshold=0.85)
+
+if decision["decision"] == "accept":
+    ingest(report.text)
+else:
+    quarantine(report.id, report.text, decision)   # 人のレビューへ
+log_decision(decision)
+```
+
+下の比較は、同じレポート群を二つの構成に通したときに何が変わるかをまとめたものです。
+
+<table>
+  <thead>
+    <tr><th>観点</th><th>Before（素の取り込み）</th><th>After（受け入れゲート）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>引用の解決確認</td><td>なし</td><td>主張ごとに信頼ソースへ解決</td></tr>
+    <tr><td>外部ドメイン混入</td><td>素通り</td><td>許可ドメイン外は不合格に計上</td></tr>
+    <tr><td>解決不能な引用</td><td>気づけない</td><td>media_unresolvable として記録</td></tr>
+    <tr><td>失敗時の扱い</td><td>そのまま蓄積</td><td>隔離してレビュー待ち</td></tr>
+    <tr><td>しきい値調整の材料</td><td>残らない</td><td>却下理由が毎回貯まる</td></tr>
+  </tbody>
+</table>
+
+## 却下理由をカテゴリで残し、毎晩見直す
+
+ゲートは合否を出すだけでは育ちません。なぜ落ちたのかをカテゴリで残しておくと、しきい値や許可リストの調整が「勘」ではなく「観測」になります。私自身、運用の自動化を回していて何度も実感したのは、無人で流す処理ほど「失敗の内訳」を構造で持っておくことが効く、という点でした。落ちた事実だけでは翌朝に何を直せばいいか分かりませんが、`domain_not_allowed` が増えているのか `media_unresolvable` が増えているのかが分かれば、打ち手は自然に決まります。
+
+```python
+import json, sqlite3, datetime
+
+def log_decision(d: dict, db="gate_log.sqlite"):
+    con = sqlite3.connect(db)
+    con.execute("""CREATE TABLE IF NOT EXISTS gate_log(
+        ts TEXT, report_id TEXT, decision TEXT, coverage REAL, reasons TEXT)""")
+    con.execute("INSERT INTO gate_log VALUES(?,?,?,?,?)", (
+        datetime.datetime.now().isoformat(timespec="seconds"),
+        d["report_id"], d["decision"], d["coverage"], json.dumps(d["reject_reasons"]),
+    ))
+    con.commit(); con.close()
+
+def nightly_review(db="gate_log.sqlite"):
+    con = sqlite3.connect(db)
+    rows = con.execute("""SELECT decision, COUNT(*), AVG(coverage)
+        FROM gate_log WHERE ts >= datetime('now','-1 day') GROUP BY decision""").fetchall()
+    con.close()
+    return rows
+```
+
+毎晩の集計で `quarantine` の比率と平均カバレッジを見ます。隔離が急に増えた日は、たいていモデルの既定が入れ替わったか、許可ドメインの更新漏れか、MCP サーバー側の出力が変わったかのどれかです。理由のカテゴリ別件数を併せて見れば、どれなのかはすぐ絞れます。
+
+## しきい値をどう決めるか
+
+最初から 0.85 のような数字を信じる必要はありません。むしろ最初の一週間は「全件をいったん隔離して、人が合否を付ける」モードで回し、人の判断とカバレッジ率の対応を観察するのが堅実です。人が「取り込んでよい」と判断したレポートのカバレッジ分布と、「これは駄目」と判断した分布が分かれる境目を、しきい値の初期値にします。
+
+<table>
+  <thead>
+    <tr><th>運用フェーズ</th><th>しきい値の扱い</th><th>狙い</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>立ち上げ1週目</td><td>全件 quarantine（人が合否付け）</td><td>カバレッジと人の判断の対応を観測</td></tr>
+    <tr><td>2〜3週目</td><td>境目の値を暫定しきい値に</td><td>明らかな合格だけ自動化</td></tr>
+    <tr><td>定常</td><td>却下理由の推移で微調整</td><td>取りこぼしと誤取り込みの均衡</td></tr>
+  </tbody>
+</table>
+
+しきい値は高くするほど安全ですが、上げすぎると正しいレポートまで隔離されて人の手間が増えます。安全側に倒しつつ、隔離されたものの中から「本当は合格だった」割合を毎週見て、少しずつ緩めるのが現実的です。
+
+## 無人運用に組み込むときの注意点
+
+いくつか、実際に組み込んで気づいた点を挙げておきます。まず、`background=True` で長時間処理を webhook で受ける場合、レポート本体と grounding メタデータが別々のタイミングで届くことがあります。ゲートは grounding が揃ってから動かすべきで、本文だけ先に来た段階で取り込まないようにします。
+
+次に、許可ドメインの集合は「コードに直書き」ではなく設定として外に出し、変更履歴を残します。許可リストは静かに腐るので、どの引用がどの理由で落ちたかのログと突き合わせて、月に一度は棚卸しします。
+
+最後に、ゲートはあくまで「根拠が信頼ソースに解決できるか」を見るもので、主張の内容が正しいかまでは保証しません。解決できる引用が付いていても、その引用が主張を支えていない、ということは起こり得ます。そこまで踏み込むなら、引用先のテキストと主張の含意一致を別の軽量モデルで見る層を足すことになりますが、まずは「解決可否」だけでも、無人取り込みの事故はかなり減らせます。
+
+## 組み込み手順（最小構成）
+
+実際に手を動かすときは、次の順で組むと迷いません。私はこの順番で小さく回し始めることを推奨します。
+
+1. File Search 文書IDと許可ドメインの2集合を、コード外の設定ファイルに用意します。
+2. `include_grounding_metadata=True` でレポートと grounding を構造で受け取ります。
+3. `normalize_report` で主張と引用のリストへ正規化します。
+4. `TrustResolver` と `evaluate` でカバレッジ率と却下理由を算出します。
+5. 立ち上げ1週目は `threshold=1.01` 相当（全件 quarantine）にして人が合否を付け、境目の値を初期しきい値にします。
+6. `log_decision` で毎回記録し、`nightly_review` で隔離比率と理由の内訳を毎晩確認します。
+
+この6手順だけでも、無人取り込みに「根拠の足切り」が一枚入ります。最初から完璧なしきい値を狙うより、まず全件隔離で観測してから緩める進め方を推奨します。
+
+## まとめ：次の一歩
+
+Deep Research が MCP で自前データに繋がったことで、調査を自動化に組み込む道が一気に現実的になりました。だからこそ、取り込み口に「引用が信頼ソースへ解決できるか」を見る受け入れゲートを一枚挟んでおくと、便利さと安全さを両立できます。
+
+次の一歩としては、まず手元の Deep Research レポートを数本、`normalize_report` で構造に落として `evaluate` にかけ、いまのカバレッジ率がどのあたりに分布するかを見てみてください。数字を見れば、自分のソース構成でしきい値をどこに置くべきかの当たりが付きます。そこから却下理由のログを育てていけば、ゲートは運用しながら少しずつ賢くなっていきます。
+
+最後までお読みいただき、ありがとうございました。同じように調査の自動化に取り組んでいる方の参考になれば幸いです。

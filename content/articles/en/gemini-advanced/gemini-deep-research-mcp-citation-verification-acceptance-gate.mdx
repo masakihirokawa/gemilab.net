@@ -1,0 +1,270 @@
+---
+title: "Don't Ingest Gemini Deep Research Reports Blindly — A Citation-Verification Acceptance Gate for MCP-Grounded Research"
+slug: "gemini-deep-research-mcp-citation-verification-acceptance-gate"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-27T16:00"
+author: "Gemini Lab"
+description: "Now that Deep Research connects to MCP servers and File Search, you can ground research on your own data. This builds an acceptance gate that verifies, before any automated ingest, whether each citation resolves to a trusted source — with an allowlist, a grounding-coverage ratio, and categorized reject reasons, all in working code."
+tags: ["Gemini", "Deep Research", "MCP", "File Search", "Verification"]
+highlights:
+  - "Receive Deep Research citations as structure and decide acceptance by whether each resolves to a trusted source"
+  - "Allowlist resolution plus a grounding-coverage ratio for graceful rejection, and how to set the threshold from real data"
+  - "Log reject reasons by category and review them nightly to keep unattended ingestion trustworthy"
+---
+
+In the June 27, 2026 update, the new Deep Research gained MCP-server connectivity and File Search support. What used to be a feature that broadly searched public information can now treat your own data stores and on-hand MCP tools as grounding. As an indie developer who runs a fair amount of automation solo, I genuinely welcomed this. It looks like I can have it research questions against my own documents and logs, then feed the result straight into a drafting pipeline.
+
+But the first thing that made me pause, when I actually tried wiring it in, was a simple question: can I really ingest the returned report as-is? A Deep Research output is cited prose. Citations make it read as authoritative, but whether each citation actually resolves to a source I trust — versus an unknown external page or a reference that points at nothing — is impossible to tell by reading the text. In an unattended ingest path, when this check is missing, "plausible-but-poorly-grounded" text quietly accumulates.
+
+This article implements an acceptance gate that sits just before automated ingestion. It has three stages: pull citations out as structure, check whether each resolves against an allowlist of trusted sources, and stop ingestion if the grounding-coverage ratio falls below a threshold. The gate's core is plain verification logic that does not depend on the exact shape of the external API, so it survives changes to the Deep Research SDK.
+
+## Where the naive ingest path goes wrong
+
+When you connect Deep Research to MCP, its grounding can mix "documents in your own File Search store" and "the external web." The report body makes claims, and each claim carries citations. The problem is that citation provenance splits three ways. One is your trusted sources (File Search document IDs on the allowlist, or domains you've approved). The second is unknown external domains. The third is citations that, when you try to resolve them, lead to nothing real.
+
+Unattended ingestion fails when the second and third slip in and you treat "has a citation" as "is trustworthy." The third kind is especially nasty: the citation is formally present, yet its media_id, page number, or URL does not resolve to an actual source. A human reviewer would notice "this source looks off," but automation lets it through.
+
+So the gate should verify neither readability nor length, but exactly one thing: does each individual citation actually resolve to a trusted source? We aggregate that per claim and decide ingestion by the share that resolved — the grounding-coverage ratio.
+
+## Receive the report as structure
+
+To verify by machine, you first have to lift citations out of prose into structure. When you call Deep Research via the Interactions API, you pass your MCP connector and File Search as tools and receive the output with grounding metadata included. Below is the request skeleton. Field names follow the June 2026 changelog; adjust them to your installed SDK version. The verification body in the following sections is pure logic, so even if this part shifts, the gate does not need to be rebuilt.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+# Skeleton: run Deep Research with "own data first"
+# - pass your MCP server and File Search as grounding sources
+op = client.interactions.create(
+    model="gemini-flash-latest",  # 3.5 Flash GA; speed and cost help for survey work
+    agent="deep-research",
+    input="Summarize this month's auto-posting failure trends, grounded in our ops logs",
+    tools=[
+        types.Tool(file_search=types.FileSearch(
+            file_search_store_names=["projects/me/locations/global/fileSearchStores/ops-logs"],
+        )),
+        types.Tool(mcp=types.McpConnector(
+            server_url="https://mcp.example.internal/ops",
+            allowed_tools=["search_runs", "get_run"],
+        )),
+    ],
+    config=types.InteractionConfig(
+        include_grounding_metadata=True,  # receive citations as structure
+        background=True,                  # take long jobs over a webhook
+    ),
+)
+```
+
+The key here is `include_grounding_metadata=True`. Without it, citations arrive only as footnote-like phrases in the body, and machine verification becomes far harder. Once you have structured citations, the rest is straightforward data processing.
+
+On the receiving side, normalize the report into an array of "claims" and "the citations attached to each claim." Citations carry different information depending on provenance, so flatten them into one shared shape.
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Citation:
+    kind: str                       # "file_search" | "web" | "mcp"
+    doc_id: str | None = None       # File Search document ID
+    media_id: str | None = None     # media_id for visual citations
+    page_numbers: list[int] = field(default_factory=list)
+    url: str | None = None          # source URL for web / mcp
+
+@dataclass
+class Claim:
+    text: str
+    citations: list[Citation]
+
+def normalize_report(grounding) -> list[Claim]:
+    claims: list[Claim] = []
+    for seg in grounding.segments:
+        cites = []
+        for c in seg.citations:
+            cites.append(Citation(
+                kind=c.source_type,
+                doc_id=getattr(c, "document_id", None),
+                media_id=getattr(c, "media_id", None),
+                page_numbers=list(getattr(c, "page_numbers", []) or []),
+                url=getattr(c, "uri", None),
+            ))
+        claims.append(Claim(text=seg.text, citations=cites))
+    return claims
+```
+
+After `normalize_report`, the report becomes an easy-to-verify "list of claims and citations." From here on, we never touch the external API.
+
+## Inside the gate: allowlist and coverage
+
+The decision has two stages. First evaluate each citation by "does it resolve to a trusted source?" Then look at each claim for "does it have at least one trusted citation?" and turn that share into the overall coverage ratio.
+
+Build the trusted-source allowlist as two sets: File Search document IDs, and approved domains. For File Search citations, check that the doc_id is in the allowed set and, if it's a media citation, that the media_id resolves to something real. For web/MCP citations, check that the URL's domain is in the allowed set.
+
+```python
+from urllib.parse import urlparse
+
+class TrustResolver:
+    def __init__(self, allowed_doc_ids: set[str], allowed_domains: set[str], media_exists):
+        self.allowed_doc_ids = allowed_doc_ids
+        self.allowed_domains = allowed_domains
+        self.media_exists = media_exists  # media_id -> bool (real-existence check)
+
+    def resolve(self, c: Citation) -> tuple[bool, str]:
+        if c.kind == "file_search":
+            if not c.doc_id or c.doc_id not in self.allowed_doc_ids:
+                return False, "doc_id_not_allowed"
+            if c.media_id and not self.media_exists(c.media_id):
+                return False, "media_unresolvable"
+            return True, "ok"
+        if c.kind in ("web", "mcp"):
+            if not c.url:
+                return False, "missing_url"
+            host = (urlparse(c.url).hostname or "").lower()
+            if not any(host == d or host.endswith("." + d) for d in self.allowed_domains):
+                return False, "domain_not_allowed"
+            return True, "ok"
+        return False, "unknown_source_type"
+```
+
+Compute coverage as "claims with at least one trusted citation ÷ claims that should be cited." If you drop general statements or preambles that need no citation into the denominator, the ratio sinks unfairly, so only count claims that either carry a citation or that the model judged to be factual claims needing one.
+
+```python
+def evaluate(claims: list[Claim], resolver: TrustResolver) -> dict:
+    reasons: dict[str, int] = {}
+    grounded = 0
+    checkable = 0
+    for cl in claims:
+        if not cl.citations:
+            continue  # statements needing no citation stay out of the denominator
+        checkable += 1
+        ok_here = False
+        for c in cl.citations:
+            ok, why = resolver.resolve(c)
+            if ok:
+                ok_here = True
+            else:
+                reasons[why] = reasons.get(why, 0) + 1
+        if ok_here:
+            grounded += 1
+    coverage = grounded / checkable if checkable else 0.0
+    return {
+        "coverage": round(coverage, 3),
+        "grounded": grounded,
+        "checkable": checkable,
+        "reject_reasons": reasons,
+    }
+```
+
+Finally, decide ingestion by a threshold. On pass, ingest; on fail, quarantine for human review. We quarantine rather than discard because we want to keep the failures we'll use to tune the threshold.
+
+```python
+def gate(report_id: str, claims, resolver, threshold: float = 0.85) -> dict:
+    res = evaluate(claims, resolver)
+    res["report_id"] = report_id
+    res["decision"] = "accept" if res["coverage"] >= threshold else "quarantine"
+    return res
+```
+
+## Before / After: naive ingest vs gated ingest
+
+The difference shows up most at the ingestion mouth. The naive setup passes the body straight to the next stage as soon as a report returns.
+
+```python
+# Before: ingest without looking inside the citations
+report = fetch_report(op)
+ingest(report.text)   # passes on plausibility alone
+```
+
+With the gate in place, a grounding-resolution cutoff always runs before ingestion.
+
+```python
+# After: ingest only after passing the acceptance gate
+report = fetch_report(op)
+claims = normalize_report(report.grounding)
+decision = gate(report.id, claims, resolver, threshold=0.85)
+
+if decision["decision"] == "accept":
+    ingest(report.text)
+else:
+    quarantine(report.id, report.text, decision)   # to human review
+log_decision(decision)
+```
+
+The comparison below summarizes what changes when the same set of reports runs through the two setups.
+
+<table>
+  <thead>
+    <tr><th>Aspect</th><th>Before (naive ingest)</th><th>After (acceptance gate)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Citation resolution check</td><td>None</td><td>Resolved to trusted source per claim</td></tr>
+    <tr><td>External-domain leakage</td><td>Passes through</td><td>Out-of-allowlist domains counted as fails</td></tr>
+    <tr><td>Unresolvable citations</td><td>Invisible</td><td>Recorded as media_unresolvable</td></tr>
+    <tr><td>Handling of failures</td><td>Accumulates as-is</td><td>Quarantined for review</td></tr>
+    <tr><td>Material for tuning</td><td>None retained</td><td>Reject reasons pile up each run</td></tr>
+  </tbody>
+</table>
+
+## Keep reject reasons by category and review nightly
+
+A gate that only emits pass/fail never matures. If you keep why it failed by category, tuning the threshold and allowlist becomes "observation" rather than "intuition." Something I've felt many times running my own automation is that the more unattended a process is, the more it pays to hold the breakdown of failures as structure. The bare fact that something failed doesn't tell you what to fix the next morning; but knowing whether `domain_not_allowed` is rising or `media_unresolvable` is rising makes the move obvious.
+
+```python
+import json, sqlite3, datetime
+
+def log_decision(d: dict, db="gate_log.sqlite"):
+    con = sqlite3.connect(db)
+    con.execute("""CREATE TABLE IF NOT EXISTS gate_log(
+        ts TEXT, report_id TEXT, decision TEXT, coverage REAL, reasons TEXT)""")
+    con.execute("INSERT INTO gate_log VALUES(?,?,?,?,?)", (
+        datetime.datetime.now().isoformat(timespec="seconds"),
+        d["report_id"], d["decision"], d["coverage"], json.dumps(d["reject_reasons"]),
+    ))
+    con.commit(); con.close()
+
+def nightly_review(db="gate_log.sqlite"):
+    con = sqlite3.connect(db)
+    rows = con.execute("""SELECT decision, COUNT(*), AVG(coverage)
+        FROM gate_log WHERE ts >= datetime('now','-1 day') GROUP BY decision""").fetchall()
+    con.close()
+    return rows
+```
+
+In the nightly roll-up, watch the `quarantine` share and the average coverage. A day when quarantines suddenly spike usually means one of three things: the model default quietly changed, the allowed-domain list missed an update, or the MCP server's output shifted. Read it alongside per-category reason counts and you can narrow down which one quickly.
+
+## How to set the threshold
+
+You don't have to trust a number like 0.85 from the start. It's sounder to run the first week in a "quarantine everything and let a human label pass/fail" mode, observing how human judgment maps onto the coverage ratio. The boundary where the coverage distribution of reports humans called "fine to ingest" separates from those they called "no good" becomes your initial threshold.
+
+<table>
+  <thead>
+    <tr><th>Phase</th><th>Threshold handling</th><th>Goal</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Week 1</td><td>Quarantine all (humans label)</td><td>Observe coverage vs human judgment</td></tr>
+    <tr><td>Weeks 2–3</td><td>Set the boundary value as a provisional threshold</td><td>Automate only the clear passes</td></tr>
+    <tr><td>Steady state</td><td>Nudge by reject-reason trends</td><td>Balance false drops and bad ingests</td></tr>
+  </tbody>
+</table>
+
+Higher thresholds are safer, but raise them too far and correct reports get quarantined, growing human workload. Lean to the safe side, then each week look at the share of quarantined items that "were actually fine," and loosen gradually.
+
+## Notes for wiring this into unattended operation
+
+A few things I noticed once it was actually wired in. First, when you take long jobs over a webhook with `background=True`, the report body and grounding metadata can arrive at different times. The gate should run only after grounding is complete; don't ingest at the stage where only the body has arrived.
+
+Second, keep the allowed-domain set as external configuration rather than hardcoded, and retain a change history. Allowlists rot quietly, so reconcile them against the log of which citation failed for which reason, and take stock once a month.
+
+Finally, the gate only checks "does the grounding resolve to a trusted source" — it does not guarantee that the claim's content is correct. A claim can carry a resolvable citation that doesn't actually support it. If you want to go that far, add a layer that uses a separate lightweight model to check entailment between the cited text and the claim; but even resolution alone cuts unattended-ingest accidents considerably.
+
+## Wrap-up: the next step
+
+Now that Deep Research connects to your own data via MCP, folding research into automation has become genuinely practical all at once. That's exactly why placing a single acceptance gate at the ingestion mouth — one that checks "does each citation resolve to a trusted source" — lets you keep both the convenience and the safety.
+
+For a next step, take a handful of your own Deep Research reports, drop them through `normalize_report` into structure, run `evaluate`, and see where today's coverage ratios fall. The numbers will give you a feel for where to place the threshold for your own source mix. Grow the reject-reason log from there, and the gate gets a little smarter as you operate it.
+
+Thank you for reading to the end. I hope it helps anyone working on automating their own research.
