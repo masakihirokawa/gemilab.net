@@ -1,0 +1,312 @@
+---
+title: "Gemini API の 429 を全部リトライしてはいけません — レート制限と Spend Cap 枯渇を見分けるリトライ設計"
+slug: "gemini-api-429-retryable-vs-spend-cap-exhaustion-retry-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-27T19:45"
+author: "Gemini Lab"
+description: "429 RESOURCE_EXHAUSTED には『1秒待てば直る』ものと『今月はもう叩いても無駄』なものが混ざっています。Project Spend Caps の一般提供で後者が現実的になった今、両者を分類してリトライ層とサーキットブレーカーを設計する方法を実装込みでまとめます。"
+tags: ["gemini-api", "rate-limit", "retry", "spend-cap", "production"]
+highlights:
+  - "429 を浴びるたびに指数バックオフで叩き続けていた人が、リトライ可・不可を機械的に判定する分類層を今日から実装できる"
+  - "Project Spend Caps で月額上限に当たった時に、無駄なリトライでレイテンシだけ膨らませず、キャッシュや軽量モデルへ静かに縮退させる回路を入手できる"
+  - "RetryInfo・QuotaFailure・自前の月次予算ゲートという3つの信号をどう組み合わせて『叩いてよいか』を決めるか、判断基準を持ち帰れる"
+---
+
+個人開発で運営している壁紙アプリの裏側で Gemini を回していると、`429 RESOURCE_EXHAUSTED` は珍しいエラーではありません。問題は、この 429 が二種類あることに長いあいだ気づいていなかったことでした。ひとつは「同じ秒に投げすぎた」一過性のレート制限で、数百ミリ秒待てば素直に通ります。もうひとつは「このプロジェクトの今月の予算をもう使い切った」枯渇で、こちらは何秒待っても、何回叩いても、月が変わるまで通りません。
+
+両方を同じ指数バックオフで処理していると、後者のときにリトライ層が静かに暴れます。1リクエストにつき7回まで再試行する設定なら、枯渇したプロジェクトに対してアプリが延々と7倍の無駄打ちを続け、ユーザーから見れば「読み込みが異常に遅いだけのアプリ」になります。AdMob の広告収益で回している無料アプリだと、この遅延はそのまま離脱につながります。
+
+2026年6月26日に Project Spend Caps が一般提供になり、プロジェクト単位で月間ドル上限を設定できるようになりました。これは費用を構造的に止められる嬉しい更新ですが、同時に「上限に当たった 429」を本番で踏む確率を確実に上げます。つまり、429 を一律でリトライする設計は、いまこそ見直しどきです。プロジェクト構成そのものでの分離は[Spend Cap の影響範囲をティア別に分ける設計](/articles/gemini-api/gemini-api-spend-cap-blast-radius-per-tier-project-isolation)で扱っているので、本記事はリクエスト時の縮退に絞ります。
+
+## 429 を「待てば直る」と「待っても無駄」に二分する
+
+最初にやるべきは、リトライ層に渡る前に 429 を分類することです。判断材料は大きく3つあります。
+
+ひとつ目は、エラーレスポンスに含まれる `google.rpc.RetryInfo` です。サーバーが「この時間だけ待ってから再試行してよい」と明示している場合、`retryDelay` フィールドが入ってきます。これが付いている 429 は、設計上リトライしてよいレート制限だと解釈できます。
+
+ふたつ目は `QuotaFailure` の詳細で、どのクォータ次元（リクエスト毎分・トークン毎分など）に当たったかが分かります。秒・分単位で回復するクォータなら待てば直りますが、日次や月次の上限に当たっているなら、待ち時間の単位がまるで違います。
+
+みっつ目が、自分でしか持っていない情報、つまり**自前の月次支出ゲート**です。これが最も重要です。Spend Cap に当たったかどうかを API のエラー本文だけから確実に判定しようとすると、エラー形状の細部に依存した脆い実装になります。代わりに、自分の側で「今月いくら使ったか」を概算で持っておき、その数字を分類の主軸に据えます。API はあくまで補助信号として使います。
+
+<table>
+<thead>
+<tr><th>信号</th><th>意味</th><th>リトライ判断</th></tr>
+</thead>
+<tbody>
+<tr><td>RetryInfo.retryDelay あり</td><td>サーバー指定の待機後に回復見込み</td><td><strong>リトライ可</strong>（指定秒だけ待つ）</td></tr>
+<tr><td>QuotaFailure が分単位クォータ</td><td>RPM/TPM 超過。すぐ回復</td><td><strong>リトライ可</strong>（バックオフ）</td></tr>
+<tr><td>自前の月次支出ゲートが上限超過</td><td>今月の予算を使い切った可能性大</td><td><strong>リトライ不可</strong>（縮退へ）</td></tr>
+<tr><td>RetryInfo なし・原因不明の枯渇が連続</td><td>判別不能だが回復していない</td><td><strong>保守的に遮断</strong>（ブレーカーを開く）</td></tr>
+</tbody>
+</table>
+
+ここでの設計判断は「迷ったら叩かない」です。リトライして失われるのは時間とわずかなレイテンシ予算ですが、枯渇しているプロジェクトを叩き続けて得られるものは何もありません。
+
+## 分類層を実装する
+
+Gemini の Python SDK（`google-genai`）でエラーを受け、上記の信号を読み取る分類器を組みます。SDK のバージョンによって例外の属性名は揺れるため、特定の属性に依存せず、防御的に取り出すのがコツです。
+
+```python
+# pip install google-genai
+from dataclasses import dataclass
+from enum import Enum
+import json
+import re
+
+
+class Verdict(Enum):
+    RETRYABLE = "retryable"        # 待てば直る（バックオフ可）
+    TERMINAL = "terminal"          # 今月は無駄（縮退へ）
+    UNKNOWN = "unknown"            # 判別不能（保守的に遮断）
+
+
+@dataclass
+class Classification:
+    verdict: Verdict
+    retry_after_s: float | None    # サーバー指定の待機秒（あれば）
+    reason: str
+
+
+def _extract_details(err) -> dict:
+    """例外から構造化詳細を防御的に取り出す。SDK 差異を吸収する。"""
+    # google-genai の APIError は .code / .status / .details を持つことが多いが、
+    # バージョン差があるため getattr と文字列フォールバックで拾う。
+    payload = {}
+    for attr in ("details", "response_json", "args"):
+        val = getattr(err, attr, None)
+        if isinstance(val, dict):
+            payload = val
+            break
+        if isinstance(val, (list, tuple)) and val and isinstance(val[0], dict):
+            payload = val[0]
+            break
+    if not payload:
+        # 最後の手段：文字列化した本文から JSON 片を拾う
+        text = str(getattr(err, "message", "") or err)
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                payload = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                payload = {}
+    return payload
+
+
+def _retry_delay_seconds(details: dict) -> float | None:
+    """google.rpc.RetryInfo の retryDelay（例 "5s"）を秒に変換する。"""
+    error = details.get("error", details)
+    for d in error.get("details", []):
+        t = d.get("@type", "")
+        if "RetryInfo" in t:
+            raw = d.get("retryDelay", "")
+            m = re.match(r"(\d+(?:\.\d+)?)s", str(raw))
+            if m:
+                return float(m.group(1))
+    return None
+
+
+def _quota_dimension(details: dict) -> str | None:
+    """QuotaFailure からクォータ ID（分単位か否かの手がかり）を取り出す。"""
+    error = details.get("error", details)
+    for d in error.get("details", []):
+        if "QuotaFailure" in d.get("@type", ""):
+            for v in d.get("violations", []):
+                qid = v.get("quotaId") or v.get("subject") or ""
+                if qid:
+                    return qid
+    return None
+
+
+def classify_429(err, monthly_budget_exhausted: bool) -> Classification:
+    """429 を3値に分類する。monthly_budget_exhausted は自前の支出ゲート由来。"""
+    details = _extract_details(err)
+    delay = _retry_delay_seconds(details)
+    qid = _quota_dimension(details) or ""
+
+    # 自前ゲートが「今月もう無理」と言っているなら、それを最優先で信じる
+    if monthly_budget_exhausted:
+        return Classification(Verdict.TERMINAL, None, "monthly spend gate exhausted")
+
+    # サーバーが待機秒を指定 → レート制限。素直に待つ
+    if delay is not None:
+        return Classification(Verdict.RETRYABLE, delay, f"server RetryInfo={delay}s")
+
+    # 分単位クォータ（PerMinute 等）に当たっている → 待てば回復
+    if re.search(r"(per[-_ ]?minute|PerMinute|RPM|TPM)", qid, re.IGNORECASE):
+        return Classification(Verdict.RETRYABLE, None, f"per-minute quota: {qid}")
+
+    # 日次・月次・プロジェクトのクォータ枯渇 → 待っても基本直らない
+    if re.search(r"(per[-_ ]?day|PerDay|monthly|project)", qid, re.IGNORECASE):
+        return Classification(Verdict.TERMINAL, None, f"long-window quota: {qid}")
+
+    # RetryInfo もクォータ次元も読めない枯渇 → 判別不能。保守的に扱う
+    return Classification(Verdict.UNKNOWN, None, "no RetryInfo, unknown quota")
+```
+
+ポイントは、`monthly_budget_exhausted` という自前の真偽値を最優先で信用していることです。なぜなら、これは推測ではなく自分の手元の記録に基づく事実だからです。API のエラー形状は将来変わり得ますが、「今月の概算支出が上限に達した」という判定は自分のコードが握っています。Spend Cap 時代の堅牢さは、ここをサーバー任せにしないことから来ます。
+
+## 自前の月次支出ゲートを薄く持つ
+
+支出ゲートは厳密な会計である必要はありません。`usage_metadata` のトークン数に料金単価を掛けた概算で十分です。目的は請求額を当てることではなく、「上限の手前で叩くのをやめる」ためのスイッチを持つことです。
+
+```python
+import time
+from threading import Lock
+
+# 概算単価（USD / 100万トークン）。実値は料金表で確認して置き換える
+PRICE_PER_M_INPUT = 0.30
+PRICE_PER_M_OUTPUT = 2.50
+MONTHLY_CAP_USD = 40.0       # Project Spend Caps と同額か、やや手前に置く
+SOFT_RATIO = 0.92            # 上限の 92% で縮退を始める
+
+
+class MonthlySpendGate:
+    def __init__(self, cap_usd: float = MONTHLY_CAP_USD):
+        self.cap = cap_usd
+        self._spent = 0.0
+        self._period = time.gmtime().tm_mon
+        self._lock = Lock()
+
+    def _rollover(self):
+        m = time.gmtime().tm_mon
+        if m != self._period:
+            self._period = m
+            self._spent = 0.0
+
+    def record(self, usage) -> None:
+        """1回の応答の usage_metadata を概算コストに換算して積む。"""
+        in_tok = getattr(usage, "prompt_token_count", 0) or 0
+        out_tok = getattr(usage, "candidates_token_count", 0) or 0
+        cost = (in_tok / 1e6) * PRICE_PER_M_INPUT + (out_tok / 1e6) * PRICE_PER_M_OUTPUT
+        with self._lock:
+            self._rollover()
+            self._spent += cost
+
+    @property
+    def exhausted(self) -> bool:
+        with self._lock:
+            self._rollover()
+            return self._spent >= self.cap * SOFT_RATIO
+
+    @property
+    def spent_usd(self) -> float:
+        with self._lock:
+            self._rollover()
+            return self._spent
+```
+
+`SOFT_RATIO` を 0.92 に置いているのは意図的です。Project Spend Caps が止めてくれるのはハードな天井ですが、自前ゲートはその少し手前で先に縮退を始めます。こうすると、API がハードに 429 を返し始める前に、こちら側が穏やかに軽量モデルやキャッシュへ寄せていけます。実際に運用してみると、ハード上限に「当てて」から対処するより、9割の段階で滑らかに減速させるほうが、ユーザー体験の段差がほとんど出ません。
+
+## リトライ層とサーキットブレーカーをつなぐ
+
+分類器とゲートができたら、呼び出し本体に通します。`RETRYABLE` だけ指数バックオフし、`TERMINAL` と `UNKNOWN` は即座に縮退へ回します。さらに、枯渇が連続したらサーキットブレーカーを開き、しばらく API を叩くこと自体をやめます。
+
+```python
+import random
+from google import genai
+from google.genai import errors as genai_errors
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+gate = MonthlySpendGate()
+
+
+class Breaker:
+    """連続枯渇でしばらく発呼を止める単純なブレーカー。"""
+    def __init__(self, open_secs: float = 300.0):
+        self.open_secs = open_secs
+        self._open_until = 0.0
+
+    @property
+    def is_open(self) -> bool:
+        return time.monotonic() < self._open_until
+
+    def trip(self):
+        self._open_until = time.monotonic() + self.open_secs
+
+    def reset(self):
+        self._open_until = 0.0
+
+
+breaker = Breaker()
+
+
+def generate_with_policy(prompt: str, model: str = "gemini-flash-latest",
+                         max_retries: int = 5):
+    if breaker.is_open or gate.exhausted:
+        return degrade(prompt, why="breaker_open" if breaker.is_open else "budget")
+
+    attempt = 0
+    while True:
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt)
+            gate.record(resp.usage_metadata)   # 成功したら必ず計上する
+            breaker.reset()
+            return resp.text
+        except genai_errors.APIError as err:
+            if getattr(err, "code", None) != 429:
+                raise   # 429 以外はこの層の責務ではない
+            c = classify_429(err, monthly_budget_exhausted=gate.exhausted)
+
+            if c.verdict is Verdict.TERMINAL:
+                breaker.trip()
+                return degrade(prompt, why=c.reason)
+
+            if c.verdict is Verdict.UNKNOWN:
+                # 判別不能：1回だけ短く試し、なお枯渇ならブレーカーを開く
+                if attempt >= 1:
+                    breaker.trip()
+                    return degrade(prompt, why=c.reason)
+
+            if attempt >= max_retries:
+                return degrade(prompt, why="max_retries")
+
+            # サーバー指定があれば従い、なければ指数バックオフ + ジッター
+            wait = c.retry_after_s if c.retry_after_s is not None \
+                else min(2 ** attempt + random.uniform(0, 0.5), 30.0)
+            time.sleep(wait)
+            attempt += 1
+
+
+def degrade(prompt: str, why: str) -> str:
+    """縮退パス。キャッシュ→軽量ローカル処理→定型応答の順に落とす。"""
+    cached = cache_lookup(prompt)        # 既存の応答キャッシュがあれば返す
+    if cached:
+        return cached
+    # ここで自前の軽量な分類・テンプレ応答などに切り替える
+    log_degradation(why)                 # 監視のために理由を必ず残す
+    return fallback_response(prompt)
+```
+
+`UNKNOWN` を「1回だけ試してダメならブレーカーを開く」と扱っているのが、この設計のいちばん地味で大事なところです。原因が読めない 429 を楽観的に何度も叩くと、もしそれが枯渇だった場合に最悪の挙動になります。逆に、本当に一過性のレート制限だったとしても、1回の短い再試行で多くは拾えます。判別不能なときは「叩く回数を最小化しつつ縮退の準備をする」のが、長く運用してたどり着いた落としどころです。
+
+## 無駄なリトライがどれだけ損かを数字で見る
+
+リトライ層を見直す価値を、ざっくり見積もってみます。仮にピーク時に毎分600リクエストを捌くアプリで、月次 Spend Cap に当たって以降の3時間、何も知らずに7回バックオフを回し続けたとします。
+
+<table>
+<thead>
+<tr><th>項目</th><th>素朴な全リトライ</th><th>分類 + ブレーカー</th></tr>
+</thead>
+<tbody>
+<tr><td>枯渇後3時間の発呼数</td><td>約 60万回 × 失敗</td><td>ブレーカーで実質ゼロ</td></tr>
+<tr><td>ユーザー体感の追加遅延</td><td>1リクエストあたり数十秒</td><td>縮退応答で即時</td></tr>
+<tr><td>枯渇中に得られる成功応答</td><td>ゼロ</td><td>キャッシュ分は維持</td></tr>
+<tr><td>監視ログの S/N</td><td>429 で埋もれる</td><td>縮退理由が1本に集約</td></tr>
+</tbody>
+</table>
+
+発呼自体は 429 なので課金は増えませんが、失うものはレイテンシ、ユーザーの信頼、そして「何が起きているか分からないログ」です。枯渇しているあいだに6万回も同じ失敗を積むより、縮退理由を1種類のログに集約しておくほうが、翌朝の原因究明が桁違いに速くなります。私自身、ログが 429 で埋め尽くされて朝から30分溶かしたことがあり、それ以来この縮退ログの集約だけは欠かさないようにしています。
+
+## 落とし穴：成功時の計上を忘れると、ゲートが永遠に開かない
+
+一番やりがちな失敗は、`gate.record()` を成功パスに置き忘れることです。記録しなければ `spent_usd` はいつまでも 0 のままで、自前ゲートが Spend Cap を先回りする意味が消えます。そうなると結局、ハード上限に当てて 429 を踏むまで気づけません。`generate_content` が返ったら例外なく計上する、という規律をコードレビューで必ず確認してください。
+
+もうひとつは、ブレーカーの開放時間を長くしすぎることです。レート制限由来でうっかりブレーカーを開いてしまった場合、開放が30分だとアプリが30分まるごと縮退します。`UNKNOWN` で開くブレーカーは短め（数分）にし、`TERMINAL` と判定が固いときだけ長く開く、と分けるのが安全です。判定の確からしさと遮断時間を比例させる、と覚えておくと迷いません。
+
+## まず1つやるなら
+
+手元の Gemini 呼び出しを開いて、429 を捕まえている `except` 節を探してください。そこが「すべての 429 を同じバックオフに流している」なら、まず `RetryInfo.retryDelay` の有無だけを見る分岐を1つ足すところから始めます。サーバーが待機秒を明示している 429 と、何も言ってこない 429 を分けるだけでも、無駄打ちはかなり減ります。バックオフそのものの堅牢な組み方は[レート制限とクォータ管理の本番運用ガイド](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide)にまとめてあります。自前の月次ゲートとブレーカーは、その分岐が入ってから足していけば十分です。
+
+Project Spend Caps は費用を止める良い仕組みですが、止まった瞬間の振る舞いまでは面倒を見てくれません。そこを設計するのは、結局アプリ側の私たちの仕事だと考えています。

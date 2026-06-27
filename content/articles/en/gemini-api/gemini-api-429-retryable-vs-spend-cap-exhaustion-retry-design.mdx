@@ -1,0 +1,313 @@
+---
+title: "Don't Retry Every Gemini 429 — Telling Rate Limits Apart From Spend Cap Exhaustion"
+slug: "gemini-api-429-retryable-vs-spend-cap-exhaustion-retry-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-27T19:45"
+author: "Gemini Lab"
+description: "A 429 RESOURCE_EXHAUSTED can mean 'wait a second and it clears' or 'you're out of budget for the month.' Now that Project Spend Caps is generally available, the second case is real in production. Here's how to classify the two and build a retry layer plus a circuit breaker around them."
+tags: ["gemini-api", "rate-limit", "retry", "spend-cap", "production"]
+highlights:
+  - "If you've been hammering every 429 with exponential backoff, you'll get a classifier that mechanically decides retryable vs. terminal, ready to drop in today"
+  - "When a Project Spend Cap is hit, you'll have a circuit that quietly degrades to cache or a cheaper model instead of burning latency on doomed retries"
+  - "You'll learn how to combine three signals — RetryInfo, QuotaFailure, and your own monthly spend gate — into a single 'should I even call?' decision"
+---
+
+Running Gemini behind a wallpaper app I maintain on my own, `429 RESOURCE_EXHAUSTED` is not a rare error. The problem was that for a long time I didn't notice there are two kinds. One is a transient rate limit — you sent too much in the same second, and waiting a few hundred milliseconds clears it. The other is exhaustion — this project has spent its budget for the month, and no amount of waiting or retrying will get you through until the calendar flips.
+
+Handling both with the same exponential backoff means the retry layer quietly thrashes on the second case. With a setting of up to seven retries per request, your app keeps pounding an exhausted project with seven times the doomed traffic, and to the user it just looks like an app that's mysteriously slow to load. For an ad-supported free app, that latency turns straight into churn.
+
+On June 26, 2026, Project Spend Caps became generally available, letting you set a per-project monthly dollar ceiling. It's a welcome way to cap costs structurally — but it also reliably raises the odds of hitting a "you're over the cap" 429 in production. Which means a design that retries every 429 uniformly is exactly the thing worth revisiting right now. Separating projects at the structural level is covered in [splitting Spend Cap blast radius by tier](/en/articles/gemini-api/gemini-api-spend-cap-blast-radius-per-tier-project-isolation); this article focuses on degrading at request time.
+
+## Split 429 into "wait and it clears" and "waiting won't help"
+
+The first move is to classify the 429 before it ever reaches the retry layer. There are three signals to lean on.
+
+The first is `google.rpc.RetryInfo` in the error response. When the server explicitly says "you may retry after this delay," it includes a `retryDelay` field. A 429 carrying that is, by design, a rate limit you're allowed to retry.
+
+The second is the `QuotaFailure` detail, which tells you which quota dimension you tripped (requests-per-minute, tokens-per-minute, and so on). A per-second or per-minute quota recovers if you wait; a daily or monthly ceiling operates on a completely different time scale.
+
+The third — and the most important — is information only you hold: **your own monthly spend gate.** Trying to determine "did I hit the Spend Cap?" purely from the API's error body produces a brittle implementation that depends on the fine shape of the error. Instead, keep a rough running total of "how much have I spent this month?" on your side and make that the primary axis of classification. Treat the API details as a supporting signal only.
+
+<table>
+<thead>
+<tr><th>Signal</th><th>Meaning</th><th>Retry decision</th></tr>
+</thead>
+<tbody>
+<tr><td>RetryInfo.retryDelay present</td><td>Server expects recovery after a stated wait</td><td><strong>Retryable</strong> (wait the stated seconds)</td></tr>
+<tr><td>QuotaFailure is a per-minute quota</td><td>RPM/TPM exceeded; recovers soon</td><td><strong>Retryable</strong> (backoff)</td></tr>
+<tr><td>Your monthly spend gate is over the line</td><td>Likely out of budget for the month</td><td><strong>Not retryable</strong> (degrade)</td></tr>
+<tr><td>No RetryInfo, repeated unexplained exhaustion</td><td>Undeterminable but not recovering</td><td><strong>Trip the breaker</strong> conservatively</td></tr>
+</tbody>
+</table>
+
+The design rule here is: when in doubt, don't call. Retrying costs you time and a sliver of latency budget, but pounding an exhausted project buys you nothing at all.
+
+## Implementing the classifier
+
+Using Gemini's Python SDK (`google-genai`), here's a classifier that reads those signals off the exception. Exception attribute names drift between SDK versions, so the trick is to extract things defensively rather than depend on one specific attribute.
+
+```python
+# pip install google-genai
+from dataclasses import dataclass
+from enum import Enum
+import json
+import re
+
+
+class Verdict(Enum):
+    RETRYABLE = "retryable"        # clears with a wait (backoff OK)
+    TERMINAL = "terminal"          # pointless this month (degrade)
+    UNKNOWN = "unknown"            # undeterminable (trip conservatively)
+
+
+@dataclass
+class Classification:
+    verdict: Verdict
+    retry_after_s: float | None    # server-stated wait, if any
+    reason: str
+
+
+def _extract_details(err) -> dict:
+    """Pull structured details off the exception, absorbing SDK differences."""
+    # google-genai's APIError often carries .code / .status / .details,
+    # but versions vary, so probe with getattr and fall back to the string body.
+    payload = {}
+    for attr in ("details", "response_json", "args"):
+        val = getattr(err, attr, None)
+        if isinstance(val, dict):
+            payload = val
+            break
+        if isinstance(val, (list, tuple)) and val and isinstance(val[0], dict):
+            payload = val[0]
+            break
+    if not payload:
+        # last resort: scrape a JSON fragment out of the stringified body
+        text = str(getattr(err, "message", "") or err)
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                payload = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                payload = {}
+    return payload
+
+
+def _retry_delay_seconds(details: dict) -> float | None:
+    """Convert google.rpc.RetryInfo retryDelay (e.g. "5s") into seconds."""
+    error = details.get("error", details)
+    for d in error.get("details", []):
+        t = d.get("@type", "")
+        if "RetryInfo" in t:
+            raw = d.get("retryDelay", "")
+            m = re.match(r"(\d+(?:\.\d+)?)s", str(raw))
+            if m:
+                return float(m.group(1))
+    return None
+
+
+def _quota_dimension(details: dict) -> str | None:
+    """Read the quota ID from QuotaFailure (a hint for per-minute vs not)."""
+    error = details.get("error", details)
+    for d in error.get("details", []):
+        if "QuotaFailure" in d.get("@type", ""):
+            for v in d.get("violations", []):
+                qid = v.get("quotaId") or v.get("subject") or ""
+                if qid:
+                    return qid
+    return None
+
+
+def classify_429(err, monthly_budget_exhausted: bool) -> Classification:
+    """Classify a 429 into three buckets. monthly_budget_exhausted comes
+    from your own spend gate."""
+    details = _extract_details(err)
+    delay = _retry_delay_seconds(details)
+    qid = _quota_dimension(details) or ""
+
+    # If your own gate says "done for the month," trust that first.
+    if monthly_budget_exhausted:
+        return Classification(Verdict.TERMINAL, None, "monthly spend gate exhausted")
+
+    # Server stated a wait -> rate limit. Just wait.
+    if delay is not None:
+        return Classification(Verdict.RETRYABLE, delay, f"server RetryInfo={delay}s")
+
+    # Hit a per-minute quota (PerMinute, etc.) -> recovers with a wait
+    if re.search(r"(per[-_ ]?minute|PerMinute|RPM|TPM)", qid, re.IGNORECASE):
+        return Classification(Verdict.RETRYABLE, None, f"per-minute quota: {qid}")
+
+    # Daily/monthly/project exhaustion -> waiting generally won't fix it
+    if re.search(r"(per[-_ ]?day|PerDay|monthly|project)", qid, re.IGNORECASE):
+        return Classification(Verdict.TERMINAL, None, f"long-window quota: {qid}")
+
+    # Exhaustion with no RetryInfo and no readable dimension -> undeterminable
+    return Classification(Verdict.UNKNOWN, None, "no RetryInfo, unknown quota")
+```
+
+The key is that `monthly_budget_exhausted` — your own boolean — is trusted above everything else. That value isn't a guess; it's a fact grounded in your own records. The API's error shape may change in the future, but the verdict "my estimated spend this month hit the ceiling" is owned by your code. Robustness in the Spend Cap era starts with not delegating that judgment to the server.
+
+## Keep a thin monthly spend gate
+
+The spend gate doesn't need to be precise accounting. A rough estimate — token counts from `usage_metadata` multiplied by unit prices — is plenty. The goal isn't to predict the invoice; it's to own a switch that stops you from calling just shy of the ceiling.
+
+```python
+import time
+from threading import Lock
+
+# Rough unit prices (USD / 1M tokens). Replace with the real values from the pricing page.
+PRICE_PER_M_INPUT = 0.30
+PRICE_PER_M_OUTPUT = 2.50
+MONTHLY_CAP_USD = 40.0       # match your Project Spend Cap, or sit slightly under it
+SOFT_RATIO = 0.92            # begin degrading at 92% of the cap
+
+
+class MonthlySpendGate:
+    def __init__(self, cap_usd: float = MONTHLY_CAP_USD):
+        self.cap = cap_usd
+        self._spent = 0.0
+        self._period = time.gmtime().tm_mon
+        self._lock = Lock()
+
+    def _rollover(self):
+        m = time.gmtime().tm_mon
+        if m != self._period:
+            self._period = m
+            self._spent = 0.0
+
+    def record(self, usage) -> None:
+        """Convert one response's usage_metadata into estimated cost and add it."""
+        in_tok = getattr(usage, "prompt_token_count", 0) or 0
+        out_tok = getattr(usage, "candidates_token_count", 0) or 0
+        cost = (in_tok / 1e6) * PRICE_PER_M_INPUT + (out_tok / 1e6) * PRICE_PER_M_OUTPUT
+        with self._lock:
+            self._rollover()
+            self._spent += cost
+
+    @property
+    def exhausted(self) -> bool:
+        with self._lock:
+            self._rollover()
+            return self._spent >= self.cap * SOFT_RATIO
+
+    @property
+    def spent_usd(self) -> float:
+        with self._lock:
+            self._rollover()
+            return self._spent
+```
+
+Setting `SOFT_RATIO` to 0.92 is deliberate. Project Spend Caps gives you a hard ceiling; your own gate starts degrading a little before it. That way, before the API begins returning hard 429s, your side has already eased toward a lighter model or the cache. In practice, gliding to a stop at 90% produces almost no visible step in user experience, compared with slamming into the hard ceiling and reacting after the fact.
+
+## Wire the retry layer to a circuit breaker
+
+With the classifier and gate in place, run the call through them. Only `RETRYABLE` gets exponential backoff; `TERMINAL` and `UNKNOWN` go straight to degradation. And when exhaustion repeats, open a circuit breaker and stop calling the API entirely for a while.
+
+```python
+import random
+from google import genai
+from google.genai import errors as genai_errors
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+gate = MonthlySpendGate()
+
+
+class Breaker:
+    """A simple breaker that halts calls for a while after repeated exhaustion."""
+    def __init__(self, open_secs: float = 300.0):
+        self.open_secs = open_secs
+        self._open_until = 0.0
+
+    @property
+    def is_open(self) -> bool:
+        return time.monotonic() < self._open_until
+
+    def trip(self):
+        self._open_until = time.monotonic() + self.open_secs
+
+    def reset(self):
+        self._open_until = 0.0
+
+
+breaker = Breaker()
+
+
+def generate_with_policy(prompt: str, model: str = "gemini-flash-latest",
+                         max_retries: int = 5):
+    if breaker.is_open or gate.exhausted:
+        return degrade(prompt, why="breaker_open" if breaker.is_open else "budget")
+
+    attempt = 0
+    while True:
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt)
+            gate.record(resp.usage_metadata)   # always account for a success
+            breaker.reset()
+            return resp.text
+        except genai_errors.APIError as err:
+            if getattr(err, "code", None) != 429:
+                raise   # non-429s aren't this layer's job
+            c = classify_429(err, monthly_budget_exhausted=gate.exhausted)
+
+            if c.verdict is Verdict.TERMINAL:
+                breaker.trip()
+                return degrade(prompt, why=c.reason)
+
+            if c.verdict is Verdict.UNKNOWN:
+                # undeterminable: try once briefly; if still exhausted, open breaker
+                if attempt >= 1:
+                    breaker.trip()
+                    return degrade(prompt, why=c.reason)
+
+            if attempt >= max_retries:
+                return degrade(prompt, why="max_retries")
+
+            # Honor a server-stated wait; otherwise exponential backoff + jitter
+            wait = c.retry_after_s if c.retry_after_s is not None \
+                else min(2 ** attempt + random.uniform(0, 0.5), 30.0)
+            time.sleep(wait)
+            attempt += 1
+
+
+def degrade(prompt: str, why: str) -> str:
+    """Degradation path: cache -> lightweight local handling -> canned reply."""
+    cached = cache_lookup(prompt)        # return a prior cached response if any
+    if cached:
+        return cached
+    # swap in your own lightweight classifier / templated reply here
+    log_degradation(why)                 # always record the reason for monitoring
+    return fallback_response(prompt)
+```
+
+Treating `UNKNOWN` as "try once, and open the breaker if it fails" is the quietest but most important part of this design. Optimistically pounding a 429 whose cause you can't read produces the worst behavior if it turns out to be exhaustion. Conversely, if it really was a transient rate limit, one short retry catches most of them. When you can't tell, "minimize the number of calls while preparing to degrade" is the balance I landed on after running this for a while.
+
+## Put a number on how wasteful blind retries are
+
+To see why revisiting the retry layer is worth it, here's a rough estimate. Say an app handling 600 requests per minute at peak hits its monthly Spend Cap, and for three hours afterward keeps grinding through seven backoff rounds, none the wiser.
+
+<table>
+<thead>
+<tr><th>Item</th><th>Naive retry-everything</th><th>Classifier + breaker</th></tr>
+</thead>
+<tbody>
+<tr><td>Calls in the 3 hours after exhaustion</td><td>~600k × failing</td><td>effectively zero (breaker)</td></tr>
+<tr><td>Added latency per user</td><td>tens of seconds per request</td><td>instant degraded response</td></tr>
+<tr><td>Successful responses during the outage</td><td>zero</td><td>cache hits preserved</td></tr>
+<tr><td>Signal-to-noise in logs</td><td>buried under 429s</td><td>one consolidated degrade reason</td></tr>
+</tbody>
+</table>
+
+The calls themselves are 429s, so billing doesn't grow — but what you lose is latency, user trust, and logs that tell you nothing. Rather than stacking sixty thousand identical failures during an outage, consolidating the degrade reason into one log line makes the next morning's investigation dramatically faster. I once lost half an hour at the start of a day to logs drowned in 429s, and ever since I've made consolidating that degrade log non-negotiable.
+
+## Pitfall: forget to record on success and the gate never opens
+
+The most common mistake is leaving `gate.record()` off the success path. If you don't record, `spent_usd` stays at 0 forever, and the whole point of the gate getting ahead of the Spend Cap evaporates. You're then back to noticing nothing until you slam into the hard ceiling and eat a 429. Make "every returned `generate_content` gets accounted for" a rule you check in review.
+
+The other is setting the breaker's open window too long. If you accidentally trip the breaker on a rate-limit-origin 429 and the window is 30 minutes, your app degrades for a full 30 minutes. Keep the breaker that `UNKNOWN` opens short (a few minutes), and only open it for a long time when the `TERMINAL` verdict is firm. Scale the cutoff to your confidence in the verdict and you won't have to agonize over it.
+
+## If you do one thing first
+
+Open your Gemini call sites and find the `except` that catches 429. If it funnels every 429 into the same backoff, start by adding a single branch that only checks for the presence of `RetryInfo.retryDelay`. Just separating the 429s where the server states a wait from the ones that say nothing already cuts a lot of wasted calls. The robust mechanics of backoff itself are laid out in the [rate limiting and quota management production guide](/en/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide). The monthly gate and breaker can come after that branch is in.
+
+Project Spend Caps is a good mechanism for stopping cost — but it doesn't take care of how your app behaves the moment it stops. Designing that part is, in the end, our job on the app side.
