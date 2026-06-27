@@ -1,0 +1,250 @@
+---
+title: "Your Gemini Completion Event Will Arrive Twice — An Idempotent Sink That Makes Webhook + Reconciliation Effectively Once-Only"
+slug: "gemini-completion-event-idempotent-sink-exactly-once-design"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-27T19:54"
+author: "Gemini Lab"
+description: "Once you receive Gemini long-running operations over a Webhook and back it up with a reconciliation poller, the same completion arrives twice and publishing or billing runs twice. Build an idempotent sink with a normalized key and a claim-run-commit pattern that keeps side effects effectively once-only."
+tags: ["gemini", "webhook", "idempotency", "batch-api", "production"]
+highlights:
+  - "If your webhook-plus-reconciliation dual path keeps running completion handlers twice and duplicating publishes or notifications, you'll get a design that collapses them to effectively once"
+  - "You'll be able to normalize an idempotency key from the operation name and enforce a claim-run-commit cycle backed by a SQLite UNIQUE constraint, with runnable code"
+  - "Including how to retry a side effect that fails midway and how to size the claim TTL, so you can run unattended pipelines without fear of double-processing"
+---
+
+Right after you move long-running operations from polling to a Webhook and then add a reconciliation poller as a safety net, a different bug surfaces: the same batch completion gets processed twice. A generated article gets published twice, or two completion notifications go out.
+
+This is not a side effect of adding reconciliation. The moment you have two delivery paths, duplicates are structurally unavoidable. If [the reconciliation story — events still drop the instant you deploy](/articles/gemini-api/gemini-long-running-operations-webhook-reconciliation) is about *recovering missed* terminal events, this article is about the other half: what to do when recovery means you now grab the same completion twice. The fix is to make the sink idempotent, so that no matter how many times an event arrives, the side effect runs exactly once.
+
+## Why double-processing happens — the dual path is the premise, not the accident
+
+Gemini's webhook delivery is at-least-once. If the connection drops before your receiver returns 2xx, Google can't confirm success and re-delivers the same event. Even if you processed it successfully but only the 2xx response failed, the redelivery still happens. So even a webhook on its own must be built assuming a completion can arrive twice.
+
+Add a reconciliation poller and the duplicate paths multiply.
+
+<table>
+<thead>
+<tr><th>Where duplicates come from</th><th>What's happening</th></tr>
+</thead>
+<tbody>
+<tr><td>Webhook redelivery</td><td>Disconnect before 2xx → Google re-delivers the same event</td></tr>
+<tr><td>Webhook racing the poller</td><td>The low-frequency poller independently detects the same completion while the webhook is mid-handler</td></tr>
+<tr><td>Double receipt during deploy</td><td>Old instance starts processing → can't respond during cutover → redelivered to the new instance</td></tr>
+<tr><td>Manual retry</td><td>An operator re-runs the poller by hand and re-submits a completion that isn't committed yet</td></tr>
+</tbody>
+</table>
+
+The key is to stop trying to plug these *individually* as exceptional cases. You can't seal every path. Instead, make the sink so that calling it any number of times produces the same result, and the number of paths stops mattering. Idempotency isn't an effort to reduce the number of entrances — it's a design that funnels everything into a single exit.
+
+## The shape — split the sink into "decision" and "side effect"
+
+The trick to preventing double-processing is to put one gate between receiving the completion event and triggering the side effect (publish, bill, notify). The gate's job is to decide, atomically, whether anyone has already triggered the side effect for this completion.
+
+Split it into three phases.
+
+1. **Normalize** — extract a stable idempotency key from the incoming event
+2. **Claim** — assert "I will process this completion" first, and reject contenders
+3. **Commit** — run the side effect to completion, then record it as done
+
+Both the webhook receiver and the reconciliation poller just call this same sink at the end. There can be many entrances, but only one function triggers the side effect.
+
+## Where to get the idempotency key — normalize the operation name
+
+Choose an idempotency key that is always the same value for the same completion and always different for different completions. For Gemini long-running operations, the operation's name (`operations/...` or the batch job resource name) is the most stable identifier. Never mix in a timestamp or random ID. If the value changes on redelivery, the key loses its meaning.
+
+```python
+import re
+
+def idempotency_key(event: dict) -> str:
+    """Extract a stable idempotency key from a completion event.
+
+    Returns the same string for the same completion whether it came
+    from a webhook payload or from an operation the poller got via list.
+    """
+    # Field names differ between webhook and REST list, so try candidates in order
+    name = (
+        event.get("name")
+        or event.get("operation")
+        or event.get("operationName")
+        or event.get("resourceName")
+    )
+    if not name:
+        raise ValueError(f"operation name not found: {list(event.keys())}")
+
+    # Absorb trailing slash, surrounding whitespace, and case differences
+    name = name.strip().rstrip("/")
+    # Collapse the projects/.../locations/... prefix; use the stable tail
+    m = re.search(r"(operations|batches|batchJobs)/[A-Za-z0-9_\-]+$", name)
+    canonical = m.group(0) if m else name
+    return f"gemini:{canonical}"
+
+
+# Confirm the same completion yields the same key from webhook and poller
+webhook_event = {"name": "projects/p/locations/us/operations/abc-123/"}
+poller_event = {"operation": "operations/abc-123"}
+assert idempotency_key(webhook_event) == idempotency_key(poller_event)
+print(idempotency_key(webhook_event))  # -> gemini:operations/abc-123
+```
+
+Pinning the normalization with an `assert` is essential. The webhook and the REST list can differ subtly in field names and prefixes, and if that drifts you get "same completion, different key" and double-processing comes right back. As an indie developer receiving batches across several projects, I once fell into exactly this trap, where a prefix difference quietly broke the match. A unit test for normalization is a safety net that rescues you later.
+
+## Implement claim-run-commit with SQLite
+
+Build the gate as a UNIQUE constraint on the idempotency key. With SQLite you can write an atomic claim without any extra dependency. You only need three states.
+
+<table>
+<thead>
+<tr><th>State</th><th>Meaning</th><th>How the next identical event is treated</th></tr>
+</thead>
+<tbody>
+<tr><td>CLAIMED</td><td>Someone is processing; side effect not done</td><td>Ignored within TTL, seized after TTL</td></tr>
+<tr><td>DONE</td><td>Side effect completed</td><td>Ignored immediately (effectively once holds)</td></tr>
+<tr><td>(no row)</td><td>Nobody has touched it yet</td><td>Attempt a claim</td></tr>
+</tbody>
+</table>
+
+```python
+import sqlite3
+import time
+import contextlib
+
+DB = "idempotency.db"
+CLAIM_TTL_SEC = 600  # longer than the side effect is expected to ever take
+
+def init_db():
+    con = sqlite3.connect(DB)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS sink (
+            key        TEXT PRIMARY KEY,   -- idempotency key (UNIQUE)
+            state      TEXT NOT NULL,      -- CLAIMED / DONE
+            claimed_at REAL,
+            done_at    REAL
+        )
+    """)
+    con.commit()
+    con.close()
+
+
+@contextlib.contextmanager
+def db():
+    con = sqlite3.connect(DB, isolation_level=None)  # explicit transactions
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+def try_claim(key: str) -> bool:
+    """Return True if this process won the right to run the side effect.
+
+    The UNIQUE constraint guarantees that of two concurrent calls,
+    exactly one INSERT succeeds.
+    """
+    now = time.time()
+    with db() as con:
+        con.execute("BEGIN IMMEDIATE")  # take the write lock up front
+        row = con.execute(
+            "SELECT state, claimed_at FROM sink WHERE key = ?", (key,)
+        ).fetchone()
+
+        if row is None:
+            con.execute(
+                "INSERT INTO sink(key, state, claimed_at) VALUES (?, 'CLAIMED', ?)",
+                (key, now),
+            )
+            con.execute("COMMIT")
+            return True
+
+        state, claimed_at = row
+        if state == "DONE":
+            con.execute("COMMIT")
+            return False  # already committed -> do not process again
+
+        # Left as CLAIMED (e.g. the process died mid-handler)
+        if now - (claimed_at or 0) > CLAIM_TTL_SEC:
+            con.execute(
+                "UPDATE sink SET claimed_at = ? WHERE key = ?", (now, key)
+            )
+            con.execute("COMMIT")
+            return True  # seize an expired claim and retry
+        con.execute("COMMIT")
+        return False  # another process is working on it; do nothing now
+
+
+def mark_done(key: str):
+    with db() as con:
+        con.execute(
+            "UPDATE sink SET state = 'DONE', done_at = ? WHERE key = ?",
+            (time.time(), key),
+        )
+```
+
+Taking the write lock first with `BEGIN IMMEDIATE` matters. With the default deferred transaction, two calls can both read "no row" and then both proceed to INSERT, one failing with a UNIQUE violation. If you swallow that exception, you can't tell whether the swallowed case was "failed to claim" or "already DONE," and double-processing leaks through anyway. Take the lock first and the decision itself is serialized.
+
+## A sink that runs the side effect exactly once
+
+Wrap the three phases into one function. The webhook receiver and the reconciliation poller both just call it.
+
+```python
+def process_completion(event: dict, do_side_effect) -> str:
+    """Receive a completion event and run the side effect effectively once.
+
+    do_side_effect(key) is the real work: publish, bill, notify.
+    Guaranteed to be called at most once per idempotency key.
+    """
+    key = idempotency_key(event)
+
+    if not try_claim(key):
+        return "skipped"  # already DONE or another process is working
+
+    try:
+        do_side_effect(key)   # <- this must not run twice
+    except Exception:
+        # If the side effect fails, do NOT mark DONE.
+        # The claim is seized after TTL and retried another time.
+        raise
+
+    mark_done(key)
+    return "processed"
+
+
+# Usage: both webhook and poller call the same sink
+def publish_article(key: str):
+    print(f"[publish] published the article for {key}")
+
+# From the webhook
+print(process_completion({"name": "operations/abc-123"}, publish_article))
+# -> [publish] published the article for gemini:operations/abc-123
+#    processed
+
+# The reconciliation poller picks up the same completion later
+print(process_completion({"operation": "operations/abc-123"}, publish_article))
+# -> skipped  (publishing does not run twice)
+```
+
+When the side effect raises, leaving without calling `mark_done` is the crux of the design. If you mark it DONE, you record "processed" while it's actually incomplete, and it will never be retried. Leave it CLAIMED instead and, after the TTL elapses, the reconciliation poller can seize it and retry. Never mark a failure as DONE — that's the one rule you can't break.
+
+## When the webhook and the poller arrive at the same time
+
+The case you'll worry about most is the webhook receiver and the reconciliation poller literally grabbing the same completion at the same instant. In the three-phase design, both call `try_claim`. Thanks to the `BEGIN IMMEDIATE` lock, only one succeeds at the SQLite level; the other sees the CLAIMED row and returns `False`. The side effect runs once.
+
+If you receive across multiple processes or hosts, the SQLite file must live on shared storage, or you replace it with a KV or relational DB. The requirement is exactly one thing: an atomic INSERT-if-not-exists on the idempotency key. On stores with weak compare-and-swap, like Cloudflare KV, lean on conditional writes or a relational DB's UNIQUE constraint to be safe.
+
+## How to size the claim TTL
+
+Set the TTL comfortably longer than the worst-case completion time of the side effect. Too short and another process seizes a claim that's still legitimately running, producing genuine double-processing. Too long and a completion whose process died gets retried late.
+
+In production I measured the p99 runtime of the side effect and set the initial TTL to 3–5x that. With a setup where publishing took seconds and finished within a minute or two even including external-API retries, I left the TTL at 600 seconds. Keeping the TTL longer than the poller's interval (a few to ten-odd minutes) avoids the poller mistakenly seizing a claim that's processing normally.
+
+## Details the docs don't mention
+
+- **Take the idempotency key at the granularity of the side effect.** One key for the whole batch hurts when you want to reprocess only part of it. If "one article to publish" is the unit of the side effect, subdivide the key per article.
+- **Don't delete DONE rows.** It's tempting to clean up old DONE entries, but a late redelivery right after deletion brings double-processing back. If you must clean up, restrict it to rows past a generous redelivery grace window (several days).
+- **Log the `skipped` count.** Arriving twice is not abnormal, but a sudden spike in `skipped` signals a change on the delivery side or in the reconciliation interval. Surfacing the count helps you catch quiet degradation early.
+- **Keep the decision out of external state inside the side effect.** Branching on "is it already published?" by asking the publish target causes that query itself to race. Funnel the decision into the idempotency ledger alone and keep the side effect to "just do it."
+
+## Where to start
+
+First, wrap `process_completion` over wherever you currently receive completion events and trigger side effects, and pin the key-normalization test with an `assert`. Route both the webhook and the reconciliation poller through the same sink, and double-processing converges to effectively once. Reconciliation recovers what dropped; the idempotency ledger rejects duplicates — only with both does completion handling in an unattended pipeline approach exactly-once. Signature verification and the migration from polling itself are laid out in [the design record of rebuilding the Batch API around a Webhook](/articles/gemini-api/gemini-batch-webhook-polling-to-event-driven-redesign), so when you're hardening the receiving entrance, read that alongside this.
