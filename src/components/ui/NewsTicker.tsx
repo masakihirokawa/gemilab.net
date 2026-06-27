@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "API — Gemini 3.5 Flashが一般提供。gemini-flash-latestの実体となり、エージェント・コーディングで持続的に高性能を出します",
-    "AGENT — Managed Agentsが公開プレビュー。Googleホストの隔離Linuxサンドボックスでステートフルな自律エージェントを構築できます",
-    "SEARCH — File Searchがマルチモーダル対応。gemini-embedding-2で画像をそのまま埋め込み・検索できます",
-    "RESEARCH — Deep Researchの新版が協調プランニング・可視化・MCPサーバー連携・File Searchに対応しました",
-    "SHEETS — Gemini in Sheetsが周辺データ構造を解析し、数式エラーを1クリックで診断・修正します",
-    "ROADMAP — Gemini 3.5 Proは品質調整のため7月へ延期。最新の主力はFlash系です",
+    "API — Event-driven WebhooksでBatch APIや長時間処理の完了を通知受信。ポーリングが不要になります",
+    "SEARCH — File Searchがgemini-embedding-2に対応し、画像もネイティブに埋め込み・検索できます",
+    "SECURITY — 6/19以降、未制限APIキーからのリクエストが遮断されました。キー制限の点検を",
+    "MODEL — Gemini 3.5 Flashが一般提供。gemini-flash-latestの本体になりました",
+    "AGENT — Managed AgentsがGemini APIで公開プレビュー。隔離サンドボックスで自律エージェントを実行できます",
+    "DEPRECATED — 画像プレビュー2モデルが6/25で停止。preview依存の処理は確認しておきましょう",
   ],
   en: [
-    "API — Gemini 3.5 Flash is generally available and now powers gemini-flash-latest for sustained agentic and coding performance",
-    "AGENT — Managed Agents enter public preview, running stateful autonomous agents in Google-hosted isolated Linux sandboxes",
-    "SEARCH — File Search adds multimodal search, embedding and searching images natively with gemini-embedding-2",
-    "RESEARCH — A new Deep Research agent adds collaborative planning, visualization, MCP server integration, and File Search",
-    "SHEETS — Gemini in Sheets analyzes surrounding data to diagnose and fix formula errors in one click",
-    "ROADMAP — Gemini 3.5 Pro slips to July for refinement; the Flash line leads for now",
+    "API — Event-driven webhooks deliver Batch API and long-running completions, removing the need to poll",
+    "SEARCH — File Search now supports gemini-embedding-2, embedding and searching images natively",
+    "SECURITY — Since June 19, requests from unrestricted API keys are blocked — review your key limits",
+    "MODEL — Gemini 3.5 Flash is generally available and now powers gemini-flash-latest",
+    "AGENT — Managed Agents hit public preview in the Gemini API, running in isolated sandboxes",
+    "DEPRECATED — Two image-preview models shut down June 25 — check any preview-dependent flows",
   ],
 };
 
