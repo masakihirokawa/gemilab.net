@@ -1,0 +1,212 @@
+---
+title: "Gemini Computer Use が「古い画面」を操作して静かに事故るとき — 観測と検証で守る運用メモ"
+slug: "gemini-computer-use-stale-frame-misclick-verification-field-notes"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-27T13:30"
+author: "Gemini Lab"
+description: "Computer Use エージェントは、画面が変わった後の古いスクリーンショットを根拠にクリックし、エラーも出さずに別の場所を押します。誤操作を計測し、観測・実行・検証の三拍子で止める運用メモです。"
+tags: ["gemini-computer-use", "automation", "agents", "production", "advanced"]
+highlights:
+  - "Gemini Computer Use の古いフレームへの操作を「実行前アサーション」で弾くループ実装"
+  - "破壊的操作を冪等化し、二重クリックや取り消し不能の事故を防ぐ設計"
+  - "アクション成功率・スタックループ・ステップ予算を計測して暴走を止める計装"
+---
+
+## 成功したように見えて、別のボタンを押していた
+
+Computer Use を最初に本番相当の作業に回したとき、いちばん怖かったのは派手なクラッシュではありませんでした。ログ上は全ステップ「成功」と並んでいるのに、できあがった結果がまるで違う、という静かな失敗です。原因を追うと、エージェントは数百ミリ秒前のスクリーンショットを根拠に座標を計算し、その間にダイアログが開いて画面が動いていました。古いフレームの「保存」ボタンの位置を、新しい画面では「削除」が占めていた、という類のことが起きていたのです。
+
+この種の事故は例外を投げません。クリックは座標として正しく実行され、API は淡々と次のステップへ進みます。だからこそ、`try/except` をいくら丁寧に書いても捕まりません。守るべきは「操作が失敗したとき」ではなく、「操作した相手が、自分が見たはずの画面と本当に同じか」を毎回確かめる仕組みのほうです。
+
+私は個人開発でストア提出用のスクリーンショット差し替えのような、退屈で取りこぼしの多い反復作業を自動化に寄せてきました。その経験から言えるのは、人間が手でやるときは無意識に「あれ、画面変わった？」と一拍置いているということです。エージェントにはその一拍がありません。だから一拍を、コードとして外付けしてやる必要があります。
+
+## なぜ「沈黙する誤操作」が起きるのか
+
+Computer Use のループは、概念的には観測（スクリーンショット）→ 推論（次の操作の決定）→ 実行（クリック・入力）の繰り返しです。事故は、この三つの間に時間差があることから生まれます。
+
+<table>
+<thead><tr><th>失敗モード</th><th>何が起きるか</th><th>例外は出るか</th></tr></thead>
+<tbody>
+<tr><td>フレーム陳腐化（stale frame）</td><td>観測から実行までの間に画面が遷移し、古い座標を押す</td><td>出ない</td></tr>
+<tr><td>座標ドリフト</td><td>解像度・DPI・スクロール位置の差でモデルの座標と実画面がズレる</td><td>出ない</td></tr>
+<tr><td>楽観的連打</td><td>反応が遅い UI に対し、確認せず次の操作を重ねて二重実行</td><td>出ない</td></tr>
+<tr><td>ループのスタック</td><td>同じ画面に対し同じ操作を繰り返し、進まないまま予算を溶かす</td><td>出ない</td></tr>
+</tbody>
+</table>
+
+共通しているのは、どれも「モデルが見た世界」と「実際に操作した世界」の不一致だということです。モデルを賢くしても完全には消えません。賢いモデルでも、観測した瞬間より後の出来事は知りようがないからです。対策は推論側ではなく、実行を取り囲む薄い制御層に置くのが現実的です。
+
+## 「観測→実行→検証」に作り替える
+
+素朴な実装は、モデルが返した操作をそのまま実行して次へ進みます。本番では、実行の前後にアサーションを挟んで「押す直前の画面」と「押した直後の画面」の両方を確かめる形に変えます。
+
+```python
+import time
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+MODEL = "gemini-2.5-computer-use-preview"  # 実際のモデル名は最新のドキュメントで確認してください
+
+def capture():
+    """環境依存。スクリーンショットの bytes と論理サイズを返す。"""
+    png, width, height = grab_screen()  # 各自の実装
+    return png, width, height
+
+def run_step(prev_png, goal, history):
+    """1ステップ分の推論。モデルに直前の画面と目標を渡す。"""
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=[
+            types.Part.from_bytes(data=prev_png, mime_type="image/png"),
+            types.Part.from_text(text=f"目標: {goal}\nこれまで: {history}\n次の1操作だけを返す"),
+        ],
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(computer_use=types.ComputerUse())],
+            temperature=0.0,
+        ),
+    )
+    return extract_action(resp)  # {"type": "click", "x":..,"y":..} 等を取り出す
+```
+
+ここまでは普通のループです。要は、この後に「実行する前にもう一度見る」工程を足します。
+
+```python
+def perceptual_hash(png):
+    """画面の見た目をハッシュ化。stale 検出に使う軽量な指紋。"""
+    return dhash(png)  # 画像差分ハッシュ。完全一致でなく近傍判定に使う
+
+def execute_with_guard(action, observed_png, observed_hash):
+    # 1) 実行直前にもう一度撮る
+    fresh_png, w, h = capture()
+    if hamming(observed_hash, perceptual_hash(fresh_png)) > STALE_THRESHOLD:
+        # 観測時と画面が違う → 古いフレームへの操作は中止
+        return {"status": "stale", "fresh_png": fresh_png}
+
+    # 2) クリック対象の局所領域だけを比較（全画面より敏感）
+    if action["type"] == "click":
+        roi = crop(fresh_png, action["x"], action["y"], radius=48)
+        roi_at_observe = crop(observed_png, action["x"], action["y"], radius=48)
+        if local_changed(roi, roi_at_observe):
+            return {"status": "stale_local", "fresh_png": fresh_png}
+
+    # 3) 実行 → 直後を撮って「画面が変わったか」を確認
+    do_action(action)
+    time.sleep(SETTLE_MS / 1000)
+    after_png, _, _ = capture()
+    progressed = hamming(perceptual_hash(fresh_png), perceptual_hash(after_png)) > NOOP_THRESHOLD
+    return {"status": "ok" if progressed else "noop", "after_png": after_png}
+```
+
+肝は三点です。第一に、推論に使った画面とは別に、**実行の直前にもう一度撮って指紋を比べる**こと。第二に、クリック座標の**周辺だけを切り出して比較**すること。全画面ハッシュは時計表示の変化などで鈍りますが、局所比較なら押そうとしている要素の差し替えに敏感です。第三に、実行後に画面が**まったく変わらなかったら `noop` として扱う**こと。反応のない操作を「成功」と数えないだけで、楽観的連打の大半が止まります。
+
+`stale` が返ったら、その操作は捨てて、新しいフレームでもう一度推論からやり直します。捨てる勇気が、古い画面への操作を根絶やしにします。
+
+## 破壊的操作は冪等に寄せる
+
+検証を入れても、削除や送信のように取り消せない操作は別扱いが要ります。ここでは「実行前に満たすべき条件」を明示し、満たさなければ実行しない事前条件ガードを使います。
+
+```python
+DESTRUCTIVE = {"delete", "submit", "purchase", "send"}
+
+def guarded_destructive(action, fresh_png):
+    label = action.get("label", "")
+    if action["type"] not in DESTRUCTIVE:
+        return execute_with_guard(action, fresh_png, perceptual_hash(fresh_png))
+
+    # 実行前条件: ボタン文言が想定どおりか、確認ダイアログが出ているか
+    text_here = ocr_near(fresh_png, action["x"], action["y"], radius=64)
+    if label and label not in text_here:
+        # モデルが「削除」を押すつもりが、実画面では別ラベル → 中止
+        return {"status": "precondition_failed", "expected": label, "found": text_here}
+
+    # 取り消し不能な操作はステップを2段に割り、確認画面を必須にする
+    return {"status": "needs_confirm_screen", "action": action}
+```
+
+ポイントは、破壊的操作を一発で通さず、**確認画面の存在を実行条件にする**ことです。人間の UI では「本当に削除しますか？」が安全弁になっていますが、エージェントはそれを無視して突っ切れてしまいます。そこで、確認画面を観測できたステップでのみ最終操作を許可します。OCR でボタン直下の文言を読み、モデルが意図したラベルと一致しなければ止めるだけでも、誤対象への破壊的操作はかなり防げます。
+
+## 失敗を数える計装
+
+守りを入れたら、次は「どれだけ守れているか」を計測します。私が最初に欲しかったのは派手なダッシュボードではなく、たった三つの数字でした。
+
+<table>
+<thead><tr><th>指標</th><th>定義</th><th>異常のサイン</th></tr></thead>
+<tbody>
+<tr><td>アクション成功率</td><td>実行後に画面が前進した操作 ÷ 全操作</td><td>0.7 を下回ると座標ドリフトを疑う</td></tr>
+<tr><td>stale 率</td><td>実行前ガードで中止した操作の割合</td><td>急上昇は UI の遷移が速すぎる兆候</td></tr>
+<tr><td>スタックループ長</td><td>同一画面ハッシュに対する連続操作回数</td><td>3 を超えたら人間へエスカレーション</td></tr>
+</tbody>
+</table>
+
+```python
+from collections import Counter
+
+class RunMetrics:
+    def __init__(self):
+        self.counts = Counter()
+        self.recent_hashes = []
+
+    def record(self, result, screen_hash):
+        self.counts[result["status"]] += 1
+        self.recent_hashes.append(screen_hash)
+        self.recent_hashes = self.recent_hashes[-5:]
+
+    def stuck_len(self):
+        if not self.recent_hashes:
+            return 0
+        last = self.recent_hashes[-1]
+        return sum(1 for h in reversed(self.recent_hashes)
+                   if hamming(h, last) <= NOOP_THRESHOLD)
+
+    def success_rate(self):
+        ok = self.counts["ok"]
+        total = sum(self.counts.values()) or 1
+        return ok / total
+```
+
+この三つを各実行の末尾にログへ落としておくと、後から「成功率が落ちた日」と「UI を更新した日」がきれいに重なって見えます。原因究明が推測ではなく突き合わせになるのが、計装のいちばんの効用です。
+
+## 予算で暴走を止める
+
+最後に、どれだけ守っても進まないときは止める判断が要ります。エージェント自動化のコストは、API 課金より「壊れた状態のまま走り続けた時間」に出ます。
+
+```python
+def run_task(goal, max_steps=40):
+    m = RunMetrics()
+    history = []
+    for step in range(max_steps):
+        png, w, h = capture()
+        h_now = perceptual_hash(png)
+        if m.stuck_len() >= 3:
+            return escalate("stuck", goal, history)      # 同じ画面で足踏み
+        if m.success_rate() < 0.5 and step > 8:
+            return escalate("low_success", goal, history) # 早期に手応えがない
+        action = run_step(png, goal, history)
+        if action["type"] == "done":
+            return {"status": "completed", "steps": step}
+        result = (guarded_destructive(action, png)
+                  if action["type"] in DESTRUCTIVE else
+                  execute_with_guard(action, png, h_now))
+        m.record(result, h_now)
+        history.append({"step": step, "action": action["type"], "result": result["status"]})
+    return escalate("budget_exhausted", goal, history)
+```
+
+ステップ上限・スタック検知・低成功率の三つを抜け道なく置くと、「気づいたら同じ操作を何十回も繰り返していた」という最悪の浪費が消えます。エスカレーション先は通知一本でも構いません。大事なのは、止まらない自動化を作らないことです。私自身、無人で回す前提の構成ほど、止める条件を先に決めておくほど安心して任せられると感じています。
+
+## どの順で入れるかの判断
+
+一度に全部を入れる必要はありません。私の場合は、次の順序を推奨します。
+
+1. 実行直前の再撮影と局所比較 — stale 操作を可視化する。ここだけで誤クリックの体感はおおむね半分（約50%減）まで落ちました
+2. noop 判定 — 反応のない操作を成功に数えない。楽観的連打への対処はこれが効きます
+3. 事前条件ガードと三指標の計装 — 破壊的操作のエラーを根本から回避する
+
+最初の一週間は success_rate を毎日眺めることをお勧めします。0.7（70%）を下回る日が UI 更新と重なるなら、座標ドリフトを疑うという注意点として覚えておくと、本番での原因究明が一気に速くなります。
+
+## 次の一歩
+
+手元の Computer Use ループがあるなら、まず `execute_with_guard` の「実行前にもう一度撮って局所比較する」一点だけを足してみてください。stale 操作が可視化された瞬間に、これまで「たまに結果が変」で片付けていた事故の正体が見えてきます。そこから事前条件ガードと三指標の計装へ広げれば、無人運用に踏み出す足場ができます。

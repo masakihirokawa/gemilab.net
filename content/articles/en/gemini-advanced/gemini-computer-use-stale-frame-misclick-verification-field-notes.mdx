@@ -1,0 +1,202 @@
+---
+title: "When Gemini Computer Use Acts on a Stale Screen and Fails Quietly — Field Notes on Guarding the Loop"
+slug: "gemini-computer-use-stale-frame-misclick-verification-field-notes"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-27T13:30"
+author: "Gemini Lab"
+description: "A Computer Use agent will click based on a screenshot taken moments ago, miss the real target, and throw no error. These are field notes on measuring those silent misclicks and stopping them with an observe-act-verify loop."
+tags: ["gemini-computer-use", "automation", "agents", "production", "advanced"]
+highlights:
+  - "A concrete loop that rejects actions aimed at a stale frame before they execute"
+  - "Making destructive actions idempotent so double-clicks and irreversible mistakes can't slip through"
+  - "Instrumenting action success rate, stuck loops, and a step budget to halt runaway runs"
+---
+
+## It looked successful, but it pressed the wrong button
+
+The first time I put Computer Use on a near-production task, the scary part wasn't a loud crash. It was the quiet failure where every step in the log says "success" yet the result is completely wrong. Tracing it back, the agent had computed coordinates from a screenshot taken a few hundred milliseconds earlier, and in that window a dialog had opened and the screen had shifted. The "Save" button from the old frame was now occupied by "Delete" in the new one.
+
+This class of failure never raises an exception. The click executes at valid coordinates, and the API moves calmly to the next step. No amount of careful `try/except` will catch it. What you actually need to guard isn't "the action failed" — it's "is the surface I just touched really the same one I thought I saw?"
+
+In my own work as an indie developer, I've leaned on automation for the dull, easy-to-miss repetitive work — things like swapping out store screenshots. What that taught me is that when a human does it by hand, they unconsciously pause for a beat — *wait, did the screen just change?* An agent has no such beat. So you have to bolt that beat on, in code.
+
+## Why silent misclicks happen
+
+A Computer Use loop is, conceptually, observe (screenshot) → reason (decide the next action) → execute (click, type), repeated. The accidents are born from the time gaps between those three.
+
+<table>
+<thead><tr><th>Failure mode</th><th>What happens</th><th>Exception?</th></tr></thead>
+<tbody>
+<tr><td>Stale frame</td><td>The screen transitions between observation and execution; an old coordinate is clicked</td><td>No</td></tr>
+<tr><td>Coordinate drift</td><td>Resolution, DPI, or scroll position differences misalign the model's coordinates with the real screen</td><td>No</td></tr>
+<tr><td>Optimistic repeats</td><td>Against a slow UI, the next action is stacked without confirmation, double-firing</td><td>No</td></tr>
+<tr><td>Stuck loop</td><td>The same action repeats on the same screen, burning budget without progress</td><td>No</td></tr>
+</tbody>
+</table>
+
+They all share one thing: a mismatch between "the world the model saw" and "the world it actually acted on." A smarter model won't fully erase this — even a smart model can't know what happened after the moment it observed. The practical fix lives not in the reasoning side but in a thin control layer wrapped around execution.
+
+## Rebuild it as observe → execute → verify
+
+A naive implementation runs whatever action the model returns and moves on. In production, you sandwich assertions around execution so you check both the screen right before the press and the screen right after.
+
+```python
+import time
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+MODEL = "gemini-2.5-computer-use-preview"  # confirm the exact model name in the latest docs
+
+def capture():
+    """Environment-specific. Returns screenshot bytes and logical size."""
+    png, width, height = grab_screen()  # your implementation
+    return png, width, height
+
+def run_step(prev_png, goal, history):
+    """One reasoning step. Hand the model the latest screen and the goal."""
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=[
+            types.Part.from_bytes(data=prev_png, mime_type="image/png"),
+            types.Part.from_text(text=f"Goal: {goal}\nSo far: {history}\nReturn only the next single action"),
+        ],
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(computer_use=types.ComputerUse())],
+            temperature=0.0,
+        ),
+    )
+    return extract_action(resp)  # pull out {"type": "click", "x":..,"y":..} etc.
+```
+
+So far it's an ordinary loop. The point is what comes next: "look once more before you act."
+
+```python
+def perceptual_hash(png):
+    """Hash the look of the screen. A lightweight fingerprint for stale detection."""
+    return dhash(png)  # difference hash, used for nearness rather than exact match
+
+def execute_with_guard(action, observed_png, observed_hash):
+    # 1) Capture again right before executing
+    fresh_png, w, h = capture()
+    if hamming(observed_hash, perceptual_hash(fresh_png)) > STALE_THRESHOLD:
+        # Screen differs from observation time -> abort the action on the old frame
+        return {"status": "stale", "fresh_png": fresh_png}
+
+    # 2) Compare only the local region around the click target (more sensitive than full-screen)
+    if action["type"] == "click":
+        roi = crop(fresh_png, action["x"], action["y"], radius=48)
+        roi_at_observe = crop(observed_png, action["x"], action["y"], radius=48)
+        if local_changed(roi, roi_at_observe):
+            return {"status": "stale_local", "fresh_png": fresh_png}
+
+    # 3) Execute -> capture after -> confirm the screen actually changed
+    do_action(action)
+    time.sleep(SETTLE_MS / 1000)
+    after_png, _, _ = capture()
+    progressed = hamming(perceptual_hash(fresh_png), perceptual_hash(after_png)) > NOOP_THRESHOLD
+    return {"status": "ok" if progressed else "noop", "after_png": after_png}
+```
+
+Three things matter. First, separate from the screen used for reasoning, **capture once more right before execution and compare fingerprints.** Second, **crop and compare only around the click coordinate.** A full-screen hash is dulled by things like a ticking clock, but a local comparison is sensitive to the very element being swapped under you. Third, **treat a post-action screen that didn't change at all as a `noop`.** Simply not counting an unresponsive action as "success" stops most optimistic repeats.
+
+When `stale` comes back, throw the action away and reason again from a fresh frame. The willingness to discard is what eradicates actions on an old screen.
+
+## Push destructive actions toward idempotency
+
+Even with verification, irreversible actions like delete or submit need separate handling. Here you make the conditions that must hold before execution explicit, and refuse to act if they aren't met.
+
+```python
+DESTRUCTIVE = {"delete", "submit", "purchase", "send"}
+
+def guarded_destructive(action, fresh_png):
+    label = action.get("label", "")
+    if action["type"] not in DESTRUCTIVE:
+        return execute_with_guard(action, fresh_png, perceptual_hash(fresh_png))
+
+    # Preconditions: is the button text what we expect? is a confirm dialog present?
+    text_here = ocr_near(fresh_png, action["x"], action["y"], radius=64)
+    if label and label not in text_here:
+        # The model meant to press "Delete" but the real screen shows another label -> abort
+        return {"status": "precondition_failed", "expected": label, "found": text_here}
+
+    # For irreversible actions, split into two steps and require a confirmation screen
+    return {"status": "needs_confirm_screen", "action": action}
+```
+
+The idea is to never let a destructive action through in one shot, and instead **make the presence of a confirmation screen a precondition.** Human UIs use "Are you sure?" as a safety valve, but an agent will barrel straight past it. So you only allow the final action on a step where a confirmation screen was actually observed. Even just reading the text under the button via OCR and stopping when it doesn't match the model's intended label goes a long way toward preventing destructive actions on the wrong target.
+
+## Instrument the failures
+
+Once the guards are in, measure how well they're holding. What I wanted first wasn't a fancy dashboard — it was three numbers.
+
+<table>
+<thead><tr><th>Metric</th><th>Definition</th><th>Sign of trouble</th></tr></thead>
+<tbody>
+<tr><td>Action success rate</td><td>Actions where the screen advanced after execution ÷ all actions</td><td>Below 0.7, suspect coordinate drift</td></tr>
+<tr><td>Stale rate</td><td>Share of actions aborted by the pre-execution guard</td><td>A spike means the UI transitions too fast</td></tr>
+<tr><td>Stuck loop length</td><td>Consecutive actions against the same screen hash</td><td>Over 3, escalate to a human</td></tr>
+</tbody>
+</table>
+
+```python
+from collections import Counter
+
+class RunMetrics:
+    def __init__(self):
+        self.counts = Counter()
+        self.recent_hashes = []
+
+    def record(self, result, screen_hash):
+        self.counts[result["status"]] += 1
+        self.recent_hashes.append(screen_hash)
+        self.recent_hashes = self.recent_hashes[-5:]
+
+    def stuck_len(self):
+        if not self.recent_hashes:
+            return 0
+        last = self.recent_hashes[-1]
+        return sum(1 for h in reversed(self.recent_hashes)
+                   if hamming(h, last) <= NOOP_THRESHOLD)
+
+    def success_rate(self):
+        ok = self.counts["ok"]
+        total = sum(self.counts.values()) or 1
+        return ok / total
+```
+
+Log these three at the end of each run, and later "the day the success rate dropped" and "the day we updated the UI" line up cleanly. Turning root-cause work from guessing into matching is the biggest payoff of instrumentation.
+
+## Stop runaway runs with a budget
+
+Finally, when nothing progresses no matter how well you guard, you need the judgment to stop. The cost of agent automation shows up less in API billing and more in "time spent running while broken."
+
+```python
+def run_task(goal, max_steps=40):
+    m = RunMetrics()
+    history = []
+    for step in range(max_steps):
+        png, w, h = capture()
+        h_now = perceptual_hash(png)
+        if m.stuck_len() >= 3:
+            return escalate("stuck", goal, history)       # treading water on one screen
+        if m.success_rate() < 0.5 and step > 8:
+            return escalate("low_success", goal, history)  # no traction early on
+        action = run_step(png, goal, history)
+        if action["type"] == "done":
+            return {"status": "completed", "steps": step}
+        result = (guarded_destructive(action, png)
+                  if action["type"] in DESTRUCTIVE else
+                  execute_with_guard(action, png, h_now))
+        m.record(result, h_now)
+        history.append({"step": step, "action": action["type"], "result": result["status"]})
+    return escalate("budget_exhausted", goal, history)
+```
+
+Place all three — a step ceiling, stuck detection, and low success rate — with no way around them, and the worst waste ("I looked up and it had repeated the same action dozens of times") disappears. The escalation target can be a single notification. What matters is not building automation that never stops. I find that the more I intend to run something unattended, the more I want the stopping conditions decided up front.
+
+## Where to start
+
+If you already have a Computer Use loop, add just the one thing in `execute_with_guard`: capture again right before execution and compare the local region. The moment stale actions become visible, the accidents you'd been writing off as "the result is occasionally weird" reveal their real cause. From there, extend toward precondition guards and the three-metric instrumentation, and you'll have the footing to step into unattended operation.
