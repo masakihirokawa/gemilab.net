@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MODEL — Gemini 3.5 Flashが一般提供。3.1 Proをほぼ全ベンチで上回りつつ高速に動きます",
-    "API — Interactions APIがGAに到達。Geminiモデルとエージェントを扱う主要APIになりました",
-    "AGENTS — Managed Agentsが公開プレビュー。Googleホストの隔離Linuxサンドボックスで自律エージェントを動かせます",
-    "COST — Project Spend Capsでプロジェクト単位のGemini API月額上限を設定できます",
-    "SHEETS — Gemini in Sheetsが周辺データを解析し、数式エラーをワンクリックで診断・修正します",
-    "STUDIO — Google AI Studioが刷新され、スターターアプリのギャラリーが拡充されました",
+    "API — Gemini 3.5 Flashが一般提供。gemini-flash-latestの実体となり、エージェント・コーディングで持続的に高性能を出します",
+    "AGENT — Managed Agentsが公開プレビュー。Googleホストの隔離Linuxサンドボックスでステートフルな自律エージェントを構築できます",
+    "SEARCH — File Searchがマルチモーダル対応。gemini-embedding-2で画像をそのまま埋め込み・検索できます",
+    "RESEARCH — Deep Researchの新版が協調プランニング・可視化・MCPサーバー連携・File Searchに対応しました",
+    "SHEETS — Gemini in Sheetsが周辺データ構造を解析し、数式エラーを1クリックで診断・修正します",
+    "ROADMAP — Gemini 3.5 Proは品質調整のため7月へ延期。最新の主力はFlash系です",
   ],
   en: [
-    "MODEL — Gemini 3.5 Flash is generally available, beating 3.1 Pro on nearly all benchmarks while running faster",
-    "API — The Interactions API reaches GA as the primary way to work with Gemini models and agents",
-    "AGENTS — Managed Agents enter public preview, running autonomous agents in Google-hosted isolated Linux sandboxes",
-    "COST — Project Spend Caps let you set a monthly dollar limit on Gemini API usage per project",
-    "SHEETS — Gemini in Sheets diagnoses and fixes formula errors in one click by analyzing surrounding data",
-    "STUDIO — Google AI Studio gets a developer-first refresh with an expanded gallery of starter apps",
+    "API — Gemini 3.5 Flash is generally available and now powers gemini-flash-latest for sustained agentic and coding performance",
+    "AGENT — Managed Agents enter public preview, running stateful autonomous agents in Google-hosted isolated Linux sandboxes",
+    "SEARCH — File Search adds multimodal search, embedding and searching images natively with gemini-embedding-2",
+    "RESEARCH — A new Deep Research agent adds collaborative planning, visualization, MCP server integration, and File Search",
+    "SHEETS — Gemini in Sheets analyzes surrounding data to diagnose and fix formula errors in one click",
+    "ROADMAP — Gemini 3.5 Pro slips to July for refinement; the Flash line leads for now",
   ],
 };
 
