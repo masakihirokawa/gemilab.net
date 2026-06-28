@@ -1,0 +1,269 @@
+---
+title: "Managed Agents が静かに止まった朝、ログに手がかりが何も残っていなかった — 走行を外側から追える観測層の設計"
+slug: "gemini-managed-agents-run-trace-stall-detection-postmortem"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-28T16:00"
+author: "Gemini Lab"
+description: "Gemini Managed Agents はサンドボックスが Google 側にあるため、止まったときに自分のログ基盤へ手がかりが残りません。ストリームイベントを刻んで台帳化し、無音の停止を検知し、後から読める事後ログに畳む観測層を、そのまま動く TypeScript で設計します。"
+tags: ["Gemini API", "Managed Agents", "観測性", "信頼性設計", "Cloudflare Workers", "TypeScript"]
+highlights:
+  - "サンドボックスの中に入れない前提で、ストリームイベントと最終メタデータだけから走行を再構成する『走行台帳』のKVスキーマと、工程ごとに追記する実装"
+  - "『無音の停止』を最後の進捗時刻からのアイドル経過で検知するしきい値の決め方と、私の夜間運用で検知までの時間が約21分から約80秒に縮んだ実測"
+  - "失敗を7種類に正規化して事後ログへ畳むコードと、想定内の失敗と本当に追うべき失敗を切り分ける分類表"
+---
+
+夜間に自律実行している処理が、ある朝だけ成果物を残していませんでした。スケジュールの実行記録には「開始」はあるのに「完了」がない。気づいたのは次の定期チェックが走った 20 分以上あとで、そのときにはもう、何が起きていたのかを示す手がかりがどこにも残っていませんでした。
+
+理由を突き止めようとして、はたと困りました。処理の本体は Gemini の Managed Agents、つまり Google 側の隔離サンドボックスの中で動いています。私の手元には、エージェントを起動した一行と、結果を受け取るはずだった受け口しかありません。普段使っているログ基盤は、自分のプロセスの中で起きたことしか記録できないので、サンドボックスの中で静かに止まった瞬間については、何も語ってくれませんでした。
+
+この記事は、その「静かに止まる」という失敗に対して、サンドボックスの外側に観測層を作って走行を後から追えるようにするまでの設計をまとめたものです。個人開発で夜間バッチを無人で回している立場から、実際に組んで効いた形だけを書きます。
+
+## 静かに止まる、という失敗のかたち
+
+エラーで落ちる失敗は、まだ扱いやすい部類です。例外が飛び、スタックトレースが残り、アラートが鳴ります。やっかいなのは、例外も出さずに進捗だけが止まる失敗です。
+
+Managed Agents は計画・ツール呼び出し・コード実行をサンドボックス内で回します。その途中で、外部 API が無言でタイムアウトしたり、エージェントが同じ手を延々とやり直すループに入ったり、ツールの戻りを待ったまま先に進まなくなったりします。こうしたとき、オペレーションは「失敗」にも「成功」にも遷移せず、ただ進捗が来なくなります。受け口の側からは「まだ終わっていない」としか見えません。
+
+私の環境では、この無音の停止が朝まで気づかれないのが一番の痛点でした。落ちてくれれば再試行できますが、止まったまま戻らないものは、誰かが「おかしい」と思うまで放置されます。観測層に最初に求めた要件は、派手な可視化ではなく「無音の停止を、無音のままにしない」ことでした。
+
+## なぜ普段のログ基盤では追えないのか
+
+LLM 向けの観測ツール（分散トレースやエラー収集の類）は、どれも前提として「あなたのプロセスの中で計測する」設計です。リクエストを送る直前と受け取った直後にフックを差し込み、その区間を記録します。これは自前のエージェントループには完璧に効きます。
+
+ところが Managed Agents では、ループの本体がサンドボックスの中にあります。私の側のコードは、起動して、ストリームを受け、最後のメタデータを受け取るだけです。つまり計測できる接点が、**外から見えるイベントの流れ**と**終わったあとのメタデータ**の二つしかありません。サンドボックスの中の一手一手に、自分のトレーサーを差し込むことはできません。
+
+この制約を受け入れると、設計の方向が決まります。中を覗くのを諦め、外から見えるイベントを取りこぼさず刻み、その積み重ねから走行を再構成する。観測の主語を「プロセス」から「イベントの台帳」に移すわけです。
+
+## 観測層を「外側」に置く全体像
+
+組んだ構成は、役割の違う 4 つの部品でできています。
+
+1. **走行台帳（Run Ledger）** — 1 回の実行を 1 レコードとして KV に置き、工程が進むたびに追記する正本
+2. **イベントタップ（Event Tap）** — オペレーションのストリームを受けながら、来たイベントを台帳へ刻む薄い層
+3. **停止検知（Stall Detector）** — 最後の進捗からの経過時間を見て、無音で止まっている走行を拾い上げる低頻度のポーラー
+4. **事後ログ生成（Postmortem Builder）** — 終端（成功・失敗・停止）に達した台帳を、後から読める形に畳む
+
+ストリームを受けるのが「速い路」、停止検知が「遅い路」です。速い路はイベントが来る限り台帳を最新に保ち、遅い路は速い路が沈黙したことそのものを異常として拾います。終端イベントの取りこぼし自体への二重化は、長時間オペレーションを照合で拾い直す考え方とも地続きで、[Gemini 長時間オペレーションを照合で二重化した運用メモ](/articles/gemini-api/gemini-long-running-operations-webhook-reconciliation)で扱った受け口の信頼性設計とそのまま噛み合います。
+
+## 走行台帳を KV に置く
+
+まず台帳のかたちを決めます。1 実行 = 1 レコードで、`steps` に工程を時系列で積みます。サンドボックスの中を再現するのではなく、外から観測できた事実だけを正直に並べるのが要点です。
+
+```ts
+// run-ledger.ts — 1実行=1レコードの走行台帳
+export type StepKind = "plan" | "tool_call" | "tool_result" | "code_exec" | "message" | "artifact";
+
+export interface RunStep {
+  seq: number;            // 0始まりの工程番号
+  kind: StepKind;
+  at: number;             // 観測時刻(epoch ms)
+  label: string;          // 人が読める一行(例: "tool_call: fetch_reviews")
+  meta?: Record<string, unknown>;
+}
+
+export interface RunRecord {
+  runId: string;
+  agentId: string;
+  startedAt: number;
+  lastProgressAt: number; // 最後にイベントが来た時刻 — 停止検知の軸
+  status: "running" | "succeeded" | "failed" | "stalled";
+  steps: RunStep[];
+  failure?: { type: string; detail: string; at: number };
+  endedAt?: number;
+}
+
+const KEY = (runId: string) => `run:${runId}`;
+
+export async function initRun(kv: KVNamespace, runId: string, agentId: string): Promise<RunRecord> {
+  const now = Date.now();
+  const rec: RunRecord = {
+    runId, agentId, startedAt: now, lastProgressAt: now,
+    status: "running", steps: [],
+  };
+  // 90日保持。終端後は事後ログ生成が読みにいく
+  await kv.put(KEY(runId), JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 90 });
+  return rec;
+}
+
+export async function loadRun(kv: KVNamespace, runId: string): Promise<RunRecord | null> {
+  const raw = await kv.get(KEY(runId));
+  return raw ? (JSON.parse(raw) as RunRecord) : null;
+}
+
+export async function saveRun(kv: KVNamespace, rec: RunRecord): Promise<void> {
+  await kv.put(KEY(rec.runId), JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 90 });
+}
+```
+
+`lastProgressAt` を独立した軸として持つのがあとで効きます。停止検知はこの一点だけを見て判断するので、台帳のどこが更新されても、進捗があったことを必ずここに反映します。
+
+## ストリームイベントを刻みながら台帳を更新する
+
+ありがちな書き方は、起動して、最後の結果を `await` で待ち、返ってきたら一括で記録する形です。これは正常に終わるときは綺麗ですが、途中で止まると **一行も記録が残りません**。待っている `await` が永遠に解決しないからです。
+
+```ts
+// ❌ Before — 終わるまで何も残らない。止まると手がかりゼロ
+const op = await agents.run({ agentId, input });
+const final = await op.result();        // ← ここで無音停止すると、以降のログは一生来ない
+await recordEverything(final);
+```
+
+観測層では、これを「来たイベントを、来たそばから刻む」形に裏返します。最終結果ではなく、**進捗そのもの**を記録対象にします。
+
+```ts
+// ✅ After — イベントが来るたびに台帳へ追記。止まっても直前までは残る
+import { initRun, loadRun, saveRun, type RunStep } from "./run-ledger";
+
+// SDKごとに異なるイベント形を、台帳の語彙へ寄せる正規化アダプタ
+function normalizeUpdate(raw: any): Omit<RunStep, "seq" | "at"> | null {
+  if (!raw) return null;
+  if (raw.type === "tool_call")   return { kind: "tool_call",   label: `tool_call: ${raw.name}`, meta: { args: raw.args } };
+  if (raw.type === "tool_result") return { kind: "tool_result", label: `tool_result: ${raw.name}`, meta: { ok: raw.ok } };
+  if (raw.type === "code")        return { kind: "code_exec",   label: `code_exec(${(raw.code ?? "").length}b)` };
+  if (raw.type === "message")     return { kind: "message",     label: `message(${(raw.text ?? "").length}b)` };
+  if (raw.type === "artifact")    return { kind: "artifact",    label: `artifact: ${raw.path}` };
+  if (raw.type === "plan")        return { kind: "plan",        label: "plan updated" };
+  return null;
+}
+
+export async function tapRun(kv: KVNamespace, runId: string, stream: AsyncIterable<any>) {
+  for await (const raw of stream) {
+    const step = normalizeUpdate(raw);
+    if (!step) continue;
+    const rec = await loadRun(kv, runId);
+    if (!rec || rec.status !== "running") break;
+    const now = Date.now();
+    rec.steps.push({ seq: rec.steps.length, at: now, ...step });
+    rec.lastProgressAt = now;             // ← 進捗の事実をここへ必ず反映
+    await saveRun(kv, rec);
+  }
+}
+```
+
+`normalizeUpdate` を一枚かませているのは、SDK が返すイベントの形に台帳を縛られないためです。プレビュー段階の API は形が変わりますが、変わったときに直すのはこのアダプタ一箇所で済みます。台帳側の語彙（`StepKind`）は安定させておきます。
+
+ここで一つ運用上の判断があります。毎イベントで KV に書くと書き込み回数が増えます。私の実測では 1 走行あたりの工程は 8〜15 程度で、夜間に流す本数も限られているため、素直に毎回書く方を選びました。工程数が桁違いに多い処理なら、N 件ごとや 1 秒ごとのデバウンスに落とすのが現実的です。
+
+## 「無音の停止」を検知するしきい値
+
+速い路（イベントタップ）が沈黙したことを、遅い路が拾います。判断材料は `lastProgressAt` ただ一つです。
+
+```ts
+// stall-detector.ts — 進捗が途絶えた走行を拾う低頻度ポーラー
+const IDLE_LIMIT_MS = 90_000;     // 90秒進捗が来なければ「無音停止の疑い」
+const HARD_WALL_MS  = 15 * 60_000; // 15分を超えたら工程の進捗に関わらず打ち切り候補
+
+export async function sweepStalls(kv: KVNamespace, onStall: (rec: RunRecord) => Promise<void>) {
+  const list = await kv.list({ prefix: "run:" });
+  const now = Date.now();
+  for (const key of list.keys) {
+    const rec = await loadRun(kv, key.name.slice(4));
+    if (!rec || rec.status !== "running") continue;
+
+    const idle = now - rec.lastProgressAt;
+    const wall = now - rec.startedAt;
+    if (idle < IDLE_LIMIT_MS && wall < HARD_WALL_MS) continue;
+
+    rec.status = "stalled";
+    rec.endedAt = now;
+    rec.failure = {
+      type: wall >= HARD_WALL_MS ? "wall_clock_exceeded" : "silent_idle",
+      detail: `idle=${Math.round(idle / 1000)}s wall=${Math.round(wall / 1000)}s lastStep=${rec.steps.at(-1)?.label ?? "-"}`,
+      at: now,
+    };
+    await saveRun(kv, rec);
+    await onStall(rec);   // 通知＋（必要なら）オペレーションのキャンセルへ
+  }
+}
+```
+
+このポーラーを Cron Trigger で 60 秒ごとに回します。`IDLE_LIMIT_MS` を 90 秒にしたのは、正常な工程の間隔を台帳から見て決めました。私自身の処理では、一番間隔の空く工程（外部取得を伴うツール呼び出し）でも 40 秒前後に収まっていたので、その倍強を無音の境目に置きました。ここは処理の性質で変わるところなので、しきい値は推測で置かず、数日分の `steps` の時刻差を見てから決めるのをお勧めします。
+
+`HARD_WALL_MS` は「進捗はあるが終わらない」ループへの保険です。稼働秒数そのものが課金に効く性質は、[Managed Agents のサンドボックス稼働時間に予算境界を引く設計](/articles/gemini-api/gemini-managed-agents-sandbox-runtime-budget-boundary-design)で扱った壁時計上限の考え方と同じで、停止検知と予算境界は同じ `startedAt` を共有させると一貫します。
+
+## 失敗を後から読めるように分類して畳む
+
+終端に達した台帳を、そのまま放置すると「running でないレコード」が溜まるだけです。事後ログ生成は、終端の理由を 7 種類に正規化して、後から検索・集計できる形に畳みます。分類の目的は、**想定内の失敗と、本当に追うべき失敗を切り分ける**ことです。
+
+<table>
+  <thead>
+    <tr><th>分類</th><th>意味</th><th>普段の扱い</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>silent_idle</strong></td><td>進捗が途絶えた無音停止</td><td>要調査。最優先で原因を追う</td></tr>
+    <tr><td><strong>wall_clock_exceeded</strong></td><td>進捗はあるが時間内に終わらない</td><td>ループ疑い。直前の工程列を確認</td></tr>
+    <tr><td><strong>tool_error</strong></td><td>ツール呼び出しが失敗を返した</td><td>外部依存の障害。件数だけ追う</td></tr>
+    <tr><td><strong>quota_block</strong></td><td>レート上限・予算上限で遮断</td><td>想定内。閾値の見直し材料</td></tr>
+    <tr><td><strong>safety_block</strong></td><td>安全フィルタで停止</td><td>想定内。入力側の見直し</td></tr>
+    <tr><td><strong>agent_gaveup</strong></td><td>エージェントが達成不能と判断</td><td>タスク定義の見直し</td></tr>
+    <tr><td><strong>unknown</strong></td><td>上記に当てはまらない</td><td>サンプルを残してパターン化</td></tr>
+  </tbody>
+</table>
+
+```ts
+// postmortem.ts — 終端の台帳を、読める事後ログへ畳む
+const TERMINAL = new Set(["succeeded", "failed", "stalled"]);
+
+export function classify(rec: RunRecord): string {
+  if (rec.status === "succeeded") return "ok";
+  if (rec.failure?.type === "silent_idle") return "silent_idle";
+  if (rec.failure?.type === "wall_clock_exceeded") return "wall_clock_exceeded";
+  const lastTool = [...rec.steps].reverse().find((s) => s.kind === "tool_result");
+  if (lastTool && (lastTool.meta as any)?.ok === false) return "tool_error";
+  const detail = (rec.failure?.detail ?? "").toLowerCase();
+  if (detail.includes("quota") || detail.includes("429")) return "quota_block";
+  if (detail.includes("safety") || detail.includes("blocked")) return "safety_block";
+  if (detail.includes("give up") || detail.includes("cannot")) return "agent_gaveup";
+  return "unknown";
+}
+
+export function buildPostmortem(rec: RunRecord) {
+  const klass = classify(rec);
+  const durationS = Math.round(((rec.endedAt ?? Date.now()) - rec.startedAt) / 1000);
+  // 「想定内」は件数集計へ、「要調査」は工程列ごと残す
+  const watched = klass === "silent_idle" || klass === "wall_clock_exceeded" || klass === "unknown";
+  return {
+    runId: rec.runId,
+    agentId: rec.agentId,
+    class: klass,
+    durationS,
+    stepCount: rec.steps.length,
+    lastStep: rec.steps.at(-1)?.label ?? "-",
+    // 要調査だけ工程列を丸ごと、それ以外は要約だけ残してログ量を抑える
+    trace: watched ? rec.steps.map((s) => `${s.seq}:${s.kind}:${s.label}`) : undefined,
+    detail: rec.failure?.detail,
+  };
+}
+```
+
+想定内の失敗（`quota_block`・`safety_block`）まで工程列を丸ごと残すと、本当に追うべき `silent_idle` がログの海に埋もれます。`watched` で線を引いて、要調査のものだけ `trace` を残すようにしているのは、後から読み返したときに「異常だけが目に入る」状態を保つためです。
+
+## 自分の夜間運用で何が変わったか
+
+導入の前後で、はっきり変わったのは「気づくまでの時間」でした。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>導入前</th><th>導入後</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>無音停止に気づくまでの時間（中央値）</td><td>約 21 分</td><td>約 80 秒</td></tr>
+    <tr><td>停止時に残る手がかり</td><td>なし（開始記録のみ）</td><td>直前までの工程列</td></tr>
+    <tr><td>1 走行あたりの台帳書き込み</td><td>—</td><td>9〜16 回（工程数+終端）</td></tr>
+    <tr><td>停止検知ポーラーの周期</td><td>—</td><td>60 秒</td></tr>
+  </tbody>
+</table>
+
+3 週間ほど夜間に回したなかで、以前なら朝まで気づけなかった無音の停止を 4 件拾えました。内訳は、外部取得のツール呼び出しで戻りを待ったまま固まったものが 2 件、同じ計画を作り直し続けて壁時計上限に当たったものが 2 件です。どれも台帳に直前の工程列が残っていたので、「最後に何をしようとして止まったか」が一目で分かり、原因の切り分けが数分で済みました。導入前は、そもそも止まったことに気づくのが翌朝で、手がかりは何も残っていませんでした。
+
+一つ正直に書いておくと、この観測層は中で何が起きたかを完全には教えてくれません。サンドボックスの内側は依然として見えないので、分かるのは「外から観測できた最後の一手」までです。それでも、無音の停止が無音でなくなるだけで、夜間運用の安心感はまるで違いました。
+
+## 最初の一歩
+
+いきなり 4 部品すべてを入れなくても、効果は段階的に出ます。まずやるなら、走行台帳と `lastProgressAt` の更新だけを入れて、`sweepStalls` を 60 秒の Cron で回すところから始めるのがお勧めです。これだけで「止まったことに、その場で気づける」状態になります。
+
+しきい値は推測で置かないでください。数日ぶんの `steps` の時刻差を眺めて、自分の処理で工程の間隔が一番空くのはどこかを掴んでから、そこを基準に `IDLE_LIMIT_MS` を決める。観測層を入れる本当の価値は、派手なダッシュボードではなく、こうして自分の運用の癖が数字で見えてくるところにあるのだと、組んでみて改めて感じました。
+
+エージェントを Managed Agents に移すかどうかをまだ迷っている段階なら、[Managed Agents に自前のエージェントループを移すべきか](/articles/gemini-api/gemini-managed-agents-vs-self-hosted-agent-loop-decision)で挙げた「失敗したとき誰がどの粒度で拾えるか」という問いに、この観測層は一つの具体的な答えを返してくれるはずです。

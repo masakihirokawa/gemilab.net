@@ -1,0 +1,269 @@
+---
+title: "The Morning a Managed Agent Stalled and Left No Trace — Building a Run-Observability Layer Outside the Sandbox"
+slug: "gemini-managed-agents-run-trace-stall-detection-postmortem"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-28T16:00"
+author: "Gemini Lab"
+description: "With Gemini Managed Agents, the sandbox lives on Google's side, so when a run stalls there is nothing left in your own logging stack. This is a working TypeScript design for an outside observability layer that taps stream events into a ledger, detects silent stalls, and folds runs into readable postmortems."
+tags: ["Gemini API", "Managed Agents", "Observability", "Reliability", "Cloudflare Workers", "TypeScript"]
+highlights:
+  - "A run-ledger KV schema and append-per-step implementation that reconstructs a run purely from stream events and final metadata, assuming you can never enter the sandbox"
+  - "How to set the silent-stall threshold from idle-since-last-progress, plus the measured drop in my nightly runs from ~21 minutes to ~80 seconds to detection"
+  - "Code that normalizes failures into seven classes and a table that separates expected failures from the ones you actually need to chase"
+---
+
+One morning, a process I run autonomously overnight had produced no output. The schedule log showed a "started" entry but no "completed." I only noticed more than twenty minutes later, when the next scheduled check ran — and by then, nothing remained anywhere to explain what had happened.
+
+When I tried to track down the cause, I hit a wall. The work itself runs inside Gemini's Managed Agents — that is, inside Google's isolated sandbox. On my side I only had the one line that launched the agent and the receiver that was supposed to take the result. My usual logging stack records only what happens inside my own process, so about the moment it went quiet inside the sandbox, it had nothing to say.
+
+This article is the design I landed on for that "stalls quietly" failure: building an observability layer outside the sandbox so a run can be traced after the fact. I write only the shape that actually held up, from the position of an indie developer running nightly batches unattended.
+
+## What "stalling quietly" actually looks like
+
+A failure that throws is the easier kind. An exception flies, a stack trace stays behind, an alert fires. The nasty one is the failure where no exception appears and progress simply stops.
+
+Managed Agents run planning, tool calls, and code execution inside the sandbox. Somewhere in there, an external API times out silently, the agent falls into a loop redoing the same move, or it waits forever on a tool result that never returns. When that happens, the operation transitions to neither "failed" nor "succeeded" — progress just stops arriving. From the receiver's side, all you can see is "not done yet."
+
+In my setup, this silent stall going unnoticed until morning was the real pain. If it crashes, I can retry; but something that stops and never returns sits there until a human thinks "that's odd." The first requirement I put on the observability layer was not flashy visualization — it was simply this: don't let a silent stall stay silent.
+
+## Why your usual logging stack can't follow it
+
+LLM observability tools — distributed tracing, error collection, and the like — are all built on the premise that you measure inside your own process. You hook in right before a request goes out and right after it comes back, and record that span. That works perfectly for a self-hosted agent loop.
+
+But with Managed Agents, the body of the loop lives inside the sandbox. My code only launches it, receives the stream, and takes the final metadata. In other words, I have exactly two points where measurement is possible: **the flow of events visible from outside**, and **the metadata available after it ends**. I cannot insert my own tracer into each step inside the sandbox.
+
+Accept that constraint and the design direction settles itself. Give up on peering inside; instead, record every externally visible event without dropping any, and reconstruct the run from that accumulation. You move the subject of observation from "the process" to "the ledger of events."
+
+## The whole shape: putting the layer outside
+
+The setup I built has four parts with distinct roles.
+
+1. **Run Ledger** — one execution as one record in KV, the source of truth that gets appended to as each step advances
+2. **Event Tap** — a thin layer that consumes the operation's stream and carves each incoming event into the ledger
+3. **Stall Detector** — a low-frequency poller that watches time-since-last-progress and picks up runs that have gone quiet
+4. **Postmortem Builder** — folds a ledger that has reached a terminal state (success, failure, or stall) into something readable later
+
+Consuming the stream is the "fast path"; stall detection is the "slow path." The fast path keeps the ledger current as long as events keep arriving, and the slow path treats the fast path's own silence as the anomaly. Double-covering the loss of the terminal event itself is continuous with the reconciliation idea — the receiver-reliability design I covered in [reconciling Gemini long-running operations against a ledger](/articles/gemini-api/gemini-long-running-operations-webhook-reconciliation) dovetails directly with this.
+
+## Putting the run ledger in KV
+
+First decide the ledger's shape. One execution equals one record, with steps stacked chronologically into `steps`. The point is not to reproduce the inside of the sandbox, but to honestly line up only the facts observable from outside.
+
+```ts
+// run-ledger.ts — one execution = one record
+export type StepKind = "plan" | "tool_call" | "tool_result" | "code_exec" | "message" | "artifact";
+
+export interface RunStep {
+  seq: number;            // zero-based step number
+  kind: StepKind;
+  at: number;             // observed time (epoch ms)
+  label: string;          // human-readable one-liner (e.g. "tool_call: fetch_reviews")
+  meta?: Record<string, unknown>;
+}
+
+export interface RunRecord {
+  runId: string;
+  agentId: string;
+  startedAt: number;
+  lastProgressAt: number; // when the last event arrived — the axis for stall detection
+  status: "running" | "succeeded" | "failed" | "stalled";
+  steps: RunStep[];
+  failure?: { type: string; detail: string; at: number };
+  endedAt?: number;
+}
+
+const KEY = (runId: string) => `run:${runId}`;
+
+export async function initRun(kv: KVNamespace, runId: string, agentId: string): Promise<RunRecord> {
+  const now = Date.now();
+  const rec: RunRecord = {
+    runId, agentId, startedAt: now, lastProgressAt: now,
+    status: "running", steps: [],
+  };
+  // keep 90 days; the postmortem builder reads it after a terminal state
+  await kv.put(KEY(runId), JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 90 });
+  return rec;
+}
+
+export async function loadRun(kv: KVNamespace, runId: string): Promise<RunRecord | null> {
+  const raw = await kv.get(KEY(runId));
+  return raw ? (JSON.parse(raw) as RunRecord) : null;
+}
+
+export async function saveRun(kv: KVNamespace, rec: RunRecord): Promise<void> {
+  await kv.put(KEY(rec.runId), JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 90 });
+}
+```
+
+Holding `lastProgressAt` as an independent axis pays off later. Stall detection looks at this single point to decide, so no matter which part of the ledger updates, you always reflect "progress happened" here.
+
+## Tapping stream events while updating the ledger
+
+The common way to write this is: launch, `await` the final result, and record everything at once when it returns. That is clean when it ends normally — but when it stalls midway, **not a single line is left behind**, because the `await` you are waiting on never resolves.
+
+```ts
+// ❌ Before — nothing is left until it finishes. If it stalls, you have zero clues.
+const op = await agents.run({ agentId, input });
+const final = await op.result();        // ← if it goes silent here, no further log ever arrives
+await recordEverything(final);
+```
+
+In the observability layer, you turn this inside out: carve each event the moment it arrives. The thing you record is not the final result but **progress itself**.
+
+```ts
+// ✅ After — append to the ledger on every event. Even on a stall, you keep up to the last step.
+import { initRun, loadRun, saveRun, type RunStep } from "./run-ledger";
+
+// a normalizing adapter that pulls each SDK's event shape toward the ledger's vocabulary
+function normalizeUpdate(raw: any): Omit<RunStep, "seq" | "at"> | null {
+  if (!raw) return null;
+  if (raw.type === "tool_call")   return { kind: "tool_call",   label: `tool_call: ${raw.name}`, meta: { args: raw.args } };
+  if (raw.type === "tool_result") return { kind: "tool_result", label: `tool_result: ${raw.name}`, meta: { ok: raw.ok } };
+  if (raw.type === "code")        return { kind: "code_exec",   label: `code_exec(${(raw.code ?? "").length}b)` };
+  if (raw.type === "message")     return { kind: "message",     label: `message(${(raw.text ?? "").length}b)` };
+  if (raw.type === "artifact")    return { kind: "artifact",    label: `artifact: ${raw.path}` };
+  if (raw.type === "plan")        return { kind: "plan",        label: "plan updated" };
+  return null;
+}
+
+export async function tapRun(kv: KVNamespace, runId: string, stream: AsyncIterable<any>) {
+  for await (const raw of stream) {
+    const step = normalizeUpdate(raw);
+    if (!step) continue;
+    const rec = await loadRun(kv, runId);
+    if (!rec || rec.status !== "running") break;
+    const now = Date.now();
+    rec.steps.push({ seq: rec.steps.length, at: now, ...step });
+    rec.lastProgressAt = now;             // ← always reflect the fact of progress here
+    await saveRun(kv, rec);
+  }
+}
+```
+
+The reason for putting `normalizeUpdate` in front is to keep the ledger from being tied to the event shapes the SDK returns. Preview-stage APIs change shape, and when they do, the only place you fix is this one adapter. You keep the ledger's vocabulary (`StepKind`) stable.
+
+There is one operational judgment here. Writing to KV on every event raises the write count. In my measurements a run has on the order of 8–15 steps, and I only run a limited number overnight, so I chose to write plainly on every event. For work with an order of magnitude more steps, debouncing to every N events or once per second is the realistic move.
+
+## The threshold for a "silent stall"
+
+The slow path picks up the fact that the fast path (the event tap) has gone silent. The only basis for the call is `lastProgressAt`.
+
+```ts
+// stall-detector.ts — a low-frequency poller for runs whose progress has ceased
+const IDLE_LIMIT_MS = 90_000;     // no progress for 90s ⇒ "suspected silent stall"
+const HARD_WALL_MS  = 15 * 60_000; // past 15 min, a cutoff candidate regardless of step progress
+
+export async function sweepStalls(kv: KVNamespace, onStall: (rec: RunRecord) => Promise<void>) {
+  const list = await kv.list({ prefix: "run:" });
+  const now = Date.now();
+  for (const key of list.keys) {
+    const rec = await loadRun(kv, key.name.slice(4));
+    if (!rec || rec.status !== "running") continue;
+
+    const idle = now - rec.lastProgressAt;
+    const wall = now - rec.startedAt;
+    if (idle < IDLE_LIMIT_MS && wall < HARD_WALL_MS) continue;
+
+    rec.status = "stalled";
+    rec.endedAt = now;
+    rec.failure = {
+      type: wall >= HARD_WALL_MS ? "wall_clock_exceeded" : "silent_idle",
+      detail: `idle=${Math.round(idle / 1000)}s wall=${Math.round(wall / 1000)}s lastStep=${rec.steps.at(-1)?.label ?? "-"}`,
+      at: now,
+    };
+    await saveRun(kv, rec);
+    await onStall(rec);   // notify, and (if needed) cancel the operation
+  }
+}
+```
+
+Run this poller every 60 seconds with a Cron Trigger. I set `IDLE_LIMIT_MS` to 90 seconds by reading normal step intervals off the ledger. In my work, even the widest-spaced step (a tool call involving an external fetch) stayed around 40 seconds, so I placed the silence boundary at a bit over twice that. This shifts with the nature of the work, so rather than guessing the threshold, I recommend looking at the time deltas between `steps` over a few days before deciding.
+
+`HARD_WALL_MS` is insurance against the "progress, but never finishes" loop. The fact that wall-clock seconds themselves drive billing is the same wall-clock-ceiling thinking I covered in [drawing a budget boundary on Managed Agents sandbox runtime](/articles/gemini-api/gemini-managed-agents-sandbox-runtime-budget-boundary-design); stall detection and the budget boundary stay consistent when you let them share the same `startedAt`.
+
+## Classifying failures so they can be read later
+
+If you leave terminal ledgers alone, you just accumulate "records that aren't running." The postmortem builder normalizes the terminal reason into seven classes and folds it into something searchable and countable. The purpose of the classification is to **separate expected failures from the ones you actually need to chase**.
+
+<table>
+  <thead>
+    <tr><th>Class</th><th>Meaning</th><th>Usual handling</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>silent_idle</strong></td><td>silent stall where progress ceased</td><td>Investigate. Chase the cause first</td></tr>
+    <tr><td><strong>wall_clock_exceeded</strong></td><td>progresses but doesn't finish in time</td><td>Suspected loop. Check the recent step run</td></tr>
+    <tr><td><strong>tool_error</strong></td><td>a tool call returned a failure</td><td>External dependency fault. Just count it</td></tr>
+    <tr><td><strong>quota_block</strong></td><td>blocked by rate or budget ceiling</td><td>Expected. Material for revising thresholds</td></tr>
+    <tr><td><strong>safety_block</strong></td><td>stopped by a safety filter</td><td>Expected. Revisit the input side</td></tr>
+    <tr><td><strong>agent_gaveup</strong></td><td>agent judged the task unachievable</td><td>Revisit the task definition</td></tr>
+    <tr><td><strong>unknown</strong></td><td>none of the above</td><td>Keep a sample and turn it into a pattern</td></tr>
+  </tbody>
+</table>
+
+```ts
+// postmortem.ts — fold a terminal ledger into a readable postmortem
+const TERMINAL = new Set(["succeeded", "failed", "stalled"]);
+
+export function classify(rec: RunRecord): string {
+  if (rec.status === "succeeded") return "ok";
+  if (rec.failure?.type === "silent_idle") return "silent_idle";
+  if (rec.failure?.type === "wall_clock_exceeded") return "wall_clock_exceeded";
+  const lastTool = [...rec.steps].reverse().find((s) => s.kind === "tool_result");
+  if (lastTool && (lastTool.meta as any)?.ok === false) return "tool_error";
+  const detail = (rec.failure?.detail ?? "").toLowerCase();
+  if (detail.includes("quota") || detail.includes("429")) return "quota_block";
+  if (detail.includes("safety") || detail.includes("blocked")) return "safety_block";
+  if (detail.includes("give up") || detail.includes("cannot")) return "agent_gaveup";
+  return "unknown";
+}
+
+export function buildPostmortem(rec: RunRecord) {
+  const klass = classify(rec);
+  const durationS = Math.round(((rec.endedAt ?? Date.now()) - rec.startedAt) / 1000);
+  // count the "expected" ones; keep the full step run for "investigate"
+  const watched = klass === "silent_idle" || klass === "wall_clock_exceeded" || klass === "unknown";
+  return {
+    runId: rec.runId,
+    agentId: rec.agentId,
+    class: klass,
+    durationS,
+    stepCount: rec.steps.length,
+    lastStep: rec.steps.at(-1)?.label ?? "-",
+    // keep the whole step run only for the watched ones; summarize the rest to hold down log volume
+    trace: watched ? rec.steps.map((s) => `${s.seq}:${s.kind}:${s.label}`) : undefined,
+    detail: rec.failure?.detail,
+  };
+}
+```
+
+If you keep the full step run even for expected failures (`quota_block`, `safety_block`), the `silent_idle` cases you actually need to chase drown in a sea of logs. The reason I draw the line with `watched` and keep `trace` only for the investigate-class ones is to preserve a state where, on rereading, only the anomalies catch your eye.
+
+## What changed in my own nightly runs
+
+Before and after introducing this, the thing that clearly changed was time-to-notice.
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>Before</th><th>After</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Time to notice a silent stall (median)</td><td>~21 min</td><td>~80 s</td></tr>
+    <tr><td>Clues left at the stall</td><td>none (only the start record)</td><td>the step run up to the last move</td></tr>
+    <tr><td>Ledger writes per run</td><td>—</td><td>9–16 (step count + terminal)</td></tr>
+    <tr><td>Stall-detector poll period</td><td>—</td><td>60 s</td></tr>
+  </tbody>
+</table>
+
+Over about three weeks of running this overnight, I caught four silent stalls that previously I would not have noticed until morning. Two were tool calls that froze waiting on an external fetch return; two were the agent rebuilding the same plan over and over until it hit the wall-clock ceiling. In every case the ledger had kept the recent step run, so "what it was last trying to do when it stopped" was visible at a glance, and isolating the cause took a few minutes. Before this, I only noticed the stall the next morning, and no clue remained at all.
+
+One thing I'll say plainly: this observability layer does not fully tell you what happened inside. The interior of the sandbox is still invisible, so all you learn is "the last move observable from outside." Even so, just making a silent stall no longer silent changed how safe nightly operation feels, completely.
+
+## A first step
+
+You don't need to add all four parts at once for an effect — it comes in stages. If you do one thing first, I recommend adding just the run ledger and the `lastProgressAt` update, and running `sweepStalls` on a 60-second Cron. That alone gets you to "you notice, on the spot, that it stalled."
+
+Don't set the threshold by guessing. Look at the time deltas between `steps` over a few days, grasp where your work has the widest gap between steps, and decide `IDLE_LIMIT_MS` from there. The real value of adding an observability layer is not a flashy dashboard but exactly this — seeing the habits of your own operation come out in numbers — something I felt anew only after building it.
+
+If you're still on the fence about whether to move your agent onto Managed Agents at all, this observability layer gives one concrete answer to the question I raised in [should you move your agent loop onto Managed Agents](/articles/gemini-api/gemini-managed-agents-vs-self-hosted-agent-loop-decision): when it fails, who can pick it up, and at what granularity.
