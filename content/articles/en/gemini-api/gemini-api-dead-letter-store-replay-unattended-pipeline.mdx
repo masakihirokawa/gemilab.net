@@ -1,0 +1,270 @@
+---
+title: "Stop Losing Silently-Failed Jobs in Your Unattended Gemini API Pipeline"
+slug: "gemini-api-dead-letter-store-replay-unattended-pipeline"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-29T04:55"
+author: "Gemini Lab"
+description: "When an unattended Gemini API batch drops a single job in silence, you may not notice for days. Here is a minimal dead-letter store and a safe replay flow — with copy-paste code and the operational judgment that makes it work."
+tags: ["gemini", "gemini-api", "batch", "reliability", "automation"]
+highlights:
+  - "You can drop in a minimal dead-letter store so a nightly batch never loses a single quietly-failed job"
+  - "You'll be able to separate failures worth retrying from permanent ones, stopping both infinite retries and silent disappearance"
+  - "You'll get a safe, capped replay flow to recover parked jobs in bulk after you've fixed the root cause"
+---
+
+One morning I was scanning the logs of a batch job that runs at 2 a.m. and noticed that out of 50 inputs, exactly one had no result. No exception had been raised, the retries had quietly run out, and the job had vanished — no output, no record anywhere. The reason I didn't catch it for three days is that the failure had been handled not as an *error*, but as *nothing*.
+
+Running automated jobs for several blogs and wallpaper apps as an indie developer, I've come to think these "silent drops" are the scariest kind of bug. A failure that shows up on a dashboard is fixable. A failure that leaves no trace gives you nothing to even notice. This article walks through how to keep an unattended Gemini API pipeline from discarding a single failed job — a dead-letter store plus a replay flow, written the way I actually run it.
+
+## More retries won't stop the silent disappearance
+
+When people think about handling failures, retries come to mind first — but retries only solve half the problem. The other half is where a job goes *after* the retries are exhausted. Most code, once it exceeds `max_attempts`, moves on with a `return None` or a `continue`. The loop completes normally, the exit code is 0, and the failure is recorded nowhere.
+
+There's a second trap: failures that are pointless to retry at all. A malformed input JSON, a permanent safety-filter block, an `INVALID_ARGUMENT` — these return the same result no matter how many times you throw them. Retrying here burns API spend and time, and then disappears in silence anyway.
+
+So what you actually need isn't more retries — it's a *terminal destination for failures*. Things that might recover get tried again after a delay; things that won't recover get parked instead of dropped, so a human can deal with them later. That parking lot is the dead-letter store.
+
+## What to store in the dead letter
+
+You don't need special middleware to start a dead-letter store — a single SQLite table is plenty. I confirm the flow on local SQLite first and move it to something like Firestore only when I need to. What matters is not where it lives but that it holds *everything required to replay later*.
+
+Store the job's unique ID, the input itself (essential for replay), a fingerprint of the input (for deduplication), the model used, the failure class, the last error message, the attempt count, the first and most recent timestamps, and a status.
+
+```python
+import sqlite3
+import json
+import time
+import hashlib
+
+DLQ_PATH = "dead_letter.db"
+
+
+def init_dlq(path: str = DLQ_PATH) -> None:
+    """Create the minimal dead-letter table."""
+    con = sqlite3.connect(path)
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dead_letter (
+            job_id        TEXT PRIMARY KEY,
+            payload_hash  TEXT NOT NULL,
+            payload_json  TEXT NOT NULL,
+            model         TEXT,
+            error_class   TEXT NOT NULL,
+            error_message TEXT,
+            attempts      INTEGER NOT NULL,
+            first_seen    REAL NOT NULL,
+            last_seen     REAL NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'parked'
+        )
+        """
+    )
+    con.commit()
+    con.close()
+
+
+def payload_fingerprint(payload: dict) -> str:
+    """Build a stable fingerprint that identifies the same input."""
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def park(job_id: str, payload: dict, model: str,
+         error_class: str, error_message: str, attempts: int,
+         path: str = DLQ_PATH) -> None:
+    """Park a permanently-failed job in the dead letter (update if it exists)."""
+    now = time.time()
+    con = sqlite3.connect(path)
+    con.execute(
+        """
+        INSERT INTO dead_letter
+            (job_id, payload_hash, payload_json, model,
+             error_class, error_message, attempts, first_seen, last_seen, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'parked')
+        ON CONFLICT(job_id) DO UPDATE SET
+            last_seen     = excluded.last_seen,
+            attempts      = excluded.attempts,
+            error_class   = excluded.error_class,
+            error_message = excluded.error_message
+        """,
+        (job_id, payload_fingerprint(payload),
+         json.dumps(payload, ensure_ascii=False), model,
+         error_class, error_message, attempts, now, now),
+    )
+    con.commit()
+    con.close()
+```
+
+Making `job_id` the primary key and using `ON CONFLICT ... DO UPDATE` means that when the same job fails again, you update `last_seen` and the attempt count instead of adding a row. Without this, one recurring permanent failure can fill the dead letter with hundreds of rows and bury the breakdown you actually want to read.
+
+## Split "retryable" from "permanent" mechanically
+
+If you decide whether to park a job by gut feeling each time, the line will drift. Put the classification in one function that maps status code and message to a category, so the judgment lives in a single place.
+
+```python
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+PERMANENT_STATUS = {400, 403, 404, 422}
+
+
+def classify_failure(status_code: int, message: str) -> str:
+    """Classify a failure as 'retryable' / 'permanent' / 'unknown'."""
+    text = (message or "").upper()
+
+    # Failures caused by the input itself return the same result every time.
+    if status_code in PERMANENT_STATUS:
+        return "permanent"
+    if "INVALID_ARGUMENT" in text or "FAILED_PRECONDITION" in text:
+        return "permanent"
+    if "SAFETY" in text or "BLOCKED" in text:
+        return "permanent"
+
+    # Transient load or network issues may recover after a delay.
+    if status_code in RETRYABLE_STATUS:
+        return "retryable"
+    if "DEADLINE_EXCEEDED" in text or "UNAVAILABLE" in text:
+        return "retryable"
+
+    return "unknown"
+```
+
+The principle is simple: if the input content is the cause, it's permanent; if an external factor is, it's retryable; anything you can't call either way is `unknown` and gets a small, cautious number of tries. The table below shows the cases I push to the permanent side in production.
+
+<table>
+  <thead>
+    <tr><th>Failure</th><th>Class</th><th>Handling</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>429 (rate limit)</td><td>retryable</td><td>Back off and retry</td></tr>
+    <tr><td>503 / UNAVAILABLE</td><td>retryable</td><td>Wait, then retry</td></tr>
+    <tr><td>400 / INVALID_ARGUMENT</td><td>permanent</td><td>Park immediately</td></tr>
+    <tr><td>Safety-filter block</td><td>permanent</td><td>Park and revisit the content</td></tr>
+    <tr><td>Unexplained timeout</td><td>unknown</td><td>Try a few times, then park</td></tr>
+  </tbody>
+</table>
+
+The key is *not* treating `unknown` as permanent. Misclassify a transient issue as permanent and you'll pile up jobs that would have passed on recovery, increasing your replay workload. Push a permanent failure into retries and you burn spend. For ambiguous failures, "try a little, then park" is the safe side.
+
+## Wire the parking path into the pipeline
+
+With classification and a parking lot in place, the body just connects retries and parking honestly. Permanent failures are parked at once; `unknown` ones get a cautious backoff; reaching the cap parks them as "exhausted."
+
+```python
+import random
+
+
+class ApiError(Exception):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+def run_with_dead_letter(job_id: str, payload: dict, model: str,
+                         call_model, max_attempts: int = 4):
+    """Retry a model call; park permanent failures and exhausted retries.
+
+    Assumes call_model(payload) -> dict, raising ApiError on failure.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return call_model(payload)
+        except ApiError as exc:
+            kind = classify_failure(exc.status_code, exc.message)
+
+            if kind == "permanent":
+                park(job_id, payload, model,
+                     error_class="permanent:%d" % exc.status_code,
+                     error_message=exc.message, attempts=attempt)
+                return None
+
+            if attempt >= max_attempts:
+                park(job_id, payload, model,
+                     error_class="exhausted:%d" % exc.status_code,
+                     error_message=exc.message, attempts=attempt)
+                return None
+
+            # retryable / unknown get a cautious backoff.
+            backoff = min(2 ** attempt, 30) + random.uniform(0, 1)
+            time.sleep(backoff)
+```
+
+Prefixing `error_class` with strings like `permanent:400` and `exhausted:503` lets you tell "content problem" from "external factor persisting" at a glance when you read the breakdown later. The value of a dead letter is less the parking itself and more that what you parked can be classified and read.
+
+## Replay safely, after you've fixed the cause
+
+Parking isn't the goal. The loop only closes when you recover the accumulated jobs after fixing the cause. Throwing everything back blindly will re-hit still-broken permanent failures — poison jobs — and burn spend, so replay is always capped and dry-run-first.
+
+```python
+def replay(call_model, limit: int = 20, dry_run: bool = True,
+           path: str = DLQ_PATH) -> dict:
+    """Replay parked jobs. Meant to be run by hand after a fix."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT * FROM dead_letter WHERE status = 'parked' "
+        "ORDER BY last_seen ASC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+    recovered, still_failing = 0, 0
+    for row in rows:
+        payload = json.loads(row["payload_json"])
+        if dry_run:
+            print("[dry-run] would replay %s (%s)" % (row["job_id"], row["error_class"]))
+            continue
+        try:
+            call_model(payload)
+            con.execute(
+                "UPDATE dead_letter SET status = 'recovered', last_seen = ? "
+                "WHERE job_id = ?",
+                (time.time(), row["job_id"]),
+            )
+            recovered += 1
+        except ApiError:
+            still_failing += 1
+
+    con.commit()
+    con.close()
+    return {"scanned": len(rows), "recovered": recovered,
+            "still_failing": still_failing, "dry_run": dry_run}
+```
+
+I default `dry_run=True` so you can eyeball *what* would be replayed before hitting the live API. I've made the mistake of skipping that check, re-throwing a batch of poison jobs and inflating my call count, so I keep dry-run on by default as the safe stance. Jobs that succeed on replay move to `recovered` and drop off the `parked` list, leaving only what still needs a look.
+
+## Make the drops visible every day
+
+A dead letter nobody looks at isn't much better than disappearance. To stay confident the parking is working, I log the breakdown once a day. The output is short — counts per `error_class` are enough.
+
+```python
+def dlq_summary(path: str = DLQ_PATH) -> None:
+    """Log the dead-letter breakdown once a day."""
+    con = sqlite3.connect(path)
+    rows = con.execute(
+        "SELECT error_class, COUNT(*) AS n FROM dead_letter "
+        "WHERE status = 'parked' GROUP BY error_class ORDER BY n DESC"
+    ).fetchall()
+    con.close()
+
+    if not rows:
+        print("dead-letter: clean (0 parked)")
+        return
+    total = sum(n for _, n in rows)
+    print("dead-letter: %d parked" % total)
+    for error_class, n in rows:
+        print("  %4d  %s" % (n, error_class))
+```
+
+Once reading this one line each morning becomes a habit, you notice shifts like "`permanent:400` spiked only today." I use that number as an early sensor for whether a bug slipped into the input-generation side that day. The day-over-day delta matters more than the absolute count.
+
+## Where I set the thresholds in practice
+
+Finally, a few judgments that don't show up in the code. `max_attempts` around 4 was plenty; raising it barely moves the recovery rate and just parks permanent failures later. Capping `unknown` retries at two keeps poison jobs from burning spend over a wide range.
+
+Alerting on the *day-over-day increase* of `parked` proved more useful than alerting on the total. Alert on the total and a small backlog of un-recovered jobs keeps the notification permanently lit until it's ignored. Alert on the delta and you only act on days that differ from the norm. That instinct isn't specific to Gemini API — it applies to anything you run unattended.
+
+If you want the event-driven big picture around this, the article on [designing event-driven async pipelines with Gemini API](/articles/gemini-api/gemini-api-event-driven-async-pipeline-production) is close, and if you want to sharpen the retry line, the piece on [why you shouldn't retry every Gemini 429](/articles/gemini-api/gemini-api-429-retryable-vs-spend-cap-exhaustion-retry-design) is adjacent.
+
+Start by creating one `dead_letter` table in local SQLite and replacing a single `return None` in your running pipeline with `park(...)`. The next job that fails will stay, instead of disappearing.
