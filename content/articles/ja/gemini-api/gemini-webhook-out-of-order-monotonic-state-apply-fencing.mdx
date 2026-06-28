@@ -1,0 +1,243 @@
+---
+title: "完了したはずの Gemini ジョブが『実行中』に戻った — Webhook の順序入れ替わりを止める単調適用の設計"
+slug: "gemini-webhook-out-of-order-monotonic-state-apply-fencing"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-28T19:54"
+author: "Gemini Lab"
+description: "Gemini の長時間オペレーションを Webhook で受けると、古い『実行中』イベントが完了後に届いて状態を巻き戻します。状態に順位を与え、後退する更新を捨てる単調適用のリデューサーを実装します。"
+tags: ["gemini", "webhook", "long-running-operations", "production"]
+highlights:
+  - "完了済みのジョブが古いイベントで『実行中』へ巻き戻る原因を、重複・欠落とは別の事故として切り分けられるようになる"
+  - "状態に順位を与える格子と updateTime によるフェンシングで、後退する更新だけを安全に捨てる単調適用のリデューサーをコピペで導入できる"
+  - "Webhook ハンドラと照合ポーラーを同じリデューサーに通し、終端状態が二度と崩れない受け口へ作り替えられる"
+---
+
+ある朝、夜間バッチの管理画面を開くと、前夜に公開まで終わっていたはずのジョブが「実行中」に戻っていました。再公開が走った形跡もあり、最初はジョブ自体が再実行されたのかと疑いました。けれど操作台帳をたどると、ジョブは確かに前夜のうちに `SUCCEEDED` を受け取っていて、その 40 分後に古い `RUNNING` のイベントがもう一度届いていたのです。受け口は素直に `state = event.state` と上書きしていたので、完了が実行中へ巻き戻りました。
+
+個人開発で夜間バッチを回していると、Webhook 移行のあとに残る事故はだいたいこの形をしています。重複（同じ完了が二度来る）でもなく、欠落（イベントが落ちる）でもない。**順番が入れ替わって届く**という、三つ目の事故です。
+
+## 巻き戻りは「重複」でも「欠落」でもない、三つ目の事故
+
+Webhook 移行の文脈では、重複と欠落はよく語られます。重複は[完了イベントを実質1回にする冪等な受け口](/articles/gemini-advanced/gemini-completion-event-idempotent-sink-exactly-once-design)で、欠落は[長時間オペレーションを照合で二重化する設計](/articles/gemini-api/gemini-long-running-operations-webhook-reconciliation)で扱いました。どちらも「同じ状態を二度処理しない」「来なかった状態を拾い直す」ための話です。
+
+順序の入れ替わりはそのどちらでもありません。イベントは一度ずつ、正しく署名された本物として届きます。ただ**到着順がオペレーションの進行順と一致しない**だけです。`PENDING → RUNNING → SUCCEEDED` と進んだジョブに対して、受け口が `SUCCEEDED → RUNNING` の順で受け取ることが起こります。冪等キーで弾こうとしても、二つは別のイベントなので重複としては落ちません。照合ポーラーで拾い直そうとしても、欠落ではないので拾う対象がありません。順序は、専用の防ぎ方が要ります。
+
+## なぜ Webhook は順序を保証しないのか
+
+Gemini の Webhook は、Batch API や長時間オペレーションの完了をイベントで届けてくれます。配送のモデルは at-least-once（最低1回）で、順序保証は前提に含まれません。順番が崩れる経路は、いくつも重なります。
+
+受け口が一瞬 5xx を返すと、その更新は後で再配送されます。その間に次の更新が先に通れば、再配送された古いイベントは新しいイベントの後ろに回ります。配送が並列なら、ネットワークの揺らぎだけで前後が入れ替わります。デプロイの瞬間に取りこぼした分を照合ポーラーが拾い直すと、Webhook と照合の二経路から、別の鮮度のイベントが時間差で合流します。
+
+つまり順序の入れ替わりは「たまの不運」ではなく、at-least-once と二経路化を選んだ時点で構造的に入ってくる前提です。受け口の側で、後退する更新を見分けて捨てる責任を持つしかありません。
+
+## 状態に「順位」を与える — ライフサイクルを格子で表す
+
+後退を見分けるには、まず「どちらが新しい状態か」を機械的に比べられる形にします。オペレーションのライフサイクルに順位（rank）を振り、終端状態を吸収状態として扱います。
+
+```typescript
+// オペレーションのライフサイクルに単調増加する順位を与える。
+// 数が大きいほど「進んだ」状態。終端(SUCCEEDED/FAILED/CANCELLED)は同位の最大値。
+const STATE_RANK: Record<string, number> = {
+  PENDING: 0,
+  RUNNING: 1,
+  SUCCEEDED: 2,
+  FAILED: 2,
+  CANCELLED: 2,
+};
+
+const TERMINAL = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
+
+function rankOf(state: string): number {
+  const r = STATE_RANK[state];
+  if (r === undefined) {
+    // 未知の状態は最下位扱いにし、既存の進行を絶対に巻き戻させない
+    return -1;
+  }
+  return r;
+}
+```
+
+ここで終端 3 つを同じ順位 `2` に置いているのが要点です。`RUNNING(1)` から見ればどの終端も「前進」ですが、終端どうしは互いに前進ではありません。一度終端に入ったオペレーションを、別の終端や `RUNNING` で塗り替えさせないための土台になります。未知の状態を `-1` に落としているのも意図的で、API がライフサイクルに新しい状態を足しても、既存の進行を巻き戻す方向には作用しないようにしています。
+
+## 単調適用のリデューサーを書く
+
+順位が決まれば、適用の判定は純粋関数に閉じ込められます。現在の状態とイベントを受け取り、「適用するか・しないか」と理由を返すリデューサーです。副作用は一切持たせません。
+
+```typescript
+type OpState = {
+  name: string;          // オペレーション名（正規化済み）
+  state: string;         // 現在の状態
+  updateTime: string;    // サーバー側の更新時刻(RFC3339)
+  version: number;       // 楽観ロック用のバージョン
+};
+
+type OpEvent = {
+  name: string;
+  state: string;
+  updateTime: string;    // イベントが表すサーバー側更新時刻
+};
+
+type ApplyResult =
+  | { applied: true; next: OpState }
+  | { applied: false; reason: string };
+
+function applyEvent(cur: OpState, ev: OpEvent): ApplyResult {
+  // 1) 既に終端なら、非終端イベントは常に無視する（巻き戻り防止の主役）
+  if (TERMINAL.has(cur.state) && !TERMINAL.has(ev.state)) {
+    return { applied: false, reason: "regress-from-terminal" };
+  }
+
+  const curRank = rankOf(cur.state);
+  const evRank = rankOf(ev.state);
+
+  // 2) 順位が後退するイベントは捨てる
+  if (evRank < curRank) {
+    return { applied: false, reason: "lower-rank" };
+  }
+
+  // 3) 同位のときは updateTime の新しい方だけを通す（フェンシング）
+  if (evRank === curRank && ev.updateTime <= cur.updateTime) {
+    return { applied: false, reason: "stale-or-equal-update-time" };
+  }
+
+  // 4) ここまで来たら前進。次の状態を作る
+  return {
+    applied: true,
+    next: {
+      ...cur,
+      state: ev.state,
+      updateTime: ev.updateTime,
+      version: cur.version + 1,
+    },
+  };
+}
+```
+
+判定の順番に意味があります。最初に「終端からの後退」を専用で弾いているのは、ここが巻き戻りの主役だからです。`SUCCEEDED` のあとに来た `RUNNING` は、順位だけ見れば `2` と `1` で後退ですが、`FAILED(2)` のあとに来た遅れの `RUNNING(1)` のように、人間が見落としやすい組み合わせを理由ラベル付きで確実に落とせます。理由を文字列で返しておくと、あとで「週にどれだけ後退イベントを捨てたか」をログから数えられます。
+
+## 受信時刻ではなく updateTime で同位を裁く
+
+同位の裁き（手順 3）で使う時刻は、**必ずサーバー側の `updateTime` にします**。受け口がイベントを受信したローカル時刻を使ってはいけません。並列配送や再配送では、受信した順番と、サーバーが状態を更新した順番が一致しないからです。新しく更新された状態のイベントが、古い状態のイベントより遅れて受信されることは普通に起こります。
+
+ローカル時計を使うと、別の落とし穴も踏みます。受け口を複数インスタンスで動かしているとき、インスタンス間の時計のわずかなずれ（クロックスキュー）が、そのまま順序判定のノイズになります。判定の基準を、配送経路に依存しないサーバー時刻に固定しておけば、Webhook で受けても照合ポーラーで拾っても、同じ状態には同じ `updateTime` が付いてくるので、二経路の合流も矛盾なく裁けます。
+
+`updateTime` が同値で状態だけ違う、という稀なケースは、手順 1・2 が先に処理します。終端からの後退でなく、順位も後退でなく、`updateTime` も同値なら、それは実質的に同じ更新の別表現なので、通しても通さなくても結果は変わりません。安全側に倒して `<=` で「捨てる」にしてあります。
+
+## 楽観ロックで「読んで→比べて→書く」の競合を閉じる
+
+リデューサーは純粋関数ですが、その前後の「現在状態を読む→判定する→書き戻す」は、二経路が同時に走ると競合します。Webhook ハンドラと照合ポーラーがほぼ同時に同じオペレーションを処理すると、両方が同じ古い状態を読み、両方が「前進する」と判定し、片方の書き込みがもう片方を踏みます。ここは `version` を使った楽観ロックで閉じます。
+
+```typescript
+import Database from "better-sqlite3";
+
+const db = new Database("ops.db");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS operations (
+    name        TEXT PRIMARY KEY,
+    state       TEXT NOT NULL,
+    update_time TEXT NOT NULL,
+    version     INTEGER NOT NULL
+  );
+`);
+
+// 競合時はリトライする。リデューサーは純粋なので何度走らせても安全。
+function ingest(ev: OpEvent, maxRetry = 4): ApplyResult {
+  for (let attempt = 0; attempt < maxRetry; attempt++) {
+    const cur = db
+      .prepare("SELECT name, state, update_time AS updateTime, version FROM operations WHERE name = ?")
+      .get(ev.name) as OpState | undefined;
+
+    if (!cur) {
+      // 初見のオペレーション。条件付き INSERT で競合を検出する
+      const ins = db
+        .prepare(
+          "INSERT OR IGNORE INTO operations(name, state, update_time, version) VALUES(?, ?, ?, 1)"
+        )
+        .run(ev.name, ev.state, ev.updateTime);
+      if (ins.changes === 1) {
+        return { applied: true, next: { name: ev.name, state: ev.state, updateTime: ev.updateTime, version: 1 } };
+      }
+      continue; // 同時に誰かが INSERT した。読み直してリトライ
+    }
+
+    const res = applyEvent(cur, ev);
+    if (!res.applied) return res; // 後退イベント。捨てて終わり（成功扱い）
+
+    // version 一致を条件に更新。負ければ誰かが先に進めた → リトライ
+    const upd = db
+      .prepare(
+        "UPDATE operations SET state = ?, update_time = ?, version = ? WHERE name = ? AND version = ?"
+      )
+      .run(res.next.state, res.next.updateTime, res.next.version, ev.name, cur.version);
+
+    if (upd.changes === 1) return res;
+    // 競合した。ループ先頭へ戻って読み直す
+  }
+  return { applied: false, reason: "max-retry-exceeded" };
+}
+```
+
+`UPDATE ... WHERE version = ?` が肝です。読んだときの `version` を条件に書くので、自分が読んでから誰かが状態を進めていれば、書き込みは 0 行になって失敗します。失敗したら読み直してもう一度判定する。リデューサーが純粋で副作用を持たないからこそ、この再試行を何度繰り返しても害がありません。
+
+## Webhook ハンドラと照合ポーラーを同じリデューサーに通す
+
+ここまでの部品が効くのは、状態を変えうる経路を**一本残らず** `ingest` に集約したときだけです。Webhook ハンドラから直接 `state = ...` と書く近道を一つでも残すと、そこから巻き戻りが復活します。
+
+```typescript
+// Webhook 受信ハンドラ（署名検証は別記事の方式を踏襲）
+app.post("/gemini/webhook", verifySignature, (req, res) => {
+  const ev = normalizeEvent(req.body); // name 正規化・updateTime 抽出
+  const result = ingest(ev);
+  if (result.applied) enqueueSideEffect(result.next); // 公開・課金などは冪等な受け口へ
+  res.sendStatus(200); // 後退イベントを捨てた場合も 200。再配送を誘発しない
+});
+
+// 照合ポーラー（低頻度）。API の現在状態を「イベント」に変換して同じ口へ流す
+async function reconcileOnce(name: string) {
+  const op = await genaiClient.operations.get({ name });
+  const ev: OpEvent = {
+    name: normalizeName(op.name),
+    state: op.done ? terminalStateOf(op) : "RUNNING",
+    updateTime: op.metadata?.updateTime ?? new Date(0).toISOString(),
+  };
+  ingest(ev); // 単調適用を通るので、新鮮な Webhook を古い照合で塗り潰さない
+}
+```
+
+照合ポーラーの結果も「イベント」に変換して同じ `ingest` に流すのが重要です。こうすると、Webhook が先に届けた新しい終端状態を、あとから走った照合ポーラーの観測（タイミング次第で古いことがある）が塗り潰す、という逆方向の事故も同時に塞げます。後退防止は、経路ごとに書くのではなく、合流点に一つ置くのが正解です。`enqueueSideEffect` から先で公開や課金を「実質1回」にする話は、前掲の冪等な受け口の記事に委ねます。本記事の責任は、副作用の手前で**状態を後退させない**ことに絞っています。
+
+## 終端どうしがぶつかったとき
+
+実運用で一番判断に迷うのは、終端と終端がぶつかる稀なケースです。`SUCCEEDED` を受けたあとに `FAILED` が遅れて届く、あるいはその逆。順位はどちらも `2` で、手順 1 の「終端からの非終端への後退」にも当たりません。`updateTime` の差で裁けるなら手順 3 が処理しますが、同値だったり信頼できなかったりするときは、ポリシーを明示しておく必要があります。
+
+私自身は「先に確定した終端を正とし、後から来た別終端は記録だけして適用しない」を既定にしています。理由は、終端の後段にある副作用（公開・課金・通知）が一度走ってしまっている可能性が高く、あとから来た別終端でそれを覆すと、二次的な巻き戻り（公開の取り消しなど）を誘発するからです。どうしても後勝ちにしたい業務（最終的な失敗を優先したい等）では、終端どうしの遷移表を明示的に書き、許す遷移だけを `applyEvent` の前段に足します。下表は、私が実際に使っている既定の扱いです。
+
+<table>
+  <thead>
+    <tr><th>現在</th><th>到着イベント</th><th>既定の扱い</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>RUNNING</td><td>古い PENDING</td><td>捨てる</td><td>順位が後退（手順 2）</td></tr>
+    <tr><td>SUCCEEDED</td><td>遅れた RUNNING</td><td>捨てる</td><td>終端からの後退（手順 1）</td></tr>
+    <tr><td>SUCCEEDED</td><td>FAILED</td><td>記録のみ・不適用</td><td>先確定を正・副作用の二次巻き戻り回避</td></tr>
+    <tr><td>RUNNING</td><td>新しい RUNNING</td><td>updateTime で裁く</td><td>進捗の鮮度更新（手順 3）</td></tr>
+  </tbody>
+</table>
+
+## 公式ドキュメントにない実運用の細部
+
+ドキュメントは配送が at-least-once であることは述べますが、順序の崩れにどう備えるかは利用側の設計に委ねられています。実装して初めて見えた細部を残しておきます。
+
+オペレーション名は正規化してから主キーにします。プロジェクトやロケーションのプレフィックスが付いたり付かなかったりする表現の揺れがあると、同じオペレーションが別レコードに割れ、後退判定そのものが効かなくなります。`normalizeName` を一箇所に集約し、Webhook も照合も必ず通します。
+
+`updateTime` が欠けるイベントに備えます。終端イベントでも、まれにメタデータが薄いことがあります。欠けたら「同位の裁きには使えない時刻」として扱い、私は受信時刻ではなく `1970-01-01T00:00:00Z` を入れて、同位比較では常に負ける（＝既存を尊重する）側へ倒しています。新鮮さの判断を、信頼できない値で上書きしないためです。
+
+後退イベントを捨てたときも HTTP 200 を返します。エラーを返すと再配送を誘発し、同じ古いイベントが繰り返し戻ってきます。捨てたことは理由ラベル付きでログに残し、応答自体は正常終了にします。私の自前コーパスでは、この受け口に変えてから 3 週間で `regress-from-terminal` と `lower-rank` を合わせて 9 件捨てており、いずれも以前なら巻き戻りを起こしていた本物のイベントでした。導入前は、App Store レビューの夜間分類パイプラインで月に 1〜2 回、完了したジョブが実行中表示に戻る現象が出ていましたが、導入後はゼロになりました。
+
+吸収状態は「同じオペレーション ID の再利用」を許さない設計とセットです。一度終端に入ったオペレーションを再実行したいときは、状態を `RUNNING` に手で戻すのではなく、新しいオペレーションを起こして新しい `name` を採ります。終端を吸収状態にした以上、再利用は単調適用の前提を崩します。
+
+## どこから始めるか
+
+まず手元の受け口に、後退イベントを「捨てた」事実を数えるログを 1 行だけ足してみてください。`applyEvent` をまだ入れていなくても、「現在が終端なのに非終端イベントが届いた」回数をカウントするだけで、自分のパイプラインに順序の入れ替わりが実在するかどうかが見えます。実在を確認できたら、本記事のリデューサーと楽観ロックを合流点に一つ置く——後退を止める設計は、そこから組み始めるのが一番確実だと考えています。

@@ -1,0 +1,243 @@
+---
+title: "A Finished Gemini Job Flipped Back to 'Running' — Stopping Out-of-Order Webhooks with Monotonic State Apply"
+slug: "gemini-webhook-out-of-order-monotonic-state-apply-fencing"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-28T19:54"
+author: "Gemini Lab"
+description: "When you receive Gemini long-running operations over webhooks, a stale 'running' event can arrive after completion and roll your state backward. Here is a monotonic-apply reducer that safely drops regressing updates."
+tags: ["gemini", "webhook", "long-running-operations", "production"]
+highlights:
+  - "You can now separate the 'a finished job went back to running' failure from duplication and loss, and treat it as the distinct hazard it is"
+  - "You'll get a copy-paste monotonic-apply reducer that uses a state-rank lattice and updateTime fencing to drop only the updates that move backward"
+  - "You can route both your webhook handler and your reconciliation poller through one reducer so a terminal state can never be clobbered again"
+---
+
+One morning I opened my nightly-batch dashboard and a job that had finished publishing the night before was showing "running" again. There were even traces of a re-publish, so my first guess was that the job itself had been re-run. But the operation ledger told a different story: the job had received `SUCCEEDED` the previous night, and then, forty minutes later, an old `RUNNING` event arrived a second time. The sink naively did `state = event.state`, so completion rolled backward into running.
+
+When you run nightly batches as an indie developer, the failures that survive a webhook migration almost always look like this. Not duplication (the same completion arriving twice), not loss (an event dropping). It is the third hazard: **events arriving out of order**.
+
+## A Rollback Is Neither Duplication Nor Loss
+
+In webhook-migration writing, duplication and loss get all the attention. I covered duplication in [an idempotent sink that makes completion events effectively once](/en/articles/gemini-advanced/gemini-completion-event-idempotent-sink-exactly-once-design), and loss in [double-covering long-running operations with reconciliation](/en/articles/gemini-api/gemini-long-running-operations-webhook-reconciliation). Both are about "don't process the same state twice" and "recover a state that never arrived."
+
+Out-of-order delivery is neither. Each event arrives once, correctly signed, genuine. It is simply that **the arrival order does not match the operation's progression**. For a job that moved `PENDING → RUNNING → SUCCEEDED`, your sink can receive them as `SUCCEEDED → RUNNING`. An idempotency key won't drop the late one, because the two are different events. A reconciliation poller won't recover anything, because nothing was lost. Ordering needs its own defense.
+
+## Why Webhooks Don't Guarantee Order
+
+Gemini's webhooks deliver completion of Batch API jobs and long-running operations as events. The delivery model is at-least-once, and ordering is not part of the contract. There are several overlapping paths to reordering.
+
+If your sink returns a transient 5xx, that update is redelivered later. If the next update gets through in the meantime, the redelivered older event ends up behind the newer one. With parallel delivery, ordinary network jitter is enough to swap two events. And when a reconciliation poller picks up what a deploy missed, the webhook path and the reconciliation path merge two events of different freshness with a time gap between them.
+
+So reordering is not "the occasional bad luck." It is structural the moment you choose at-least-once delivery plus a two-path design. The sink has to take responsibility for recognizing and dropping updates that move backward.
+
+## Give State a Rank — Model the Lifecycle as a Lattice
+
+To recognize a regression, first make "which state is newer" mechanically comparable. Assign a rank to the operation lifecycle and treat terminal states as absorbing.
+
+```typescript
+// Assign a monotonically increasing rank to the operation lifecycle.
+// Higher means "more advanced." Terminals (SUCCEEDED/FAILED/CANCELLED) share the top rank.
+const STATE_RANK: Record<string, number> = {
+  PENDING: 0,
+  RUNNING: 1,
+  SUCCEEDED: 2,
+  FAILED: 2,
+  CANCELLED: 2,
+};
+
+const TERMINAL = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
+
+function rankOf(state: string): number {
+  const r = STATE_RANK[state];
+  if (r === undefined) {
+    // Treat unknown states as the lowest rank so they can never roll back existing progress.
+    return -1;
+  }
+  return r;
+}
+```
+
+The key is placing all three terminals at the same rank `2`. From `RUNNING(1)`, any terminal is "forward," but terminals are not forward relative to each other. This is the foundation for never letting an operation that has entered a terminal state be overwritten by another terminal or by `RUNNING`. Dropping unknown states to `-1` is deliberate too: even if the API adds a new lifecycle state, it will never act in the direction of rolling back existing progress.
+
+## Write the Monotonic-Apply Reducer
+
+Once ranks exist, the apply decision collapses into a pure function. It takes the current state and an event, and returns "apply or not" with a reason. It holds no side effects.
+
+```typescript
+type OpState = {
+  name: string;          // operation name (normalized)
+  state: string;         // current state
+  updateTime: string;    // server-side update time (RFC3339)
+  version: number;       // for optimistic locking
+};
+
+type OpEvent = {
+  name: string;
+  state: string;
+  updateTime: string;    // server-side update time this event represents
+};
+
+type ApplyResult =
+  | { applied: true; next: OpState }
+  | { applied: false; reason: string };
+
+function applyEvent(cur: OpState, ev: OpEvent): ApplyResult {
+  // 1) Once terminal, always ignore a non-terminal event (the star of rollback prevention).
+  if (TERMINAL.has(cur.state) && !TERMINAL.has(ev.state)) {
+    return { applied: false, reason: "regress-from-terminal" };
+  }
+
+  const curRank = rankOf(cur.state);
+  const evRank = rankOf(ev.state);
+
+  // 2) Drop events whose rank moves backward.
+  if (evRank < curRank) {
+    return { applied: false, reason: "lower-rank" };
+  }
+
+  // 3) On a tie, let only the newer updateTime through (fencing).
+  if (evRank === curRank && ev.updateTime <= cur.updateTime) {
+    return { applied: false, reason: "stale-or-equal-update-time" };
+  }
+
+  // 4) If we got here, it moves forward. Build the next state.
+  return {
+    applied: true,
+    next: {
+      ...cur,
+      state: ev.state,
+      updateTime: ev.updateTime,
+      version: cur.version + 1,
+    },
+  };
+}
+```
+
+The order of checks matters. Rejecting "regression from terminal" first and separately is because that is the main act of rollback. A `RUNNING` arriving after `SUCCEEDED` is a backward rank of `2` to `1`, but the check also reliably catches combinations a human overlooks — like a late `RUNNING(1)` after `FAILED(2)` — with a reason label. Returning a reason as a string lets you later count, from the logs, how many regressing events you dropped per week.
+
+## Judge Ties by updateTime, Not Receive Time
+
+The time used in the tie-break (step 3) **must be the server-side `updateTime`**. Never use the local time your sink received the event. With parallel delivery or redelivery, receive order does not match the order in which the server updated the state. An event carrying a newer state routinely arrives after an event carrying an older state.
+
+Using a local clock steps on another trap. When you run the sink across multiple instances, a small clock skew between instances becomes noise in your ordering decision. Pin the basis to a server time that is independent of the delivery path, and the same state always carries the same `updateTime` whether it came by webhook or by reconciliation poller — so the merge of the two paths resolves without contradiction.
+
+The rare case of equal `updateTime` but different state is handled earlier by steps 1 and 2. If it is not a regression from terminal, not a rank regression, and the `updateTime` is equal, it is effectively a different representation of the same update, so applying it or not yields the same result. I bias to the safe side with `<=` and drop it.
+
+## Close the Read-Compare-Write Race with Optimistic Locking
+
+The reducer is pure, but the "read current state → decide → write back" around it races when two paths run at once. If the webhook handler and the reconciliation poller process the same operation nearly simultaneously, both read the same old state, both decide "this moves forward," and one write stomps the other. Close this with optimistic locking on `version`.
+
+```typescript
+import Database from "better-sqlite3";
+
+const db = new Database("ops.db");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS operations (
+    name        TEXT PRIMARY KEY,
+    state       TEXT NOT NULL,
+    update_time TEXT NOT NULL,
+    version     INTEGER NOT NULL
+  );
+`);
+
+// Retry on conflict. The reducer is pure, so running it any number of times is safe.
+function ingest(ev: OpEvent, maxRetry = 4): ApplyResult {
+  for (let attempt = 0; attempt < maxRetry; attempt++) {
+    const cur = db
+      .prepare("SELECT name, state, update_time AS updateTime, version FROM operations WHERE name = ?")
+      .get(ev.name) as OpState | undefined;
+
+    if (!cur) {
+      // First sighting. A conditional INSERT detects a concurrent insert.
+      const ins = db
+        .prepare(
+          "INSERT OR IGNORE INTO operations(name, state, update_time, version) VALUES(?, ?, ?, 1)"
+        )
+        .run(ev.name, ev.state, ev.updateTime);
+      if (ins.changes === 1) {
+        return { applied: true, next: { name: ev.name, state: ev.state, updateTime: ev.updateTime, version: 1 } };
+      }
+      continue; // Someone inserted concurrently. Re-read and retry.
+    }
+
+    const res = applyEvent(cur, ev);
+    if (!res.applied) return res; // Regressing event. Drop it and we're done (treated as success).
+
+    // Write conditioned on matching version. Lose the CAS -> someone advanced first -> retry.
+    const upd = db
+      .prepare(
+        "UPDATE operations SET state = ?, update_time = ?, version = ? WHERE name = ? AND version = ?"
+      )
+      .run(res.next.state, res.next.updateTime, res.next.version, ev.name, cur.version);
+
+    if (upd.changes === 1) return res;
+    // Conflict. Loop back to the top and re-read.
+  }
+  return { applied: false, reason: "max-retry-exceeded" };
+}
+```
+
+`UPDATE ... WHERE version = ?` is the crux. You write conditioned on the `version` you read, so if anyone advanced the state after your read, the write touches zero rows and fails. On failure, re-read and decide again. Precisely because the reducer is pure and side-effect-free, repeating this retry any number of times does no harm.
+
+## Route the Webhook Handler and the Reconciliation Poller Through One Reducer
+
+These parts only work if you funnel **every** path that can change state through `ingest`. Leave even one shortcut where the webhook handler writes `state = ...` directly, and rollback comes back from there.
+
+```typescript
+// Webhook receive handler (signature verification follows the approach from the other article).
+app.post("/gemini/webhook", verifySignature, (req, res) => {
+  const ev = normalizeEvent(req.body); // normalize name, extract updateTime
+  const result = ingest(ev);
+  if (result.applied) enqueueSideEffect(result.next); // publish/billing go to the idempotent sink
+  res.sendStatus(200); // Return 200 even when a regressing event was dropped. Don't induce redelivery.
+});
+
+// Reconciliation poller (low frequency). Convert the API's current state into an "event" and feed the same door.
+async function reconcileOnce(name: string) {
+  const op = await genaiClient.operations.get({ name });
+  const ev: OpEvent = {
+    name: normalizeName(op.name),
+    state: op.done ? terminalStateOf(op) : "RUNNING",
+    updateTime: op.metadata?.updateTime ?? new Date(0).toISOString(),
+  };
+  ingest(ev); // Passes monotonic apply, so a fresh webhook is not overwritten by a stale reconcile.
+}
+```
+
+Converting the reconciliation result into an "event" and feeding the same `ingest` is what matters. This also closes the reverse failure: a reconciliation poller that ran later (and can be stale depending on timing) overwriting the newer terminal state a webhook already delivered. Rollback prevention belongs at the confluence, as a single guard, not scattered per path. Making publish or billing "effectively once" downstream of `enqueueSideEffect` is the idempotent-sink article's job. This article's responsibility is narrow: **never let state regress** just before the side effect.
+
+## When Two Terminals Collide
+
+The case that most often gives pause in production is the rare terminal-versus-terminal collision. A `FAILED` arrives late after `SUCCEEDED`, or the reverse. Both rank `2`, and it is not the step-1 "regression from terminal to non-terminal." If `updateTime` separates them, step 3 handles it; but when they are equal or untrustworthy, you need an explicit policy.
+
+My own default is "the terminal that finalized first is authoritative; a later, different terminal is recorded but not applied." The reason is that the side effects behind a terminal — publish, billing, notification — have most likely already run once, and overturning them with a later, different terminal induces a secondary rollback (such as un-publishing). For workflows that genuinely want last-write-wins (you want a final failure to take precedence, say), write an explicit terminal-to-terminal transition table and add the allowed transitions ahead of `applyEvent`. The table below is the default treatment I actually use.
+
+<table>
+  <thead>
+    <tr><th>Current</th><th>Arriving event</th><th>Default treatment</th><th>Reason</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>RUNNING</td><td>old PENDING</td><td>drop</td><td>rank regresses (step 2)</td></tr>
+    <tr><td>SUCCEEDED</td><td>late RUNNING</td><td>drop</td><td>regression from terminal (step 1)</td></tr>
+    <tr><td>SUCCEEDED</td><td>FAILED</td><td>record only, do not apply</td><td>first-finalize wins; avoid secondary rollback</td></tr>
+    <tr><td>RUNNING</td><td>newer RUNNING</td><td>judge by updateTime</td><td>progress freshness update (step 3)</td></tr>
+  </tbody>
+</table>
+
+## The Production Details the Docs Don't Cover
+
+The docs state that delivery is at-least-once, but how to prepare for broken ordering is left to the consumer's design. Here are the details I only saw once I implemented it.
+
+Normalize the operation name before using it as a primary key. If the representation wobbles — sometimes carrying a project or location prefix, sometimes not — the same operation splits into separate records and the regression check itself stops working. Consolidate `normalizeName` in one place and pass both webhook and reconciliation through it.
+
+Prepare for events missing `updateTime`. Even terminal events occasionally come with thin metadata. When it is missing, treat it as "a time unusable for tie-breaking"; I insert `1970-01-01T00:00:00Z` rather than the receive time, so it always loses the tie (i.e., respects the existing state). The point is not to overwrite a freshness judgment with an untrustworthy value.
+
+Return HTTP 200 even when you drop a regressing event. Returning an error induces redelivery, and the same old event keeps coming back. Log the drop with its reason label, but make the response itself a normal success. In my own corpus, after switching to this sink, I dropped 9 events combining `regress-from-terminal` and `lower-rank` over three weeks — all genuine events that would previously have caused a rollback. Before adopting it, my nightly App Store review classification pipeline showed a finished job reverting to a running display once or twice a month; after, it went to zero.
+
+The absorbing state pairs with a design that does not allow "reuse of the same operation ID." When you want to re-run an operation that has entered a terminal state, do not hand-edit the state back to `RUNNING`; start a new operation and take a new `name`. Once you make terminals absorbing, reuse breaks the premise of monotonic apply.
+
+## Where to Start
+
+First, add a single log line to your current sink that counts the fact that you "dropped" a regressing event. Even without `applyEvent` in place, just counting how often "a non-terminal event arrived while current is terminal" will reveal whether reordering is real in your pipeline. Once you confirm it is real, place this article's reducer and optimistic lock as one guard at the confluence — that is, in my view, the most reliable place to begin building a design that stops the rollback.
