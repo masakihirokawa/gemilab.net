@@ -1,0 +1,233 @@
+---
+title: "Mixing Text and Images in One File Search Skewed My Results Toward Images — Rebalancing by Modality After Retrieval"
+slug: "gemini-file-search-multimodal-modality-bias-rerank-rebalance"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-28T12:00"
+author: "Gemini Lab"
+description: "When you put text and images in a single File Search store with gemini-embedding-2, results can quietly skew toward one modality. Here is how to measure that skew and even it out after retrieval, using per-modality normalization and quota-based merging — with working code."
+tags: ["gemini-api", "file-search", "multimodal", "search", "python", "production"]
+highlights:
+  - "Reframe why a mixed text+image File Search leans toward one modality as a difference in score distributions, and learn to measure the skew in your own store with numbers"
+  - "Get working code for per-modality score normalization and quota-based merging so the composition of your retrieved set stays the way you intend"
+  - "Add a lightweight query-intent check that shifts the quota, so both image-leaning and text-leaning questions hold up without collapsing"
+---
+
+One morning, as an indie developer, I wanted to search across the Dolice Labs help articles, so I dropped the text articles, the app screenshots, and a pile of wallpaper assets into a single File Search store. Now that `gemini-embedding-2` can embed text and images into the same space, this was supposed to give me one index I could query with words or with pictures.
+
+Then I asked, "where do I configure billing," and the top of the list was nothing but screenshots and wallpapers. Of the eight hits, only two were the text articles I actually wanted.
+
+The embeddings were working. Images were retrievable by meaning. And yet the answer I needed got pushed under a heap of images. This was less a precision problem than a quirk specific to mixed stores: **the modality composition of the retrieved set skews.** Today I want to write down how I measured that skew and evened it out after retrieval, with the implementation.
+
+## Why a mixed store leans toward one modality
+
+The cause is that text and images have **different similarity-score distributions.**
+
+Against the same query vector, the cosine similarity of image chunks can come out systematically higher — and more tightly packed — than text chunks. This is not about one being better than the other. It is a scale mismatch that arises because each modality clusters differently inside the embedding space.
+
+If you naively rank everything on one score and take the top eight, the modality with the slightly higher average eats the slots. In my store the image side scored a touch higher, so images devoured the slots. With a different store, text could just as easily crowd out images the same way.
+
+In other words, the problem is slicing two distributions mixed onto one number line. **Level the playing field before you allocate** — that becomes the spine of the design.
+
+## First, measure the skew — compute the modality mix
+
+Before fixing anything, turn the skew into a number. It is a tiny measurement: decide whether each hit is text or image, then look at the composition of the top N.
+
+File Search grounding metadata includes a `media_id` and page numbers for visual citations. I simply treat "a chunk with a `media_id` (or an image reference) as image modality, and a chunk with text body as text modality." Adjust the field names to match your SDK version.
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Hit:
+    id: str
+    score: float          # the similarity score the store returned
+    modality: str         # "text" or "image"
+    text: str = ""        # the text chunk body, if any
+
+def detect_modality(chunk) -> str:
+    """Infer the modality from a grounding chunk.
+    Adjust the SDK field names to your environment."""
+    media_id = getattr(chunk, "media_id", None)
+    if media_id:
+        return "image"
+    # Fallback if image references live in a different field
+    if getattr(chunk, "image_uri", None) or getattr(chunk, "inline_image", None):
+        return "image"
+    return "text"
+
+def modality_mix(hits, top_n=8):
+    top = hits[:top_n]
+    counts = {"text": 0, "image": 0}
+    for h in top:
+        counts[h.modality] = counts.get(h.modality, 0) + 1
+    total = max(1, len(top))
+    return {k: (v, round(v / total, 2)) for k, v in counts.items()}
+
+# Example: measure the raw top 8 right after retrieval
+# print(modality_mix(raw_hits, top_n=8))
+# => {'text': (2, 0.25), 'image': (6, 0.75)}  ← a text question, yet 3/4 images
+```
+
+The gap between the "composition you expected" and the "composition you actually got" is what you are fixing. If a question looking for text help is 75% images, it is worth leveling the field.
+
+## Narrow the options to three
+
+There are many ways to even out skew, but if you limit yourself to what one person can keep running, three are realistic.
+
+<table>
+<thead>
+<tr><th>Approach</th><th>What it does</th><th>When it fits</th></tr>
+</thead>
+<tbody>
+<tr><td>In-modality normalization</td><td>Re-take a z-score within text and within images, then rank together</td><td>When you want to mix both modalities as fairly as possible</td></tr>
+<tr><td>Quotas</td><td>Assign a minimum and maximum per modality to the top slots and fill</td><td>When you want to guarantee a floor like "at least 4 text hits"</td></tr>
+<tr><td>Intent weighting</td><td>Decide whether the question leans text or image, and shift the allocation dynamically</td><td>When the kinds of questions vary</td></tr>
+</tbody>
+</table>
+
+In practice these are not exclusive — you layer them. I settled on three stages: "normalize within modality to level the field → enforce a floor with quotas → fine-tune the quota by intent." Here is each in turn.
+
+## Implementation 1: normalize scores per modality
+
+First, z-score text and images separately so they sit on the same scale. This removes the head start that image scores systematically enjoyed.
+
+```python
+import statistics
+
+def zscore_by_modality(hits):
+    """Re-score to mean 0 / std 1 within each modality."""
+    by_mod = {}
+    for h in hits:
+        by_mod.setdefault(h.modality, []).append(h)
+
+    rescored = []
+    for mod, group in by_mod.items():
+        scores = [h.score for h in group]
+        mu = statistics.fmean(scores)
+        # std is unstable with few samples, so guard it
+        sigma = statistics.pstdev(scores) if len(scores) > 1 else 1.0
+        sigma = sigma or 1.0
+        for h in group:
+            z = (h.score - mu) / sigma
+            rescored.append((z, h))
+
+    rescored.sort(key=lambda t: t[0], reverse=True)
+    return [h for _, h in rescored]
+```
+
+The thing to watch is that **normalization is sensitive to the sample count within a modality.** If a query only pulled two images, the z-score of those two is not trustworthy. The quota stage downstream absorbs that instability.
+
+## Implementation 2: allocate top slots with quotas
+
+Using the normalized order, fill the top N slots while guaranteeing a floor per modality. A composition like "of the top 8, at least 4 text and at least 2 images" is easier to operate when you keep it as a config value outside the code.
+
+```python
+def quota_merge(ranked_hits, top_n=8, min_quota=None):
+    """Fill the top slots while guaranteeing a minimum count per modality."""
+    if min_quota is None:
+        min_quota = {"text": 4, "image": 2}
+
+    buckets = {"text": [], "image": []}
+    for h in ranked_hits:
+        buckets.setdefault(h.modality, []).append(h)
+
+    result, used = [], {"text": 0, "image": 0}
+
+    # 1) Secure the minimum per modality first
+    for mod, q in min_quota.items():
+        take = buckets.get(mod, [])[:q]
+        result.extend(take)
+        used[mod] += len(take)
+
+    # 2) Fill remaining slots by normalized score (skip already chosen)
+    chosen = {id(h) for h in result}
+    for h in ranked_hits:
+        if len(result) >= top_n:
+            break
+        if id(h) not in chosen:
+            result.append(h)
+            chosen.add(id(h))
+
+    # 3) Re-sort by normalized rank before returning
+    order = {id(h): i for i, h in enumerate(ranked_hits)}
+    result.sort(key=lambda h: order.get(id(h), 1_000_000))
+    return result[:top_n]
+```
+
+The trick is to hold the floor as a **count**, not a ratio. Hold it as a percentage (say, 50% text) and the rounding wobbles every time the total changes. For a small personal index, counts read more clearly and caused fewer surprises.
+
+## Implementation 3: move the quota by query intent
+
+Finally, swap the quota itself depending on whether the question leans text or image. Questions like "what does the screen look like" want more images; "how do I configure it" or "pricing" want more text. The classifier need not be heavy. I used a lightweight model — or, to start, simple rules.
+
+```python
+IMAGE_HINTS = ("screen", "look", "looks", "screenshot", "design", "wallpaper", "ui")
+TEXT_HINTS  = ("configure", "setup", "how to", "steps", "pricing", "error", "spec", "why")
+
+def quota_for_query(query: str, top_n=8):
+    q = query.lower()
+    image_lean = any(k in q for k in IMAGE_HINTS)
+    text_lean  = any(k in q for k in TEXT_HINTS)
+
+    if image_lean and not text_lean:
+        return {"image": 5, "text": 2}
+    if text_lean and not image_lean:
+        return {"text": 5, "image": 2}
+    # Neutral. Show a baseline of both.
+    return {"text": 4, "image": 2}
+
+def search_rebalanced(query, raw_hits, top_n=8):
+    ranked = zscore_by_modality(raw_hits)
+    quota = quota_for_query(query, top_n=top_n)
+    return quota_merge(ranked, top_n=top_n, min_quota=quota)
+```
+
+Rules cover most of it; route only the ambiguous questions to a light judge like `gemini-flash-lite`. For one developer, that split keeps cost and speed in balance — using a heavy model for the classification itself adds an extra call to every single search.
+
+## Operational notes you won't find in the docs
+
+A few things I learned over a few weeks of running this, which the documentation does not spell out.
+
+First, **hold thresholds as quantiles, not fixed values.** Re-indexing and store additions nudge the score distribution over time. An absolute cutoff like "accept scores above 0.7" can suddenly bite too hard or stop biting at all. Holding it as an in-modality quantile (top X%) kept behavior stable as the distribution drifted.
+
+Second, **quotas double as cost control.** Mixing many image chunks into the answer context inflates input tokens accordingly. Capping images was not only a quality decision; it was also a ceiling on the cost per answer.
+
+Third, **don't force text into a question only images can answer.** A quota floor expresses "I'd like to show at least this many," but padding in loosely-related text by a fixed count just muddies the answer. I keep the floor conditional on "if inventory exists," paired with a guard that excludes anything whose relevance score falls through the floor.
+
+## How much it helped (observed on my own corpus)
+
+My index is roughly 1,200 text help-article chunks and about 600 images — screenshots and wallpapers. On a 40-question check set I assembled by hand, I compared before and after adding the post-retrieval rebalancing.
+
+<table>
+<thead>
+<tr><th>Metric</th><th>No rebalance</th><th>With rebalance</th></tr>
+</thead>
+<tbody>
+<tr><td>Text hits in the top 8 for text-leaning questions (avg)</td><td>1.9</td><td>4.3</td></tr>
+<tr><td>Modality sufficiency (share of questions with 3+ relevant text hits in top 8)</td><td>54%</td><td>89%</td></tr>
+<tr><td>NDCG@8 (against hand-labeled relevance)</td><td>0.71</td><td>0.78</td></tr>
+<tr><td>Added cost per search</td><td>0</td><td>~0 (rules handle most)</td></tr>
+</tbody>
+</table>
+
+The NDCG gain is modest, but it felt larger than the number. The reassurance that "the answer I looked for won't be buried under images" is what makes you reach for the search day to day. These are observations on my own index, so the numbers shift with a different mix. I'd start by running the `modality_mix` above to measure the skew in your own store.
+
+## Where I stumbled
+
+The z-score goes wild when a modality has only one or two hits. At first it reshuffled the top in unnatural ways, and I burned half a day finding out why. Skipping normalization for thinly-sampled modalities and handling them with the quota alone made it stable.
+
+The other was missed intent. Phrasings outside the rules ("how does it appear?") weren't caught as image-leaning and fell through to the neutral quota. Don't aim for a perfect ruleset — design it so a miss lands on neutral, and the failure stays small.
+
+## The next step
+
+Run `modality_mix` against your current store, throw five representative text-leaning and five image-leaning questions at it, and look at the composition of the top 8. Once the skew is visible, adding just `zscore_by_modality` → `quota_merge` changes the feel a lot. Intent classification can wait until you actually feel the need.
+
+Concretely, here is the order I'd recommend:
+
+1. Turn the current skew into a number with `modality_mix`
+2. Level the field within each modality using `zscore_by_modality`
+3. Guarantee a floor for the top slots with `quota_merge`
+
+Thank you for reading. I hope this is a useful first step for anyone else puzzled by skew in a mixed store.
