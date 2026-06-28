@@ -1,0 +1,245 @@
+---
+title: "When Gemini × Qdrant Hybrid Search Was Quietly Losing Recall — Field Notes on Instrumenting RRF Weights and Sparse-Vector Drift"
+slug: "gemini-qdrant-hybrid-rag-recall-regression-rrf-instrumentation-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-28T13:30"
+author: "Gemini Lab"
+description: "Run Gemini embeddings with Qdrant hybrid search in production and your dashboards stay green while recall quietly slips. These field notes show how to catch it with measurement — RRF weights, sparse-vector drift, missing payload indexes — and protect it with a quality budget."
+tags: ["Gemini API", "Qdrant", "Hybrid Search", "RAG", "RRF", "Recall", "Production", "Instrumentation"]
+highlights:
+  - "The pattern where recall drops while every dashboard stays green, and the measurement code that surfaces it"
+  - "How to tune RRF k and dense/sparse weights by measuring against a small eval set instead of guessing"
+  - "The real causes of silent recall loss: sparse-vector drift, missing payload indexes, and mid-flight embedding swaps"
+---
+## Search is still fast — the answers just got thinner
+
+One morning I noticed that my support RAG was answering noticeably worse than it had six months earlier. The latency graph was a flat line, Qdrant's health check was green, and the error rate was zero. What had degraded wasn't response time — it was the **quality of the documents being retrieved**. The right candidates simply weren't surfacing near the top anymore.
+
+This kind of decay never trips an alert. No 500s, no 429s — the system just keeps handing thin context to Gemini. Generation flows smoothly, so a human only feels "this is weak" when they actually read the output. The genuinely scary thing about vector search is that **it keeps working even when it's broken**. As an indie developer I've run several small support RAGs, and nothing has bitten me later quite like this quiet decay.
+
+These are field notes on running Gemini embeddings with Qdrant hybrid search in production: how I caught the slow recall regression with measurement, and how I tuned RRF weights and sparse-vector design with numbers rather than intuition. Not a general intro — just the parts I couldn't have noticed without measuring.
+
+---
+
+## Put measurement first — make recall visible
+
+Before any precision discussion, I always build a small eval set first. You don't need a pristine dataset. Pull 50–100 queries from real query logs and attach one or a few "if this is retrieved, it's correct" document IDs to each. Just having this lets you say, in numbers rather than guesses, whether a config change was an improvement or a regression.
+
+```python
+# eval_set.py — keep the eval set as JSONL (one query per line)
+# {"query": "...", "relevant_ids": ["doc_12", "doc_88"]}
+import json
+
+def load_eval_set(path: str) -> list[dict]:
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+def recall_at_k(retrieved_ids: list[str], relevant_ids: list[str], k: int) -> float:
+    """How much of the ground truth made the top k (0.0–1.0)."""
+    if not relevant_ids:
+        return 0.0
+    top = set(retrieved_ids[:k])
+    hit = sum(1 for r in relevant_ids if r in top)
+    return hit / len(relevant_ids)
+
+def mrr(retrieved_ids: list[str], relevant_ids: list[str]) -> float:
+    """Where the first correct hit landed (reciprocal of its rank)."""
+    for rank, doc_id in enumerate(retrieved_ids, start=1):
+        if doc_id in relevant_ids:
+            return 1.0 / rank
+    return 0.0
+```
+
+I run both `recall@10` and `MRR` every time I touch a setting. **Recall measures how much you miss; MRR measures whether you place correct hits near the top** — rely on one alone and you'll misjudge. In practice, changing RRF weights often raised recall while lowering MRR, a tug of war you only see if you watch both.
+
+---
+
+## Wiring hybrid search in Qdrant
+
+Hybrid search combines a dense vector (semantic closeness) with a sparse vector (lexical match, e.g. BM25). Gemini handles the former; Qdrant holds the latter. Build the collection so both vectors live on a single point.
+
+```python
+# collection.py
+from qdrant_client import QdrantClient, models
+
+client = QdrantClient(url="http://localhost:6333")
+COLLECTION = "docs_hybrid"
+
+def ensure_collection(dim: int = 768) -> None:
+    if client.collection_exists(COLLECTION):
+        return
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config={
+            # Dense: Gemini embedding, compared by cosine
+            "dense": models.VectorParams(size=dim, distance=models.Distance.COSINE),
+        },
+        sparse_vectors_config={
+            # Sparse: BM25. Holding IDF server-side keeps term weights stable
+            "bm25": models.SparseVectorParams(modifier=models.Modifier.IDF),
+        },
+    )
+    # Always index fields you filter on (the core of a pitfall below)
+    for field, schema in [("lang", "keyword"), ("updated_at", "integer")]:
+        client.create_payload_index(COLLECTION, field_name=field, field_schema=schema)
+```
+
+I forgot that final `create_payload_index` more than once and paid for it. Without an index on a filtered field, Qdrant has to **scan broadly** to find points matching the filter. At small scale it feels instant; as point counts grow it surfaces as "only filtered queries are slow — and recall drops." Attaching `modifier=IDF` to the sparse vector lets the server weight terms by rarity, so you aren't at the mercy of client-side BM25 implementation differences.
+
+### Embed with the new SDK and an explicit task_type
+
+Generate embeddings with the `google-genai` client. What matters here is `task_type`: pass `RETRIEVAL_DOCUMENT` at index time and `RETRIEVAL_QUERY` at search time, and the same string yields an asymmetric embedding tuned for retrieval. Forget to align these and dense-side precision quietly erodes.
+
+```python
+# embed.py
+from google import genai
+from google.genai import types
+
+genai_client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+EMBED_MODEL = "gemini-embedding-001"  # pin output dim to 768 via config
+
+def embed(text: str, *, is_query: bool) -> list[float]:
+    resp = genai_client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(
+            task_type="RETRIEVAL_QUERY" if is_query else "RETRIEVAL_DOCUMENT",
+            output_dimensionality=768,
+        ),
+    )
+    return resp.embeddings[0].values
+```
+
+`gemini-embedding-001` lets you truncate the output dimension (MRL), so I pin it to 768 to fit Qdrant's memory. **The dimension you choose here must match exactly across already-indexed data and all future queries.** Change the dimension or model midstream and your existing vectors and new queries end up living in different spaces — results quietly collapse. That's the heart of the "embedding migration" pitfall below.
+
+---
+
+## Tune RRF by measuring it
+
+How do you fuse two rankings — dense and sparse — into one? I use Reciprocal Rank Fusion (RRF). It just maps each rank to `1 / (k + rank)` and sums, but that simplicity is exactly why it handles dense/sparse scores that live on different scales.
+
+Qdrant can do the fusion server-side via its Query API. Start by simply prefetching both paths and fusing.
+
+```python
+# search.py
+def hybrid_search(query: str, top_k: int = 10, query_filter=None):
+    dense_q = embed(query, is_query=True)
+    sparse_q = build_bm25_sparse(query)  # term->weight dict to a SparseVector
+    res = client.query_points(
+        collection_name=COLLECTION,
+        prefetch=[
+            models.Prefetch(query=dense_q, using="dense", limit=40),
+            models.Prefetch(query=sparse_q, using="bm25", limit=40),
+        ],
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
+        query_filter=query_filter,
+        limit=top_k,
+        with_payload=True,
+    )
+    return [p.id for p in res.points]
+```
+
+Two knobs matter here. One is each `prefetch` limit (how many each path contributes before fusion); the other is RRF's `k`. **If the pre-fusion limit is too small, the right answer is cut before it ever reaches the fusion table.** On my data, raising the pre-fusion limit from 20 to 40 moved `recall@10` from 0.71 to 0.83 — about a 17% improvement. Pushing to 80 plateaued the gain and only grew latency. The rule isn't "wider is better" — it's **find the plateau on your eval set**.
+
+RRF's `k` governs the tug of war between dense and sparse. Qdrant's built-in fusion fixes `k`, but if you fuse yourself you can control it with a weighted RRF:
+
+```python
+def weighted_rrf(dense_ids, sparse_ids, w_dense=1.0, w_sparse=0.6, k=60):
+    scores = {}
+    for rank, doc_id in enumerate(dense_ids, start=1):
+        scores[doc_id] = scores.get(doc_id, 0.0) + w_dense / (k + rank)
+    for rank, doc_id in enumerate(sparse_ids, start=1):
+        scores[doc_id] = scores.get(doc_id, 0.0) + w_sparse / (k + rank)
+    return [doc_id for doc_id, _ in sorted(scores.items(), key=lambda x: -x[1])]
+```
+
+For my corpus (Japanese technical docs plus proper-noun-heavy queries), `w_dense=1.0 / w_sparse=0.6` was best. Queries with proper nouns or error codes lean sparse; paraphrase-heavy questions lean dense. **No single ratio is optimal across all queries**, so splitting the eval set by query type shows you which way to bias.
+
+---
+
+## The three causes of silent recall loss
+
+Once measurement was in place, the culprits converged on these three.
+
+<table>
+<thead>
+<tr><th>Symptom</th><th>Real cause</th><th>How it shows up in metrics</th></tr>
+</thead>
+<tbody>
+<tr><td>Only filtered queries are inaccurate</td><td>Missing payload index → scan cut short</td><td>Large recall gap with vs. without filter</td></tr>
+<tr><td>Proper-noun queries miss</td><td>Sparse vocab drift (normalization / tokenization mismatch)</td><td>Sparse-only recall lower than dense</td></tr>
+<tr><td>Gradual overall decay</td><td>Embedding model/dim changed midstream → space mismatch</td><td>Recall low only on newly added docs</td></tr>
+</tbody>
+</table>
+
+### Stop sparse drift with one shared normalizer
+
+The hardest to spot is sparse drift. If tokenization or normalization (width, case, punctuation) differs even slightly between index time and query time, `GeminiAPI` and `gemini api` become different terms and your lexical match silently misses. I keep normalization in a single function and route both indexing and search through it.
+
+```python
+import re, unicodedata
+
+def normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)  # unify full/half width
+    text = text.lower()
+    text = re.sub(r"[\s_]+", " ", text)
+    return text.strip()
+```
+
+Unglamorous, but this one move visibly lifted `recall@10` on proper-noun queries. **Sparse precision is decided by preprocessing consistency, not by the model** — that's the lesson I took from operating it.
+
+### Migrate embeddings with dual writes, no downtime
+
+When you eventually move from `gemini-embedding-001` to something like `gemini-embedding-2`, swapping everything at once means old and new mix until reindexing finishes, and search breaks in between. I add a new named vector (e.g. `dense_v2`) to the collection, write new documents to both, and only switch the search path after the backfill completes. I flip it only after the eval set shows `dense_v2`-only recall beating the old version. **Deciding the switch with numbers instead of a hunch** is the biggest payoff of building the eval set first.
+
+---
+
+## Handoff to Gemini and a quality budget
+
+Finally, the retrieved context goes to Gemini to produce the answer. The measurement mindset continues here: pack the top payloads directly, and even when using `thinking`, constrain the system instruction so the model **doesn't assert anything not grounded in the passed context**.
+
+```python
+def answer(query: str) -> str:
+    ids = hybrid_search(query, top_k=8)
+    chunks = fetch_payloads(ids)  # pull bodies from Qdrant
+    context = "\n\n---\n\n".join(c["text"] for c in chunks)
+    resp = genai_client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=f"Answer concisely, grounded only in the material below.\n\nMaterial:\n{context}\n\nQuestion: {query}",
+        config=types.GenerateContentConfig(temperature=0.2),
+    )
+    return resp.text
+```
+
+In operation I set a **budget (floor)** on `recall@10`. For me, dropping below 0.80 raises an automatic alert and I go suspect that week's added data and config diffs. The threshold depends on the service, but the point is to log the eval value on every config change and data addition, so you can later binary-search for "when did it regress?"
+
+```python
+# nightly_eval.py — run the eval set nightly and append to history
+import statistics, time, json
+
+def nightly():
+    eval_set = load_eval_set("eval.jsonl")
+    recalls, mrrs = [], []
+    for row in eval_set:
+        ids = hybrid_search(row["query"], top_k=10)
+        recalls.append(recall_at_k(ids, row["relevant_ids"], 10))
+        mrrs.append(mrr(ids, row["relevant_ids"]))
+    record = {
+        "ts": int(time.time()),
+        "recall@10": round(statistics.mean(recalls), 3),
+        "mrr": round(statistics.mean(mrrs), 3),
+        "n": len(eval_set),
+    }
+    with open("eval_history.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    if record["recall@10"] < 0.80:
+        raise SystemExit(f"⚠️ recall budget breached: {record['recall@10']}")
+```
+
+Since adding this nightly job, a human is never the first to notice a regression — the numbers raise their hand first.
+
+---
+
+As a next step, assemble an eval set — 50 queries is plenty — and measure `recall@10` and `MRR` just once. Usually the number comes back lower than you expected, and that's exactly where improvement starts. Thanks for reading, and I hope this helps anyone wrestling with search that's "working but weak."

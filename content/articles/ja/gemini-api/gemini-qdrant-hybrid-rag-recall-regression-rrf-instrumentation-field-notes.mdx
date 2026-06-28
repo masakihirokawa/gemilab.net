@@ -1,0 +1,247 @@
+---
+title: "Gemini × Qdrant のハイブリッド検索が再現率を静かに落としていたとき — RRF の重みと疎ベクトルのズレを計測する運用メモ"
+slug: "gemini-qdrant-hybrid-rag-recall-regression-rrf-instrumentation-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-28T13:30"
+author: "Gemini Lab"
+description: "Gemini の埋め込みと Qdrant のハイブリッド検索を本番で回すと、ダッシュボードは緑のまま再現率だけが静かに落ちます。RRF の重み・疎ベクトルのズレ・ペイロードインデックスの欠落を計測で捕まえ、品質バジェットで守る運用メモです。"
+tags: ["Gemini API", "Qdrant", "ハイブリッド検索", "RAG", "RRF", "再現率", "本番運用", "計測"]
+highlights:
+  - "ダッシュボードが緑でも recall@10 が落ちる典型パターンと、それを数値で捕まえる計測コード"
+  - "RRF の k と密/疎の重み（融合前 limit 20→40 で recall@10 が 0.71→0.83）を測って決める評価セットの回し方"
+  - "疎ベクトルのズレ・ペイロードインデックス欠落・埋め込みモデル切り替えの落とし穴と回避策"
+---
+## 検索は速いのに、答えが薄くなっていく
+
+ある朝、サポート用に積んだ RAG の回答が、半年前より明らかに浅くなっていることに気づきました。レイテンシのグラフは綺麗な横ばい、Qdrant のヘルスチェックも緑、エラー率もゼロです。落ちていたのは応答時間ではなく、**取得しているドキュメントの質**でした。正解候補が上位に来なくなっていたのです。
+
+この種の劣化はアラートに引っかかりません。500 も 429 も出ず、ただ「関連の薄い文脈」を Gemini に渡し続けます。生成は淀みなく流れるので、人間が読んで初めて「なんか弱いな」と感じる。ベクター検索の本当に怖いところは、**壊れても動いてしまう**点にあると考えています。私自身、個人開発でサポート用の小さな RAG をいくつも回してきましたが、この静かな劣化ほど後から効いてくるものはありませんでした。
+
+ここでは Gemini の埋め込みと Qdrant のハイブリッド検索を本番で運用する中で、再現率（recall）の静かな低下をどう計測で捕まえ、RRF の重みと疎ベクトルの設計をどう数値で詰めたかを、実装と一緒に整理します。汎用的な入門ではなく、「測らないと気づけなかった」部分に絞ります。
+
+---
+
+## まず計測を置く — 再現率を見える化する最小セット
+
+精度の議論を始める前に、私は必ず小さな評価セットを先に作ります。完璧なデータセットは要りません。実運用のクエリログから 50〜100 件を抜き、各クエリに「これが取れていれば正解」というドキュメント ID を 1〜数件ひも付けるだけです。これがあるだけで、設定変更が改善なのか改悪なのかを推測でなく数字で言えるようになります。
+
+```python
+# eval_set.py — 評価セットは JSONL で持つ（1行1クエリ）
+# {"query": "...", "relevant_ids": ["doc_12", "doc_88"]}
+import json
+
+def load_eval_set(path: str) -> list[dict]:
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+def recall_at_k(retrieved_ids: list[str], relevant_ids: list[str], k: int) -> float:
+    """上位 k 件に正解がどれだけ含まれていたか（0.0〜1.0）"""
+    if not relevant_ids:
+        return 0.0
+    top = set(retrieved_ids[:k])
+    hit = sum(1 for r in relevant_ids if r in top)
+    return hit / len(relevant_ids)
+
+def mrr(retrieved_ids: list[str], relevant_ids: list[str]) -> float:
+    """最初の正解が何位に来たか（順位の逆数）。上位性能を見るのに効く"""
+    for rank, doc_id in enumerate(retrieved_ids, start=1):
+        if doc_id in relevant_ids:
+            return 1.0 / rank
+    return 0.0
+```
+
+私はこの `recall@10` と `MRR` の 2 つを、設定を触るたびに必ず回します。**再現率は「取りこぼしの量」、MRR は「正解を上に置けているか」**を見ているので、片方だけだと判断を誤ります。実際、RRF の重みを変えると recall は上がるのに MRR が下がる、という綱引きがよく起きました。
+
+---
+
+## ハイブリッド検索を Qdrant に組む
+
+ハイブリッド検索は、意味の近さを見る密ベクトルと、語の一致を見る疎ベクトル（BM25 など）を両取りする手法です。Gemini の埋め込みは前者を担い、後者は Qdrant 側で持ちます。コレクションは両方のベクトルを 1 つのポイントに同居させて作ります。
+
+```python
+# collection.py
+from qdrant_client import QdrantClient, models
+
+client = QdrantClient(url="http://localhost:6333")
+COLLECTION = "docs_hybrid"
+
+def ensure_collection(dim: int = 768) -> None:
+    if client.collection_exists(COLLECTION):
+        return
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config={
+            # 密ベクトル: Gemini 埋め込み。コサイン類似度で比較
+            "dense": models.VectorParams(size=dim, distance=models.Distance.COSINE),
+        },
+        sparse_vectors_config={
+            # 疎ベクトル: BM25。IDF をサーバ側で持たせると語の重みが安定する
+            "bm25": models.SparseVectorParams(
+                modifier=models.Modifier.IDF,
+            ),
+        },
+    )
+    # フィルタに使うフィールドは必ずインデックスする（後述の落とし穴の核心）
+    for field, schema in [("lang", "keyword"), ("updated_at", "integer")]:
+        client.create_payload_index(COLLECTION, field_name=field, field_schema=schema)
+```
+
+最後の `create_payload_index` を私は何度も忘れて痛い目を見ました。フィルタ条件に使うフィールドにインデックスがないと、Qdrant はフィルタを満たす点を探すために**広く走査**します。データが小さいうちは体感ゼロですが、点数が増えると「フィルタ付きだけ遅い・再現率が落ちる」形で表に出ます。`modifier=IDF` を疎ベクトルに付けておくと、語の希少性に応じた重み付けをサーバ側が担ってくれるので、クライアントの BM25 実装差に振り回されません。
+
+### 埋め込みは新しい SDK で task_type を明示する
+
+埋め込み生成は `google-genai` クライアントで書きます。ここで効くのが `task_type` の指定です。インデックス時は `RETRIEVAL_DOCUMENT`、検索時は `RETRIEVAL_QUERY` を渡すと、同じ文字列でも検索に向いた非対称な埋め込みになります。これを揃え忘れると、密ベクトル側の精度が地味に落ちます。
+
+```python
+# embed.py
+from google import genai
+from google.genai import types
+
+genai_client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+EMBED_MODEL = "gemini-embedding-001"  # 出力次元は config で 768 に固定
+
+def embed(text: str, *, is_query: bool) -> list[float]:
+    resp = genai_client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(
+            task_type="RETRIEVAL_QUERY" if is_query else "RETRIEVAL_DOCUMENT",
+            output_dimensionality=768,
+        ),
+    )
+    return resp.embeddings[0].values
+```
+
+`gemini-embedding-001` は出力次元を切り詰められる（MRL）ので、Qdrant のメモリと相談して 768 に固定しています。**ここで決めた次元は、インデックス済みデータと未来のクエリで完全に一致していなければなりません**。次元やモデルを途中で変えると、既存ベクトルと新しいクエリが別の空間に住むことになり、検索結果が静かに崩れます。これは後述する「埋め込み移行」の落とし穴の本体です。
+
+---
+
+## RRF を「測って」調律する
+
+密と疎の 2 つのランキングをどう 1 本に束ねるか。私は Reciprocal Rank Fusion（RRF）を使っています。各リストでの順位 `rank` を `1 / (k + rank)` に変換して足すだけの素朴な式ですが、スコアのスケールが違う密/疎を混ぜるのに向いています。
+
+Qdrant はサーバ側の Query API で融合までやってくれます。まずは素直に両方を引いて束ねる形です。
+
+```python
+# search.py
+def hybrid_search(query: str, top_k: int = 10, query_filter=None):
+    dense_q = embed(query, is_query=True)
+    sparse_q = build_bm25_sparse(query)  # 語→重みの dict を SparseVector に変換
+    res = client.query_points(
+        collection_name=COLLECTION,
+        prefetch=[
+            models.Prefetch(query=dense_q, using="dense", limit=40),
+            models.Prefetch(query=sparse_q, using="bm25", limit=40),
+        ],
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
+        query_filter=query_filter,
+        limit=top_k,
+        with_payload=True,
+    )
+    return [p.id for p in res.points]
+```
+
+ここで効くのが 2 つのつまみです。1 つは各 `prefetch` の `limit`（融合前に各経路から何件拾うか）、もう 1 つは RRF の `k` です。**融合前 limit が小さすぎると、正解が融合のテーブルに乗る前に切り捨てられます**。私の手元では、融合前 limit を 20 から 40 に上げただけで `recall@10` が 0.71 から 0.83 へ、約 17% 改善しました。一方で 80 まで広げても改善は頭打ちで、レイテンシだけ伸びました。「広げれば良い」ではなく、**評価セットで頭打ちの点を探す**のが正解です。
+
+RRF の `k` は密と疎のどちらを優先するかの綱引きに効きます。Qdrant 標準の融合では `k` は固定的ですが、自前で融合する場合は次のように重み付き RRF にすると制御できます。
+
+```python
+def weighted_rrf(dense_ids, sparse_ids, w_dense=1.0, w_sparse=0.6, k=60):
+    scores = {}
+    for rank, doc_id in enumerate(dense_ids, start=1):
+        scores[doc_id] = scores.get(doc_id, 0.0) + w_dense / (k + rank)
+    for rank, doc_id in enumerate(sparse_ids, start=1):
+        scores[doc_id] = scores.get(doc_id, 0.0) + w_sparse / (k + rank)
+    return [doc_id for doc_id, _ in sorted(scores.items(), key=lambda x: -x[1])]
+```
+
+私の用途（日本語の技術文書 + 固有名詞の多いクエリ）では `w_dense=1.0 / w_sparse=0.6` が最良でした。固有名詞やエラーコードを含むクエリは疎ベクトルが強いので、私はそうしたクエリでは疎側に寄せることをお勧めします。言い換えの多い質問は密が強い。**全クエリで最適な比は存在しない**ので、評価セットをクエリ種別ごとに分けて測ると、どちらに寄せるべきかが見えてきます。
+
+---
+
+## 静かな再現率低下を起こす 3 つの原因
+
+計測を置いてから、劣化の犯人はほぼこの 3 つに収束しました。
+
+<table>
+<thead>
+<tr><th>症状</th><th>本当の原因</th><th>計測での見え方</th></tr>
+</thead>
+<tbody>
+<tr><td>フィルタ付きクエリだけ精度が低い</td><td>ペイロードインデックス未作成で走査打ち切り</td><td>filter あり/なしで recall に大差</td></tr>
+<tr><td>固有名詞クエリの取りこぼし</td><td>疎ベクトルの語彙ズレ（正規化・分かち書きの不一致）</td><td>sparse 単独 recall が密より低い</td></tr>
+<tr><td>全体が徐々に劣化</td><td>埋め込みモデル/次元の途中変更で空間が不一致</td><td>新規追加分だけ recall が低い</td></tr>
+</tbody>
+</table>
+
+### 疎ベクトルのズレは「同じ正規化」で防ぐ
+
+最も気づきにくいのが疎ベクトルのズレです。インデックス時と検索時で、トークン化や正規化（全角半角、大文字小文字、記号の扱い）が少しでも違うと、`GeminiAPI` と `gemini api` が別語になり、せっかくのキーワード一致が外れます。私は正規化を 1 つの関数に閉じ込め、インデックスと検索の両方から必ずそれを通すようにしています。
+
+```python
+import re, unicodedata
+
+def normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)  # 全角→半角を統一
+    text = text.lower()
+    text = re.sub(r"[\s_]+", " ", text)
+    return text.strip()
+```
+
+地味ですが、この一手で固有名詞クエリの `recall@10` が体感で一段上がりました。**疎ベクトルの精度はモデルではなく前処理の一貫性で決まる**、というのが運用して得た実感です。
+
+### 埋め込み移行はデュアルライトで無停止に
+
+`gemini-embedding-001` から将来 `gemini-embedding-2` のようなモデルへ移すとき、全件を一気に貼り替えると、再インデックスが終わるまで新旧が混ざって検索が崩れます。私は新しい名前付きベクトル（例: `dense_v2`）をコレクションに追加し、新規ドキュメントは両方に書き、バックフィルが完了してから検索経路を切り替える、という手順を取ります。評価セットで `dense_v2` 単独の recall が旧版を上回ったのを確認してから切る。**切り替えの正否を体感でなく数字で決められる**のは、評価セットを先に作っておいた最大の見返りです。
+
+---
+
+## Gemini への受け渡しと品質バジェット
+
+検索が返した文脈は、最後に Gemini へ渡して回答にします。ここでも計測の発想は続きます。取得した上位の payload を素直に詰め、`thinking` を使う場合も**渡した文脈に根拠が無い主張を足さない**よう、system 指示で縛ります。
+
+```python
+def answer(query: str) -> str:
+    ids = hybrid_search(query, top_k=8)
+    chunks = fetch_payloads(ids)  # Qdrant から本文を引く
+    context = "\n\n---\n\n".join(c["text"] for c in chunks)
+    resp = genai_client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=f"次の資料だけを根拠に、日本語で簡潔に答えてください。\n\n資料:\n{context}\n\n質問: {query}",
+        config=types.GenerateContentConfig(temperature=0.2),
+    )
+    return resp.text
+```
+
+そして運用では、`recall@10` に**バジェット（下限値）**を決めています。私の場合は 0.80 を割ったら自動でアラートを上げ、その週の追加データと設定差分を疑う、という運用です。閾値はサービスによりますが、大事なのは「いつ劣化したか」を後から二分探索できるよう、設定変更とデータ追加のたびに評価値をログに残すことです。
+
+```python
+# nightly_eval.py — 夜間に評価セットを回して履歴に追記する
+import statistics, time, json
+
+def nightly():
+    eval_set = load_eval_set("eval.jsonl")
+    recalls, mrrs = [], []
+    for row in eval_set:
+        ids = hybrid_search(row["query"], top_k=10)
+        recalls.append(recall_at_k(ids, row["relevant_ids"], 10))
+        mrrs.append(mrr(ids, row["relevant_ids"]))
+    record = {
+        "ts": int(time.time()),
+        "recall@10": round(statistics.mean(recalls), 3),
+        "mrr": round(statistics.mean(mrrs), 3),
+        "n": len(eval_set),
+    }
+    with open("eval_history.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    if record["recall@10"] < 0.80:
+        raise SystemExit(f"⚠️ recall budget breached: {record['recall@10']}")
+```
+
+この夜間ジョブを置いてから、劣化に人間が先に気づくことがなくなりました。数字が先に手を挙げてくれるからです。
+
+---
+
+次の一歩としては、いま使っている評価セットを 50 件で良いので用意し、`recall@10` と `MRR` を 1 度だけ測ってみてください。たいてい、思っていたより低い数字が出ます。そこが改善の出発点になります。最後までお読みいただき、ありがとうございました。同じように「動いているのに弱い」検索と向き合っている方の助けになれば幸いです。
