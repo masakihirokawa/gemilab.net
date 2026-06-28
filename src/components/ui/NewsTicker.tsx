@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "API — Event-driven WebhooksでBatch APIや長時間処理の完了を通知受信。ポーリングが不要になります",
-    "SEARCH — File Searchがgemini-embedding-2に対応し、画像もネイティブに埋め込み・検索できます",
-    "SECURITY — 6/19以降、未制限APIキーからのリクエストが遮断されました。キー制限の点検を",
-    "MODEL — Gemini 3.5 Flashが一般提供。gemini-flash-latestの本体になりました",
-    "AGENT — Managed AgentsがGemini APIで公開プレビュー。隔離サンドボックスで自律エージェントを実行できます",
-    "DEPRECATED — 画像プレビュー2モデルが6/25で停止。preview依存の処理は確認しておきましょう",
+    "MODEL — Gemini 3.5 Flashが一般提供。エージェント・コーディング向けの最有力モデルとして公開されました",
+    "AGENT — Managed AgentsがGemini APIで公開プレビュー。隔離されたLinuxサンドボックスで自律エージェントを実行できます",
+    "WEBHOOK — Event-driven WebhooksがBatch APIと長時間処理に対応し、ポーリングが不要になりました",
+    "SECURITY — 6/19以降、未制限APIキーからのリクエストが遮断されます。キーの制限設定を見直しましょう",
+    "DEPRECATED — 画像プレビュー2モデルが6/25で停止します。preview依存のフローは早めに移行を",
+    "CODEASSIST — 6/18より個人向けCode Assist拡張とCLIが、AI Pro/Ultra層への提供を停止しました",
   ],
   en: [
-    "API — Event-driven webhooks deliver Batch API and long-running completions, removing the need to poll",
-    "SEARCH — File Search now supports gemini-embedding-2, embedding and searching images natively",
-    "SECURITY — Since June 19, requests from unrestricted API keys are blocked — review your key limits",
-    "MODEL — Gemini 3.5 Flash is generally available and now powers gemini-flash-latest",
-    "AGENT — Managed Agents hit public preview in the Gemini API, running in isolated sandboxes",
-    "DEPRECATED — Two image-preview models shut down June 25 — check any preview-dependent flows",
+    "MODEL — Gemini 3.5 Flash is generally available as Google's top pick for agentic and coding tasks",
+    "AGENT — Managed Agents enter public preview in the Gemini API, running in isolated Linux sandboxes",
+    "WEBHOOK — Event-driven webhooks now cover the Batch API and long-running ops, removing polling",
+    "SECURITY — From June 19, requests from unrestricted API keys are blocked — review your key limits",
+    "DEPRECATED — Two image-preview models shut down June 25 — migrate any preview-dependent flows",
+    "CODEASSIST — Since June 18, individual Code Assist extensions and CLI stopped serving Pro/Ultra tiers",
   ],
 };
 
