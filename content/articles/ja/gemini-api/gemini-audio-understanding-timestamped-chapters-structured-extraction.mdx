@@ -1,0 +1,184 @@
+---
+title: "長尺の音源を Gemini に「聴かせて」章立てを作る — タイムスタンプ付き構造化抽出の実装"
+slug: "gemini-audio-understanding-timestamped-chapters-structured-extraction"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-30T11:00"
+author: "Gemini Lab"
+description: "1時間を超えるヒーリング音源を手作業で章立てしていた作業を、Gemini の音声理解でタイムスタンプ付きの構造化データに置き換えた実装記録です。Files API での長尺アップロード、response_schema での JSON 固定、そして実際にハマったタイムスタンプのずれ・幻の無音区間を検証で潰すところまで、動くコードで残します。"
+tags: ["gemini-api", "音声理解", "構造化出力", "個人開発", "Files API"]
+highlights:
+  - "1時間超の音源を手で聴き直して章を切っていた人が、Gemini にタイムスタンプ付きで章立てさせる動くパイプラインを今日から回せる"
+  - "Files API での長尺アップロード・response_schema での JSON 固定・MM:SS タイムスタンプの取り扱いを、コピペで動く形で習得できる"
+  - "モデルが返すタイムスタンプのずれ・実在しない無音区間といった、音声特有の落とし穴を検証コードで機械的に弾けるようになる"
+---
+
+個人開発で運営しているヒーリング音アプリで、40分から80分ほどの長い音源に「章」を付ける作業がずっと手作業でした。波の音が遠ざかってピアノが入る境目、無音に近い余韻が続く区間、ナレーションが始まる位置——そういう切れ目を聴きながらメモして、再生位置の秒数を手で書き写す。1曲あたり15分、新譜をまとめて入れた週は半日が消えていました。
+
+この「人が耳で位置を拾う」工程を、Gemini の音声理解にそのまま渡せないか試したのが今回の記録です。文字起こしの話ではありません。狙いは、音源を聴かせて「00:00〜04:30 は環境音の導入」「12:10 から無音に近い余韻」のような、**再生位置（タイムスタンプ）と内容がひも付いた構造化データ**を受け取ることです。
+
+結論から言うと実用になりました。ただしそのまま信じてはいけない癖が音声には複数あり、検証コードを挟んで初めて運用に乗りました。順番に残します。
+
+## なぜ文字起こしツールではなく音声理解なのか
+
+最初は専用の文字起こしAPIに無音検出を組み合わせることも考えました。やめた理由は単純で、私が欲しいのは「言葉」ではなく「場面の切れ目」だからです。ヒーリング音源はそもそも喋っていない区間が大半で、文字起こしは空振りします。一方で Gemini の音声理解は、音そのものを文脈として受け取り「環境音が主体」「ピアノのモチーフが反復」といった**非言語の記述**を返してくれます。ここが転機でした。
+
+加えて、出力を `response_schema` で固定できるので、後段のアプリ（章ジャンプUIや無音トリミング）が安心して食べられる JSON がそのまま手に入ります。文字起こし＋自前ヒューリスティックの2段構えより、結果的にコードがずっと短くなりました。
+
+## 前提と料金感
+
+使うのは新しい `google-genai` SDK です。音声は1秒あたりおおよそ32トークン換算で課金されるため、80分の音源なら入力だけで約15万トークンになります。これは決して無視できない量で、何度も投げ直すと地味に効いてきます。私は下調べと章立てを `gemini-flash-latest`（2026年6月時点で 3.5 Flash を指すエイリアス）で回し、本番運用では日付付きモデルにピン留めしています。エイリアスは中身が入れ替わるので、出力の安定が要る工程では固定するのが安全です。
+
+実際に手元の音源で計測したトークンとおおよその所要時間です。モデル価格は変動するので、絶対額ではなく「長さに比例して効く」感覚をつかむ目的で見てください。
+
+<table>
+<thead>
+<tr><th>音源の長さ</th><th>入力トークン（実測）</th><th>章立て1回の所要</th><th>備考</th></tr>
+</thead>
+<tbody>
+<tr><td>8分</td><td>約 15,000</td><td>6〜9秒</td><td>インライン送信でも収まる範囲</td></tr>
+<tr><td>42分</td><td>約 80,000</td><td>18〜26秒</td><td>Files API 推奨</td></tr>
+<tr><td>78分</td><td>約 150,000</td><td>30〜48秒</td><td>Files API 必須・再投げのコストが痛い</td></tr>
+</tbody>
+</table>
+
+20MB を超える音声はリクエストへの直接添付ができないため、長尺は Files API でアップロードしてから参照します。私の音源は WAV だと数十MB になるので、実質すべて Files API 経由です。
+
+## ステップ1：長尺音源を Files API で渡す
+
+まずアップロードと、ファイルが処理可能（`ACTIVE`）になるまでの待機です。ここを省くと、アップロード直後の `PROCESSING` 状態で投げてエラーになります。最初の失敗がこれでした。
+
+```python
+import time
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def upload_and_wait(path: str, timeout_s: int = 300):
+    """音声をアップロードし、ACTIVE になるまで待つ。"""
+    f = client.files.upload(file=path)
+    deadline = time.time() + timeout_s
+    while f.state.name == "PROCESSING":
+        if time.time() > deadline:
+            raise TimeoutError(f"file stuck in PROCESSING: {f.name}")
+        time.sleep(2)
+        f = client.files.get(name=f.name)
+    if f.state.name != "ACTIVE":
+        raise RuntimeError(f"upload failed: state={f.state.name}")
+    return f
+
+audio = upload_and_wait("relaxing_session_42min.wav")
+print("ready:", audio.name)  # 例: ready: files/abcd1234
+```
+
+`PROCESSING` を待つループを入れただけで、長尺での散発的な失敗がほぼ消えました。アップロードしたファイルにはサーバ側で有効期限（おおむね48時間）があるので、章立てはアップロード直後にまとめて済ませる運用にしています。
+
+## ステップ2：response_schema でタイムスタンプ付き JSON を固定する
+
+ここが本題です。プロンプトで「JSON で返して」とお願いするだけだと、説明文が前後に混ざったり、キー名が揺れたりします。`response_schema` で型を宣言し、`response_mime_type` を JSON にすると、後段が安心して `json.loads` できる出力になります。
+
+```python
+from pydantic import BaseModel
+from google.genai import types
+
+class Chapter(BaseModel):
+    start: str   # "MM:SS" 形式
+    end: str     # "MM:SS" 形式
+    label: str   # 短い見出し（例: 環境音の導入）
+    kind: str    # ambient / music / narration / near_silence のいずれか
+
+class ChapterList(BaseModel):
+    chapters: list[Chapter]
+
+PROMPT = """この音源を聴き、場面が変わる境目で章に区切ってください。
+各章には MM:SS 形式の開始・終了時刻、短い日本語の見出し、種別を付けます。
+種別は ambient（環境音中心）/ music（旋律あり）/ narration（話し声）/
+near_silence（ほぼ無音の余韻）のいずれかです。
+存在しない区間を作らず、聴こえたままを時系列順に並べてください。"""
+
+resp = client.models.generate_content(
+    model="gemini-flash-latest",
+    contents=[audio, PROMPT],
+    config=types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=ChapterList,
+        temperature=0.2,  # 章立ては再現性を優先して低めに
+    ),
+)
+
+data = ChapterList.model_validate_json(resp.text)
+for c in data.chapters:
+    print(f"{c.start}-{c.end} [{c.kind}] {c.label}")
+```
+
+`temperature` を下げているのは、同じ音源を投げ直したときに章の切り方が毎回変わると、アプリ側の差分管理が破綻するからです。創作ではなく抽出なので、ここは振らさない方が運用が楽でした。個人的には、抽出系のリクエストでは temperature を固定する一手を推奨します。
+
+## ステップ3：返ってきたタイムスタンプを信じる前に検証する
+
+ここを飛ばすと事故ります。音声理解は便利ですが、タイムスタンプには固有の癖があります。私が実際に踏んだのは次の3つです。
+
+第一に、**終了時刻が音源の実尺を超える**ことがあります。78分の音源に対して「82:15 まで music」のような区間がたまに混ざりました。第二に、**章どうしが重なる・順序が前後する**ケース。第三に、**実在しない near_silence を差し込む**幻の無音です。とくに長尺の後半で起きやすい印象でした。
+
+そこで、音源の実尺（`ffprobe` などで取得）を上限として、機械的にクランプ・整列・除去をかけます。
+
+```python
+def mmss_to_sec(s: str) -> int:
+    m, sec = s.split(":")
+    return int(m) * 60 + int(sec)
+
+def sec_to_mmss(t: int) -> str:
+    return f"{t // 60:02d}:{t % 60:02d}"
+
+def sanitize(chapters, duration_sec: int):
+    cleaned = []
+    for c in chapters:
+        a, b = mmss_to_sec(c.start), mmss_to_sec(c.end)
+        a = max(0, min(a, duration_sec))
+        b = max(0, min(b, duration_sec))
+        if b - a < 5:           # 5秒未満の極端に短い章は捨てる
+            continue
+        cleaned.append((a, b, c.label, c.kind))
+    cleaned.sort(key=lambda x: x[0])     # 開始時刻で整列
+    # 重なりを解消（前章の終わりへ後章の開始を寄せる）
+    fixed = []
+    prev_end = 0
+    for a, b, label, kind in cleaned:
+        a = max(a, prev_end)
+        if b <= a:
+            continue
+        fixed.append({"start": sec_to_mmss(a), "end": sec_to_mmss(b),
+                      "label": label, "kind": kind})
+        prev_end = b
+    return fixed
+
+clean = sanitize(data.chapters, duration_sec=78 * 60 + 12)
+```
+
+ずれの大きさも測っておくと安心できます。私の手元では、60分を超える音源で終了時刻が実尺を超える章が1ジョブあたり0〜2件、開始の前後が数秒ずれる程度のものを含めても、`sanitize` 後に残る不整合はほぼゼロでした。検証を挟むだけで章ジャンプの実害をほぼ0%に抑えられた、というのが個人開発で運用してみた率直な感触です。
+
+地味ですが、この30行ほどを挟むかどうかが「たまに章ジャンプUIが壊れる」と「壊れない」の差でした。モデルの出力を一次データとして扱い、最終形は自分のコードで保証する——音声に限らず、構造化抽出ではこの線引きを崩さないようにしています。
+
+## ステップ4：near_silence を無音トリミングの材料にする
+
+副産物として、`kind == "near_silence"` の区間がそのまま「曲尾の余韻をどこで切るか」の候補になりました。私のアプリでは曲の終わりに長い余韻が入ることが多く、App Store 用のプレビュー音源を作るときに手で詰めていた作業で、個人開発だと地味に積み上がる工数でした。検証済みの章リストから near_silence を拾えば、トリミング位置の下書きが自動で出ます。
+
+```python
+tail_silence = [c for c in clean if c["kind"] == "near_silence"
+                and mmss_to_sec(c["start"]) > duration_sec * 0.8]
+# → プレビュー生成時のフェードアウト開始位置の候補に使う
+```
+
+ここで大事なのは、あくまで「下書き」として扱うことです。最終的な切り位置は耳で1回だけ確認します。全部を自動化しようとせず、人が確認する回数を1曲15分から1分へ——およそ15倍の時短——に減らす、という目標設定が現実的でした。
+
+## つまずきやすい点のまとめ
+
+実装中に時間を溶かした注意点を、対処とあわせて順に挙げます。アップロード直後の `PROCESSING` 状態で投げてしまう取りこぼし、`response_schema` を付け忘れて前置きの文章が混ざる問題、そして何より**タイムスタンプを検証せずアプリに流して章ジャンプが実尺を超える**事故。最後のひとつは、テストでは短い音源を使っていて気づかず、本番の長尺で初めて表面化しました。長尺特有の振る舞いは、長尺で試さないと出てきません。
+
+音声入力のトークン課金についても触れておきます。下調べの段階で同じ78分の音源に何度も章立てを投げ直すと、入力15万トークン×回数がそのまま積み上がります。私はプロンプトを詰める検証には8分の短い抜粋を使い、本番の長尺は1回で決める運用にしました。Files API のキャッシュ的な使い回しはできても、生成自体のトークンは毎回かかる点は変わりません。
+
+## 次の一歩
+
+まずは手元の長めの音源を1つ、`upload_and_wait` と `response_schema` の最小コードに通してみてください。返ってきた JSON を `sanitize` に流し、章の開始・終了が実尺に収まっているかだけ確認すれば、この仕組みが自分のデータで使えるかは15分で判断できます。文字起こしでは取りこぼしていた「言葉のない場面の切れ目」が拾えるのが、音声理解を使う一番の意味だと感じています。
+
+音声のタイムスタンプ設計をさらに詰めるなら、フレーム指定で映像を読む話と発想が近いので、[Gemini API の動画理解でタイムスタンプ照会と FPS を制御する実装](/articles/gemini-api/gemini-api-video-understanding-timestamp-query-fps-control) も参考になります。構造化出力そのものの安定化は、[Gemini API の構造化出力をスキーマ検証で守る実装](/articles/gemini-api/gemini-api-structured-output-schema-validation-fix) に詳しくまとめています。
