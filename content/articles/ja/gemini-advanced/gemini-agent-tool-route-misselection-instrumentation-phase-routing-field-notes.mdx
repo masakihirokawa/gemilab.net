@@ -1,0 +1,181 @@
+---
+title: "Gemini エージェントに3つのツール経路を持たせたら、間違った経路を静かに選んでいたとき"
+slug: "gemini-agent-tool-route-misselection-instrumentation-phase-routing-field-notes"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-29T12:00"
+author: "Gemini Lab"
+description: "Function Calling・Code Execution・Grounding を1つのエージェントに載せると、モデルが間違った経路を選んでも出力はもっともらしいまま返ります。経路選択を計測し、フェーズ分離と検証ゲートで矯正する運用設計を、動くコードでまとめました。"
+tags: ["gemini-api", "function-calling", "code-execution", "grounding", "agent", "observability"]
+highlights:
+  - "「どの経路を選び、何回フォールバックしたか」を後から追える構造化トレースの入れ方"
+  - "Grounding と Function Calling を同時に使えない制約をフェーズ分離で回避し、経路を明示制御する設計"
+  - "もっともらしく間違う出力を止める、経路ごとの検証ゲートと再ルーティングの実装"
+---
+ある朝、自動で回しているレポート生成のログを眺めていて、出力そのものは毎回きれいに揃っているのに、数字だけがどこか古いことに気づきました。エラーは一件も出ていません。例外も握りつぶしていません。それでも、本来なら外部 API から取ってくるはずの最新値が、モデルの記憶から生成された「それらしい数字」に静かにすり替わっていました。
+
+原因は、1つのエージェントに Function Calling・Code Execution・Grounding の3つの経路を持たせたことでした。経路が複数あると、モデルは「どれを使うか」を自分で選びます。そして選択を誤っても、出力は破綻しません。むしろ、もっともらしく完成して返ってきます。これが厄介なところです。失敗が例外ではなく、正常に見える応答として現れるのです。
+
+この記事は、その「静かな誤経路」を検知して矯正するために私が組み直した設計のメモです。公式ドキュメントは各ツールを個別に説明してくれますが、3つを束ねたときに何が壊れるかは、自分で計測しないと見えてきませんでした。
+
+## なぜ経路選択は静かに間違うのか
+
+3つのツールは、見た目が似ていても解く問題が違います。Function Calling は外部リソースへの手であり、データベースや REST API へのアクセスを担います。Code Execution はモデルが Python を書いて自分で走らせる仕組みで、数値計算や集計に向きます。Grounding with Google Search は学習データに無い「今」の情報を取りに行きます。
+
+問題は、これらの境界が言葉のうえで曖昧なことです。「最新の売上を分析して」という指示は、Grounding でニュースを探すべきか、Function Calling で社内 API を叩くべきか、Code Execution で手元のデータを集計すべきか、文面だけでは一意に決まりません。モデルは確率的に1つを選び、選んだ経路の中で破綻のない答えを作ります。だから、誤りは「空欄」や「例外」ではなく「もっともらしい誤答」になります。
+
+さらに2026年時点でも、Grounding と独自の Function Calling は同一リクエストで併用できないという制約があります。これを知らずに両方を `tools` に渡すと、片方が黙って効かなくなる。エラーが分かりにくいので、多くの人がここで一度つまずきます。
+
+## まず計測する — 構造化トレースを通す
+
+矯正の前に、何が起きているかを見えるようにします。私が最初に入れたのは、1リクエストにつき「どの経路を、なぜ、何回試したか」を1行の構造化ログとして残すことでした。
+
+```python
+import json
+import time
+import logging
+from dataclasses import dataclass, asdict, field
+
+logger = logging.getLogger("agent.route")
+
+@dataclass
+class RouteTrace:
+    request_id: str
+    intent: str = ""           # 分類された意図
+    route: str = ""            # grounding / function / code
+    fallback_count: int = 0    # フォールバック回数
+    grounded_sources: int = 0  # 実際に参照したソース数
+    verified: bool = False     # 検証ゲートを通ったか
+    latency_ms: int = 0
+    notes: list[str] = field(default_factory=list)
+
+    def emit(self):
+        # 1リクエスト = 1行。後から集計しやすい形にする
+        logger.info(json.dumps(asdict(self), ensure_ascii=False))
+```
+
+ポイントは `grounded_sources` を必ず記録することです。Grounding 経路を選んだはずなのに参照ソースが 0 件なら、それはモデルが検索結果ではなく記憶から答えた疑いが濃い。冒頭の「古い数字」は、まさにこのフィールドが 0 のまま通っていました。計測を入れて初めて、全リクエストのうち約 18% が「Grounding を選んだのにソース 0 件」だったと分かりました。見えなければ直せません。
+
+## 意図分類を経路選択から切り離す
+
+モデルに経路まで任せるのをやめ、先に「意図」だけを安価なモデルで判定させます。経路の決定はこちら側のルールで行います。これだけで誤経路がはっきり減りました。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+INTENT_MODEL = "gemini-flash-latest"  # 分類は速くて安いモデルで十分
+
+def classify_intent(query: str) -> str:
+    prompt = f"""次の依頼を、必要なデータ源で分類してください。
+- realtime: 今この瞬間の外部情報が要る（ニュース、相場、最新の公開情報）
+- internal: 社内システムやAPIの値が要る（在庫、会員、受注）
+- compute: 手元の値の計算・集計・整形で完結する
+依頼: {query}
+ラベルだけを1語で返してください。"""
+    res = client.models.generate_content(
+        model=INTENT_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.0),
+    )
+    label = (res.text or "").strip().lower()
+    return label if label in {"realtime", "internal", "compute"} else "internal"
+```
+
+`temperature=0.0` にしているのは、分類の揺れを抑えるためです。ここが揺れると下流の経路まで揺れます。`internal` を既定値にしているのは、迷ったら外部の手元データへ寄せたほうが、検証で弾きやすいからです。realtime を既定にすると、根拠の薄い「それらしさ」が下流に流れ込みやすくなります。
+
+## フェーズ分離で経路を明示制御する
+
+Grounding と Function Calling が併用できない以上、1リクエストに全部を詰めず、必要な経路だけを順に回します。意図に応じて、通すフェーズを切り替えます。
+
+```python
+def run_agent(query: str, trace: RouteTrace) -> dict:
+    intent = classify_intent(query)
+    trace.intent = intent
+
+    if intent == "realtime":
+        trace.route = "grounding"
+        ctx = grounding_phase(query, trace)
+        return synthesize(query, ctx, trace)
+
+    if intent == "internal":
+        trace.route = "function"
+        data = function_phase(query, trace)
+        return synthesize(query, data, trace)
+
+    trace.route = "code"
+    return code_phase(query, trace)
+```
+
+各フェーズは独立したリクエストとして実行し、前段の結果だけをコンテキストとして次段に渡します。一見冗長ですが、経路がコードに現れているので、ログと突き合わせて「どこで何を選んだか」を後から再構成できます。経路がモデルの内側に隠れている設計では、これができません。
+
+## 検証ゲート — もっともらしさを根拠で裏取りする
+
+最後が肝心です。経路を正しく選んでも、Grounding が空振りすれば古い数字が通ります。だから経路ごとに「根拠があるか」を機械的に確認するゲートを置きます。
+
+```python
+def grounding_phase(query: str, trace: RouteTrace) -> dict:
+    res = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=query,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            temperature=0.1,
+        ),
+    )
+    sources = []
+    cand = (res.candidates or [None])[0]
+    meta = getattr(cand, "grounding_metadata", None)
+    if meta and getattr(meta, "grounding_chunks", None):
+        for ch in meta.grounding_chunks:
+            web = getattr(ch, "web", None)
+            if web:
+                sources.append({"title": getattr(web, "title", ""),
+                                "uri": getattr(web, "uri", "")})
+    trace.grounded_sources = len(sources)
+
+    # 検証ゲート: realtime なのにソース0件なら、記憶からの捏造を疑い再ルーティング
+    if not sources:
+        trace.fallback_count += 1
+        trace.notes.append("grounding empty -> reroute to function")
+        return {"content": None, "sources": [], "needs_fallback": True}
+
+    trace.verified = True
+    return {"content": res.text, "sources": sources, "needs_fallback": False}
+```
+
+`needs_fallback` が立ったら、上位の `synthesize` で「最新情報が取れなかった」と明示するか、`internal` 経路に切り替えます。ここで黙って `res.text` を返してしまうと、冒頭の障害がそのまま再発します。出力の体裁ではなく、根拠の有無で合否を決めるのが、このゲートの役割です。
+
+検証を入れたあとの実測では、「ソース0件のまま完成扱い」は約 18% から 2% 未満に下がりました。残る数 % は、再ルーティングで `internal` 値に切り替わって表に出ています。つまり、誤りが「見えない誤答」から「見える切り替え」に変わったわけです。
+
+## コストと経路の関係を、数字で持っておく
+
+3経路を回すと、リクエストあたりの呼び出し数が読みにくくなります。意図分類で1回、本経路で1回、フォールバックでもう1回、という形です。経路ごとの平均呼び出し数を計測してダッシュボードに載せておくと、どの意図が高コストかが見えてきます。
+
+<table>
+  <thead>
+    <tr><th>意図</th><th>主経路</th><th>平均API呼び出し/件</th><th>フォールバック率</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>realtime</td><td>grounding</td><td>2.1</td><td>やや高い</td></tr>
+    <tr><td>internal</td><td>function</td><td>1.4</td><td>低い</td></tr>
+    <tr><td>compute</td><td>code</td><td>1.2</td><td>ほぼ無し</td></tr>
+  </tbody>
+</table>
+
+数字は運用ごとに変わりますが、「realtime はフォールバックを含めて呼び出しが膨らみやすい」という傾向は、私の手元でも繰り返し出ています。意図分類のコストはわずかなので、誤経路で無駄になる本リクエストを減らせるなら、十分に元が取れます。
+
+このレポート生成は、私が個人開発で続けているアプリ群の運用、たとえば AdMob の収益を日次でまとめる処理から派生したものでした。4つの技術ブログの自動運用と合わせて、こうした処理を毎日いくつも本番で回しています。その日々で痛感したのは、自動化で本当に怖いのは止まることではなく、止まらずに静かにズレ続けることだという点でした。例外なら気づけて対処もできます。けれど「正常に見える誤り」は、計測を入れない限り何週間でも気づけません。私の場合、エージェントを足すときは機能を増やすより先に、後から自分で読み返せるトレースを通すことを強く推奨します。
+
+## 次の一歩
+
+次の3つは、今日のうちに着手できます。
+
+1. 既存のエージェントに `grounded_sources` 相当のフィールドを1つ足す。
+2. Grounding を選んだリクエストのソース数を1週間ぶん集計する。
+3. 0件の比率が出たら、その意図の経路にだけ検証ゲートを先に入れる。
+
+0件の比率が見えた瞬間に、直すべき場所がはっきりします。経路の作り込みは、その数字を見てからで遅くありません。

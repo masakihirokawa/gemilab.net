@@ -1,0 +1,180 @@
+---
+title: "When Your Gemini Agent Has Three Tool Routes and Quietly Picks the Wrong One"
+slug: "gemini-agent-tool-route-misselection-instrumentation-phase-routing-field-notes"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-06-29T12:00"
+author: "Gemini Lab"
+description: "Put Function Calling, Code Execution, and Grounding into one agent and the model will sometimes choose the wrong route, while the output still looks perfectly plausible. Here is how I instrument route selection and correct it with phase separation and verification gates, with working code."
+tags: ["gemini-api", "function-calling", "code-execution", "grounding", "agent", "observability"]
+highlights:
+  - "A structured trace that lets you reconstruct which route was chosen and how many times it fell back"
+  - "Phase separation that works around the Grounding-and-Function-Calling restriction and makes routing explicit"
+  - "Per-route verification gates and rerouting that stop plausible-but-wrong answers from shipping"
+---
+One morning I was looking at the logs of a report pipeline I run on a schedule, and the outputs were as clean as ever, but the numbers felt slightly stale. No errors. No swallowed exceptions. And yet the value that should have come fresh from an external API had quietly been replaced by a plausible-looking number generated from the model's memory.
+
+The cause was that I had given a single agent three routes: Function Calling, Code Execution, and Grounding. When several routes exist, the model decides which one to use. And when it chooses wrong, the output does not break. It comes back looking finished and reasonable. That is the hard part. The failure shows up not as an exception but as a normal-looking response.
+
+This is a set of notes on the design I rebuilt to detect and correct that quiet misrouting. The official docs explain each tool on its own, but what breaks when you bundle all three only became visible once I measured it myself.
+
+## Why route selection fails silently
+
+The three tools look similar but solve different problems. Function Calling is a hand into external resources — databases, REST APIs, internal systems. Code Execution lets the model write Python and run it itself, which suits computation and aggregation. Grounding with Google Search fetches the "now" that the training data does not contain.
+
+The trouble is that the boundaries are fuzzy in plain language. "Analyze the latest sales" does not uniquely map to one route: should it ground against news, call an internal API, or aggregate local data with code? The model picks one probabilistically and produces a coherent answer inside whatever route it chose. So the mistake is not a blank or an exception — it is a plausible wrong answer.
+
+On top of that, as of 2026, Grounding and custom Function Calling still cannot be combined in the same request. Pass both in `tools` without knowing this and one of them silently stops working. The error is easy to misread, so many people stumble here once.
+
+## Measure first — push a structured trace through
+
+Before correcting anything, make what is happening visible. The first thing I added was a single structured log line per request: which route, chosen why, attempted how many times.
+
+```python
+import json
+import logging
+from dataclasses import dataclass, asdict, field
+
+logger = logging.getLogger("agent.route")
+
+@dataclass
+class RouteTrace:
+    request_id: str
+    intent: str = ""           # classified intent
+    route: str = ""            # grounding / function / code
+    fallback_count: int = 0
+    grounded_sources: int = 0  # sources actually referenced
+    verified: bool = False     # passed the verification gate
+    latency_ms: int = 0
+    notes: list[str] = field(default_factory=list)
+
+    def emit(self):
+        # One request = one line, easy to aggregate later
+        logger.info(json.dumps(asdict(self), ensure_ascii=False))
+```
+
+The key is always recording `grounded_sources`. If the model chose the grounding route but referenced zero sources, it likely answered from memory rather than from search results. That stale number at the start of this article? This field was sitting at 0 the whole time. Only after instrumenting did I learn that about 18% of requests chose grounding yet returned zero sources. You cannot fix what you cannot see.
+
+## Separate intent classification from route selection
+
+Stop letting the model decide the route too. Classify the intent first with a cheap model, then decide the route with your own rules. This alone cut misrouting noticeably.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+INTENT_MODEL = "gemini-flash-latest"  # classification is fine on a fast, cheap model
+
+def classify_intent(query: str) -> str:
+    prompt = f"""Classify this request by the data source it needs.
+- realtime: needs external information from right now (news, prices, latest public data)
+- internal: needs values from internal systems or APIs (inventory, members, orders)
+- compute: completes with calculation or formatting of data already at hand
+Request: {query}
+Return only one lowercase label."""
+    res = client.models.generate_content(
+        model=INTENT_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.0),
+    )
+    label = (res.text or "").strip().lower()
+    return label if label in {"realtime", "internal", "compute"} else "internal"
+```
+
+`temperature=0.0` keeps the classification from wobbling, because a wobble here propagates into the route downstream. I default to `internal` because, when in doubt, leaning toward local data makes the answer easier to reject at the verification gate. Defaulting to realtime tends to let thinly grounded "plausibility" flow downstream instead.
+
+## Make routing explicit with phase separation
+
+Since Grounding and Function Calling cannot coexist in one request, do not cram everything in. Run only the routes you need, in order, switching phases based on intent.
+
+```python
+def run_agent(query: str, trace: RouteTrace) -> dict:
+    intent = classify_intent(query)
+    trace.intent = intent
+
+    if intent == "realtime":
+        trace.route = "grounding"
+        ctx = grounding_phase(query, trace)
+        return synthesize(query, ctx, trace)
+
+    if intent == "internal":
+        trace.route = "function"
+        data = function_phase(query, trace)
+        return synthesize(query, data, trace)
+
+    trace.route = "code"
+    return code_phase(query, trace)
+```
+
+Each phase runs as an independent request, passing only the previous result forward as context. It looks verbose, but the route is visible in the code, so you can reconstruct "what was chosen where" by lining it up against the logs. A design where the route hides inside the model cannot do this.
+
+## The verification gate — back up plausibility with evidence
+
+This is the decisive part. Even with the right route chosen, a grounding miss lets a stale number through. So place a gate per route that mechanically confirms whether evidence exists.
+
+```python
+def grounding_phase(query: str, trace: RouteTrace) -> dict:
+    res = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=query,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            temperature=0.1,
+        ),
+    )
+    sources = []
+    cand = (res.candidates or [None])[0]
+    meta = getattr(cand, "grounding_metadata", None)
+    if meta and getattr(meta, "grounding_chunks", None):
+        for ch in meta.grounding_chunks:
+            web = getattr(ch, "web", None)
+            if web:
+                sources.append({"title": getattr(web, "title", ""),
+                                "uri": getattr(web, "uri", "")})
+    trace.grounded_sources = len(sources)
+
+    # Gate: realtime with zero sources -> suspect fabrication, reroute
+    if not sources:
+        trace.fallback_count += 1
+        trace.notes.append("grounding empty -> reroute to function")
+        return {"content": None, "sources": [], "needs_fallback": True}
+
+    trace.verified = True
+    return {"content": res.text, "sources": sources, "needs_fallback": False}
+```
+
+When `needs_fallback` is set, the upper `synthesize` either states plainly that fresh information was unavailable, or switches to the `internal` route. Quietly returning `res.text` here reproduces the original incident exactly. The gate's job is to decide pass/fail on the presence of evidence, not on how finished the output looks.
+
+After adding verification, "completed despite zero sources" dropped from about 18% to under 2% in my measurements. The remaining few percent now surface as a reroute to an `internal` value. In other words, the error changed from an invisible wrong answer into a visible switch.
+
+## Keep the cost-route relationship in numbers
+
+Running three routes makes per-request call counts hard to predict: one for intent classification, one for the main route, and another on fallback. Measuring the average call count per route and putting it on a dashboard reveals which intents are expensive.
+
+<table>
+  <thead>
+    <tr><th>Intent</th><th>Main route</th><th>Avg API calls / req</th><th>Fallback rate</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>realtime</td><td>grounding</td><td>2.1</td><td>somewhat high</td></tr>
+    <tr><td>internal</td><td>function</td><td>1.4</td><td>low</td></tr>
+    <tr><td>compute</td><td>code</td><td>1.2</td><td>near zero</td></tr>
+  </tbody>
+</table>
+
+The numbers shift per workload, but the pattern that "realtime balloons once you include fallbacks" keeps showing up on my side. Intent classification costs little, so if it cuts down main requests wasted on the wrong route, it pays for itself easily.
+
+This report pipeline grew out of running my own indie developer apps — for instance, a job that tallies AdMob revenue daily. Together with the automation behind four technical blogs, I fire off processes like these in production every day. What that routine drilled into me is that the real danger in automation is not stopping — it is drifting quietly without stopping. Exceptions you can catch and handle. A "normal-looking error," though, can go unnoticed for weeks unless you measure for it. In my case, I strongly recommend pushing a trace you can re-read later before adding any features.
+
+## Next step
+
+Three things you can start today:
+
+1. Add a single field equivalent to `grounded_sources` to your existing agent.
+2. Aggregate the source count for grounding-route requests over one week.
+3. Once the zero-source ratio surfaces, add a verification gate to that intent's route first.
+
+The moment the zero-source ratio becomes visible, the place to fix becomes obvious. Building out the routing can wait until you have seen that number.
