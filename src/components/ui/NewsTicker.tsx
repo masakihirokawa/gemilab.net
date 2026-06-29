@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MODEL — Gemini 3.5 Flashが一般提供。エージェント・コーディング向けの最有力モデルとして公開されました",
-    "AGENT — Managed AgentsがGemini APIで公開プレビュー。隔離されたLinuxサンドボックスで自律エージェントを実行できます",
-    "WEBHOOK — Event-driven WebhooksがBatch APIと長時間処理に対応し、ポーリングが不要になりました",
-    "SECURITY — 6/19以降、未制限APIキーからのリクエストが遮断されます。キーの制限設定を見直しましょう",
-    "DEPRECATED — 画像プレビュー2モデルが6/25で停止します。preview依存のフローは早めに移行を",
-    "CODEASSIST — 6/18より個人向けCode Assist拡張とCLIが、AI Pro/Ultra層への提供を停止しました",
+    "MODEL — Gemini 3.5 Flashが一般提供となり、gemini-flash-latestの実体になりました",
+    "API — Interactions APIが一般提供となり、Geminiモデルとエージェントを扱う主要APIになりました",
+    "AGENT — Managed Agentsが公開プレビューで提供され、隔離Linux環境で自律エージェントを動かせます",
+    "API — バックグラウンド実行が加わり、長時間処理を投げて結果を後から受け取れます",
+    "SEARCH — File Searchがgemini-embedding-2で画像もそのまま検索できるようになりました",
+    "NOTICE — 6/19以降、未制限APIキーからのリクエストが遮断されるようになりました",
   ],
   en: [
-    "MODEL — Gemini 3.5 Flash is generally available as Google's top pick for agentic and coding tasks",
-    "AGENT — Managed Agents enter public preview in the Gemini API, running in isolated Linux sandboxes",
-    "WEBHOOK — Event-driven webhooks now cover the Batch API and long-running ops, removing polling",
-    "SECURITY — From June 19, requests from unrestricted API keys are blocked — review your key limits",
-    "DEPRECATED — Two image-preview models shut down June 25 — migrate any preview-dependent flows",
-    "CODEASSIST — Since June 18, individual Code Assist extensions and CLI stopped serving Pro/Ultra tiers",
+    "MODEL — Gemini 3.5 Flash reaches general availability and becomes gemini-flash-latest",
+    "API — The Interactions API hits GA as the primary way to work with Gemini models and agents",
+    "AGENT — Managed Agents enter public preview, running stateful agents in isolated Linux sandboxes",
+    "API — Background execution lands, letting you fire long-running jobs and collect results later",
+    "SEARCH — File Search now embeds and searches images natively via gemini-embedding-2",
+    "NOTICE — Since June 19, requests from unrestricted API keys are blocked",
   ],
 };
 
