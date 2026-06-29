@@ -1,0 +1,179 @@
+---
+title: "When Apps Script Time-Driven Triggers Quietly Run Out: Consolidating Gemini Automations into One Dispatcher"
+slug: "apps-script-gemini-time-driven-trigger-exhaustion-dispatcher"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-06-29T19:58"
+author: "Gemini Lab"
+description: "Apps Script caps you at 20 triggers per user and a daily total trigger-runtime budget. Here is how to stop your Gemini automations from silently dying as you add more, using a single dispatcher, a schedule table, and an external heartbeat."
+tags: ["gemini", "apps-script", "google-workspace", "automation", "trigger"]
+highlights:
+  - "You can now explain why triggers silently stop as you add Gemini automations, in terms of two concrete numbers: the 20-trigger cap and the ~90-minute daily runtime budget"
+  - "You get working code that replaces one-trigger-per-job with a single 5-minute dispatcher driven by a schedule table"
+  - "You can implement a heartbeat plus external monitoring and LockService double-run protection so a stalled pipeline never goes unnoticed"
+---
+
+"The auto-reply that worked yesterday had stopped — with no error at all." If you run several Google Workspace automations as an indie developer, you meet this silent failure sooner or later. In my own setup I was generating review-reply drafts for my wallpaper apps, summarizing inquiry emails, and rolling up sales figures — each on its own time-driven trigger. One day they all stopped together, and the execution log did not even record a failure.
+
+The cause was not a bug in my code. I had exhausted Apps Script's trigger resources. We tend to design as if triggers are unlimited, but the ceiling arrives much earlier than expected. Below I pin that ceiling down in numbers, then show how to fold a sprawl of per-job triggers into a single dispatcher that fires every five minutes.
+
+## Triggers run dry against two separate limits
+
+What most people miss is that there is more than one constraint. Exhaustion happens against two distinct resources.
+
+The first is the **number of triggers**. Apps Script allows up to 20 triggers per user, per script. If you grow your automations as "one feature, one trigger," the 20th brings `This script has too many triggers`, and every `ScriptApp.newTrigger` after that fails quietly.
+
+The second is the **total trigger runtime per day**. On a free gmail.com account, cumulative trigger runtime tops out around 90 minutes per day; even a paid Google Workspace account caps at roughly six hours. Because each Gemini API call spends seconds waiting on the network, that time budget melts faster than you would think as jobs pile up. Once it is gone, the rest of the day's triggers **simply stop firing, with no notification**.
+
+The table below lists the key limits to keep in mind. Note that the numbers depend on the account type.
+
+<table>
+<thead>
+<tr><th>Resource</th><th>Free (gmail.com)</th><th>Workspace (paid)</th><th>Symptom on exhaustion</th></tr>
+</thead>
+<tbody>
+<tr><td>Triggers / user / script</td><td>20</td><td>20</td><td>newTrigger fails</td></tr>
+<tr><td>Total trigger runtime / day</td><td>~90 min</td><td>~6 hours</td><td>Firing stops silently</td></tr>
+<tr><td>Max runtime per execution</td><td>6 min</td><td>30 min</td><td>Killed mid-run</td></tr>
+<tr><td>UrlFetch calls / day</td><td>20,000</td><td>100,000</td><td>fetch throws</td></tr>
+</tbody>
+</table>
+
+The point that bites is this: **a trigger-per-feature design presses on both limits at once.** It consumes trigger slots, and the startup overhead and empty checks of each trigger eat into the runtime budget. When mine stopped, I was still under 20 triggers — but three triggers firing every five minutes had drained the daily runtime budget before noon.
+
+## Drop one-trigger-per-job and consolidate into a single dispatcher
+
+The skeleton of the fix is simple. Create exactly **one** trigger and fire it every five minutes. That single entry point decides, from a schedule table, which jobs are due, and runs only those in order. The trigger count stays at one, and so does the runtime footprint.
+
+Start with the job definitions. Each job carries only an interval (in minutes) and the function to run.
+
+```javascript
+// Job definitions. Each is just a declaration: run fn once every intervalMin.
+const JOBS = [
+  { id: 'reviewReplyDraft', intervalMin: 15, fn: runReviewReplyDraft },
+  { id: 'inquirySummary',   intervalMin: 30, fn: runInquirySummary },
+  { id: 'salesRollup',      intervalMin: 60, fn: runSalesRollup },
+];
+
+// The single entry point called by the 5-minute trigger
+function dispatch() {
+  const lock = LockService.getScriptLock();
+  // Avoid overlap if the previous run is still going. Bow out silently if we can't get it.
+  if (!lock.tryLock(1000)) return;
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const now = Date.now();
+    const runStart = now;
+    const RUN_BUDGET_MS = 4 * 60 * 1000; // Safety valve: exit before the 6-min cap
+
+    for (const job of JOBS) {
+      if (Date.now() - runStart > RUN_BUDGET_MS) break; // Respect the time budget
+      const lastKey = 'last_' + job.id;
+      const last = Number(props.getProperty(lastKey) || 0);
+      if (now - last < job.intervalMin * 60 * 1000) continue; // Not due yet
+      try {
+        job.fn();
+        props.setProperty(lastKey, String(now)); // Advance only on success
+      } catch (e) {
+        console.error('job failed: ' + job.id + ' / ' + e);
+        // On failure, do not update last = it retries next cycle (each fn stays idempotent)
+      }
+    }
+    props.setProperty('heartbeat', String(now)); // Liveness record
+  } finally {
+    lock.releaseLock();
+  }
+}
+```
+
+Three things matter here. First, `RUN_BUDGET_MS` makes the loop exit before hitting the six-minute execution cap; any leftover jobs are picked up by the next dispatch five minutes later. Second, `LockService` prevents double execution — if a previous run overruns into the next firing, one of them quietly steps aside, so the same job never runs in parallel. Third, `last_` is advanced only on success; on failure the timestamp does not move, so the job retries on the next cycle.
+
+## Guarantee "always exactly one trigger" with an install script
+
+A nice property of the dispatcher approach is that trigger management itself becomes idempotent in code. Adding and removing triggers by hand tends to leave duplicates, wasting both slots and runtime budget. The function below deletes every existing `dispatch` trigger first, then recreates exactly one.
+
+```javascript
+function installDispatcher() {
+  // Sweep existing dispatch triggers (eradicate duplicate registrations)
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'dispatch')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+
+  // Create the single 5-minute trigger
+  ScriptApp.newTrigger('dispatch')
+    .timeBased()
+    .everyMinutes(5)
+    .create();
+
+  console.log('dispatcher installed: 1 trigger / every 5 min');
+}
+```
+
+When you want another job, you add one line to the `JOBS` array. The trigger count does not grow. That is what breaks the "the more features I add, the sooner triggers run dry" structure. If you want to tighten the permission design for deployment too, see [least-privilege scope design for Apps Script and Gemini](/en/articles/gemini-workspace/apps-script-gemini-least-privilege-oauth-scope-design).
+
+## Cap Gemini calls per cycle
+
+Even consolidated, if each job hammers the Gemini API without limit, you inflate the UrlFetch daily cap and your bill. I prefer to set a per-cycle cap on how many items a job processes, deferring the rest to the next cycle. Making steady, small progress on a fixed cadence is more stable than processing a large batch at once and hitting the six-minute cap partway through.
+
+```javascript
+function runReviewReplyDraft() {
+  const MAX_PER_RUN = 5; // Per-cycle Gemini call cap
+  const pending = fetchPendingReviews(MAX_PER_RUN); // Fetch only what's unprocessed
+  for (const r of pending) {
+    const draft = callGemini(
+      'gemini-flash-latest',
+      'Write one polite reply draft to this app review:\n' + r.body
+    );
+    saveDraft(r.id, draft); // Save idempotently (same id overwrites)
+  }
+}
+
+function callGemini(model, prompt) {
+  const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/'
+    + model + ':generateContent';
+  const res = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': key },
+    payload: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    muteHttpExceptions: true,
+  });
+  const code = res.getResponseCode();
+  if (code === 429 || code >= 500) {
+    // Rate limits and transient faults: give up this cycle, defer to the next (no retry storm)
+    throw new Error('retryable: ' + code);
+  }
+  const json = JSON.parse(res.getContentText());
+  return json.candidates[0].content.parts[0].text;
+}
+```
+
+With `MAX_PER_RUN` at 5, a job on a 15-minute interval processes up to 20 items an hour. For the review-reply drafts of my wallpaper apps (shipped on both App Store and Google Play), that cadence almost never let a backlog build up. Unless the workload is urgent, keeping each cycle light beats spinning faster — it is gentler on the trigger runtime budget and on the production work that ties directly to AdMob revenue. As a starting point I recommend keeping `MAX_PER_RUN` between 3 and 5 on a 5-minute dispatch. In my own setup that cut total trigger-runtime consumption by roughly 40%, and the noon exhaustion stopped happening. Raising the count is fine once you are stable at this number. The idempotency of the batch processing itself is something I dig into in [idempotent Sheets batches built around the 6-minute cap](/en/articles/gemini-workspace/apps-script-gemini-sheets-batch-6min-limit-idempotent).
+
+## Put the "it stopped" detector outside the script
+
+The weakness of the dispatcher approach is that when triggers run dry and firing stops, the mechanism that would tell you it stopped dies with it. An in-script watchdog dies the moment the trigger does. So the heartbeat **must be monitored from outside**.
+
+`dispatch` writes the current time to `heartbeat` on every cycle. Expose that as a small web endpoint that can be read from outside, and have an external uptime monitor poll it on a fixed interval. If the heartbeat has not updated within a set window, the monitor raises an alert.
+
+```javascript
+function doGet() {
+  const hb = Number(
+    PropertiesService.getScriptProperties().getProperty('heartbeat') || 0
+  );
+  const ageMin = (Date.now() - hb) / 60000;
+  // Treat anything older than 15 minutes since the last firing as abnormal
+  const ok = ageMin < 15;
+  return ContentService.createTextOutput(
+    JSON.stringify({ ok: ok, ageMin: Math.round(ageMin) })
+  ).setMimeType(ContentService.MimeType.JSON);
+}
+```
+
+Deploy this as a web app and register it with an external monitor so you get notified the moment `ok` turns `false`; then a silent stall surfaces the same day. The first time it bit me, it was precisely because I had no such external monitor. Automation only becomes operations once it includes "confirming it is still running" — a lesson I learned only after it stopped.
+
+## Next step
+
+First, log `ScriptApp.getProjectTriggers().length` in your own script to count how many triggers are running right now. If you have two or more time-driven triggers, they are worth folding into a single dispatcher. Move your existing functions into the `JOBS` array, run `installDispatcher` once, and your trigger count converges to one.
