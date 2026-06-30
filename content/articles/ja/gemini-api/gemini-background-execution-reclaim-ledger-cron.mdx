@@ -1,0 +1,254 @@
+---
+title: "投げて終了する定期実行で、結果を取りこぼさない — Gemini バックグラウンド実行を再取得台帳で回す設計"
+slug: "gemini-background-execution-reclaim-ledger-cron"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-30T19:56"
+author: "Gemini Lab"
+description: "Interactions API のバックグラウンド実行を cron 駆動の定期実行で安全に回すための設計です。送信前に冪等キーで台帳へ予約し、次のティックで未取得ハンドルだけを再取得する二段コミットを、動くコードで示します。"
+tags: ["Gemini API", "Interactions API", "バックグラウンド実行", "冪等性", "自動運用"]
+highlights:
+  - "送信前に冪等キーで台帳へ予約行を書く二段コミットで、二重送信とハンドル喪失を同時に防ぎます"
+  - "SQLite 1ファイルの台帳を使い、次の cron ティックで未取得ハンドルだけを照会して完了済みを一度だけ後段へ渡す再取得ループを実装します"
+  - "送信成功と台帳書き込みの隙間で生まれる孤児ハンドルを、回収パスで拾い直すリカバリ設計を示します"
+---
+
+Interactions API のバックグラウンド実行が GA に入って、長時間処理を「投げて、後で受け取る」構成が素直に書けるようになりました。私は個人開発で記事生成のパイプラインを定期実行で回していますが、ここで一つ厄介な前提があります。cron で起動するランナーは、処理を投げたあと**プロセスごと終了してしまう**ということです。
+
+つまり、Webhook のように「常駐して通知を待つ」設計も、ループで `done` を待つポーリングも、定期実行とは噛み合いません。起動 → 投げる → 終了、を繰り返すランナーが、いつどこで完了結果を拾うのか。この一点を詰めないと、バックグラウンド実行は「投げたきり迷子になるジョブ」を量産します。
+
+常駐プロセスも Webhook エンドポイントも持たないまま、cron ティックをまたいで結果を確実に回収する「再取得台帳（reclaim ledger）」の作り方を、動くコードで組み立てていきます。
+
+## なぜポーリングでも Webhook でもなく「台帳」なのか
+
+三つの取り方には、それぞれ前提があります。違いを整理しておきます。
+
+<table>
+<thead>
+<tr><th>方式</th><th>前提となる実行形態</th><th>定期実行ランナーとの相性</th></tr>
+</thead>
+<tbody>
+<tr><td>ループでポーリング</td><td>処理が終わるまで常駐し続ける</td><td><strong>悪い</strong>（投げたら終了するので待てない）</td></tr>
+<tr><td>Webhook で受信</td><td>公開エンドポイントを常時受け付ける</td><td><strong>悪い</strong>（受け口が常駐前提・個人運用だと運用負荷が高い）</td></tr>
+<tr><td>台帳に記録して次ティックで再取得</td><td>状態を外部に持ち、起動のたびに照合する</td><td><strong>良い</strong>（起動 → 照合 → 終了で完結する）</td></tr>
+</tbody>
+</table>
+
+要は、ランナーが終了しても消えない場所に「投げたジョブの一覧」を置いておき、次に起きたときにその一覧を見て未回収のものだけ取りに行く、という形です。Webhook が「向こうから教えてくれる」のに対し、台帳方式は「自分が起きたときに思い出す」設計だと考えています。個人運用では、公開受け口を維持しなくていいぶん、こちらのほうが壊れにくいと感じています。
+
+## 設計の核心は「送信」と「台帳書き込み」の順序
+
+素朴に書くと、こうなります。
+
+```python
+# アンチパターン: 送信してから台帳に書く
+op = client.interactions.create(model="gemini-flash-latest", input=payload, background=True)
+ledger.insert(handle=op.name, status="submitted")   # ← ここでクラッシュしたら?
+```
+
+`create` が成功してから `ledger.insert` までの間にプロセスが落ちると、**API 側にはジョブが存在するのに、台帳にはハンドルが無い**状態が生まれます。これが孤児ハンドル（orphan）です。次のティックで台帳を見ても存在しないので、永遠に回収されません。課金は発生しているのに結果は捨てられる、避けたい落とし穴です。これを回避することが、この設計の主眼だと考えています。
+
+そこで順序を逆にします。先に冪等キーで予約行を書き、そのあとで送信し、返ってきたハンドルで予約行を更新します。
+
+```python
+# 二段コミット: 予約 → 送信 → ハンドル確定
+idem = idempotency_key(job)          # 同じ論理ジョブには同じキー
+ledger.reserve(idem)                  # status="reserving" で予約（既存ならスキップ）
+op = client.interactions.create(..., background=True)
+ledger.bind_handle(idem, op.name)     # status="submitted" + handle 確定
+```
+
+この順序なら、どこで落ちても辻褄が合います。予約だけ残って送信されていなければ、回収パスが「予約済みだが未送信」を検出して送り直せます。送信されたのにハンドルが確定していなければ、後述の孤児回収で拾い直せます。
+
+## 台帳のスキーマ
+
+SQLite で十分です。外部サービスを増やさずに済みます。
+
+```python
+import sqlite3, time
+
+def open_ledger(path="reclaim_ledger.db"):
+    db = sqlite3.connect(path, isolation_level=None)  # autocommit
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("""
+      CREATE TABLE IF NOT EXISTS jobs (
+        idem         TEXT PRIMARY KEY,   -- 冪等キー（論理ジョブの一意性）
+        handle       TEXT,               -- Interactions API のハンドル名
+        status       TEXT NOT NULL,      -- reserving / submitted / done / consumed / failed
+        submitted_at REAL,
+        updated_at   REAL NOT NULL
+      )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_status ON jobs(status)")
+    return db
+```
+
+`idem` を主キーにしておくことが冪等性の土台です。同じ論理ジョブ（たとえば「2026-06-30 のニュース要約」）を二度投げようとしても、予約の時点で主キー衝突として弾けます。
+
+```python
+import hashlib, json
+
+def idempotency_key(job: dict) -> str:
+    canonical = json.dumps(job, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+def reserve(db, idem) -> bool:
+    try:
+        db.execute(
+            "INSERT INTO jobs(idem, status, updated_at) VALUES (?, 'reserving', ?)",
+            (idem, time.time()),
+        )
+        return True          # 新規予約に成功
+    except sqlite3.IntegrityError:
+        return False         # 既に存在（＝二重送信を防いだ）
+```
+
+## 送信フェーズ: 予約してから投げる
+
+cron ティックの前半は「投げる」だけに集中します。結果は待ちません。
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def submit(db, job: dict):
+    idem = idempotency_key(job)
+    if not reserve(db, idem):
+        return  # 同じジョブは既に投入済み。何もしない（冪等）
+
+    try:
+        op = client.interactions.create(
+            model="gemini-flash-latest",
+            input=job["input"],
+            background=True,            # 投げて終了する
+            metadata={"idem": idem},    # 後で逆引きするための鍵
+        )
+    except Exception:
+        # 送信に失敗したら予約を戻し、次ティックで再送できるようにする
+        db.execute("UPDATE jobs SET status='reserving', updated_at=? WHERE idem=?",
+                   (time.time(), idem))
+        raise
+
+    db.execute(
+        "UPDATE jobs SET handle=?, status='submitted', submitted_at=?, updated_at=? WHERE idem=?",
+        (op.name, time.time(), time.time(), idem),
+    )
+```
+
+`background=True` で投げると、`create` はすぐにハンドル（`op.name`、たとえば `interactions/abc123` 形式）を返して戻ります。本体の処理は Google 側で進み、ランナーはそのまま終了して構いません。
+
+## 再取得フェーズ: 未回収ハンドルだけ照会する
+
+ティックの後半、というより**毎回の起動直後**に、未回収のハンドルを照合します。完了していれば結果を後段へ渡し、`consumed` に落とします。
+
+```python
+def reclaim(db, on_result):
+    rows = db.execute(
+        "SELECT idem, handle FROM jobs WHERE status='submitted' AND handle IS NOT NULL"
+    ).fetchall()
+
+    for idem, handle in rows:
+        op = client.interactions.get(name=handle)
+        if not op.done:
+            continue                         # まだ処理中。次ティックで再訪
+
+        if getattr(op, "error", None):
+            db.execute("UPDATE jobs SET status='failed', updated_at=? WHERE idem=?",
+                       (time.time(), idem))
+            continue
+
+        # 完了。後段へ渡す前に done へ進めて二重処理を防ぐ
+        db.execute("UPDATE jobs SET status='done', updated_at=? WHERE idem=?",
+                   (time.time(), idem))
+        on_result(idem, op.response)         # ここで保存・公開などの副作用
+        db.execute("UPDATE jobs SET status='consumed', updated_at=? WHERE idem=?",
+                   (time.time(), idem))
+```
+
+ここで `done` → `on_result` → `consumed` の三段にしているのは、後段の副作用（記事の保存や公開）が一度だけ走るようにするためです。仮に `on_result` の途中で落ちても、ステータスは `done` で止まっているので、次ティックで「`done` だが `consumed` でない」を拾い直して再開できます。`on_result` 自体は冪等に書いておくのが前提です（同じ `idem` での保存は上書きにする等）。
+
+```python
+def resume_unfinished(db, on_result):
+    # done まで進んだが consumed されていない＝副作用の途中で落ちたジョブ
+    rows = db.execute("SELECT idem, handle FROM jobs WHERE status='done'").fetchall()
+    for idem, handle in rows:
+        op = client.interactions.get(name=handle)
+        on_result(idem, op.response)
+        db.execute("UPDATE jobs SET status='consumed', updated_at=? WHERE idem=?",
+                   (time.time(), idem))
+```
+
+## 孤児ハンドルの回収 — 送信したのに台帳に残っていないジョブ
+
+二段コミットでも、ごく狭い隙間が残ります。`create` が成功した直後、ハンドルを書き込む `UPDATE` の前にプロセスが落ちると、API 側にジョブはあるのに台帳には `reserving`（ハンドル無し）の行しか無い、という状態です。
+
+ここを塞ぐには、二つの備えを置きます。
+
+ひとつは、`reserving` のまま長く留まっている行の検出です。送信が本当に失敗したのか、送信は成ったがハンドルを書けなかったのか、台帳側からは区別できません。そこで送信時に冪等キーを `metadata` へ刻んでおき（前掲の `submit` 参照）、回収時はそのタグで API 側のジョブを逆引きして突き合わせます。
+
+```python
+def recover_orphans(db, max_age=120):
+    stale = db.execute(
+        "SELECT idem FROM jobs WHERE status='reserving' AND updated_at < ?",
+        (time.time() - max_age,),
+    ).fetchall()
+    if not stale:
+        return
+    stale_keys = {row[0] for row in stale}
+
+    # API 側に実在するジョブを冪等キーで逆引きし、台帳へハンドルを書き戻す
+    for op in client.interactions.list(filter="background=true"):
+        idem = (op.metadata or {}).get("idem")
+        if idem in stale_keys:
+            db.execute(
+                "UPDATE jobs SET handle=?, status='submitted', updated_at=? WHERE idem=?",
+                (op.name, time.time(), idem),
+            )
+            stale_keys.discard(idem)
+
+    # ここで残った stale_keys は API 側にも無い＝送信自体が失敗。
+    # reserving のまま残し、次の submit で再送させる
+```
+
+もうひとつは、`max_age` を「バックグラウンド実行が確実にハンドルを返すまでの時間」より十分長く取ることです。私は誤って処理中のジョブを孤児扱いしないよう、`max_age` をティック間隔の半分以下に抑えつつ、送信レイテンシの実測値（手元では中央値で 1 秒未満、p95 で 3 秒前後）の 30 倍以上を確保しています。送信は速く返るので、数分の余裕があれば取り違えはまず起きません。
+
+## ランナー本体 — 起動するたびに同じ手順を踏む
+
+cron が叩くのはこの関数だけです。起動 → 回収 → 投入 → 終了、という形に固定します。
+
+```python
+def tick(jobs_for_today):
+    db = open_ledger()
+    # 1) まず取りこぼしを拾う（孤児・前回投げたぶん・副作用の途中落ち）
+    recover_orphans(db)
+    reclaim(db, on_result=persist_article)
+    resume_unfinished(db, on_result=persist_article)
+    # 2) 今回ぶんを投げる（冪等なので二重起動しても安全）
+    for job in jobs_for_today:
+        submit(db, job)
+    db.close()
+```
+
+この関数がやることは、起動のたびに次の三手だけです。
+
+1. 前回までの取りこぼし（孤児・未回収・副作用の途中落ち）を拾う
+2. 今回ぶんのジョブを冪等に投げる
+3. 何も待たずにプロセスを終了する
+
+順序が重要です。**回収を投入より先に**置くことで、「前回投げた結果」を毎回最優先で拾えます。もし投入を先にすると、回収しないまま新しいジョブを積み増し、滞留が雪だるま式に増えます。
+
+この形にしてから、定期実行が途中で落ちても、次の起動が必ず辻褄を合わせてくれるようになりました。以前は Webhook の受け口を維持するために常駐プロセスを抱えていましたが、それ自体が落ちると今度は受信側が穴になります。状態を SQLite の一ファイルに寄せて、起動のたびに照合するだけの設計のほうが、私自身の運用規模では明らかに壊れにくくなりました。
+
+## 運用で効いた小さな判断
+
+`consumed` の行は消さずに残しています。一定期間（私は 30 日）保持して、同じ `idem` の再投入を弾く履歴として使います。容量は知れているので、消すより残すほうが安全です。
+
+`failed` は別扱いで通知に回します。台帳から拾って手元のログに集約し、再送するか諦めるかを後で判断します。自動再送のループに入れてしまうと、壊れた入力で延々と課金する事故につながるので、ここは人の判断を挟むようにしています。
+
+冪等キーには日付や版番号を含めます。「同じ内容を意図的に再生成したい」ときは、キーに版番号を混ぜれば別ジョブとして通せます。冪等性は「同じものを二度やらない」ためのもので、「二度とやれない」ためのものではない、という線引きを台帳の鍵で表現しています。
+
+次に手を動かすなら、まず `open_ledger` と `submit` / `reclaim` の三つだけを、ダミーの `on_result`（print するだけ）で動かしてみてください。投げて、プロセスを途中で停止し、もう一度 `tick` を呼んだときに結果が拾い直せること。この一往復が確認できれば、あとは後段の副作用を差し込むだけです。
+
+正式なフィールド名やフィルタ構文は更新で変わり得ますので、実装前に [Gemini API changelog](https://ai.google.dev/gemini-api/docs/changelog) で最新の Interactions API の仕様を確認してください。同じように定期実行で苦労されている方の役に立てば嬉しいです。

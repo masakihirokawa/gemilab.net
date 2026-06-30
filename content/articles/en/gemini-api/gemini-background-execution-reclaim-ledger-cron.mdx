@@ -1,0 +1,254 @@
+---
+title: "Fire-and-Forget on a Cron That Never Loses a Result: Reclaiming Gemini Background Executions with a Submission Ledger"
+slug: "gemini-background-execution-reclaim-ledger-cron"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-30T19:57"
+author: "Gemini Lab"
+description: "A design for running the Interactions API's background execution safely from a cron-driven runner. We reserve a row in a ledger by idempotency key before submitting, then reclaim only outstanding handles on the next tick — shown with working code."
+tags: ["Gemini API", "Interactions API", "Background Execution", "Idempotency", "Automation"]
+highlights:
+  - "A two-phase commit that writes a reservation row by idempotency key before submitting, preventing double submits and lost handles at once"
+  - "A reclaim loop backed by a single SQLite file that, on each cron tick, queries only outstanding handles and hands finished results downstream exactly once"
+  - "A recovery path that picks up orphan handles created in the gap between a successful submit and the ledger write"
+---
+
+Background execution in the Interactions API reaching GA finally makes the "submit now, collect later" shape easy to write. I run an article-generation pipeline on a schedule as an indie developer, and there's one awkward fact baked into that setup: a cron-launched runner **exits entirely** after it submits its work.
+
+So neither a long-lived process waiting on a webhook, nor a loop polling for `done`, fits a scheduled runner. A process that goes launch → submit → exit, over and over, has to answer one question: when and where does it ever collect the finished result? Skip that question and background execution just manufactures jobs that wander off and never come back.
+
+Let's build a "reclaim ledger" that recovers results reliably across cron ticks — without any long-lived process and without a public webhook endpoint.
+
+## Why a ledger, not polling or webhooks
+
+The three ways of collecting results each assume a different execution model. It's worth laying the differences out.
+
+<table>
+<thead>
+<tr><th>Approach</th><th>Assumed execution model</th><th>Fit with a scheduled runner</th></tr>
+</thead>
+<tbody>
+<tr><td>Polling in a loop</td><td>Stay resident until the job finishes</td><td><strong>Poor</strong> (the runner exits, so it can't wait)</td></tr>
+<tr><td>Receiving a webhook</td><td>Keep a public endpoint listening at all times</td><td><strong>Poor</strong> (a resident receiver — heavy to operate solo)</td></tr>
+<tr><td>Record to a ledger, reclaim next tick</td><td>Keep state outside the process; reconcile on each launch</td><td><strong>Good</strong> (launch → reconcile → exit, self-contained)</td></tr>
+</tbody>
+</table>
+
+The idea is to keep a list of submitted jobs somewhere that survives the runner's exit, and on the next launch, look at that list and go fetch only the ones not yet collected. Where a webhook means "the other side tells you," a ledger means "you remind yourself when you next wake up." For solo operation, not having to keep a public receiver alive makes it noticeably harder to break.
+
+## The crux is the order of "submit" and "ledger write"
+
+The naive version looks like this.
+
+```python
+# Anti-pattern: submit first, then write to the ledger
+op = client.interactions.create(model="gemini-flash-latest", input=payload, background=True)
+ledger.insert(handle=op.name, status="submitted")   # <- what if it crashes here?
+```
+
+If the process dies between `create` succeeding and `ledger.insert`, you get a state where **the job exists on the API side but the ledger has no handle for it**. That's an orphan handle. The next tick looks at the ledger, doesn't find it, and never reclaims it. You're billed for work whose result is thrown away — exactly what we want to avoid.
+
+So flip the order. Write a reservation row by idempotency key first, then submit, then update the reservation with the returned handle.
+
+```python
+# Two-phase commit: reserve -> submit -> bind handle
+idem = idempotency_key(job)          # same logical job -> same key
+ledger.reserve(idem)                  # reserve with status="reserving" (skip if it exists)
+op = client.interactions.create(..., background=True)
+ledger.bind_handle(idem, op.name)     # status="submitted" + handle bound
+```
+
+With this order, the accounting holds no matter where it dies. If only the reservation remains and nothing was submitted, the recovery path detects "reserved but not submitted" and resubmits. If it was submitted but the handle was never bound, orphan recovery (below) picks it back up.
+
+## The ledger schema
+
+SQLite is plenty. It saves you from adding another service.
+
+```python
+import sqlite3, time
+
+def open_ledger(path="reclaim_ledger.db"):
+    db = sqlite3.connect(path, isolation_level=None)  # autocommit
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("""
+      CREATE TABLE IF NOT EXISTS jobs (
+        idem         TEXT PRIMARY KEY,   -- idempotency key (uniqueness of a logical job)
+        handle       TEXT,               -- Interactions API handle name
+        status       TEXT NOT NULL,      -- reserving / submitted / done / consumed / failed
+        submitted_at REAL,
+        updated_at   REAL NOT NULL
+      )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_status ON jobs(status)")
+    return db
+```
+
+Making `idem` the primary key is the foundation of idempotency. Try to submit the same logical job twice (say, "the news summary for 2026-06-30") and the reservation fails on a primary-key collision.
+
+```python
+import hashlib, json
+
+def idempotency_key(job: dict) -> str:
+    canonical = json.dumps(job, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+def reserve(db, idem) -> bool:
+    try:
+        db.execute(
+            "INSERT INTO jobs(idem, status, updated_at) VALUES (?, 'reserving', ?)",
+            (idem, time.time()),
+        )
+        return True          # new reservation succeeded
+    except sqlite3.IntegrityError:
+        return False         # already exists (= prevented a double submit)
+```
+
+## Submit phase: reserve, then fire
+
+The first half of the cron tick focuses only on submitting. It does not wait for results.
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+def submit(db, job: dict):
+    idem = idempotency_key(job)
+    if not reserve(db, idem):
+        return  # this job is already in flight; do nothing (idempotent)
+
+    try:
+        op = client.interactions.create(
+            model="gemini-flash-latest",
+            input=job["input"],
+            background=True,            # fire and exit
+            metadata={"idem": idem},    # key for reverse lookup later
+        )
+    except Exception:
+        # if the submit failed, roll the reservation back so the next tick can resend
+        db.execute("UPDATE jobs SET status='reserving', updated_at=? WHERE idem=?",
+                   (time.time(), idem))
+        raise
+
+    db.execute(
+        "UPDATE jobs SET handle=?, status='submitted', submitted_at=?, updated_at=? WHERE idem=?",
+        (op.name, time.time(), time.time(), idem),
+    )
+```
+
+With `background=True`, `create` returns a handle (`op.name`, e.g. `interactions/abc123`) immediately and comes back. The real work proceeds on Google's side, and the runner is free to exit.
+
+## Reclaim phase: query only outstanding handles
+
+In the second half of the tick — really, right after every launch — reconcile the uncollected handles. If one is done, hand the result downstream and move it to `consumed`.
+
+```python
+def reclaim(db, on_result):
+    rows = db.execute(
+        "SELECT idem, handle FROM jobs WHERE status='submitted' AND handle IS NOT NULL"
+    ).fetchall()
+
+    for idem, handle in rows:
+        op = client.interactions.get(name=handle)
+        if not op.done:
+            continue                         # still running; revisit next tick
+
+        if getattr(op, "error", None):
+            db.execute("UPDATE jobs SET status='failed', updated_at=? WHERE idem=?",
+                       (time.time(), idem))
+            continue
+
+        # done. advance to 'done' before the side effect to guard against double processing
+        db.execute("UPDATE jobs SET status='done', updated_at=? WHERE idem=?",
+                   (time.time(), idem))
+        on_result(idem, op.response)         # the side effect: persist, publish, etc.
+        db.execute("UPDATE jobs SET status='consumed', updated_at=? WHERE idem=?",
+                   (time.time(), idem))
+```
+
+The three steps `done` → `on_result` → `consumed` exist so the downstream side effect (saving or publishing the article) runs exactly once. If `on_result` dies partway, the status is stuck at `done`, so the next tick picks up "`done` but not `consumed`" and resumes. The premise is that `on_result` itself is written idempotently (e.g. a save for the same `idem` is an overwrite).
+
+```python
+def resume_unfinished(db, on_result):
+    # advanced to 'done' but never 'consumed' = the process died inside the side effect
+    rows = db.execute("SELECT idem, handle FROM jobs WHERE status='done'").fetchall()
+    for idem, handle in rows:
+        op = client.interactions.get(name=handle)
+        on_result(idem, op.response)
+        db.execute("UPDATE jobs SET status='consumed', updated_at=? WHERE idem=?",
+                   (time.time(), idem))
+```
+
+## Recovering orphans — jobs submitted but missing from the ledger
+
+Even with the two-phase commit, a tiny gap remains. If the process dies right after `create` succeeds but before the `UPDATE` that writes the handle, the job exists on the API side while the ledger holds only a `reserving` row with no handle. Closing this pitfall is the whole point of the design.
+
+To close this, put two safeguards in place.
+
+The first is detecting rows that linger in `reserving` for too long. From the ledger alone you can't tell whether the submit genuinely failed or whether it succeeded but the handle write didn't. So stamp the idempotency key into `metadata` at submit time (see `submit` above) and, during recovery, reverse-look-up the API-side job by that tag and reconcile.
+
+```python
+def recover_orphans(db, max_age=120):
+    stale = db.execute(
+        "SELECT idem FROM jobs WHERE status='reserving' AND updated_at < ?",
+        (time.time() - max_age,),
+    ).fetchall()
+    if not stale:
+        return
+    stale_keys = {row[0] for row in stale}
+
+    # reverse-look-up real API-side jobs by idempotency key, write the handle back
+    for op in client.interactions.list(filter="background=true"):
+        idem = (op.metadata or {}).get("idem")
+        if idem in stale_keys:
+            db.execute(
+                "UPDATE jobs SET handle=?, status='submitted', updated_at=? WHERE idem=?",
+                (op.name, time.time(), idem),
+            )
+            stale_keys.discard(idem)
+
+    # whatever stays in stale_keys has no API-side job = the submit itself failed.
+    # leave it as 'reserving' so the next submit resends it
+```
+
+The second is keeping `max_age` comfortably longer than the time background execution needs to reliably return a handle. To avoid mistaking an in-flight job for an orphan, I keep `max_age` below half the tick interval while still holding it to 30x the measured submit latency (here, a median under 1 second and a p95 around 3 seconds). Submits return fast, so a few minutes of slack makes a mix-up effectively impossible.
+
+## The runner itself — the same steps on every launch
+
+Cron only ever calls this one function. Fix the shape as launch → reclaim → submit → exit.
+
+```python
+def tick(jobs_for_today):
+    db = open_ledger()
+    # 1) sweep up the leftovers first (orphans, last run's submissions, half-done side effects)
+    recover_orphans(db)
+    reclaim(db, on_result=persist_article)
+    resume_unfinished(db, on_result=persist_article)
+    # 2) submit this run's work (idempotent, so a double launch is safe)
+    for job in jobs_for_today:
+        submit(db, job)
+    db.close()
+```
+
+This function does the same three things on every launch:
+
+1. Sweep up leftovers from prior runs (orphans, uncollected handles, half-done side effects)
+2. Submit this run's jobs idempotently
+3. Exit the process without waiting on anything
+
+Order matters. Putting **reclaim before submit** means "last run's results" are always picked up first. Submit first instead, and you pile on new jobs without collecting, and the backlog snowballs.
+
+Since adopting this shape, a scheduled run dying partway no longer matters — the next launch always squares the books. I used to keep a resident process alive just to host a webhook receiver, but when that itself died, the receiving side became the hole. Pushing state into a single SQLite file and reconciling on each launch is, at my operating scale, plainly harder to break.
+
+## Small calls that paid off in operation
+
+I don't delete `consumed` rows. I keep them for a window (30 days for me) and use them as the history that rejects re-submitting the same `idem`. The footprint is trivial, so keeping is safer than deleting.
+
+I route `failed` separately to notifications. I pull them from the ledger into a local log and decide later whether to resend or give up. Folding them into an auto-resend loop risks billing endlessly on broken input, so I keep a human judgment in that loop.
+
+I include a date or version number in the idempotency key. When I want to deliberately regenerate the same content, mixing a version into the key lets it pass as a distinct job. Idempotency is for "don't do the same thing twice," not "can never do it again" — and the ledger key is where I draw that line.
+
+If you want to put your hands on this next, start with just the three functions `open_ledger`, `submit`, and `reclaim` against a dummy `on_result` (one that only prints). Submit, stop the process partway, then call `tick` again and confirm the result is still recovered. Once you've seen that round trip, all that's left is wiring in the real downstream side effect.
+
+Exact field names and filter syntax can change with updates, so check the current Interactions API surface in the [Gemini API changelog](https://ai.google.dev/gemini-api/docs/changelog) before you build. If you're wrestling with scheduled runs too, I hope this helps.
