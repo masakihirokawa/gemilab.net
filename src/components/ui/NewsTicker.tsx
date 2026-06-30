@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MODEL — Gemini 3.5 Flashが一般提供となり、gemini-flash-latestの実体になりました",
-    "API — Interactions APIが一般提供となり、Geminiモデルとエージェントを扱う主要APIになりました",
-    "AGENT — Managed Agentsが公開プレビューで提供され、隔離Linux環境で自律エージェントを動かせます",
-    "API — バックグラウンド実行が加わり、長時間処理を投げて結果を後から受け取れます",
-    "SEARCH — File Searchがgemini-embedding-2で画像もそのまま検索できるようになりました",
-    "NOTICE — 6/19以降、未制限APIキーからのリクエストが遮断されるようになりました",
+    "API — Interactions APIが一般提供となり、GeminiモデルとエージェントのためのAI Studio・APIの既定APIになりました",
+    "AGENT — Managed Agentsがパブリックプレビューとなり、Googleホストの隔離Linuxサンドボックスで自律エージェントを動かせます",
+    "SECURITY — 6月19日以降、制限なしのAPIキーからのリクエストが拒否され、キーへの制限付与が前提になりました",
+    "CLI — Gemini CLIが6月18日にEOLとなり、Agentic 2.0（Antigravity CLI）へ置き換わりました",
+    "MODEL — Gemini 3.5 FlashがGAとなり、エージェント処理やコーディングで持続的な高性能を発揮します",
+    "UPDATE — 旧画像プレビューモデル（gemini-3.1-flash-image-preview等）が6月25日に廃止されました",
   ],
   en: [
-    "MODEL — Gemini 3.5 Flash reaches general availability and becomes gemini-flash-latest",
-    "API — The Interactions API hits GA as the primary way to work with Gemini models and agents",
-    "AGENT — Managed Agents enter public preview, running stateful agents in isolated Linux sandboxes",
-    "API — Background execution lands, letting you fire long-running jobs and collect results later",
-    "SEARCH — File Search now embeds and searches images natively via gemini-embedding-2",
-    "NOTICE — Since June 19, requests from unrestricted API keys are blocked",
+    "API — The Interactions API reaches general availability as the default API for Gemini models and agents",
+    "AGENT — Managed Agents enter public preview, running autonomous agents in Google-hosted isolated Linux sandboxes",
+    "SECURITY — From June 19, requests from unrestricted API keys are rejected, so keys now need restrictions",
+    "CLI — Gemini CLI reaches end-of-life on June 18, replaced by the Agentic 2.0 Antigravity CLI",
+    "MODEL — Gemini 3.5 Flash is generally available for sustained frontier performance on agentic and coding tasks",
+    "UPDATE — Older image preview models such as gemini-3.1-flash-image-preview were shut down on June 25",
   ],
 };
 
