@@ -1,0 +1,205 @@
+---
+title: "Folding Scattered Call Sites Into One Front Door: Migrating to the Interactions API for Automation"
+slug: "gemini-interactions-api-single-front-door-call-site-consolidation"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-30T16:30"
+author: "Gemini Lab"
+description: "With the Interactions API now generally available, Gemini's calls can settle behind a single entry point. Here is a migration design for folding scattered call sites — generateContent, Batch, and homegrown agent loops — into one front door without breaking anything, complete with a working adapter layer."
+tags: ["gemini-api", "interactions-api", "architecture", "migration", "automation", "observability"]
+highlights:
+  - "An order and decision rule for gathering scattered call sites behind one adapter layer through a non-breaking, staged migration"
+  - "An implementation pattern that centralizes idempotency keys, instrumentation, and model swaps at the front door — with a working Python adapter"
+  - "A design for folding away result-waiting loops on top of background execution, plus how to avoid the double-counting that migrations invite"
+---
+
+It was somewhere around my twenty-odd scheduled jobs that I noticed the "entry point" of my own code had quietly split into four. Article prep called `generateContent` directly; the nightly bulk work went through Batch; the App Store review summaries ran on a homegrown agent loop; the image work lived in yet another helper. Each was the shortest path at the time. But the first thing I had to do, returning to one job after six months, was remember which entry point it had even used.
+
+On June 30 the Interactions API became generally available, and the primary entry point for Gemini's models and agents settled here. Managed Agents, background execution, and Gemini Omni all line up under the same door. This reads less like a flashy feature and more like the quiet kind of update that pays off slowly over a long time. A single call surface means the version of me six months from now no longer has to remember where a call was coming from.
+
+This article is not about writing one fresh script. It is a migration design for folding already-running, scattered call sites into one front door — without stopping them, without breaking them. It covers a working adapter layer, the order of migration, and the accidents that happen precisely because you are mid-migration.
+
+## What scattered entry points actually cost
+
+More call sites is not painful at first. It hurts six months later, and it surfaces in three shapes.
+
+The first is duplicated instrumentation. Token accounting, retry-on-failure, timeout handling — you end up writing each one slightly differently per entry point. In my case, the retry ceiling was three on the `generateContent` path and, on the Batch path, unset and therefore unbounded — a mismatch I found only later. It is the classic way a cost anomaly goes unnoticed for too long.
+
+The second is that a model swap never ends in one place. When `gemini-flash-latest` became the body of 3.5 Flash, I had to change four entry points separately. Every time I fixed one, I doubted whether I had really fixed them all. That is not a problem of count; it is a problem of an unseeable blast radius.
+
+The third is that you cannot easily adopt a new operating mode. Even when you want background execution — submit, then receive when done — scattered entry points make it hard to tell which path to rewrite first.
+
+The essential benefit of consolidation is that all three become "fix it in one place." The Interactions API can be that receiver, but you do not need to move everything at once. Slipping a thin layer in between was the safest approach I found.
+
+## Put the front door in your adapter layer, not the API
+
+Here is the judgment I most want to convey. Do not place the consolidated front door on the Interactions API itself. Place it on a thin adapter layer that you own.
+
+The reason is simple: the API's details will keep changing. Just as the legacy `outputs` schema was removed on June 6, schemas and arguments move with their deprecation deadlines. If your application code grips those details directly, every such change means touching every job. With one adapter in between, only the inside of the adapter changes.
+
+What the adapter offers is exactly one entry point. You hand it "what you want done," and a "result" comes back. Inside, it calls the Interactions API.
+
+```python
+# llm_gateway.py — the single front door you own
+import os
+import time
+import uuid
+import logging
+from dataclasses import dataclass, field
+from typing import Any
+
+from google import genai  # the real call is confined to the inside of this module only
+
+log = logging.getLogger("llm_gateway")
+_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+# Centralize model selection here. A swap is fixed in this one place.
+MODEL_BY_TIER = {
+    "fast": "gemini-flash-latest",      # prep, classification, light passes
+    "deep": "gemini-3-pro",             # the real work that needs reasoning
+}
+
+@dataclass
+class Request:
+    task: str                            # what you want done (the prompt body)
+    tier: str = "fast"                   # fast / deep
+    idempotency_key: str = field(default_factory=lambda: uuid.uuid4().hex)
+    background: bool = False             # submit long work and receive later
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class Result:
+    text: str
+    model: str
+    usage: dict[str, int]
+    idempotency_key: str
+
+def run(req: Request, *, max_retries: int = 3) -> Result:
+    """The single entry point every job passes through.
+    Instrumentation, retries, and model selection all converge here."""
+    model = MODEL_BY_TIER[req.tier]
+    started = time.monotonic()
+    last_err: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            # The one and only API-dependent point. Even if details shift,
+            # nothing leaks outside this function.
+            resp = _client.interactions.create(
+                model=model,
+                input=req.task,
+                # A re-send with the same key prevents duplicate billing and execution
+                idempotency_key=req.idempotency_key,
+                background=req.background,
+            )
+            usage = {
+                "input": resp.usage.input_tokens,
+                "output": resp.usage.output_tokens,
+            }
+            _record(req, model, usage, time.monotonic() - started, attempt)
+            return Result(
+                text=resp.output_text,
+                model=model,
+                usage=usage,
+                idempotency_key=req.idempotency_key,
+            )
+        except Exception as err:  # narrow the type in real use
+            last_err = err
+            wait = min(2 ** attempt, 30)
+            log.warning("run failed (attempt %d/%d): %s — retry in %ss",
+                        attempt, max_retries, err, wait)
+            time.sleep(wait)
+
+    _record(req, model, {}, time.monotonic() - started, max_retries, failed=True)
+    raise RuntimeError("llm_gateway.run exhausted retries") from last_err
+
+def _record(req, model, usage, elapsed, attempts, *, failed=False):
+    # Instrumentation in one place too. Cost rollups and latency monitoring
+    # are just a matter of reading this log line.
+    log.info("llm_call key=%s model=%s tier=%s in=%s out=%s elapsed=%.2f attempts=%d failed=%s job=%s",
+             req.idempotency_key, model, req.tier,
+             usage.get("input"), usage.get("output"),
+             elapsed, attempts, failed, req.metadata.get("job", "-"))
+```
+
+Please note that the argument names of `_client.interactions.create(...)` are the spot to confirm against the docs at the time you adopt this. GA pushes arguments toward stability, but the very design of not scattering this across your app is your insurance against that uncertainty. Code outside the adapter knows only `run(Request(...))`.
+
+The moment you place this adapter, the three pains above disappear. Instrumentation is the one `_record`. Model swaps are the one `MODEL_BY_TIER`. The retry ceiling is the one argument on `run`. None of them require hunting around anymore.
+
+## Fold without breaking — the order of migration
+
+Rewriting every existing job at once is the way most likely to cause an accident. I went in this order, starting from the lowest-risk path and watching a night of production logs before moving on.
+
+1. **Start with read-only, idempotent paths.** Jobs like classification or summarization, where the same input may produce the same output and re-running on failure is safe, move to the adapter first. For me that was automatic wallpaper classification. Even if something went wrong, the blast radius was small, and I could confirm the `idempotency_key` actually worked.
+2. **Close the instrumentation gap.** Make adapter-routed calls distinguishable in the logs from the direct calls you haven't migrated yet. A mark like `metadata={"job": "...", "via": "gateway"}` lets you measure progress as "what fraction of log lines went through the gateway."
+3. **Then the paths that write or bill.** Processes that reconcile against Stripe, where a double execution is real damage, move next. Here `idempotency_key` earns its keep — a re-send with the same key does not run twice.
+4. **Finally, long work goes background.** Last, switch the paths that were "waiting for a result" via Batch or a homegrown loop to `background=True`. Folding into submit-and-receive-when-done happens at this stage.
+
+The crux of this order is that each stage is independently valuable. If your hands stop midway, every path up to that point is reliably easier to live with. A migration that "means nothing unless you finish all of it" has a high chance of stalling in busy solo development.
+
+## The accident migrations invite — avoid double counting
+
+Mid-consolidation, there is always a period where the new and old paths run side by side. The accident unique to this period is double-counting of cost and metrics.
+
+What I did once: the adapter recorded `usage`, but old measurement code left on the pre-migration direct path was still alive, so the same call was counted in two places. The monthly token rollup did not match the actual bill, and it cost me half a day to find why.
+
+There are two ways to avoid it. One is to **concentrate measurement only inside the adapter and delete the old measurement on direct paths as you migrate them.** The other, for the early migration when that is hard, is to always tag gateway-routed logs with `via=gateway` so you can de-duplicate by path at rollup time.
+
+```python
+# On the rollup side: prevent double counting via the path mark
+def aggregate(log_rows):
+    seen = set()
+    total_in = total_out = 0
+    for row in log_rows:
+        key = row["idempotency_key"]
+        if key in seen:        # count the same call only once
+            continue
+        seen.add(key)
+        total_in += row.get("input") or 0
+        total_out += row.get("output") or 0
+    return {"input": total_in, "output": total_out, "calls": len(seen)}
+```
+
+Make `idempotency_key` the primary key of measurement, and the same call is counted once no matter which path — new or old — its record came through. The discipline of always issuing this key at the consolidated front door is what protects your rollups during migration.
+
+## Fold away result-waiting loops, on top of background execution
+
+Let me say a bit more about the background execution touched on in the last stage.
+
+When running long work on a schedule, I used to write polling — submit, then ask at fixed intervals whether it had finished. Empty checks pile up into wasted calls. Assuming background execution and event notification, you can delete the waiting loop itself.
+
+The adapter's `run`, when `background=True`, is designed to return a handle — an identifier for collecting the result later — rather than the result. Collection is split onto a separate path: a webhook, or a pickup at the next job launch.
+
+```python
+@dataclass
+class Handle:
+    operation_id: str
+    idempotency_key: str
+
+def submit(req: Request) -> Handle:
+    """Submit long work and return without waiting. Collect the result later."""
+    req.background = True
+    resp = _client.interactions.create(
+        model=MODEL_BY_TIER[req.tier],
+        input=req.task,
+        idempotency_key=req.idempotency_key,
+        background=True,
+    )
+    log.info("submit key=%s op=%s job=%s", req.idempotency_key,
+             resp.operation_id, req.metadata.get("job", "-"))
+    return Handle(operation_id=resp.operation_id,
+                  idempotency_key=req.idempotency_key)
+```
+
+What matters here is to *delete* the waiting loop, not *shorten* it. Shortening only starts a never-ending tuning of the interval somewhere. Separate the fact of submitting from the duty of collecting, and hand collection to an event or the next launch. Fold the design this way and, even as your scheduled job count grows, the total wait time stops growing with it. After I made this change, the "calls that only check whether a thing has finished" visibly thinned out of my nightly logs.
+
+## Where to stop folding
+
+Consolidation is a means, not an end. Routing every call through the adapter is not always right.
+
+Worth folding in are calls that **run repeatedly, need instrumentation, and may have their model swapped.** Nearly all scheduled jobs land here. Conversely, a one-off investigation script you write and throw away on the spot does not need to pass through the adapter. The front door you own is for code that lives long.
+
+My rule is plain: "Will I touch this code again in six months?" If I think I will, it goes through the adapter. If I think I won't, it stays a direct call. Deciding consolidation by the lifespan of my own code rather than the novelty of a feature — that, I believe, is the best brake against scattering all over again.
+
+Folding entry points into one is the work of embedding a handoff note to your future self into the code itself. Start by routing the safest, idempotent path through the front door. The feel of that one path's logs lining up cleanly becomes solid footing for the next.

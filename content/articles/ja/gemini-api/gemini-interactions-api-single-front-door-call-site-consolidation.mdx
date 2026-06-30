@@ -1,0 +1,202 @@
+---
+title: "散らばった呼び出し口を一つに畳む — Interactions API を自動運用の正面玄関にする移行設計"
+slug: "gemini-interactions-api-single-front-door-call-site-consolidation"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-06-30T16:30"
+author: "Gemini Lab"
+description: "Interactions API の一般提供で、Gemini の呼び出しが一つの入り口に寄せられるようになりました。generateContent・Batch・自前エージェントループに散らばった呼び出し口を、壊さずに正面玄関へ畳んでいく移行設計を、薄いアダプタ層の実装とともに整理します。"
+tags: ["gemini-api", "interactions-api", "architecture", "migration", "automation", "observability"]
+highlights:
+  - "散らばった呼び出し口を一つのアダプタ層へ寄せる、壊さない段階移行の順序と判断基準"
+  - "idempotency key・1か所の計装・モデル差し替えを正面玄関に集約する実装パターン（動くPythonアダプタ付き）"
+  - "background 実行を前提にした、結果待ちループを畳むための設計と、移行中の二重計上を避ける運用注意点"
+---
+
+定期実行のジョブが二十数本まで増えたあたりで、私は自分のコードの「入り口」がいつの間にか四種類に分かれていることに気づきました。記事の下調べは `generateContent` を直接叩き、夜間の一括処理は Batch、App Store レビューの要約は自前で組んだエージェントループ、画像まわりは別のヘルパー。どれも当時は最短だった選び方なのですが、半年ぶりに一本のジョブを直そうとして、まずどの入り口を使っていたかを思い出すところから始める羽目になりました。
+
+6月30日に Interactions API が一般提供となり、Gemini のモデルとエージェントを扱う主要な入り口がここへ寄せられました。Managed Agents、バックグラウンド実行、Gemini Omni も同じ入り口の下に並びます。これは派手な新機能というより、地味に、しかし長く効く種類の更新だと感じています。呼び出し口が一本化されるということは、半年後の自分が「どこから呼んでいたか」を思い出さなくてよくなる、ということだからです。
+
+この記事は、新規に一本のスクリプトを書く話ではありません。すでに動いている散らばった呼び出し口を、止めずに、壊さずに、一つの正面玄関へ畳んでいくための移行設計です。動くアダプタ層のコードと、移行の順序、そして移行中だからこそ起きる事故の避け方までを扱います。
+
+## 入り口が散らばると、何が高くつくのか
+
+呼び出し口が増えること自体は、最初は痛みを生みません。痛むのは半年後です。具体的には三つの形で表に出てきます。
+
+一つ目は、計装の重複です。トークン消費の記録、失敗時のリトライ、タイムアウトの扱いを、入り口ごとに少しずつ違う形で書いてしまう。私の場合、リトライ回数の上限が `generateContent` 経路では3回、Batch 経路では設定し忘れて無制限、という不揃いを後から見つけました。コストの異常に気づくのが遅れる典型です。
+
+二つ目は、モデルの差し替えが一度で終わらないことです。`gemini-flash-latest` が 3.5 Flash の実体になったとき、私は四つの入り口を別々に直す必要がありました。一か所直すたびに、本当に全部直したか不安になる。これは数の問題ではなく、変更の影響範囲が見えないことの問題です。
+
+三つ目は、新しい運用形態に乗り換えにくいことです。バックグラウンド実行で「投げて、終わったら受け取る」形にしたくても、入り口が散らばっていると、どの経路から書き換えればよいかの当たりがつきません。
+
+一本化の本質的な利点は、これら三つが「一か所を直せば済む」状態に変わることです。Interactions API はその受け皿になりますが、いきなり全部を載せ替える必要はありません。間に薄い層を一枚挟むのが、私の見つけた最も安全なやり方でした。
+
+## 正面玄関は API ではなく、自分のアダプタ層に置く
+
+ここが、この記事で最もお伝えしたい判断です。一本化の正面玄関を Interactions API そのものに直接置くのではなく、自分が所有する薄いアダプタ層に置きます。
+
+理由は単純で、API の細部は今後も変わるからです。6月6日にレガシーの `outputs` スキーマが削除されたように、スキーマや引数は廃止期限とともに動きます。アプリ側のコードが API の細部を直接握っていると、その変更のたびに全ジョブを触ることになります。間にアダプタを一枚挟んでおけば、変わるのはアダプタの内側だけです。
+
+アダプタが提供するのは、たった一つの入り口です。「何をしてほしいか」を渡すと、「結果」が返る。その内側で Interactions API を呼びます。
+
+```python
+# llm_gateway.py — 自分が所有する唯一の正面玄関
+import os
+import time
+import uuid
+import logging
+from dataclasses import dataclass, field
+from typing import Any
+
+from google import genai  # 実体の呼び出しはこの内側だけに閉じ込める
+
+log = logging.getLogger("llm_gateway")
+_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+# モデル選択を一か所に集約する。差し替えはここだけを直す。
+MODEL_BY_TIER = {
+    "fast": "gemini-flash-latest",      # 下調べ・前処理・分類
+    "deep": "gemini-3-pro",             # 推論が要る本処理
+}
+
+@dataclass
+class Request:
+    task: str                            # 何をしてほしいか（プロンプト本体）
+    tier: str = "fast"                   # fast / deep
+    idempotency_key: str = field(default_factory=lambda: uuid.uuid4().hex)
+    background: bool = False             # 長時間処理は投げて後で受け取る
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class Result:
+    text: str
+    model: str
+    usage: dict[str, int]
+    idempotency_key: str
+
+def run(req: Request, *, max_retries: int = 3) -> Result:
+    """全ジョブが通る唯一の入り口。計装・リトライ・モデル選択をここに集約する。"""
+    model = MODEL_BY_TIER[req.tier]
+    started = time.monotonic()
+    last_err: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            # ↓ ここが API 依存の唯一の点。細部が変わってもこの関数の外には漏らさない。
+            resp = _client.interactions.create(
+                model=model,
+                input=req.task,
+                # 同じ idempotency_key の再送は重複課金・重複実行を防ぐ
+                idempotency_key=req.idempotency_key,
+                background=req.background,
+            )
+            usage = {
+                "input": resp.usage.input_tokens,
+                "output": resp.usage.output_tokens,
+            }
+            _record(req, model, usage, time.monotonic() - started, attempt)
+            return Result(
+                text=resp.output_text,
+                model=model,
+                usage=usage,
+                idempotency_key=req.idempotency_key,
+            )
+        except Exception as err:  # 実運用では型を絞る
+            last_err = err
+            wait = min(2 ** attempt, 30)
+            log.warning("run failed (attempt %d/%d): %s — retry in %ss",
+                        attempt, max_retries, err, wait)
+            time.sleep(wait)
+
+    _record(req, model, {}, time.monotonic() - started, max_retries, failed=True)
+    raise RuntimeError(f"llm_gateway.run exhausted retries") from last_err
+
+def _record(req, model, usage, elapsed, attempts, *, failed=False):
+    # 計装も一か所だけ。コスト集計・遅延監視はこのログを読めば済む。
+    log.info("llm_call key=%s model=%s tier=%s in=%s out=%s elapsed=%.2f attempts=%d failed=%s job=%s",
+             req.idempotency_key, model, req.tier,
+             usage.get("input"), usage.get("output"),
+             elapsed, attempts, failed, req.metadata.get("job", "-"))
+```
+
+注意していただきたいのは、`_client.interactions.create(...)` の引数名は提供時点のドキュメントで確認すべき箇所だということです。GA で引数は安定方向に向かいますが、ここを直接アプリに散らさないという設計そのものが、その不確実性に対する保険になります。アダプタの外側のコードは `run(Request(...))` しか知りません。
+
+このアダプタを置いた瞬間に、先ほどの三つの痛みが消えます。計装は `_record` の一か所。モデル差し替えは `MODEL_BY_TIER` の一か所。リトライ上限は `run` の引数一か所。どれも、もう探し回らなくてよくなります。
+
+## 壊さずに畳む — 移行の順序
+
+既存のジョブを一斉に書き換えるのは、最も事故が起きやすいやり方です。私は次の順で進めました。リスクの低い経路から始め、各段で本番のログを一晩観察してから次へ進みます。
+
+1. **読み取り専用・冪等な経路から**：分類や要約のように、同じ入力なら同じ出力でよく、失敗しても再実行が安全なジョブを最初にアダプタへ寄せます。私の場合は壁紙の自動分類でした。万一おかしくなっても被害が小さく、`idempotency_key` の効き目も確認できます。
+2. **計装の差を埋める**：アダプタ経由の呼び出しと、まだ直していない直叩きの呼び出しを、ログのフィールドで区別できるようにします。`metadata={"job": "...", "via": "gateway"}` のような印を付けておくと、移行の進捗が「ログ上で何割がゲートウェイ経由か」で測れます。
+3. **書き込み・課金が絡む経路**：Stripe の精算と突き合わせる処理など、二重実行が実害になる経路を次に移します。ここで `idempotency_key` が本領を発揮します。同じキーでの再送は重複実行になりません。
+4. **長時間処理を background へ**：最後に、Batch や自前ループで「結果待ち」をしていた経路を、`background=True` に切り替えます。投げて、終わったら受け取る形へ畳むのはこの段です。
+
+この順序の肝は、各段が独立して価値を持つことです。途中で手が止まっても、そこまでの経路は確実に楽になっています。「全部やり切らないと意味がない」移行は、忙しい個人開発では高い確率で頓挫します。
+
+## 移行中だからこそ起きる事故 — 二重計上を避ける
+
+一本化の途中には、新旧二つの経路が並走する期間が必ずあります。この期間に固有の事故が、コストとメトリクスの二重計上です。
+
+私が一度やったのは、アダプタ側で `usage` を記録しているのに、移行前の直叩き経路に残っていた古い計測コードも生きていて、同じ呼び出しが二か所で数えられていた、という状態でした。月次のトークン集計が実際の請求と合わず、原因を探すのに半日かかりました。
+
+避け方は二つあります。一つは、計測を**アダプタの内側だけに集約し、直叩き経路の古い計測は移行と同時に消すこと**。もう一つは、それが難しい移行初期には、アダプタ経由のログに必ず `via=gateway` の印を付け、集計時に経路で重複排除できるようにしておくことです。
+
+```python
+# 集計側：経路の印で二重計上を防ぐ
+def aggregate(log_rows):
+    seen = set()
+    total_in = total_out = 0
+    for row in log_rows:
+        key = row["idempotency_key"]
+        if key in seen:        # 同じ呼び出しは一度だけ数える
+            continue
+        seen.add(key)
+        total_in += row.get("input") or 0
+        total_out += row.get("output") or 0
+    return {"input": total_in, "output": total_out, "calls": len(seen)}
+```
+
+`idempotency_key` を計測の主キーにしておくと、新旧どちらの経路を通った記録でも、同じ呼び出しは一度しか数えられません。一本化の正面玄関でこのキーを必ず発行する、という規律が、移行期の集計を守ってくれます。
+
+## バックグラウンド実行を前提に、結果待ちループを畳む
+
+最後の段で触れた background 実行について、もう少し具体的に書きます。
+
+定期実行で長時間処理を回すとき、これまでは「投げてから、一定間隔で終わったか問い合わせる」ポーリングを書いていました。空振りの問い合わせが積み重なり、無駄な呼び出しになります。background 実行とイベント通知を前提にすると、この待ちのループ自体を消せます。
+
+アダプタの `run` は `background=True` のとき、結果ではなくハンドル（後で結果を引き取るための識別子）を返す設計にします。受け取りは別の経路――Webhook なり、次回のジョブ起動時の引き取りなり――に分けます。
+
+```python
+@dataclass
+class Handle:
+    operation_id: str
+    idempotency_key: str
+
+def submit(req: Request) -> Handle:
+    """長時間処理を投げて、待たずに帰る。結果は後で collect() で引き取る。"""
+    req.background = True
+    resp = _client.interactions.create(
+        model=MODEL_BY_TIER[req.tier],
+        input=req.task,
+        idempotency_key=req.idempotency_key,
+        background=True,
+    )
+    log.info("submit key=%s op=%s job=%s", req.idempotency_key,
+             resp.operation_id, req.metadata.get("job", "-"))
+    return Handle(operation_id=resp.operation_id,
+                  idempotency_key=req.idempotency_key)
+```
+
+ここで大切なのは、待ちのループを「短くする」のではなく「消す」ことです。短くすると、結局どこかで間隔の調整という終わらないチューニングが始まります。投げた事実と引き取りの責務を分け、引き取りはイベントか次回起動に委ねる。設計をこう畳むと、定期実行の本数が増えても、待ち時間の総量が増えなくなります。私自身、ここを変えてから、夜間ジョブの「終わったかどうか確認するだけの呼び出し」がログから目に見えて減りました。
+
+## どこまで畳むべきか、という線引き
+
+一本化は目的ではなく手段です。全ての呼び出しをアダプタへ寄せるのが常に正しいわけではありません。
+
+寄せる価値が高いのは、**繰り返し動く・計装が要る・モデルを差し替える可能性がある**呼び出しです。定期実行のジョブはほぼ全てここに入ります。逆に、一度きりの調査でその場で書き捨てるスクリプトまでアダプタに通す必要はありません。所有する正面玄関は、長く生きるコードのためのものです。
+
+私の基準は素朴で、「このコードは半年後に自分がまた触るか」です。触ると思えば、アダプタを通します。触らないと思えば、直叩きのままにします。一本化の判断を、機能の新しさではなく、自分のコードの寿命で決める。これが、散らばりを繰り返さないための一番の歯止めだと考えています。
+
+入り口を一つに畳むのは、半年後の自分への引き継ぎ書を、コードそのものに埋め込む作業です。まずは一番安全な、冪等な一本から正面玄関を通してみてください。その一本のログがきれいに揃った手応えが、次の一本への確かな足場になります。
