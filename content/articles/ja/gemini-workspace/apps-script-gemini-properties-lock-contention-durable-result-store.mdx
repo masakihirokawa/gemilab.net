@@ -1,0 +1,209 @@
+---
+title: "複数のトリガーが同時に書き込むと Gemini の結果が静かに消える — Apps Script の Properties 競合を畳む保管設計"
+slug: "apps-script-gemini-properties-lock-contention-durable-result-store"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-07-01T05:00"
+author: "Gemini Lab"
+description: "Apps Script で Gemini の結果を複数のトリガーから保管すると、read-modify-write の競合と PropertiesService の容量制限で書き込みが静かに失われます。LockService と耐久シンク、冪等キーで取りこぼさない保管層を設計します。"
+tags: ["Apps Script", "Gemini API", "LockService", "PropertiesService", "Google Workspace"]
+highlights:
+  - "PropertiesService の 9KB/値・500KB 総量制限と read-modify-write 競合で、Gemini の結果が上書きされて消える仕組みを再現コードで示します"
+  - "LockService.getScriptLock の waitLock 予算とロック粒度の決め方を、取りこぼす失敗例つきで整理します"
+  - "大きな出力を Drive へ逃がし、冪等キーで二重適用を止める保管層の完全な Apps Script コードを掲載します"
+---
+
+ある朝、Gemini に夜間生成させた要約を Apps Script でスプレッドシートへ書き戻す処理を見直していたところ、3 件動いたはずのジョブのうち 1 件分だけが、状態ストアから抜け落ちていました。エラーログには何も残っていません。実行履歴を見ると、2 つの時間主導トリガーがほぼ同じ秒に発火していました。これは個人開発でいくつもの自動化を並行させていると、いつか必ず踏む種類の落とし穴です。
+
+原因は Gemini でも Apps Script のバグでもなく、私自身が書いた「読んで、足して、書き戻す」というありふれた更新処理にありました。今回は、その更新がなぜ静かに壊れるのかを再現し、`LockService` と耐久シンク、冪等キーで取りこぼさない保管層を組み立てていきます。
+
+## なぜ消えるのか：read-modify-write の競合
+
+まず、よくある「結果を 1 つの JSON にまとめて保存する」コードを見てください。
+
+```javascript
+function appendResultNaive(jobId, text) {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty('results') || '{}';
+  const map = JSON.parse(raw);   // (A) 読む
+  map[jobId] = text;             // (B) 足す
+  props.setProperty('results', JSON.stringify(map)); // (C) 書き戻す
+}
+```
+
+1 つのトリガーだけが動いている限り、これは正しく動きます。問題は、2 つのトリガーが (A) をほぼ同時に実行したときです。両方とも「`jobId` がまだ入っていない同じ map」を読み込み、それぞれ自分の結果を足し、それぞれ (C) で書き戻します。後から (C) に到達した実行が、先に書かれた結果を丸ごと上書きします。これがいわゆる lost update（更新の喪失）で、消えたほうのジョブは例外も出さずに無かったことになります。
+
+Apps Script は 1 実行のなかでは単一スレッドですが、トリガーや並行実行は別プロセスとして同時に走り得ます。`PropertiesService` は「読み」と「書き」の間を守ってくれないので、この隙間が競合の入り口になります。
+
+## PropertiesService の制限を直視する
+
+競合を直す前に、そもそも何を `PropertiesService` に入れてよいのかを押さえておきます。プロパティストアには明確な上限があり、これを超えると `setProperty` は例外で弾かれます。
+
+<table>
+<thead>
+<tr><th>ストア</th><th>1 値の上限</th><th>総量の上限</th><th>主な用途</th></tr>
+</thead>
+<tbody>
+<tr><td>PropertiesService</td><td>約 9 KB</td><td>約 500 KB</td><td>小さな調整状態・フラグ・インデックス</td></tr>
+<tr><td>CacheService</td><td>約 100 KB</td><td>（揮発・最長 6 時間）</td><td>読み出しを速くするホットキャッシュ</td></tr>
+<tr><td>Drive / Spreadsheet</td><td>実質的に大きい</td><td>大きい</td><td>本文そのものを置く耐久シンク</td></tr>
+</tbody>
+</table>
+
+Gemini の生成結果は、要約程度でも数 KB、本文を含めれば 9 KB を平気で超えます。つまり「結果本文を `PropertiesService` に直接ためる」設計は、競合以前に容量で破綻します。実際に値のサイズを測ってから入れるなら、こう確認できます。
+
+```javascript
+function fitsInProperty_(text) {
+  const bytes = Utilities.newBlob(text).getBytes().length;
+  return bytes < 9 * 1024;  // 9KB 未満なら 1 値に収まる
+}
+```
+
+ここから導かれる原則はひとつです。`PropertiesService` には「どのジョブが、どこに、いつ書かれたか」という小さなインデックスだけを置き、結果本文は別の耐久シンクへ逃がします。
+
+## LockService でクリティカルセクションを囲う
+
+インデックスの更新は read-modify-write なので、ここを直列化します。Apps Script の `LockService` には 3 種類のロックがあり、守りたい範囲で使い分けます。
+
+<table>
+<thead>
+<tr><th>ロック</th><th>排他の範囲</th><th>向いている場面</th></tr>
+</thead>
+<tbody>
+<tr><td>getScriptLock</td><td>スクリプト全体（全ユーザー・全トリガー）</td><td>共有インデックスの更新</td></tr>
+<tr><td>getUserLock</td><td>実行ユーザー単位</td><td>ユーザーごとに独立した状態</td></tr>
+<tr><td>getDocumentLock</td><td>バインドされた 1 ドキュメント単位</td><td>同じシートへの書き込み</td></tr>
+</tbody>
+</table>
+
+時間主導トリガーは多くの場合スクリプトオーナー権限で動くため、トリガー同士の競合を止めたいなら `getScriptLock` が素直です。要点は `waitLock` の予算で、取得できなければ例外を投げます。
+
+```javascript
+function withScriptLock_(fn) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(25 * 1000);  // 25 秒だけ待つ。6 分の実行枠に余裕を残す
+  } catch (e) {
+    throw new Error('lock_timeout');  // 取れなければ上位でリトライ判断
+  }
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();  // 例外時も必ず解放する
+  }
+}
+```
+
+ここで `waitLock` の時間を欲張って 6 分近くにすると、ロック待ちだけで実行枠を食い潰し、肝心の Gemini 呼び出しや書き込みに時間が残りません。私はクリティカルセクションを「インデックスの読み書きだけ」に絞り、Gemini の呼び出しや Drive への書き込みはロックの外で済ませる形にしています。ロックの中に重い I/O を入れないことが、待ち時間の連鎖を防ぐいちばんの近道です。
+
+## 大きな出力を Drive へ逃がす
+
+結果本文は `PropertiesService` ではなく、耐久シンクへ書きます。ここでは Drive のテキストファイルを使い、同じジョブの再実行でファイルが増殖しないよう、名前で上書きします。
+
+```javascript
+const SINK_FOLDER_ID = 'YOUR_DRIVE_FOLDER_ID';
+
+function writeSink_(jobId, text) {
+  const folder = DriveApp.getFolderById(SINK_FOLDER_ID);
+  const name = 'result_' + jobId + '.txt';
+  const it = folder.getFilesByName(name);
+  if (it.hasNext()) {
+    const f = it.next();
+    f.setContent(text);       // 既存を上書き（増殖させない）
+    return f.getId();
+  }
+  return folder.createFile(name, text, MimeType.PLAIN_TEXT).getId();
+}
+```
+
+読み出しを速くしたい場合は、`CacheService` をホットパスに足します。ただしキャッシュは揮発し、最長でも 6 時間で消えるため、正本は必ず Drive 側に置きます。キャッシュはあくまで「Drive を読みに行く回数を減らす」ための層です。
+
+```javascript
+function readResult(jobId, index) {
+  const cache = CacheService.getScriptCache();
+  const hot = cache.get('res_' + jobId);
+  if (hot) return hot;
+
+  const entry = index[jobId];
+  if (!entry) return null;
+
+  const text = DriveApp.getFileById(entry.fileId).getBlob().getDataAsString();
+  if (text.length < 90 * 1024) {        // 100KB の手前で保持
+    cache.put('res_' + jobId, text, 3600); // 1 時間だけホット
+  }
+  return text;
+}
+```
+
+## 冪等キーで二重適用を止める
+
+トリガーは「念のため」二重に発火したり、失敗してリトライされたりします。同じジョブが 2 回保存されても結果が変わらないよう、冪等キーを持たせます。これは、入力（プロンプト＋モデル ID＋対象データのハッシュ）から決まる文字列にしておくと扱いやすいです。
+
+```javascript
+function idempotencyKey_(prompt, modelId, sourceText) {
+  const seed = modelId + '|' + prompt + '|' + sourceText;
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    seed,
+    Utilities.Charset.UTF_8
+  );
+  return digest.map(b => ((b & 0xff) + 0x100).toString(16).slice(1)).join('');
+}
+```
+
+保存時に「同じ `jobId` で同じ冪等キーが既にインデックスにある」なら、書かずに既存の `fileId` を返します。これで、何度トリガーが暴れても適用は 1 回だけに収束します。
+
+## まとめて保管層にする：DurableResultStore
+
+ここまでの部品を 1 つの保存関数にまとめます。クリティカルセクションは「インデックスの読み書き」だけで、Gemini 呼び出しと Drive 書き込みは外で済ませている点に注目してください。
+
+```javascript
+const INDEX_KEY = 'job_index_v1';
+
+function saveResult(jobId, idemKey, text) {
+  // 重い I/O はロックの外で先に済ませる
+  const fileId = writeSink_(jobId, text);
+
+  return withScriptLock_(() => {
+    const props = PropertiesService.getScriptProperties();
+    const index = JSON.parse(props.getProperty(INDEX_KEY) || '{}');
+
+    const existing = index[jobId];
+    if (existing && existing.idem === idemKey) {
+      return existing.fileId;   // 冪等: 二重適用を回避
+    }
+
+    index[jobId] = {
+      idem: idemKey,
+      fileId: fileId,
+      len: text.length,
+      at: new Date().toISOString(),
+    };
+    assertIndexSize_(index);    // 500KB に触れる前に弾く
+    props.setProperty(INDEX_KEY, JSON.stringify(index));
+    return fileId;
+  });
+}
+
+function assertIndexSize_(index) {
+  const bytes = Utilities.newBlob(JSON.stringify(index)).getBytes().length;
+  if (bytes > 450 * 1024) {     // 500KB の手前を警告域にする
+    throw new Error('index_near_limit:' + bytes); // 完了ジョブの剪定が必要
+  }
+}
+```
+
+`writeSink_` をロックの外に出しているのは意図的です。Drive への書き込みは数百ミリ秒かかることがあり、これをロック内に入れると、待っている側のトリガーがその分だけ実行枠を削られます。本文を先に書いてしまえば、ロック内に残るのは小さな JSON の更新だけになり、クリティカルセクションは一瞬で終わります。
+
+インデックスは放っておくと 500 KB の壁に近づきます。完了して読み出し済みのジョブは、定期的にインデックスから外し、本文ファイルだけ Drive に残す運用にしておくと、`assertIndexSize_` が火を噴く前に余裕を保てます。私の場合は、保持期間を過ぎたエントリを 1 日 1 回まとめて剪定する小さなトリガーを別に置いています。
+
+## 運用していて効いた小さな判断
+
+`getScriptLock` を入れたあとも、最初は `waitLock` を長めに取っていて、ロック待ちのタイムアウトが時々出ていました。待ち時間を 25 秒に絞り、クリティカルセクションから重い I/O を追い出したところ、タイムアウトはほとんど見なくなりました。ロックは「短く持って早く返す」ほど競合に強くなります。
+
+もう 1 つは、冪等キーを入力のハッシュにしたことです。トリガー側で一意な ID を採番する方式も試しましたが、リトライ時に新しい ID が振られてしまい、同じ生成が二重に保存される事故が起きました。入力から決まるキーにすると、リトライしても同じキーに落ち着くので、二重適用が自然に止まります。
+
+## 次の一歩
+
+まずは手元の Apps Script で、`appendResultNaive` のような read-modify-write を 1 か所だけ `withScriptLock_` で囲ってみてください。トリガーが重なったときに消えていた結果が残るようになる手応えが、いちばん早く確かめられる変化です。そこから、本文を Drive へ逃がす保管層へ広げていくと、夜間に動く自動化が静かに崩れる不安をひとつ減らせます。

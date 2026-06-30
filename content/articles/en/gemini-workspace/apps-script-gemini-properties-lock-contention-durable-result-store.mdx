@@ -1,0 +1,209 @@
+---
+title: "When Two Triggers Write at Once, Your Gemini Result Quietly Vanishes — A Durable Result Store for Apps Script"
+slug: "apps-script-gemini-properties-lock-contention-durable-result-store"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-07-01T05:00"
+author: "Gemini Lab"
+description: "Storing Gemini results from several Apps Script triggers loses writes through read-modify-write races and PropertiesService size limits. Build a result store that survives, using LockService, a durable sink, and idempotency keys."
+tags: ["Apps Script", "Gemini API", "LockService", "PropertiesService", "Google Workspace"]
+highlights:
+  - "Reproduce how PropertiesService's 9KB-per-value and 500KB-total limits plus read-modify-write races silently overwrite a Gemini result"
+  - "Size LockService.getScriptLock with a sensible waitLock budget and pick the right lock granularity, shown with the failure cases"
+  - "Ship a complete Apps Script store that offloads large output to Drive and blocks double-apply with an idempotency key"
+---
+
+One morning I was reviewing an Apps Script job that wrote Gemini's overnight summaries back into a spreadsheet, and one of three jobs that had clearly run was simply missing from the state store. No error in the logs. The execution history showed two time-driven triggers firing within the same second. If you run several automations in parallel as an indie developer, this is the kind of trap you eventually step on.
+
+The cause was neither Gemini nor an Apps Script bug. It was the ordinary "read, add, write back" update I had written myself. Here I'll reproduce why that update quietly breaks, then build a result store that survives concurrent triggers using `LockService`, a durable sink, and an idempotency key.
+
+## Why it disappears: the read-modify-write race
+
+Start with the common pattern of keeping all results in one JSON blob.
+
+```javascript
+function appendResultNaive(jobId, text) {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty('results') || '{}';
+  const map = JSON.parse(raw);   // (A) read
+  map[jobId] = text;             // (B) add
+  props.setProperty('results', JSON.stringify(map)); // (C) write back
+}
+```
+
+As long as only one trigger runs, this is fine. The trouble starts when two triggers reach (A) at nearly the same time. Both read the *same* map that does not yet contain `jobId`, each adds its own result, and each writes back at (C). Whichever execution reaches (C) last overwrites the result written first. That is a classic lost update, and the losing job vanishes without raising anything.
+
+Apps Script is single-threaded within one execution, but triggers and concurrent runs execute as separate processes that can overlap. `PropertiesService` does nothing to protect the gap between your read and your write, and that gap is where the race lives.
+
+## Look the PropertiesService limits in the eye
+
+Before fixing the race, settle what belongs in `PropertiesService` at all. The property store has firm ceilings, and crossing them makes `setProperty` throw.
+
+<table>
+<thead>
+<tr><th>Store</th><th>Per-value limit</th><th>Total limit</th><th>Best used for</th></tr>
+</thead>
+<tbody>
+<tr><td>PropertiesService</td><td>~9 KB</td><td>~500 KB</td><td>Small coordination state, flags, an index</td></tr>
+<tr><td>CacheService</td><td>~100 KB</td><td>(volatile, up to 6 hours)</td><td>A hot cache to speed up reads</td></tr>
+<tr><td>Drive / Spreadsheet</td><td>Effectively large</td><td>Large</td><td>A durable sink for the payload itself</td></tr>
+</tbody>
+</table>
+
+A Gemini result is several KB even for a summary, and easily over 9 KB once it includes body text. So "accumulate the result body directly in PropertiesService" breaks on size before it ever races. If you want to measure a value before storing it:
+
+```javascript
+function fitsInProperty_(text) {
+  const bytes = Utilities.newBlob(text).getBytes().length;
+  return bytes < 9 * 1024;  // under 9KB fits in one value
+}
+```
+
+That leads to one principle: keep only a small index — which job, where, and when — in `PropertiesService`, and push the result body to a separate durable sink.
+
+## Wrap the critical section in LockService
+
+The index update is a read-modify-write, so serialize it. Apps Script's `LockService` offers three locks; pick by the scope you need to protect.
+
+<table>
+<thead>
+<tr><th>Lock</th><th>Mutual-exclusion scope</th><th>Good for</th></tr>
+</thead>
+<tbody>
+<tr><td>getScriptLock</td><td>The whole script (all users, all triggers)</td><td>Updating a shared index</td></tr>
+<tr><td>getUserLock</td><td>Per executing user</td><td>State that is independent per user</td></tr>
+<tr><td>getDocumentLock</td><td>The single bound document</td><td>Writes to the same sheet</td></tr>
+</tbody>
+</table>
+
+Time-driven triggers usually run as the script owner, so `getScriptLock` is the natural choice when you want to stop triggers from colliding with each other. The key is the `waitLock` budget — it throws if the lock cannot be acquired in time.
+
+```javascript
+function withScriptLock_(fn) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(25 * 1000);  // wait only 25s, leaving room in the 6-min budget
+  } catch (e) {
+    throw new Error('lock_timeout'); // let the caller decide to retry
+  }
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();  // always release, even on error
+  }
+}
+```
+
+If you get greedy and set `waitLock` close to six minutes, lock-waiting alone eats the execution budget and leaves no time for the actual Gemini call or the write. I keep the critical section to "reading and writing the index only," and do the Gemini call and the Drive write outside the lock. Keeping heavy I/O out of the lock is the surest way to avoid a pile-up of waiters.
+
+## Offload large output to Drive
+
+The result body goes to a durable sink, not `PropertiesService`. Here I use a Drive text file and overwrite by name so a re-run of the same job does not spawn duplicate files.
+
+```javascript
+const SINK_FOLDER_ID = 'YOUR_DRIVE_FOLDER_ID';
+
+function writeSink_(jobId, text) {
+  const folder = DriveApp.getFolderById(SINK_FOLDER_ID);
+  const name = 'result_' + jobId + '.txt';
+  const it = folder.getFilesByName(name);
+  if (it.hasNext()) {
+    const f = it.next();
+    f.setContent(text);       // overwrite the existing one
+    return f.getId();
+  }
+  return folder.createFile(name, text, MimeType.PLAIN_TEXT).getId();
+}
+```
+
+To speed up reads, add `CacheService` as a hot path. But the cache is volatile and disappears within six hours at most, so the source of truth always stays in Drive. The cache only exists to cut how often you go back to Drive.
+
+```javascript
+function readResult(jobId, index) {
+  const cache = CacheService.getScriptCache();
+  const hot = cache.get('res_' + jobId);
+  if (hot) return hot;
+
+  const entry = index[jobId];
+  if (!entry) return null;
+
+  const text = DriveApp.getFileById(entry.fileId).getBlob().getDataAsString();
+  if (text.length < 90 * 1024) {          // stay under the 100KB ceiling
+    cache.put('res_' + jobId, text, 3600); // hot for one hour
+  }
+  return text;
+}
+```
+
+## Stop double-apply with an idempotency key
+
+Triggers fire twice "just in case," or fail and get retried. So the same job saving twice must not change the outcome — give it an idempotency key. A string derived from the input (prompt + model ID + a hash of the source data) is easy to work with.
+
+```javascript
+function idempotencyKey_(prompt, modelId, sourceText) {
+  const seed = modelId + '|' + prompt + '|' + sourceText;
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    seed,
+    Utilities.Charset.UTF_8
+  );
+  return digest.map(b => ((b & 0xff) + 0x100).toString(16).slice(1)).join('');
+}
+```
+
+On save, if the same `jobId` already carries the same idempotency key in the index, return the existing `fileId` without writing. However many times the triggers misbehave, the apply converges to exactly once.
+
+## Pull it together: DurableResultStore
+
+Here are the parts assembled into one save function. Notice that the critical section is only "read and write the index," with the Gemini call and the Drive write done outside it.
+
+```javascript
+const INDEX_KEY = 'job_index_v1';
+
+function saveResult(jobId, idemKey, text) {
+  // do the heavy I/O before taking the lock
+  const fileId = writeSink_(jobId, text);
+
+  return withScriptLock_(() => {
+    const props = PropertiesService.getScriptProperties();
+    const index = JSON.parse(props.getProperty(INDEX_KEY) || '{}');
+
+    const existing = index[jobId];
+    if (existing && existing.idem === idemKey) {
+      return existing.fileId;   // idempotent: avoid double-apply
+    }
+
+    index[jobId] = {
+      idem: idemKey,
+      fileId: fileId,
+      len: text.length,
+      at: new Date().toISOString(),
+    };
+    assertIndexSize_(index);    // reject before touching 500KB
+    props.setProperty(INDEX_KEY, JSON.stringify(index));
+    return fileId;
+  });
+}
+
+function assertIndexSize_(index) {
+  const bytes = Utilities.newBlob(JSON.stringify(index)).getBytes().length;
+  if (bytes > 450 * 1024) {     // treat just under 500KB as a warning zone
+    throw new Error('index_near_limit:' + bytes); // prune completed jobs
+  }
+}
+```
+
+Putting `writeSink_` outside the lock is deliberate. A Drive write can take a few hundred milliseconds, and holding the lock across it would steal that much execution budget from the waiting trigger. Write the body first, and all that remains inside the lock is a small JSON update that finishes in an instant.
+
+Left alone, the index drifts toward the 500 KB wall. Once a job has completed and been read, drop it from the index while keeping only its body file in Drive, and you stay clear before `assertIndexSize_` ever fires. In my own setup at Dolice Labs, a separate small trigger prunes expired entries once a day.
+
+## Small judgments that paid off
+
+Even after adding `getScriptLock`, I initially set `waitLock` long and saw occasional lock-wait timeouts. Cutting the wait to 25 seconds and evicting heavy I/O from the critical section made the timeouts nearly disappear. The shorter you hold a lock, the better it tolerates contention.
+
+The other one was deriving the idempotency key from the input hash. I also tried minting a unique ID on the trigger side, but retries assigned a fresh ID and the same generation got saved twice. A key determined by the input lands on the same value across retries, so double-apply stops on its own.
+
+## One next step
+
+Take a single read-modify-write in your own Apps Script — something like `appendResultNaive` — and wrap just that one spot in `withScriptLock_`. Watching a result survive when triggers overlap is the fastest way to feel the change. From there, extend it into a store that offloads the body to Drive, and you remove one more way for an overnight automation to fail in silence.
