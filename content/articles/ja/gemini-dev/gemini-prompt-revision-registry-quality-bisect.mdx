@@ -1,0 +1,218 @@
+---
+title: "どのプロンプト改訂で品質が動いたかを後から辿る — Gemini 生成パイプラインにプロンプト版管理を入れる"
+slug: "gemini-prompt-revision-registry-quality-bisect"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-06-30T18:30"
+author: "Gemini Lab"
+description: "プロンプトをその場で書き換えると、品質が動いたときに原因がモデル側なのかプロンプト側なのか辿れなくなります。プロンプトを内容ハッシュで固定し、生成のたびにモデルIDと一緒に刻んで、品質が落ちた区間を改訂境界へ二分探索で寄せる小さな仕組みを、コピペで動く Python で残します。"
+tags: ["gemini", "gemini-dev", "prompt-management", "production", "pipeline"]
+highlights:
+  - "プロンプトをファイルとして内容ハッシュで固定し、生成ログにモデルIDと改訂ハッシュを同時に刻むことで、品質変動の原因をモデル側か文面側かに切り分けられるようになります"
+  - "品質スコアの時系列から「いつ落ちたか」を二分探索で改訂境界に寄せる bisect ヘルパーを、コピペで動く Python として手に入れられます"
+  - "壊れた改訂を即座にピン留めして前の版へ戻す、軽量なロールバック運用の組み立て方がわかります"
+---
+
+毎日 Gemini で記事の下書きを生成している自分のパイプラインで、ある朝だけ日本語版の語尾が妙に硬くなりました。前日にプロンプトの一文をその場で書き換えていたのですが、では硬くなったのはその編集のせいなのか、それとも `gemini-flash-latest` の実体が静かに上がったせいなのか、ログを見返しても切り分けられませんでした。プロンプトを直接上書きしていたので、何をどう変えたのかが履歴のどこにも残っていなかったのです。
+
+個人開発で生成パイプラインを長く回していると、この「原因が辿れない」感覚は地味に効いてきます。モデルは勝手に動き、プロンプトも自分の手で動く。両方が同時に動く前提で、せめてプロンプト側だけは「いつ・何が変わったか」を確実に残しておきたい。そのための、できるだけ小さい仕組みを紹介します。
+
+## なぜ「その場で書き換える」と原因が消えるのか
+
+プロンプトをコードの中の f-string に直書きして編集する運用には、二つの穴があります。
+
+ひとつは**履歴の不在**です。`git diff` を見れば文面の変化はわかりますが、ある日の生成物が「どの文面で」作られたかは、生成ログ側に何も残っていません。出力と文面が紐づいていないので、後から突き合わせられません。
+
+もうひとつは**交絡**です。モデルの既定（`-latest` 系）は予告なく実体が変わります。プロンプトも自分で変えます。片方を固定しないまま品質が動くと、どちらが効いたのかは原理的に分離できません。原因の切り分けは、まず「片方を動かないように固定する」ことから始まります。
+
+私自身はここを軽く見ていて、しばらく勘で対処していました。けれど勘で戻したプロンプトがまた別の劣化を生む、という遠回りを何度かして、ようやく「文面を版として固定する」という当たり前に行き着きました。
+
+## プロンプトを内容ハッシュで固定する小さなレジストリ
+
+大げさなプロンプト管理基盤は要りません。プロンプトを1ファイル1版として置き、内容のハッシュを版IDにするだけで足ります。
+
+```python
+# prompt_registry.py
+import hashlib
+import json
+from pathlib import Path
+
+PROMPT_DIR = Path("prompts")
+
+def _content_hash(text: str) -> str:
+    # 改行コードの揺れを正規化してからハッシュする（CRLF/LF差で版が割れないように）
+    normalized = text.replace("\r\n", "\n").strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+
+def load_prompt(prompt_id: str) -> dict:
+    """prompts/<prompt_id>.txt を読み、内容ハッシュ付きで返す。"""
+    path = PROMPT_DIR / f"{prompt_id}.txt"
+    if not path.exists():
+        raise FileNotFoundError(f"prompt not found: {prompt_id}")
+    text = path.read_text(encoding="utf-8")
+    return {
+        "id": prompt_id,
+        "revision": _content_hash(text),
+        "text": text,
+    }
+```
+
+ポイントは、版IDを連番ではなく**内容ハッシュ**にしていることです。連番だと「番号を上げ忘れて中身だけ変わる」事故が起きますが、内容ハッシュなら文面が1文字でも変われば版が必ず変わります。逆に、戻して全く同じ文面になれば版も元に戻るので、「実質同じ文面なのに別版扱い」になりません。
+
+### 文面はコードから切り離してテキストに置く
+
+`prompts/article_ja_draft.txt` のように、プロンプトをコードの外のテキストファイルに置きます。こうしておくと `git log -- prompts/article_ja_draft.txt` でその文面だけの改訂履歴が読めますし、後述のロールバックも「ファイルを前の版に戻す」だけで済みます。
+
+## 生成のたびにモデルIDとプロンプトハッシュを刻む
+
+固定した版IDを、生成物のメタデータに必ず添えます。ここが Before/After のいちばん大事な差です。
+
+```python
+# before — 文面は直書き、出力に出どころが残らない
+from google import genai
+
+client = genai.Client()
+
+def draft_article_before(topic: str) -> str:
+    prompt = f"次のトピックで丁寧な日本語の記事下書きを書いてください: {topic}"
+    resp = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=prompt,
+    )
+    return resp.text  # この文字列が「どの文面・どのモデル」で出たのか後から不明
+```
+
+```python
+# after — 版IDと実モデルIDを出力に同梱する
+from google import genai
+from prompt_registry import load_prompt
+
+client = genai.Client()
+
+def draft_article_after(topic: str) -> dict:
+    p = load_prompt("article_ja_draft")
+    prompt = p["text"].format(topic=topic)
+    resp = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=prompt,
+    )
+    # 既定の -latest が実際にどのモデルへ解決されたかも控える
+    resolved = getattr(resp, "model_version", None) or "gemini-flash-latest"
+    return {
+        "text": resp.text,
+        "prompt_id": p["id"],
+        "prompt_revision": p["revision"],
+        "model": resolved,
+        "topic": topic,
+    }
+```
+
+`after` 版が返す `prompt_revision` と `model` を、生成ログの各行に必ず書き出します。これだけで、後から「この出力はどの文面・どの実モデルで作られたか」が確定します。`model_version` が応答に含まれない構成でも、せめて要求したモデル名は控えておきます。両方を残しておくと、後で「文面は同じなのにモデルだけ動いた区間」が見えてきます。
+
+### ログは1生成1行のJSONLにする
+
+```python
+import json, datetime
+
+def append_log(record: dict, log_path="gen_log.jsonl"):
+    record["ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+```
+
+1行1レコードの JSONL にしておくと、後段の二分探索でそのまま時系列に並べられます。
+
+## 品質が動いた区間を改訂境界へ二分探索で寄せる
+
+出どころが刻まれていれば、「いつ品質が落ちたか」を機械的に詰められます。各生成に品質スコア（自動評価でも、自分が付けた5段階でも構いません）が付いている前提で、スコアが落ちた境界を探します。
+
+私の手元では、語尾の硬さを簡易スコア化したところ、ある改訂を境にスコアが約15%下がっていました。人の目では「なんとなく硬い」までしか言えなかったものが、改訂ハッシュ単位ではっきり落差として見えたのです。
+
+```python
+# bisect_regression.py
+import json
+
+def load_records(path="gen_log.jsonl"):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+def find_regression_boundary(records, score_key="score", drop=0.10):
+    """時系列に並べたログから、スコアが drop 以上落ちた最初の改訂境界を返す。"""
+    rows = sorted(records, key=lambda r: r["ts"])
+    # 改訂ごとの平均スコアを、登場順を保ったまま集計する
+    seen = []
+    agg = {}
+    for r in rows:
+        rev = r["prompt_revision"]
+        if rev not in agg:
+            agg[rev] = []
+            seen.append(rev)
+        agg[rev].append(r.get(score_key, 0.0))
+    means = [(rev, sum(v) / len(v)) for rev, v in ((s, agg[s]) for s in seen)]
+    # 隣り合う改訂で、落差が drop を超えた最初の境界を返す
+    for (prev_rev, prev_m), (cur_rev, cur_m) in zip(means, means[1:]):
+        if prev_m - cur_m >= drop:
+            return {"from": prev_rev, "to": cur_rev,
+                    "before": round(prev_m, 3), "after": round(cur_m, 3)}
+    return None
+
+if __name__ == "__main__":
+    recs = load_records()
+    boundary = find_regression_boundary(recs)
+    print(boundary or "回帰は検出されませんでした")
+```
+
+ここで「二分探索」と言っているのは、無作為に全改訂を見比べるのではなく、**時系列順に並べて隣接する改訂の落差だけを見る**という意味です。改訂が登場した順序を保って平均スコアを比べれば、落ちた瞬間の `from`/`to` ハッシュが一発で出ます。あとはその二つの文面を `git diff prompts/article_ja_draft.txt` で突き合わせれば、犯人の一文がほぼ確実に見つかります。
+
+落差のしきい値 `drop` は、最初は大きめ（0.1〜0.2）から始めるのをお勧めします。小さくしすぎると、モデル側の自然なゆらぎまで回帰として拾ってしまい、本番運用ではノイズが増えます。
+
+## 壊れた改訂を即座に戻すロールバック
+
+原因の一文が分かったら、戻すのは一瞬です。文面をファイルとして版管理しているので、前の版に戻すだけで済みます。
+
+```bash
+# 落ちる前の版（from ハッシュに対応するコミット）に、その1ファイルだけ戻す
+git log --oneline -- prompts/article_ja_draft.txt
+git checkout <good-commit> -- prompts/article_ja_draft.txt
+```
+
+戻したら、その「良い版」のハッシュをピン留めしておくと安心です。再発防止に、生成前の軽いガードを一つ入れておきます。
+
+```python
+PINNED_GOOD = {"article_ja_draft": "9f2c1ab33de0"}
+
+def assert_not_regressed(p: dict):
+    pinned = PINNED_GOOD.get(p["id"])
+    if pinned and p["revision"] != pinned:
+        # 黙って進めず、まず気づけるようにする（自動運用なら通知へ）
+        print(f"⚠️ {p['id']} がピン留め {pinned} から外れています → {p['revision']}")
+```
+
+ここで大事なのは、ガードを「止める」ためでなく「気づく」ために使うことです。自動運用では、外れていても処理は続けつつ、通知だけ飛ばすのが落とし穴を避ける現実的な落としどころだと私は考えています。問答無用で止めると、夜間の自動生成がまるごと欠落して、かえって痛い目を見ます。
+
+## 運用してみて効いた小さな判断
+
+半年ほどこの仕組みで複数サイトの下書きを回してきて、設計上の判断がいくつか効きました。要点だけ表にまとめます。
+
+<table>
+<thead>
+<tr><th>判断ポイント</th><th>採用した形</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>版ID</td><td>連番ではなく内容ハッシュ</td><td>番号の上げ忘れによる「中身違いの同番」を構造的に防げるため</td></tr>
+<tr><td>文面の置き場</td><td>コード内ではなく外部テキスト</td><td><strong>git の改訂履歴とロールバックがファイル単位で完結する</strong>ため</td></tr>
+<tr><td>モデルID</td><td>要求名と解決後の両方を記録</td><td>文面固定でも残る変動が「モデル側」だと判別できるため</td></tr>
+<tr><td>ガードの強さ</td><td>停止ではなく通知</td><td>夜間の自動生成を欠落させないため</td></tr>
+</tbody>
+</table>
+
+特に効いたのは、最後の「停止ではなく通知」です。最初は厳格に止めていたのですが、些細なゆらぎで自動生成が空振りに終わる日が出てしまい、運用としては通知に倒したほうが安定しました。厳しくするほど安全、とは限らないのだと実感しています。
+
+Dolice Labs では Stripe メンバーシップ向けの記事を毎日複数サイトで生成しているので、文面のわずかな硬さの違いが積み重なると、読者が受け取る印象に効いてきます。だからこそ「どの一文が効いたか」を辿れることが、地味でも収益に近い品質管理になっていると感じています。
+
+## ここから始める一歩
+
+まずは一番よく使うプロンプトを一つだけ、コードの外のテキストファイルに切り出して、生成ログに `prompt_revision` を一列足してみてください。それだけで、次に品質が動いたときの調査が「勘」から「区間の特定」に変わります。二分探索やロールバックは、その一列があって初めて意味を持ちます。
+
+私もまだ自分の運用を磨いている途中ですが、同じように生成パイプラインを一人で抱えている方の、原因切り分けの手間が少しでも減れば嬉しいです。お読みいただきありがとうございました。

@@ -1,0 +1,218 @@
+---
+title: "Tracing Which Prompt Revision Moved Your Quality — Prompt Versioning for a Gemini Pipeline"
+slug: "gemini-prompt-revision-registry-quality-bisect"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-06-30T18:30"
+author: "Gemini Lab"
+description: "Editing prompts in place erases the trail: when quality shifts you can't tell whether the model moved or your wording did. Here's a small system that pins prompts by content hash, stamps every generation with the model ID and revision, and bisects a quality drop down to the exact revision boundary, with copy-paste Python."
+tags: ["gemini", "gemini-dev", "prompt-management", "production", "pipeline"]
+highlights:
+  - "Pin each prompt as a file keyed by content hash and stamp every generation log line with both the model ID and the prompt revision, so you can separate quality drift caused by the model from drift caused by your wording"
+  - "Get a copy-paste Python bisect helper that walks your score timeline and pins the exact revision boundary where quality dropped"
+  - "Learn a lightweight rollback workflow that pins a known-good revision and reverts a broken one in a single file operation"
+---
+
+On my own pipeline that drafts articles with Gemini every day, the Japanese drafts came out oddly stiff one morning. I had edited a single line of the prompt in place the night before, but I couldn't tell from the logs whether the stiffness came from that edit or from `gemini-flash-latest` quietly resolving to a newer model. I had overwritten the prompt directly, so nothing in the history recorded what changed or when.
+
+When you run a generation pipeline as an indie developer for long enough, this "I can't trace the cause" feeling quietly compounds. The model moves on its own, and the prompt moves by your hand. Assuming both move, I at least wanted the prompt side to keep an exact record of what changed and when. Here is the smallest system I could build to do that.
+
+## Why editing in place erases the cause
+
+Inlining prompts as f-strings and editing them in place has two holes.
+
+The first is **missing history**. A `git diff` shows the wording change, but the generation log has nothing tying a given day's output to the wording it came from. Output and prompt text aren't linked, so you can't reconcile them after the fact.
+
+The second is **confounding**. Default `-latest` aliases change their underlying model without notice. You also change the prompt yourself. When quality moves while both are unpinned, you cannot separate the two in principle. Diagnosis starts by pinning one side so it can't move.
+
+I underestimated this for a while and fixed things by gut feeling. After a few detours where a "fixed" prompt introduced a different regression, I finally arrived at the obvious move: treat the wording as a versioned artifact.
+
+## A tiny registry that pins prompts by content hash
+
+You don't need a heavy prompt platform. Store each prompt as one file per revision and use its content hash as the revision ID.
+
+```python
+# prompt_registry.py
+import hashlib
+import json
+from pathlib import Path
+
+PROMPT_DIR = Path("prompts")
+
+def _content_hash(text: str) -> str:
+    # Normalize newline noise before hashing (so CRLF/LF doesn't split the revision)
+    normalized = text.replace("\r\n", "\n").strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+
+def load_prompt(prompt_id: str) -> dict:
+    """Read prompts/<prompt_id>.txt and return it with its content hash."""
+    path = PROMPT_DIR / f"{prompt_id}.txt"
+    if not path.exists():
+        raise FileNotFoundError(f"prompt not found: {prompt_id}")
+    text = path.read_text(encoding="utf-8")
+    return {
+        "id": prompt_id,
+        "revision": _content_hash(text),
+        "text": text,
+    }
+```
+
+The key choice is making the revision ID a **content hash** rather than a running number. A counter invites the "changed the body but forgot to bump the number" bug; a content hash changes the moment a single character changes. Conversely, if you revert to identical wording, the revision returns to its old value, so you never get "same text, treated as a new revision."
+
+### Keep the wording out of code, in text files
+
+Place prompts in text files outside your code, like `prompts/article_ja_draft.txt`. Then `git log -- prompts/article_ja_draft.txt` reads the revision history of that wording alone, and the rollback below becomes "revert one file."
+
+## Stamp the model ID and prompt hash on every generation
+
+Attach the pinned revision ID to the output's metadata, every time. This is the most important difference between before and after.
+
+```python
+# before — wording inlined, no provenance in the output
+from google import genai
+
+client = genai.Client()
+
+def draft_article_before(topic: str) -> str:
+    prompt = f"Write a careful Japanese article draft on this topic: {topic}"
+    resp = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=prompt,
+    )
+    return resp.text  # which wording / which model produced this? unknown later
+```
+
+```python
+# after — ship the revision ID and resolved model ID with the output
+from google import genai
+from prompt_registry import load_prompt
+
+client = genai.Client()
+
+def draft_article_after(topic: str) -> dict:
+    p = load_prompt("article_ja_draft")
+    prompt = p["text"].format(topic=topic)
+    resp = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=prompt,
+    )
+    # also record what the -latest alias actually resolved to
+    resolved = getattr(resp, "model_version", None) or "gemini-flash-latest"
+    return {
+        "text": resp.text,
+        "prompt_id": p["id"],
+        "prompt_revision": p["revision"],
+        "model": resolved,
+        "topic": topic,
+    }
+```
+
+Write the `prompt_revision` and `model` returned by the `after` version into every line of your generation log. That alone fixes "which wording and which actual model made this output." Even when `model_version` isn't present in the response, at least record the model name you requested. Keeping both lets you later see the window where "the wording was the same but only the model moved."
+
+### Make the log one JSON line per generation
+
+```python
+import json, datetime
+
+def append_log(record: dict, log_path="gen_log.jsonl"):
+    record["ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+```
+
+A one-record-per-line JSONL drops straight into the time-ordered bisect below.
+
+## Bisect a quality drop down to the revision boundary
+
+Once provenance is stamped, you can mechanically corner "when did quality drop." Assuming each generation carries a quality score (an automatic eval, or your own 1-to-5 rating), you look for the boundary where the score fell.
+
+On my own data, when I scored the stiffness of sentence endings, the score fell by about 15% across one revision. What my eyes could only call "somehow stiff" showed up as a clear cliff at the revision-hash level.
+
+```python
+# bisect_regression.py
+import json
+
+def load_records(path="gen_log.jsonl"):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+def find_regression_boundary(records, score_key="score", drop=0.10):
+    """Return the first revision boundary where mean score fell by >= drop."""
+    rows = sorted(records, key=lambda r: r["ts"])
+    # aggregate mean score per revision, preserving first-seen order
+    seen = []
+    agg = {}
+    for r in rows:
+        rev = r["prompt_revision"]
+        if rev not in agg:
+            agg[rev] = []
+            seen.append(rev)
+        agg[rev].append(r.get(score_key, 0.0))
+    means = [(rev, sum(agg[rev]) / len(agg[rev])) for rev in seen]
+    # return the first adjacent pair whose drop exceeds the threshold
+    for (prev_rev, prev_m), (cur_rev, cur_m) in zip(means, means[1:]):
+        if prev_m - cur_m >= drop:
+            return {"from": prev_rev, "to": cur_rev,
+                    "before": round(prev_m, 3), "after": round(cur_m, 3)}
+    return None
+
+if __name__ == "__main__":
+    recs = load_records()
+    boundary = find_regression_boundary(recs)
+    print(boundary or "no regression detected")
+```
+
+By "bisect" I mean: rather than comparing every revision at random, **order them by time and only look at the drop between adjacent revisions**. Comparing mean scores in the order revisions appeared yields the `from`/`to` hashes of the moment it fell in one shot. Then `git diff prompts/article_ja_draft.txt` between those two wordings almost always surfaces the offending line.
+
+Start the `drop` threshold generously (0.1 to 0.2). Set it too small and you'll catch the model's natural jitter as a regression, which adds noise in production.
+
+## Roll back a broken revision instantly
+
+Once you know the offending line, reverting is immediate. Because the wording is version-controlled as a file, you just restore the previous revision.
+
+```bash
+# restore that one file to the commit matching the "from" (pre-drop) hash
+git log --oneline -- prompts/article_ja_draft.txt
+git checkout <good-commit> -- prompts/article_ja_draft.txt
+```
+
+After reverting, pin the "good" revision hash for peace of mind. To prevent recurrence, add one light guard before generation.
+
+```python
+PINNED_GOOD = {"article_ja_draft": "9f2c1ab33de0"}
+
+def assert_not_regressed(p: dict):
+    pinned = PINNED_GOOD.get(p["id"])
+    if pinned and p["revision"] != pinned:
+        # don't silently proceed; make it noticeable (route to alerts if unattended)
+        print(f"warning: {p['id']} drifted from pinned {pinned} -> {p['revision']}")
+```
+
+The point is to use the guard to *notice*, not to *halt*. In an unattended run, the realistic landing spot that avoids the pitfall is to keep processing while drifted but fire a notification. Halting outright drops an entire night of generation, which hurts more.
+
+## The small judgment calls that paid off
+
+After running this for several sites over about half a year, a few design choices paid off. The essentials, as a table.
+
+<table>
+<thead>
+<tr><th>Decision</th><th>What I chose</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Revision ID</td><td>Content hash, not a counter</td><td>Structurally prevents "same number, different body" from a missed bump</td></tr>
+<tr><td>Where wording lives</td><td>External text, not in code</td><td><strong>git history and rollback complete per file</strong></td></tr>
+<tr><td>Model ID</td><td>Record both requested and resolved</td><td>Tells you residual drift is on the model side even with wording pinned</td></tr>
+<tr><td>Guard strength</td><td>Notify, don't halt</td><td>Avoids dropping a night of unattended generation</td></tr>
+</tbody>
+</table>
+
+The last one mattered most. I started strict and halted on any drift, but trivial jitter ended up wasting whole runs, so leaning toward notification was more stable in practice. Stricter is not always safer.
+
+At Dolice Labs I generate articles for Stripe memberships across several sites every day, so small differences in tone compound into the impression readers receive. That's exactly why being able to trace "which line moved it" is a quiet form of quality control that sits close to revenue.
+
+## A first step from here
+
+Pull just your most-used prompt out into a text file outside your code, and add one `prompt_revision` column to your generation log. That alone turns your next investigation from "gut feeling" into "identify the window." Bisecting and rollback only become meaningful once that one column exists.
+
+I'm still refining my own operation, but if this trims the cause-isolation work for anyone else carrying a generation pipeline alone, I'll be glad. Thank you for reading.
