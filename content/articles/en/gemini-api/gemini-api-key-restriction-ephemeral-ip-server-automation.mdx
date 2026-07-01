@@ -1,0 +1,189 @@
+---
+title: "Locking Down a Gemini API Key on Servers Whose IP Keeps Changing — Restrictions for Headless Automation"
+slug: "gemini-api-key-restriction-ephemeral-ip-server-automation"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-01T20:30"
+author: "Gemini Lab"
+description: "After unrestricted keys started getting blocked, headless server automation whose egress IP changes every run can't cleanly use HTTP referrer, app restrictions, or an IP allowlist. Do you get by with API restrictions alone, funnel egress through a fixed IP, or move server workloads off API keys onto Vertex service-account auth? A decision framework and working code, without taking your pipelines down."
+tags: ["Gemini API", "API key", "security", "automation", "Vertex AI"]
+highlights:
+  - "If you've been stuck on 403s from a headless environment whose IP changes each run, you'll be able to pick the restriction that actually fits your setup"
+  - "You'll compare three options — API restriction only, fixed-IP egress, and Vertex service-account auth — by cost and operational weight, and decide"
+  - "You'll get a step-by-step way to move a running server workload off API keys onto OAuth auth without downtime"
+---
+
+When unrestricted keys started getting blocked, the first thing that bit me wasn't a browser-facing key — it was the server-side scheduled jobs running where nobody is watching. As an indie developer running update pipelines across several sites, most of that work runs headless: it spins up on a near-disposable execution environment, does its thing, and disappears. Build it that way and the source IP of your requests changes on every run.
+
+That's exactly where this key-restriction change hurts. A browser has a referrer; a mobile app has a package name and signature. A headless server job has none of those. The only application restriction left is an IP allowlist — and that one is a trap. Set it, and the next run arrives from a different IP and blocks itself. A very silly way to take your own pipeline down.
+
+This article focuses narrowly on that headless case: how to make a key restriction actually stick. The short version, which is where I landed myself: satisfy the floor with an **API restriction** for now, and if you're in it for the long haul, **take server workloads off API keys and move to service-account auth**. Here's why, and how to move without downtime.
+
+## Why application restrictions don't fit server automation
+
+A Gemini API key takes restrictions in two layers. One is the **API restriction** — which APIs the key may call. The other is the **application restriction** — where the request may come from, in four flavors: HTTP referrer, IP address, Android app, and iOS app.
+
+The problem is that all four application restrictions assume the caller is stably identifiable. Browsers have referrers; mobile apps have package names and signatures. A headless server job has none of them. That leaves IP restriction, and IP is the awkward one:
+
+- CI, serverless, and disposable execution environments get assigned a different node each run, so the egress IP changes.
+- With no fixed IP, there's no stable value to write into the allowlist in the first place.
+- Allowing a wide CIDR to compensate defeats the point of restricting at all.
+
+So for headless work you're naturally down to three choices: **give up on application restrictions and satisfy the floor with an API restriction**, **funnel egress through a fixed IP so an IP restriction can work**, or **step off the API-key mechanism entirely**. Let's take them in order.
+
+## First, measure what you have
+
+Before choosing, find out what's actually attached to each key. When you span multiple projects, pulling the list through the API Keys API is far more reliable than eyeballing the console. This inventories every key and its restriction state, authenticating with a service account (below) or your `gcloud auth application-default login` credentials.
+
+```python
+# Inventory each key's restriction state (uses google-cloud-api-keys)
+# pip install google-cloud-api-keys
+from google.cloud import api_keys_v2
+
+def audit_keys(project_id: str) -> None:
+    client = api_keys_v2.ApiKeysClient()
+    parent = f"projects/{project_id}/locations/global"
+
+    for key in client.list_keys(parent=parent):
+        restrictions = key.restrictions
+        api_targets = list(restrictions.api_targets) if restrictions else []
+
+        # Which application restriction, if any
+        app = "none"
+        if restrictions:
+            if restrictions.browser_key_restrictions.allowed_referrers:
+                app = "referrer"
+            elif restrictions.server_key_restrictions.allowed_ips:
+                app = "ip"
+            elif restrictions.android_key_restrictions.allowed_applications:
+                app = "android"
+            elif restrictions.ios_key_restrictions.allowed_bundle_ids:
+                app = "ios"
+
+        api_ok = "restricted" if api_targets else "ALL-APIs"
+        flag = "  <-- unrestricted (block candidate)" if app == "none" and not api_targets else ""
+        print(f"{key.display_name:<28} app={app:<9} api={api_ok}{flag}")
+
+audit_keys("your-project-id")
+# Example output:
+# cron-gemilab-pipeline        app=none      api=ALL-APIs  <-- unrestricted (block candidate)
+# web-demo-key                 app=referrer  api=restricted
+```
+
+Keys that are `app=none` and `api=ALL-APIs` are the most exposed to the block. If a key your headless jobs use shows up there, address it with one of the following.
+
+## Option A: satisfy the floor with an API restriction only
+
+The lowest-friction stopgap is to leave the application restriction empty and add **only an API restriction** — narrow the key down to the Generative Language API alone. That by itself stops a leaked key from being pivoted onto other Google APIs, and it puts you on the "restricted" side of the unrestricted-key block.
+
+```python
+# Narrow a key's API restriction to Generative Language API only
+from google.cloud import api_keys_v2
+from google.cloud.api_keys_v2 import Key, Restrictions, ApiTarget
+
+def restrict_to_gemini(project_id: str, key_id: str) -> None:
+    client = api_keys_v2.ApiKeysClient()
+    name = f"projects/{project_id}/locations/global/keys/{key_id}"
+
+    key = Key(
+        name=name,
+        restrictions=Restrictions(
+            api_targets=[ApiTarget(service="generativelanguage.googleapis.com")]
+        ),
+    )
+    # update_mask swaps only restrictions; other fields are preserved
+    op = client.update_key(key=key, update_mask="restrictions")
+    op.result()  # wait for it to apply
+    print("Restricted the key to generativelanguage.googleapis.com")
+
+restrict_to_gemini("your-project-id", "your-key-id")
+```
+
+But this is only the floor. A key with an API restriction alone, if stolen, can still call Gemini from anyone's environment. As an indie developer who eats the bill personally, stopping here honestly makes me nervous. You'll want to constrain the origin one step further.
+
+## Option B: funnel egress through a fixed IP so IP restriction works
+
+Even headless jobs can make an IP restriction work if you **pin the exit IP to one place**. The execution environment's own IP still changes, but you put a relay with a fixed IP in front of it — a NAT gateway, or a fixed-IP forwarding proxy — and route every Gemini request through it.
+
+```python
+# Call Gemini through a fixed-IP forwarding proxy
+# The runner's IP changes each run, but the key only allows the proxy's fixed IP
+import os
+from google import genai
+
+# Set HTTPS_PROXY and the httpx under the SDK routes through it
+os.environ["HTTPS_PROXY"] = "http://PROXY_HOST:PROXY_PORT"
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+resp = client.models.generate_content(
+    model="gemini-flash-latest",
+    contents="This request arrives via a fixed-IP proxy.",
+)
+print(resp.text)
+# On the key, register only the proxy's fixed IP under server_key_restrictions.allowed_ips
+```
+
+The upside is that you constrain the origin without changing the key mechanism. The downside is that the relay itself becomes something you operate. A NAT gateway accrues hourly charges; a self-run proxy is an availability problem you now own. For low-volume personal automation, whether that relay's cost and upkeep is worth what you're protecting is genuinely marginal. I ran this for a while, then moved on to the next option because the upkeep wore me down.
+
+## Option C: drop the API key on servers and move to service-account auth
+
+If you're settling in, I think this is the real answer. **API keys aren't a good fit for headless server work in the first place.** An API key is a shared secret — whoever holds it can use it — with weak tools for constraining the origin. Server-to-server calls are better served by OAuth 2.0 (service account) auth, which mints short-lived tokens per call.
+
+Called through Vertex AI, Gemini authenticates with service-account credentials instead of an API key. With the same `google-genai` SDK, flipping to `vertexai=True` lets most of your call code stay as it is.
+
+```python
+# Call Gemini with service-account auth instead of an API key (via Vertex AI)
+# Point GOOGLE_APPLICATION_CREDENTIALS at the service-account key JSON path
+from google import genai
+
+client = genai.Client(
+    vertexai=True,
+    project="your-project-id",
+    location="global",
+)
+
+resp = client.models.generate_content(
+    model="gemini-flash-latest",
+    contents="This request arrived via service-account auth. No more API key.",
+)
+print(resp.text)
+# Auth runs through Application Default Credentials.
+# Use the service account bound to the runtime and you don't even ship a key file
+```
+
+Now constraining the origin moves to "which service account gets which IAM role." You manage authority on a stable axis — identity — instead of the unstable one of IP. If shipping key files bothers you, use the service account attached to the runtime and let Application Default Credentials handle it, so you never carry the credential around. For me, the unrestricted-key block became the nudge to move server work into this shape.
+
+## How to decide how far to go
+
+How far you go depends on the nature of the work and who eats the bill. My own call is roughly the table below.
+
+<table>
+<thead>
+<tr><th>Setup</th><th>Origin constraint</th><th>Operational weight</th><th>Best for</th></tr>
+</thead>
+<tbody>
+<tr><td>A: API restriction only</td><td>Weak (callable from anywhere)</td><td>Light</td><td>Prototypes, short-lived checks, throwaway keys</td></tr>
+<tr><td>B: Fixed-IP egress + IP restriction</td><td>Medium (pinned to the proxy)</td><td>Heavy (maintaining the relay)</td><td>Existing assets whose key mechanism can't change</td></tr>
+<tr><td>C: Service-account auth</td><td>Strong (managed by identity and IAM)</td><td>Medium (migration up front, light after)</td><td>Production headless jobs that keep running</td></tr>
+</tbody>
+</table>
+
+For a one-off check with a throwaway key, A is plenty. But if you run many scheduled jobs daily — as we do at Dolice Labs — paying the up-front migration cost to land on C makes every later audit easier. Frame B as the middle ground for when you can't rewrite key-dependent code right away.
+
+## Pitfalls while switching over
+
+Moving to Vertex has a few quiet snags.
+
+- **The model name string is the same, but availability can differ subtly.** Right after switching, do one live call with the model you actually use and confirm you don't get `404` or `NOT_FOUND`. What an alias like `gemini-flash-latest` points to shifts over time.
+- **Get `location` wrong and you'll miss in that region.** If you use the global endpoint, state `location="global"` explicitly.
+- **If the service account lacks the needed role, you get `403 PERMISSION_DENIED`** — which looks exactly like the unrestricted-key-block 403, so don't misattribute the cause. On Vertex you need something like the Vertex AI User role.
+- **Pass both an API key and a service account and the SDK gets lost over which to prefer.** During migration, keep only one env var in play — decide "don't leave `GEMINI_API_KEY` set while turning on `vertexai=True`" and isolation gets easy.
+
+A single connectivity check at the moment of the switch prevents most of these. I make it a rule, every migration, to run exactly one call from the same environment before enabling the production schedule.
+
+## Your next move
+
+Run the Option A inventory code first and just check whether any `app=none`, `api=ALL-APIs` key is hiding among your headless jobs. If even one server-side key is sitting there, that's your next candidate to silently fail. Decide between getting by with A and moving to C after you've seen the inventory, and you'll get the order right.
+
+If you run automation the same way, I hope this gives you a place to start your own audit.
