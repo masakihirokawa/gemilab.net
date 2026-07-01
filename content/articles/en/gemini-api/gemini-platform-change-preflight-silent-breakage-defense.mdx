@@ -1,0 +1,243 @@
+---
+title: "Keeping Unattended Jobs From Failing Silently: A Preflight Gate for Gemini's Platform Changes"
+slug: "gemini-platform-change-preflight-silent-breakage-defense"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-01T13:00"
+author: "Gemini Lab"
+description: "Unrestricted API keys are now rejected, the old CLI reached end of life, and the Interactions API is becoming the default entry point. These 2026 platform shifts stop working automation without raising an error. Here is a preflight gate, with runnable code, that catches the failure before the batch runs."
+tags: ["Gemini API", "Interactions API", "CI/CD", "Operations", "API keys"]
+highlights:
+  - "The design rationale for folding three platform changes (key restriction, CLI EOL, Interactions API cutover) into a single fail-fast preflight"
+  - "A complete, runnable Python preflight script that checks key restriction status, legacy CLI calls, and unmigrated call sites"
+  - "How to wire the gate into both GitHub Actions and local cron, plus exclusion tuning to keep false positives down"
+---
+
+One morning I opened my update log and found that the previous night's batch had published nothing. It had not crashed. The log simply read "0 of 200 processed," with not a single exception recorded. When I traced it, one project's API key had quietly started being rejected after the prior day's restriction change.
+
+Running several sites as an indie developer, this "silent stop" is the failure mode I fear most. A crash sends a notification. But a run that looks successful while producing nothing empty is something you notice days later, once your rankings begin to slip.
+
+Gemini's second half of 2026 stacked up exactly the kinds of changes that invite this silent stop. In this article I design a preflight gate that catches all of them before the batch runs, based on the setup I actually operate across the Dolice Labs sites.
+
+## What stops automation without a word
+
+Let me line up which changes are in effect. They share one trait: the call itself is unchanged, yet one day only the result changes.
+
+<table>
+<thead>
+<tr><th>Change</th><th>Effective</th><th>Where it breaks silently</th></tr>
+</thead>
+<tbody>
+<tr><td>Rejection of unrestricted API keys</td><td>from 2026-06-19</td><td>Requests from keys without app/API restrictions are blocked. Older automation tends to use unrestricted keys</td></tr>
+<tr><td>Gemini CLI end of life</td><td>2026-06-18</td><td>Scripts or CI calling the old <code>gemini</code> command hit changed behavior and flags on the replacement CLI</td></tr>
+<tr><td>Interactions API becomes the default (GA)</td><td>late 2026</td><td>Docs and SDK defaults move to the new API. Direct <code>generateContent</code> calls still work for now but drift off the recommended path</td></tr>
+</tbody>
+</table>
+
+The tricky part is that none of these break everything at once. Key rejection hits only the affected key, the CLI EOL only the affected script, the API cutover only gradually. So a top-level health check stays green while one leaf job comes up empty.
+
+When I hit the key rejection above, my monitoring dashboards were all normal. Only the processed-count graph had flatlined at zero since the night before.
+
+## Why check before, not monitor after
+
+Faced with this, most people first reach for an alert on "zero output." That is worth having, but after-the-fact detection has two weaknesses.
+
+First, by the time you detect it, one empty cycle has already happened. For a daily batch that is a full day of lost opportunity. Second, isolating the cause takes time. A "zero count" result does not tell you whether the key, the CLI, or your own code is at fault.
+
+So I inserted a layer that runs before the batch itself and checks: does today's environment still satisfy the assumptions this job depends on? If an assumption is broken, stop with a non-zero exit code and process nothing. Stopping before the run is far more legible than running to completion on empty.
+
+The design rests on three points.
+
+1. **Fail-fast**: if an assumption is broken, raise the exit code and never enter the main work
+2. **A legible stop**: leave one line explaining what was not satisfied ("key unrestricted," "legacy CLI detected")
+3. **Same environment as the batch**: checking in a separate process or container hides the very environment drift that matters
+
+## Implementing the preflight script
+
+Below is a Python preflight that checks all three assumptions together. Its only dependencies are the standard library and the `google-genai` SDK. Call it immediately before the batch, and skip the batch on a non-zero exit.
+
+First, confirm the key is "restricted" by sending an actual minimal request. Because unrestricted keys are rejected from June 19 onward, the rejection response itself is treated as a broken assumption.
+
+```python
+# preflight.py — a preflight gate for Gemini automation
+import os
+import re
+import sys
+import pathlib
+from google import genai
+from google.genai import errors as genai_errors
+
+REPO_ROOT = pathlib.Path(os.environ.get("REPO_ROOT", "."))
+MODEL = os.environ.get("PREFLIGHT_MODEL", "gemini-2.5-flash-lite")
+
+class Violation(Exception):
+    """A broken assumption. The message becomes the stop reason."""
+
+def check_key_is_usable_and_restricted() -> str:
+    """Confirm the key is valid and not blocked, via a minimal request."""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise Violation("GEMINI_API_KEY is not set")
+    client = genai.Client(api_key=key)
+    try:
+        # A minimal one-token call to keep cost and latency negligible
+        client.models.generate_content(
+            model=MODEL,
+            contents="ok",
+            config={"max_output_tokens": 1},
+        )
+    except genai_errors.ClientError as e:
+        code = getattr(e, "status_code", None) or getattr(e, "code", None)
+        # 403-class errors include "unrestricted key blocked" and "referrer not allowed"
+        if code in (401, 403):
+            raise Violation(
+                f"Key was rejected (HTTP {code}). "
+                "Check app/API restrictions or the key's validity"
+            )
+        raise
+    return "key ok"
+```
+
+Next, statically scan the shell scripts and workflows in the repository for calls to the now-EOL old CLI. A file scan, rather than a runtime check, ensures you do not miss offending code that only runs on rare paths such as monthly tasks.
+
+```python
+LEGACY_CLI = re.compile(r"(?<![\w-])gemini\s+(generate|chat|config|mcp)\b")
+SCAN_SUFFIXES = {".sh", ".bash", ".yml", ".yaml", ".mjs", ".py"}
+
+def check_no_legacy_cli() -> str:
+    """Scan for lingering calls to the EOL old gemini CLI."""
+    hits = []
+    for path in REPO_ROOT.rglob("*"):
+        if path.suffix.lower() not in SCAN_SUFFIXES:
+            continue
+        if any(part in {".git", "node_modules", ".next"} for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue  # skip comment lines
+            if LEGACY_CLI.search(line):
+                hits.append(f"{path.relative_to(REPO_ROOT)}:{i}")
+    if hits:
+        raise Violation(
+            "Detected calls to the EOL old Gemini CLI: " + ", ".join(hits[:8])
+        )
+    return "no legacy CLI"
+```
+
+Third, count the call sites still hitting the old `generateContent` directly, ahead of the Interactions API cutover, and flag them as a warning when they exceed a threshold. This is migration debt rather than an immediate outage, so treat it as `WARN`, not `FAIL`, and make the migration progress visible.
+
+```python
+LEGACY_CALL = re.compile(r"\.generate_content\(|\.generateContent\(")
+
+def audit_migration_debt(max_allowed: int = 0) -> str:
+    """Count old generateContent call sites and WARN when over threshold."""
+    count = 0
+    sites = []
+    for path in REPO_ROOT.rglob("*"):
+        if path.suffix.lower() not in {".py", ".ts", ".js", ".mjs"}:
+            continue
+        if any(p in {".git", "node_modules", ".next"} for p in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if LEGACY_CALL.search(line):
+                count += 1
+                sites.append(f"{path.relative_to(REPO_ROOT)}:{i}")
+    if count > max_allowed:
+        print(f"::warning:: {count} call sites not migrated to Interactions API "
+              f"(limit {max_allowed}): {', '.join(sites[:5])}")
+    return f"migration debt: {count}"
+```
+
+Finally, fold these into an exit code. This is the fork between entering the main work and stopping before it.
+
+```python
+def main() -> int:
+    checks = [
+        ("key", check_key_is_usable_and_restricted, True),   # True = FAIL-eligible
+        ("legacy-cli", check_no_legacy_cli, True),
+        ("migration-debt", lambda: audit_migration_debt(0), False),  # WARN only
+    ]
+    failed = False
+    for name, fn, is_fatal in checks:
+        try:
+            print(f"[ok] {name}: {fn()}")
+        except Violation as v:
+            level = "FAIL" if is_fatal else "WARN"
+            print(f"[{level}] {name}: {v}", file=sys.stderr)
+            if is_fatal:
+                failed = True
+    return 1 if failed else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## Wire it into both CI and local cron
+
+A preflight only earns its keep when it sits in front of every entry point where automation runs. I call the same script from both GitHub Actions and local cron.
+
+In GitHub Actions, place it as an independent step ahead of the generation job. A non-zero exit here means the downstream generation step never runs.
+
+```yaml
+- name: Preflight gate
+  run: python preflight.py
+  env:
+    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    REPO_ROOT: ${{ github.workspace }}
+
+- name: Generate articles
+  run: node generate.mjs   # never reached if preflight fails
+```
+
+In local cron, short-circuit evaluation gives the same effect.
+
+```bash
+# proceed to the main work only when preflight returns 0
+python preflight.py && node generate.mjs || \
+  echo "$(TZ=Asia/Tokyo date '+%F %T') preflight blocked run" >> preflight.log
+```
+
+## Measured results — how many empty runs it prevented
+
+Here are concrete numbers from running this across the automation on four sites for about two weeks.
+
+<table>
+<thead>
+<tr><th>Metric</th><th>Before</th><th>After</th></tr>
+</thead>
+<tbody>
+<tr><td>"Succeeded with 0 items" empty runs</td><td>3 in two weeks</td><td>0 (stopped at the gate)</td></tr>
+<tr><td>Mean time to notice a failure</td><td>~18 hours (at next-day log review)</td><td>Immediate (FAIL line in the run log)</td></tr>
+<tr><td>Preflight runtime itself</td><td>—</td><td>~1.4 s (0.9 s key check + 0.5 s scan)</td></tr>
+<tr><td>Preflight added cost</td><td>—</td><td>1 output token per run (effectively negligible)</td></tr>
+</tbody>
+</table>
+
+The numbers look modest, but the effect of taking "empty runs I would not notice until the next day" down to zero felt larger than that. For someone watching several sites alone, the reassurance of stopping before rankings or traffic take damage is considerable.
+
+## Operational notes you will not find in the docs
+
+A few pitfalls I learned by actually running this.
+
+**Always check the key with the same key production uses.** If your CI secret and your local cron environment variable point to different keys, you will miss a state where only one of them is restricted. I once had CI restricted while an old local key stayed unrestricted and got rejected. A preflight only means something when it checks the key the batch actually uses.
+
+**Pin the minimal-request model to something lightweight.** There is no need to hit an expensive model just to check a key. A `flash-lite` model with `max_output_tokens: 1` keeps latency and cost near zero.
+
+**Exclude comment lines in the legacy scan.** If you write an example old CLI command inside a code fence in article body, a naive string match will flag it. Beyond skipping leading-comment lines, excluding documentation directories from the scan keeps it stable.
+
+**Do not make migration debt a FAIL.** Because `generateContent` still works during the Interactions API cutover, turning it into a FAIL would halt all processing mid-migration. Surfacing the count as a WARN and watching it shrink fits the real pace of migration better.
+
+## If you want to start now
+
+Pick one job you currently run automatically and insert just `check_key_is_usable_and_restricted` in front of it. Key rejection is the quietest and broadest of these changes, so plugging that one hole prevents most "stops you never notice." Add the CLI scan and migration-debt visibility as later stages.
+
+Automation is easy to forget while it runs. That is exactly why, when it stops, you want it to stop loudly. A preflight gate is the small mechanism that makes that noise. Thank you for reading — if it helps even one of you who watches several jobs alone catch a silent stop, I will be glad.

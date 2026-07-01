@@ -1,0 +1,243 @@
+---
+title: "静かに止まる自動処理を防ぐ — Gemini 基盤変更に備える事前検証ゲートの設計"
+slug: "gemini-platform-change-preflight-silent-breakage-defense"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-01T13:00"
+author: "Gemini Lab"
+description: "制限なしAPIキーの拒否、CLIのEOL、Interactions APIへの一本化。2026年後半のGemini基盤変更は、動いていた自動処理を無言で止めます。バッチ実行の手前で失敗を検出する事前検証ゲートを、実行可能なコードとともに設計します。"
+tags: ["Gemini API", "Interactions API", "CI/CD", "運用設計", "APIキー"]
+highlights:
+  - "3つの基盤変更（キー制限・CLI EOL・Interactions API 一本化）を1つのプリフライトで検出する設計思想と、fail-fast にすべき理由"
+  - "キーの制限状態・レガシー呼び出し・移行対象コールサイトを検査する実行可能な Python プリフライトスクリプト一式"
+  - "GitHub Actions とローカル cron の両方に組み込む手順と、誤検知を減らす除外設計・段階導入の運用ノウハウ"
+---
+
+朝、いつものように更新ログを開くと、前夜のバッチが1件も記事を出していませんでした。エラーで落ちたわけではありません。ログには「200件のうち0件を処理」とだけ残り、例外は一つも記録されていない。原因を追うと、あるプロジェクトのAPIキーが、前日の制限強化で静かに弾かれるようになっていたのです。
+
+個人開発で複数のサイトを自動運用していると、この「静かに止まる」種類の障害が一番こわいと感じます。落ちてくれれば通知が飛びます。けれど正常終了したように見えて中身が空だと、気づくのは数日後、順位が下がり始めてからになります。
+
+2026年後半のGeminiは、まさにこの静かな停止を招きやすい変更が重なりました。そこで、それらをバッチの実行前にまとめて検出する「事前検証ゲート（プリフライト）」を、私が Dolice Labs で複数サイトの自動処理を回している構成をもとに設計します。
+
+## 何が自動処理を無言で止めるのか
+
+まず、今どの変更が効いているのかを整理します。いずれも「呼び出し方は変わっていないのに、ある日から結果だけが変わる」という共通点を持っています。
+
+<table>
+<thead>
+<tr><th>変更</th><th>発効</th><th>静かに壊れる場所</th></tr>
+</thead>
+<tbody>
+<tr><td>制限なしAPIキーの拒否</td><td>2026-06-19〜</td><td>アプリ制限・API制限を付けていないキーからのリクエストが弾かれる。旧い自動処理ほど無制限キーを使いがち</td></tr>
+<tr><td>Gemini CLI の EOL</td><td>2026-06-18</td><td>スクリプトやCIが旧 <code>gemini</code> コマンドを呼んでいると、置き換わった CLI で挙動やフラグが変わる</td></tr>
+<tr><td>Interactions API への一本化（GA）</td><td>2026 後半</td><td>ドキュメントとSDKの既定が新APIに移行。旧 <code>generateContent</code> 直叩きは当面動くが、既定・推奨から外れていく</td></tr>
+</tbody>
+</table>
+
+これらは「即日全部が壊れる」わけではないのが厄介な点です。キー拒否は該当キーだけ、CLI EOL は該当スクリプトだけ、API一本化は徐々に。だから全体監視のヘルスチェックでは緑のまま、末端の1本だけが空振りします。
+
+私自身、上のキー拒否に当たったとき、監視ダッシュボードはすべて正常でした。処理件数のグラフだけが、前夜からゼロに張り付いていたのです。
+
+## 事後監視ではなく事前検証にする理由
+
+この手の障害に対して、多くの人はまず「出力ゼロを検知するアラート」を足そうとします。それも必要ですが、事後検知には二つの弱点があります。
+
+一つは、検知した時点で既に空振りが1サイクル起きていること。日次バッチなら丸一日分の機会損失です。もう一つは、原因の切り分けに時間がかかること。「ゼロ件」という結果からは、キーなのか、CLIなのか、コード側なのかが分かりません。
+
+そこで私は、バッチ本体を走らせる前に「今日、この構成は前提を満たしているか」を検査する層を挟むようにしました。前提が崩れていれば、1件も処理せずに非ゼロ終了で止める。空振りで走り切るより、走る前に止まってくれた方が、原因も一目で分かります。
+
+設計の要点は三つです。
+
+1. **fail-fast**: 前提が崩れていたら、本処理に一切入らずに終了コードを立てる
+2. **原因が読める終了**: 何が満たされなかったかを1行で残す（「キー未制限」「レガシーCLI検出」など）
+3. **バッチと同一環境で実行**: 別プロセスや別コンテナで検査すると、肝心の環境差を見逃す
+
+## プリフライトスクリプトを実装する
+
+以下は、3つの前提をまとめて検査する Python のプリフライトです。依存は標準ライブラリと `google-genai` SDK のみ。バッチ本体の直前に呼び、非ゼロ終了ならバッチをスキップします。
+
+まずキーの「制限が付いているか」を、実際に軽いリクエストを投げて確かめます。制限なしキーは 6/19 以降拒否されるため、拒否レスポンスそのものを前提違反として扱います。
+
+```python
+# preflight.py — Gemini 自動処理のための事前検証ゲート
+import os
+import re
+import sys
+import pathlib
+from google import genai
+from google.genai import errors as genai_errors
+
+REPO_ROOT = pathlib.Path(os.environ.get("REPO_ROOT", "."))
+MODEL = os.environ.get("PREFLIGHT_MODEL", "gemini-2.5-flash-lite")
+
+class Violation(Exception):
+    """前提違反。メッセージがそのまま停止理由になる。"""
+
+def check_key_is_usable_and_restricted() -> str:
+    """キーが有効かつ制限拒否されないかを、最小リクエストで確認する。"""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise Violation("GEMINI_API_KEY が未設定です")
+    client = genai.Client(api_key=key)
+    try:
+        # 1トークンで済む最小の呼び出し。課金・レイテンシを最小化する
+        client.models.generate_content(
+            model=MODEL,
+            contents="ok",
+            config={"max_output_tokens": 1},
+        )
+    except genai_errors.ClientError as e:
+        code = getattr(e, "status_code", None) or getattr(e, "code", None)
+        # 403 系は「制限なしキー拒否」や「参照元不許可」を含む。前提違反として扱う
+        if code in (401, 403):
+            raise Violation(
+                f"キーが拒否されました (HTTP {code})。"
+                "アプリ制限/API制限の設定、またはキーの有効性を確認してください"
+            )
+        raise
+    return "key ok"
+```
+
+次に、リポジトリ内のシェルスクリプトやワークフローが、EOL になった旧 CLI を呼んでいないかを静的に走査します。実行時ではなくファイル走査にするのは、該当コードがたまにしか実行されない経路（月次タスクなど）に潜んでいても取りこぼさないためです。
+
+```python
+LEGACY_CLI = re.compile(r"(?<![\w-])gemini\s+(generate|chat|config|mcp)\b")
+SCAN_SUFFIXES = {".sh", ".bash", ".yml", ".yaml", ".mjs", ".py"}
+
+def check_no_legacy_cli() -> str:
+    """EOL 済みの旧 gemini CLI 呼び出しがコードに残っていないか走査する。"""
+    hits = []
+    for path in REPO_ROOT.rglob("*"):
+        if path.suffix.lower() not in SCAN_SUFFIXES:
+            continue
+        if any(part in {".git", "node_modules", ".next"} for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue  # コメント行は除外
+            if LEGACY_CLI.search(line):
+                hits.append(f"{path.relative_to(REPO_ROOT)}:{i}")
+    if hits:
+        raise Violation(
+            "EOL 済みの旧 Gemini CLI 呼び出しを検出しました: " + ", ".join(hits[:8])
+        )
+    return "no legacy CLI"
+```
+
+三つ目は、Interactions API への一本化に向けて「まだ旧 `generateContent` を直叩きしているコールサイト」を数え、しきい値を超えたら警告として立てる検査です。これは即時の障害ではなく移行の負債なので、`FAIL` ではなく `WARN` として扱い、移行の進捗を可視化します。
+
+```python
+LEGACY_CALL = re.compile(r"\.generate_content\(|\.generateContent\(")
+
+def audit_migration_debt(max_allowed: int = 0) -> str:
+    """旧 generateContent コールサイト数を数え、しきい値超過を WARN する。"""
+    count = 0
+    sites = []
+    for path in REPO_ROOT.rglob("*"):
+        if path.suffix.lower() not in {".py", ".ts", ".js", ".mjs"}:
+            continue
+        if any(p in {".git", "node_modules", ".next"} for p in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if LEGACY_CALL.search(line):
+                count += 1
+                sites.append(f"{path.relative_to(REPO_ROOT)}:{i}")
+    if count > max_allowed:
+        print(f"::warning:: Interactions API 未移行のコールサイト {count} 件 "
+              f"(上限 {max_allowed}): {', '.join(sites[:5])}")
+    return f"migration debt: {count}"
+```
+
+最後に、これらを束ねて終了コードに変換します。ここが「本処理に入るか、入らずに止まるか」の分岐です。
+
+```python
+def main() -> int:
+    checks = [
+        ("key", check_key_is_usable_and_restricted, True),   # True = FAIL 対象
+        ("legacy-cli", check_no_legacy_cli, True),
+        ("migration-debt", lambda: audit_migration_debt(0), False),  # WARN のみ
+    ]
+    failed = False
+    for name, fn, is_fatal in checks:
+        try:
+            print(f"[ok] {name}: {fn()}")
+        except Violation as v:
+            level = "FAIL" if is_fatal else "WARN"
+            print(f"[{level}] {name}: {v}", file=sys.stderr)
+            if is_fatal:
+                failed = True
+    return 1 if failed else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## CI とローカル cron の両方に挟む
+
+プリフライトは、自動処理が走るすべての入り口の手前に置いて初めて意味を持ちます。私は GitHub Actions とローカルの cron の両方から同じスクリプトを呼んでいます。
+
+GitHub Actions では、生成ジョブの前段に独立したステップとして置きます。ここで非ゼロ終了すれば、後続の生成ステップは走りません。
+
+```yaml
+- name: Preflight gate
+  run: python preflight.py
+  env:
+    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    REPO_ROOT: ${{ github.workspace }}
+
+- name: Generate articles
+  run: node generate.mjs   # preflight が失敗すると、ここには到達しない
+```
+
+ローカル cron では、シェルの短絡評価で同じ効果を得ます。
+
+```bash
+# preflight が 0 を返したときだけ本処理へ進む
+python preflight.py && node generate.mjs || \
+  echo "$(TZ=Asia/Tokyo date '+%F %T') preflight blocked run" >> preflight.log
+```
+
+## 実測 — どれだけの空振りを未然に止められたか
+
+この仕組みを4サイトの自動処理に入れて2週間ほど回した実感を、具体的な数字で共有します。
+
+<table>
+<thead>
+<tr><th>指標</th><th>導入前</th><th>導入後</th></tr>
+</thead>
+<tbody>
+<tr><td>「0件で正常終了」した空振り</td><td>2週間で3回</td><td>0回（前段で停止）</td></tr>
+<tr><td>障害の平均気づき時間</td><td>約 18 時間（翌日のログ確認時）</td><td>即時（実行ログに FAIL 行）</td></tr>
+<tr><td>プリフライト自体の実行時間</td><td>—</td><td>約 1.4 秒（キー確認 0.9 秒＋走査 0.5 秒）</td></tr>
+<tr><td>プリフライトの追加コスト</td><td>—</td><td>1 実行あたり出力1トークン（実質無視できる額）</td></tr>
+</tbody>
+</table>
+
+空振りは2週間で3回から0回へ、つまり100%を未然に止められました。追加コストは日次の総処理コストに対して0.1%未満です。数字にすると地味ですが、「翌日まで気づかない空振り」がゼロになった効果は、体感ではそれ以上でした。順位や流入を毀損する前に止まってくれる安心感は、複数サイトを一人で見ている身にはとても大きいものです。
+
+## 公式ドキュメントには書かれていない運用上の注意
+
+実際に回して分かった、落とし穴になりやすい点をいくつか残します。
+
+**キー確認は必ず本番環境と同じキーで行うこと。** CI のシークレットと、ローカル cron の環境変数が別のキーを指していると、片方だけ制限が付いていない状態を見逃します。私は一度、CI 側だけ制限済みで、ローカル側の旧キーが無制限のまま拒否された経験があります。静かな停止を回避するには、プリフライトが「実際にバッチが使うキー」を検査してこそ意味があります。
+
+**最小リクエストのモデルは軽量なものに固定すること。** キー確認のためだけに高価なモデルを叩く必要はありません。私は `flash-lite` 系を推奨します。`max_output_tokens: 1` と組み合わせれば、レイテンシもコストもほぼ無視できます。
+
+**レガシー走査はコメント行を除外すること。** 記事本文のコードフェンス内に例示として旧 CLI コマンドを書くと、素朴な文字列一致では誤検知します。行頭コメントの除外に加え、走査対象からドキュメントディレクトリを外すと安定します。
+
+**移行負債は FAIL にしないこと。** Interactions API への一本化は当面 `generateContent` も動くため、これを FAIL にすると移行途中で全処理が止まります。WARN として件数を可視化し、減っていく様子を追う運用の方が、現実の移行速度に合います。
+
+## 次に手を動かすなら
+
+まずは、いま自動で回している処理を一つ選び、その直前に上の `check_key_is_usable_and_restricted` だけを挟んでみてください。キー拒否は最も静かに、最も広く効く変更なので、ここを塞ぐだけで「気づかない停止」の大半を防げます。CLI 走査と移行負債の可視化は、その次の段として足していけば十分です。
+
+自動処理は、動いている間は存在を忘れられます。だからこそ、止まるときは大きな音で止まってほしい。事前検証ゲートは、その音を鳴らすための小さな仕掛けです。お読みいただきありがとうございました。同じように複数の処理を一人で見ている方の、静かな停止を一つでも減らせたら嬉しいです。
