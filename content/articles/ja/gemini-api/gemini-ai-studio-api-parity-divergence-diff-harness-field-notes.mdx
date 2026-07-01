@@ -1,0 +1,144 @@
+---
+title: "AI Studio で通ったプロンプトが API では静かに崩れるとき — 差分を計測して切り分ける運用メモ"
+slug: "gemini-ai-studio-api-parity-divergence-diff-harness-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-01T09:15"
+author: "Gemini Lab"
+description: "AI Studio では完璧に動いたプロンプトが、自分のコードから Gemini API を呼ぶと空応答や 404 になる。目視ではなく、設定差と finish_reason・使用トークン・解決モデル名を機械的に記録する小さなハーネスで、原因別に切り分ける運用手順をまとめました。"
+tags: ["gemini-api", "google-ai-studio", "troubleshooting", "instrumentation", "safety-filter", "model-name"]
+highlights:
+  - "Studio の Get code と本番呼び出しの設定差を機械的に diff し、finish_reason・usage・実際に解決されたモデル名まで一度に記録する小さなハーネスの作り方"
+  - "*-latest エイリアスのドリフトや preview モデル廃止で「昨日まで動いていた」が静かに壊れる箇所を、事前に計測して掴む観測ポイント"
+  - "空応答・400・404 を症状ではなく原因（安全フィルタ / 権限・地域 / モデル解決 / API バージョン）で切り分ける、二分探索の再現手順"
+---
+
+Studio 上で何度叩いても綺麗に返ってきたプロンプトが、`Get code` でコピーして自分のコードに落とした途端に空文字を返す。私も個人開発でいくつも API を触ってきましたが、この「昨日は動いていた」の一言で片づけたくなる状況が、いちばん時間を溶かします。厄介なのは、多くの場合エラーすら出ないことです。例外が飛べばスタックトレースを追えますが、`response.text` が静かに空文字で返るときは、どこから疑えばいいのか手がかりが乏しいのです。
+
+そこで私がたどり着いたのは、原因を目視で探すのをやめて、**Studio と API の「差」そのものを毎回記録する小さなハーネス**を挟むという進め方でした。差分を数字で残せるようになると、次に同じ症状が出たときの調査時間が体感で数分に縮みます。2026 年前半に Gemini API 側で起きた変更（Interactions API の GA 化、未制限 API キーの遮断、preview モデルの相次ぐ廃止）も、この「静かに壊れる」系統の事故を増やしているので、そこも織り込んで書きます。
+
+## なぜ目視の突き合わせは破綻するのか
+
+「Studio の設定とコードを見比べればいい」という助言はよく見かけますし、正しくもあります。ただ実務では破綻しがちです。理由は三つあります。
+
+一つ目は、Studio が裏で補っている初期値が UI に全部は出ていないこと。二つ目は、モデル名がエイリアス（`gemini-flash-latest` のような `*-latest`）だと、同じ文字列でも解決先が日によって変わり得ること。三つ目は、空応答の原因が複数レイヤー（安全フィルタ・権限・モデル解決・API バージョン）にまたがるのに、`response.text` はどのレイヤーで落ちても同じ「空文字」に見えることです。
+
+目で追える差は「見えている設定」だけです。事故の多くは見えていない差で起きます。だから、突き合わせの対象を人間の注意力から、機械が吐くログへ移します。
+
+## 最小の観測点 — 空応答のときに必ず残す4つの値
+
+まず、既存の呼び出しに観測を足すところから始めます。`response.text` だけを見ている実装に、次の4つを必ずログへ落とします。これは新しい SDK（`google-genai`）の `usage_metadata` と `candidates` から取れます。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+def call_with_probe(model: str, contents: str, config: types.GenerateContentConfig):
+    res = client.models.generate_content(model=model, contents=contents, config=config)
+    cand = res.candidates[0] if res.candidates else None
+    probe = {
+        # 1. なぜ止まったのか（STOP / SAFETY / MAX_TOKENS / RECITATION など）
+        "finish_reason": str(cand.finish_reason) if cand else "NO_CANDIDATE",
+        # 2. 入力側でブロックされたか（プロンプト自体が弾かれるケース）
+        "prompt_feedback": str(res.prompt_feedback),
+        # 3. 実際に消費したトークン（0 に近ければ生成前に落ちている）
+        "usage": {
+            "prompt": res.usage_metadata.prompt_token_count,
+            "output": res.usage_metadata.candidates_token_count,
+        } if res.usage_metadata else None,
+        # 4. サーバが返したモデル名（エイリアスが何に解決されたか）
+        "resolved_model": getattr(res, "model_version", None),
+    }
+    return res, probe
+
+cfg = types.GenerateContentConfig(temperature=0.7)
+res, probe = call_with_probe("gemini-flash-latest", "今日のニュースを3行で", cfg)
+print(probe)
+print("text:", res.text or "(empty)")
+```
+
+ここで効いてくるのが4番目の `model_version` です。`*-latest` を渡していると、サーバが実際に何へ解決したかは投げてみないと分かりません。Studio で試したその日と、本番で叩く日で解決先がずれていれば、「同じモデル名なのに挙動が違う」の正体はここです。`finish_reason` が `SAFETY` なら安全フィルタ、`output` トークンが 0 に近いのに `finish_reason` が `STOP` なら生成前の段階（権限・モデル解決）を疑う、という初動の分岐がこの4値だけで立ちます。
+
+## Studio の Get code と本番設定を機械的に diff する
+
+観測点を仕込んだら、次は「設定差そのもの」を機械で取り出します。Studio の `Get code`（Python / Node.js / cURL）で吐いたコードから設定を辞書化し、自分の本番呼び出しの設定と突き合わせます。私は次のような素朴なハーネスを一つ持っておいて、症状が出るたびに二つの config を流し込んでいます。
+
+```python
+def normalize_config(model: str, cfg: dict) -> dict:
+    """比較しやすいよう、暗黙の初期値を明示して平坦化する"""
+    gen = cfg.get("generation_config", cfg)
+    flat = {
+        "model": model.strip(),
+        "temperature": gen.get("temperature"),
+        "top_p": gen.get("top_p"),
+        "max_output_tokens": gen.get("max_output_tokens"),
+        "system_instruction": (cfg.get("system_instruction") or "").strip(),
+        # 安全設定はカテゴリ→しきい値の辞書に正規化（順序差でノイズが出るのを防ぐ）
+        "safety": {s["category"]: s["threshold"] for s in cfg.get("safety_settings", [])},
+        "api_version": cfg.get("http_options", {}).get("api_version", "v1beta"),
+    }
+    return flat
+
+def diff_configs(studio: dict, prod: dict) -> list[str]:
+    s, p = normalize_config(**studio), normalize_config(**prod)
+    diffs = []
+    keys = set(s) | set(p)
+    for k in sorted(keys):
+        if s.get(k) != p.get(k):
+            diffs.append(f"[{k}] studio={s.get(k)!r}  prod={p.get(k)!r}")
+    return diffs
+
+studio = {"model": "gemini-2.5-pro", "cfg": {"generation_config": {"temperature": 0.7},
+          "safety_settings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}]}}
+prod = {"model": "gemini-2.5-pro-preview-06-05", "cfg": {"generation_config": {"temperature": 0.0}}}
+
+for line in diff_configs(studio, prod):
+    print(line)
+# [model]  studio='gemini-2.5-pro'  prod='gemini-2.5-pro-preview-06-05'
+# [safety] studio={'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_ONLY_HIGH'}  prod={}
+# [temperature] studio=0.7  prod=0.0
+```
+
+このハーネスの狙いは、**「見えていない差」を空欄として可視化する**ことです。上の例だと、prod 側は安全設定を一切明示していない（Studio 側は緩めていた）ことと、preview 付きモデル名が残っていることが一目で出ます。目視だと「safety_settings を書いていない」という不在は見落としやすいのですが、辞書の差分にすると空欄がはっきり残ります。
+
+なぜ正規化を挟むかというと、安全設定はリストで渡すため順序が違うだけで別物に見えてしまうからです。カテゴリをキーにした辞書へ畳んでから比較すると、意味のある差だけが残ります。
+
+## 「昨日まで動いていた」を生む3つのドリフト
+
+設定差がゼロなのに壊れるときは、あなたのコードではなく API 側が動いています。2026 年前半に実際に増えた事故を、観測ポイント付きで挙げます。
+
+<table>
+<thead>
+<tr><th>ドリフト</th><th>症状</th><th>ハーネスで見る値</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>*-latest エイリアスの解決先変更</strong></td><td>同じ名前なのに応答傾向や対応機能が変わる</td><td><code>model_version</code> が前回ログと違う</td></tr>
+<tr><td><strong>preview モデルの廃止</strong></td><td>ある日から 404 <code>model not found</code></td><td>モデル名に <code>-preview-</code> を含む</td></tr>
+<tr><td><strong>未制限 API キーの遮断</strong></td><td>昨日まで通っていたキーが 400/403 に</td><td><code>prompt_feedback</code> 到達前に例外</td></tr>
+</tbody>
+</table>
+
+一つ目は `gemini-flash-latest` のようなエイリアス依存です。速く追従できて便利ですが、`model_version` を毎回ログに残していないと、解決先が変わったこと自体に気づけません。本番の安定運用では、GA の固定バージョン名（`gemini-2.5-pro` のように）へ寄せ、`*-latest` は検証用に留めるのが私の基本方針です。
+
+二つ目は preview モデルの廃止です。2026 年 6 月にも複数の画像プレビューモデルが停止し、preview 名を握ったままの処理が静かに 404 化しました。Studio のドロップダウンには preview 版が並ぶことがあるので、`Get code` からコピーした名前に `-preview-` が残っていないか、ハーネスの diff で機械的に弾くと安全です。
+
+三つ目は、2026 年 6 月中旬からの「未制限 API キー拒否」です。不正利用と課金暴走を防ぐための変更ですが、制限を付けずに使い回していたキーが、ある日からリクエスト段階で拒否されます。これは `prompt_feedback` に到達する前、つまり生成ロジックの外で落ちるので、例外を握りつぶしていると空応答と区別がつきません。キーに HTTP リファラや API 制限を付けているか、この機会に点検しておく価値があります。
+
+## 締めは二分探索 — Studio 側で失敗を再現できるか
+
+diff もドリフトも空振りなら、最後は「Studio 側で失敗を作れるか」を試します。API の設定を Studio へ一項目ずつ戻し、どこで挙動が変わるかを二分探索で追う手順です。私はこの順で詰めています。
+
+具体的には、次の順で一項目ずつ確かめていきます。
+
+1. Studio を新しいセッションで開き、同じモデル・同じプロンプトで再実行して、素の状態が本当に成功するかを確かめる
+2. ハーネスの diff で出た差分を一つ選び、それだけを Studio 側へ適用して再実行する（例：`temperature` を 0.0 に、あるいは安全設定を空に）
+3. 挙動が変わった瞬間の一項目を真犯人として記録し、残りの差分は戻して切り分けを閉じる
+
+`temperature` を 0.0 にした瞬間に空応答が再現するなら犯人はそこですし、安全設定を外した瞬間に再現するなら安全フィルタです。一度に複数戻さないのが勘所で、同時に二つ変えると、どちらが効いたのか分からなくなります。私は必ず一項目ずつ戻すことを推奨します。二分探索の粒度を保つほど、記録がそのまま再現手順になるからです。
+
+この手順の良いところは、切り分けた結果がそのまま再現手順になることです。「API 側にだけある問題」なのか「プロンプト設計そのものの問題」なのかを、感覚ではなく操作の記録として残せます。チームや将来の自分に引き継ぐとき、この記録があるだけで調査のやり直しが要らなくなります。
+
+次に同じ症状に出会ったら、まずハーネスに二つの config を流し、`model_version` と `finish_reason` を並べて見てください。そこから逆算するだけで、疑うべきレイヤーは自然と一つに絞れていきます。私自身、この観測を挟むようにしてから、Gemini まわりの「なぜか動かない」に費やす時間がずいぶん静かになりました。同じところで足踏みしている方の役に立てば嬉しいです。

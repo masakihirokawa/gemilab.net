@@ -1,0 +1,137 @@
+---
+title: "When a Prompt That Worked in AI Studio Quietly Breaks Over the API — Field Notes on Measuring the Difference"
+slug: "gemini-ai-studio-api-parity-divergence-diff-harness-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-01T09:15"
+author: "Gemini Lab"
+description: "A prompt that behaves perfectly in AI Studio returns an empty string or a 404 the moment you call the Gemini API from your own code. Instead of eyeballing the two, here is a small harness that records the config diff plus finish_reason, token usage, and the model name the server actually resolved — so you can isolate the cause by layer."
+tags: ["gemini-api", "google-ai-studio", "troubleshooting", "instrumentation", "safety-filter", "model-name"]
+highlights:
+  - "A small harness that mechanically diffs Studio's Get code export against your production call and records finish_reason, token usage, and the model version the server actually resolved — all at once"
+  - "The measurement points that catch 'it worked yesterday' failures caused by *-latest alias drift and retired preview models before they bite you"
+  - "A binary-search reproduction that separates empty responses, 400s, and 404s by cause — safety filter, permission/region, model resolution, or API version — instead of by symptom"
+---
+
+A prompt you ran a dozen times in Studio, all green, returns an empty string the instant you paste it into your own code through `Get code`. As an indie developer I have wired up plenty of APIs across my own projects, and this "but it worked yesterday" is the state that eats the most time. What makes it nasty is that most of the time there is no exception at all. A thrown error gives you a stack trace to follow; a silent empty `response.text` gives you almost nothing to start from.
+
+This piece is about giving up on hunting the cause by eye, and instead inserting a **small harness that records the difference between Studio and the API on every call**. Once you can keep the diff as numbers, the next time the same symptom shows up your investigation shrinks to a couple of minutes. Several changes on the Gemini API side in the first half of 2026 — the Interactions API reaching GA, the rejection of unrestricted API keys, and a run of retired preview models — have all made this "quietly breaks" family of failures more common, so I fold that context in too.
+
+## Why eyeball comparison falls apart
+
+"Just compare the Studio settings against your code" is common advice, and it is not wrong. In practice, though, it breaks down for three reasons.
+
+First, some of the defaults Studio supplies behind the scenes are not fully shown in the UI. Second, when the model name is an alias (a `*-latest` such as `gemini-flash-latest`), the same string can resolve to different targets on different days. Third, the cause of an empty response spans multiple layers — safety filter, permission, model resolution, API version — yet `response.text` looks like the same empty string no matter which layer failed.
+
+The only differences you can chase by eye are the settings you can see. Most incidents happen in the differences you cannot. So we move the comparison off human attention and onto logs a machine produces.
+
+## The minimal probe — four values to always keep on an empty response
+
+Start by adding observation to your existing call. Into an implementation that only looks at `response.text`, always log these four values. They come from the new SDK's (`google-genai`) `usage_metadata` and `candidates`.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+def call_with_probe(model: str, contents: str, config: types.GenerateContentConfig):
+    res = client.models.generate_content(model=model, contents=contents, config=config)
+    cand = res.candidates[0] if res.candidates else None
+    probe = {
+        # 1. Why it stopped (STOP / SAFETY / MAX_TOKENS / RECITATION, ...)
+        "finish_reason": str(cand.finish_reason) if cand else "NO_CANDIDATE",
+        # 2. Whether the input side was blocked (the prompt itself was rejected)
+        "prompt_feedback": str(res.prompt_feedback),
+        # 3. Tokens actually consumed (near zero means it fell before generating)
+        "usage": {
+            "prompt": res.usage_metadata.prompt_token_count,
+            "output": res.usage_metadata.candidates_token_count,
+        } if res.usage_metadata else None,
+        # 4. The model name the server returned (what the alias resolved to)
+        "resolved_model": getattr(res, "model_version", None),
+    }
+    return res, probe
+
+cfg = types.GenerateContentConfig(temperature=0.7)
+res, probe = call_with_probe("gemini-flash-latest", "Summarize today's news in 3 lines", cfg)
+print(probe)
+print("text:", res.text or "(empty)")
+```
+
+The fourth field, `model_version`, is what earns its keep here. When you pass a `*-latest`, you cannot know what the server actually resolved to until you send the call. If the resolution on the day you tested in Studio differs from the day you hit production, that mismatch is the real identity of "same model name, different behavior." This gives you an opening branch from four values alone: `finish_reason == SAFETY` points at the safety filter; `output` tokens near zero while `finish_reason == STOP` points at a pre-generation stage (permission or model resolution).
+
+## Diffing Studio's Get code against production, mechanically
+
+With the probe in place, pull out the difference in settings itself. Turn the config from Studio's `Get code` export (Python / Node.js / cURL) into a dictionary and compare it against your production call's config. I keep a plain harness like this around and feed the two configs into it whenever a symptom shows up.
+
+```python
+def normalize_config(model: str, cfg: dict) -> dict:
+    """Flatten and make implicit defaults explicit so they compare cleanly."""
+    gen = cfg.get("generation_config", cfg)
+    flat = {
+        "model": model.strip(),
+        "temperature": gen.get("temperature"),
+        "top_p": gen.get("top_p"),
+        "max_output_tokens": gen.get("max_output_tokens"),
+        "system_instruction": (cfg.get("system_instruction") or "").strip(),
+        # Normalize safety into a category->threshold dict so order noise disappears
+        "safety": {s["category"]: s["threshold"] for s in cfg.get("safety_settings", [])},
+        "api_version": cfg.get("http_options", {}).get("api_version", "v1beta"),
+    }
+    return flat
+
+def diff_configs(studio: dict, prod: dict) -> list[str]:
+    s, p = normalize_config(**studio), normalize_config(**prod)
+    diffs = []
+    for k in sorted(set(s) | set(p)):
+        if s.get(k) != p.get(k):
+            diffs.append(f"[{k}] studio={s.get(k)!r}  prod={p.get(k)!r}")
+    return diffs
+
+studio = {"model": "gemini-2.5-pro", "cfg": {"generation_config": {"temperature": 0.7},
+          "safety_settings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}]}}
+prod = {"model": "gemini-2.5-pro-preview-06-05", "cfg": {"generation_config": {"temperature": 0.0}}}
+
+for line in diff_configs(studio, prod):
+    print(line)
+# [model]  studio='gemini-2.5-pro'  prod='gemini-2.5-pro-preview-06-05'
+# [safety] studio={'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_ONLY_HIGH'}  prod={}
+# [temperature] studio=0.7  prod=0.0
+```
+
+The point of the harness is to **surface the differences you cannot see as blanks**. In the example above, it becomes obvious at a glance that the prod side specifies no safety settings at all (while Studio had loosened them) and that a preview-suffixed model name is still in place. By eye, an absence like "no safety_settings written" is easy to miss; as a dict diff, the blank stays clearly visible.
+
+The reason to normalize first is that safety settings are passed as a list, so a mere difference in order can make two identical configs look different. Folding them into a dict keyed by category leaves only the meaningful differences.
+
+## Three drifts that manufacture "it worked yesterday"
+
+When the config diff is empty but it still breaks, it is not your code that moved — it is the API side. Here are the incidents that actually became more frequent in the first half of 2026, each with its observation point.
+
+<table>
+<thead>
+<tr><th>Drift</th><th>Symptom</th><th>Value the harness watches</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>*-latest alias resolves elsewhere</strong></td><td>Same name, but response tendency or feature support changes</td><td><code>model_version</code> differs from the last log</td></tr>
+<tr><td><strong>Retired preview model</strong></td><td>404 <code>model not found</code> from some day onward</td><td>Model name contains <code>-preview-</code></td></tr>
+<tr><td><strong>Unrestricted API key rejected</strong></td><td>A key that passed yesterday now returns 400/403</td><td>Fails before <code>prompt_feedback</code> is reached</td></tr>
+</tbody>
+</table>
+
+The first is dependence on an alias like `gemini-flash-latest`. It is convenient for staying current, but unless you log `model_version` every time, you cannot notice that the resolution target itself has moved. For stable production, my default is to pin to a fixed GA version name (such as `gemini-2.5-pro`) and keep `*-latest` for verification only.
+
+The second is the retirement of preview models. In June 2026, several image preview models were stopped, and any process still holding a preview name quietly turned into a 404. Studio's dropdown sometimes lists preview versions, so it pays to have the harness mechanically reject any name copied from `Get code` that still contains `-preview-`.
+
+The third is the "unrestricted API key rejection" that began in mid-June 2026. It is a change meant to prevent abuse and runaway billing, but a key that had been reused without any restriction starts getting rejected at the request stage from some day onward. Because this falls outside the generation logic — before `prompt_feedback` is reached — if you are swallowing exceptions it is indistinguishable from an empty response. It is worth checking whether your keys carry HTTP referrer or API restrictions while you are here.
+
+## Close with a binary search — can you reproduce the failure inside Studio?
+
+If both the diff and the drift check come up empty, the last move is to test whether you can *create* the failure inside Studio. Return the API settings to Studio one item at a time and follow, by binary search, where the behavior changes. I work it in this order.
+
+First, open Studio in a fresh session and re-run with the same model and the same prompt, to confirm the bare state truly succeeds. Then apply the differences the harness reported, one item at a time, to the Studio side. If the empty response reappears the moment you set `temperature` to 0.0, that is the culprit; if it reappears the moment you strip the safety settings, it is the safety filter. Wherever the failure reproduces on the Studio side, that single item is confirmed as the real cause.
+
+What is good about this procedure is that the result of the isolation is itself a reproduction procedure. Whether it is "a problem only on the API side" or "a problem in the prompt design itself" gets recorded as a trail of operations rather than a hunch. When you hand it to a teammate or your future self, that trail alone spares you from redoing the investigation.
+
+Next time you meet the same symptom, first feed the two configs into the harness and line up `model_version` and `finish_reason` side by side. Working backward from there, the layer to suspect narrows to one on its own. Since I started inserting this observation, the time I spend on Gemini's "somehow it doesn't work" has grown a lot quieter. I hope it helps anyone stuck at the same spot.
