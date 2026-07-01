@@ -1,0 +1,210 @@
+---
+title: "url_context が取得に失敗しても答えは返ってくる — 取得ステータスを検証してから通すゲート設計"
+slug: "gemini-url-context-silent-stale-retrieval-verification-gate"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-07-02T04:57"
+author: "Gemini Lab"
+description: "url_context ツールは対象URLの取得に失敗しても、それらしい回答を返します。url_context_metadata の取得ステータスを読み、根拠URLが実際に読めた時だけ答えを確定する検証ゲートと、失敗時のフォールバックを実装します。"
+tags: ["Gemini API", "url_context", "grounding", "自動化", "信頼性設計"]
+highlights:
+  - "url_context_metadata の url_retrieval_status を読み、取得に失敗したURLを根拠に含む応答を不合格にする検証ゲート"
+  - "取得失敗時は明示 fetch へ切り替え、根拠URLが実際に読めた時だけ答えを確定する二段構えのフォールバック"
+  - "自動運用で「自信ありげな空振り回答」がコンテンツへ静かに混入するのを止める、冪等な適用の型"
+---
+
+自動処理に url_context を組み込んで一番ひやりとしたのは、対象ページの取得に失敗しているのに、応答そのものは普通に返ってきていた場面でした。個人開発で Dolice Labs の複数サイトの下書きを定期処理で回している私自身、公式の変更履歴ページを url_context で参照させ、要点を抜き出す小さなジョブを動かしていました。ある朝、生成された下書きの一部が、実際のページには書かれていない「それらしい」内容になっていたのです。
+
+原因を追うと、対象URLの取得が失敗していました。ところが応答は空にならず、モデルが手元の知識で補った文章を、あたかもページを読んだ結果のように返していました。取得の成否を確認していなかった私の実装では、この差が完全に見えませんでした。
+
+## url_context の取得は「best-effort」だと考える
+
+url_context は、指定したURLをモデル側が取得してグラウンディングの材料にするツールです。ここで見落としがちなのは、取得が失敗しても呼び出し自体はエラーにならないという点です。ネットワーク側の一時失敗、robots による拒否、対象が動的レンダリングでほぼ空、サイズ上限超過など、取得が満たされない理由はいくつもあります。そのどれであっても、多くの場合レスポンスは 200 で返り、本文もそれらしく埋まります。
+
+自動処理で怖いのは、この「静かな失敗」です。人が画面越しに使っていれば「あれ、内容が古い」と気づけます。けれど定期実行のジョブは、返ってきたテキストをそのまま次の工程へ流します。取得の成否という一次情報を確認しない限り、空振りの回答がコンテンツへ混入し続けます。
+
+## まず url_context_metadata を読む
+
+救いは、取得の結果がメタデータとして返ってくることです。各候補には `url_context_metadata` が付き、その中の `url_metadata` に、実際に取得しにいったURLと取得ステータスが並びます。ここを読めば「どのURLが本当に読めたのか」を機械的に判定できます。
+
+まずは、応答から取得ステータスを取り出すところだけを切り出します。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+def ask_with_url_context(prompt: str, urls: list[str]):
+    # 対象URLを本文に含めると、url_context がその取得を試みます
+    url_list = "\n".join(urls)
+    full_prompt = f"{prompt}\n\n参照するURL:\n{url_list}"
+
+    resp = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=full_prompt,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(url_context=types.UrlContext())],
+        ),
+    )
+    return resp
+
+def extract_retrievals(resp) -> list[dict]:
+    """各URLの取得結果を [{url, status}] の形で返す。"""
+    out = []
+    for cand in resp.candidates or []:
+        meta = getattr(cand, "url_context_metadata", None)
+        if not meta:
+            continue
+        for um in getattr(meta, "url_metadata", []) or []:
+            out.append({
+                "url": getattr(um, "retrieved_url", None),
+                "status": str(getattr(um, "url_retrieval_status", "")),
+            })
+    return out
+```
+
+`url_retrieval_status` は列挙値で返ります。成功は末尾が `SUCCESS`、取得に失敗した場合は `ERROR`、安全性の理由で弾かれた場合は `UNSAFE` を含む値になります。文字列化して末尾で判定すると、SDK の細かな型差に振り回されずに済みます。
+
+<table>
+<thead>
+<tr><th>ステータス（末尾）</th><th>意味</th><th>その応答をどう扱うか</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>SUCCESS</strong></td><td>URLを取得できた</td><td>根拠として認める</td></tr>
+<tr><td><strong>ERROR</strong></td><td>取得に失敗した</td><td>根拠として認めない・フォールバックへ</td></tr>
+<tr><td><strong>UNSAFE</strong></td><td>安全性の理由で除外</td><td>根拠として認めない・人手キューへ</td></tr>
+<tr><td><strong>（メタデータ無し）</strong></td><td>そもそも取得を試みていない</td><td>グラウンディング不成立として不合格</td></tr>
+</tbody>
+</table>
+
+一番厄介なのは最後の行、メタデータが空のケースです。URLを本文に入れたつもりでも、モデルが取得を試みず、内部知識だけで答えることがあります。「取得ステータスが失敗」ではなく「そもそも取得の記録が無い」状態は、成功と誤認しやすいので明示的に落とします。
+
+## 成功したURLだけを根拠として認めるゲート
+
+取り出せたら、次は判定です。ここでの方針はひとつだけです。要求したURLのうち、実際に `SUCCESS` で読めたものが十分にある時だけ、その答えを確定する。それ以外は答えを採用せず、フォールバックへ渡します。
+
+```python
+def grounding_gate(resp, required_urls: list[str], min_success: int = 1):
+    """取得成功が min_success 件に満たなければ不合格にする。"""
+    retrievals = extract_retrievals(resp)
+    ok = [r for r in retrievals if r["status"].endswith("SUCCESS")]
+    failed = [r for r in retrievals if not r["status"].endswith("SUCCESS")]
+
+    verdict = {
+        "passed": len(ok) >= min_success,
+        "success_urls": [r["url"] for r in ok],
+        "failed_urls": [r["url"] for r in failed],
+        "attempted": len(retrievals),
+        "requested": len(required_urls),
+    }
+
+    # 取得の記録が一件も無い＝内部知識だけで答えた疑い
+    if verdict["attempted"] == 0:
+        verdict["passed"] = False
+        verdict["reason"] = "no_retrieval_attempted"
+    elif not verdict["passed"]:
+        verdict["reason"] = "insufficient_successful_retrieval"
+
+    return verdict
+```
+
+`min_success` を要求URL数と揃えるか、緩めて 1 件でも読めれば通すかは、ジョブの性質で決めます。変更履歴のように「1ページを正確に読めていること」が肝心なタスクでは、要求数と成功数を一致させる厳しめの設定を推奨します。私自身もその設定で運用しています。逆に複数ソースを束ねる調査系では、過半数が読めていれば通す運用が現実的でした。
+
+大事なのは、`passed` が false の時に「モデルが返した本文」を絶対に採用しないことです。本文は取得が失敗していても十分にそれらしく、だからこそ判定を本文の見た目でなく取得ステータスに一本化します。
+
+## 失敗した時は明示 fetch へ二段で逃がす
+
+ゲートで落ちた応答を、そのまま捨てるだけでは自動処理が痩せてしまいます。ここが自動処理の落とし穴で、本番運用では次の順序で取得の失敗を回避します。
+
+1. 一段目は url_context に取得を任せ、取得ステータスがすべて成功なら答えを確定します。
+2. 失敗したら二段目で自分でページを取得し、本文をコンテキストへ直接載せて要約させます。
+3. どちらの経路でも読めなければ生成せず、人手キューへ回します。
+
+この二段構えなら取得の成否を自分の手元で確定できるので、静かな失敗が残りません。
+
+```python
+import httpx
+
+def explicit_fetch(url: str, timeout: float = 10.0) -> str | None:
+    try:
+        r = httpx.get(url, timeout=timeout, follow_redirects=True)
+        r.raise_for_status()
+        text = r.text
+        # 動的レンダリングでほぼ空のページを弾く簡易チェック
+        if len(text) < 500:
+            return None
+        return text[:200_000]  # コンテキストに載る量に制限
+    except Exception:
+        return None
+
+def answer_grounded(prompt: str, urls: list[str]):
+    # 一段目: url_context に取得を任せる
+    resp = ask_with_url_context(prompt, urls)
+    gate = grounding_gate(resp, urls, min_success=len(urls))
+    if gate["passed"]:
+        return {"text": resp.text, "source": "url_context", "urls": gate["success_urls"]}
+
+    # 二段目: 自分で取得して本文をコンテキストに直接載せる
+    fetched = {u: explicit_fetch(u) for u in urls}
+    ok_pages = {u: t for u, t in fetched.items() if t}
+    if not ok_pages:
+        # どちらの経路でも読めない: 生成せず人手キューへ
+        return {"text": None, "source": "needs_review", "urls": [],
+                "failed_urls": urls}
+
+    joined = "\n\n".join(f"# {u}\n{t}" for u, t in ok_pages.items())
+    resp2 = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=f"{prompt}\n\n次の本文だけを根拠に答えてください:\n{joined}",
+    )
+    return {"text": resp2.text, "source": "explicit_fetch", "urls": list(ok_pages)}
+```
+
+二段目のポイントは、モデルに「次の本文だけを根拠に答えてください」と、参照範囲を明示的に閉じることです。こうすると、渡した本文に無いことは埋めにくくなります。それでも読めなかったURLについては、無理に生成させず `needs_review` として人手キューへ送ります。空振り回答を出すくらいなら、その一件を落とす方が自動処理としては健全だと私は考えています。
+
+## 自動運用に載せる — 冪等に、静かな失敗を残さず
+
+定期実行に組み込むと、もうひとつ気をつけたい点が出てきます。同じ入力で二重に走った時に、結果を二重に適用しないことです。私は入力URLの集合からキーを作り、確定した答えだけをそのキーで一度だけ保存するようにしています。
+
+```python
+import hashlib, json
+
+def job_key(prompt: str, urls: list[str]) -> str:
+    payload = json.dumps({"p": prompt, "u": sorted(urls)}, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+def run_job(prompt: str, urls: list[str], store: dict):
+    key = job_key(prompt, urls)
+    if key in store:            # 既に確定済みなら何もしない（冪等）
+        return store[key]
+
+    result = answer_grounded(prompt, urls)
+    if result["source"] == "needs_review":
+        # 確定していないので保存しない。次回また試せるようにする
+        log_needs_review(key, urls)
+        return result
+
+    store[key] = result         # 根拠が確認できた答えだけを保存
+    log_success(key, result["source"], result["urls"])
+    return result
+
+def log_needs_review(key, urls):
+    print(f"[needs_review] key={key} urls={urls}")
+
+def log_success(key, source, urls):
+    print(f"[ok] key={key} source={source} grounded_on={urls}")
+```
+
+`needs_review` を保存しないことで、一時的な取得失敗は次の実行で自然に回復します。逆に確定した答えは冪等キーで一度だけ適用されるので、リトライやスケジュールの重複で二重に反映される心配がありません。ログには「どのURLを根拠にしたか」を必ず残します。後から下書きを見直す時、根拠URLが辿れることが、静かな失敗を早く見つける一番の助けになりました。
+
+## 運用してみて変わったこと
+
+この検証ゲートを入れる前は、生成物のおかしさに気づくのは、たいてい公開後に自分で読み返した時でした。あとから記録を掘り返すと、取得の失敗を含む応答が全体の約20%に達していた週もありました。取得が失敗していた事実そのものが記録に残っていなかったので、「なぜこの内容になったのか」を追うだけで時間が溶けていました。
+
+ステータスを一次情報として扱うようにしてから、切り分けは一瞬になりました。ログに `needs_review` が並んでいれば取得側の問題、`source=explicit_fetch` が増えていれば url_context の取得が不調、という具合に、原因が最初から分かれて記録されます。生成の質そのものより、まず「根拠が本当に読めていたか」を見る。この順番にしただけで、自動処理の信頼できなさが目に見えて減りました。
+
+url_context は便利なツールですが、取得は約束されたものではありません。返ってきた本文の説得力ではなく、取得ステータスという確かな一次情報で答えを通す。まずは手元のジョブに `extract_retrievals` を差し込み、`SUCCESS` 以外がどれくらい混ざっているかをログに出すところから始めてみてください。おそらく、思っていたより静かな失敗が起きているはずです。
+
+同じように自動処理を回している方の、朝の下書き確認が少しでも楽になれば嬉しいです。

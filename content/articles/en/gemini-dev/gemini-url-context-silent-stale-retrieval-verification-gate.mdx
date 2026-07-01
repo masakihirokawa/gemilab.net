@@ -1,0 +1,204 @@
+---
+title: "url_context Still Answers When the Fetch Fails — Gating on Retrieval Status Before You Trust It"
+slug: "gemini-url-context-silent-stale-retrieval-verification-gate"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-07-02T04:57"
+author: "Gemini Lab"
+description: "The url_context tool returns a confident answer even when it failed to fetch the target page. This walks through reading url_retrieval_status from url_context_metadata to build a verification gate, plus a fallback that only finalizes an answer when the source URL was truly read."
+tags: ["Gemini API", "url_context", "grounding", "automation", "reliability"]
+highlights:
+  - "A verification gate that reads url_retrieval_status from url_context_metadata and rejects any answer grounded on a URL that failed to fetch"
+  - "A two-stage fallback that switches to an explicit fetch on failure and finalizes an answer only when the source was actually read"
+  - "An idempotent apply pattern that stops confident-but-empty answers from quietly leaking into automated content"
+---
+
+The scariest moment I had with url_context in automation was when the fetch of a target page had failed, yet the response came back looking perfectly normal. As an indie developer running the several sites of Dolice Labs, I run a periodic job that drafts material across them, and one small step points Gemini at an official changelog page via url_context and asks it to pull out the key points. One morning, part of a generated draft described things that were nowhere on the actual page — plausible, but invented.
+
+Tracing it back, the URL retrieval had failed. But the response was not empty: the model had filled in from its own knowledge and returned it as if it had read the page. My implementation never checked whether the fetch succeeded, so that difference was completely invisible to me.
+
+## Treat url_context retrieval as best-effort
+
+url_context is a tool that lets the model fetch the URLs you name and use them as grounding material. The easy thing to miss is that a failed fetch does not turn the call into an error. A transient network failure, a robots block, a page that renders almost empty client-side, a size limit — there are many reasons a retrieval can come up short. In most of those cases the response still returns 200, and the body still reads convincingly.
+
+In automation, this silent failure is the dangerous part. A person watching the screen would notice "wait, this looks stale." But a scheduled job passes the returned text straight to the next step. Unless you check the primary signal — whether the fetch actually succeeded — empty answers keep leaking into your content.
+
+## Read url_context_metadata first
+
+The saving grace is that the retrieval outcome comes back as metadata. Each candidate carries `url_context_metadata`, and inside it `url_metadata` lists the URLs the model tried to fetch along with a retrieval status. Read that, and you can decide mechanically which URLs were genuinely read.
+
+Start by pulling just the retrieval status out of the response.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+def ask_with_url_context(prompt: str, urls: list[str]):
+    # Including the URLs in the prompt lets url_context attempt to fetch them
+    url_list = "\n".join(urls)
+    full_prompt = f"{prompt}\n\nURLs to consult:\n{url_list}"
+
+    resp = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=full_prompt,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(url_context=types.UrlContext())],
+        ),
+    )
+    return resp
+
+def extract_retrievals(resp) -> list[dict]:
+    """Return each URL's retrieval outcome as [{url, status}]."""
+    out = []
+    for cand in resp.candidates or []:
+        meta = getattr(cand, "url_context_metadata", None)
+        if not meta:
+            continue
+        for um in getattr(meta, "url_metadata", []) or []:
+            out.append({
+                "url": getattr(um, "retrieved_url", None),
+                "status": str(getattr(um, "url_retrieval_status", "")),
+            })
+    return out
+```
+
+`url_retrieval_status` comes back as an enum. Success ends in `SUCCESS`, a failed fetch ends in `ERROR`, and a value containing `UNSAFE` means it was excluded for safety reasons. Stringifying it and matching on the suffix keeps you from being tripped up by small SDK type differences.
+
+<table>
+<thead>
+<tr><th>Status (suffix)</th><th>Meaning</th><th>How to treat that answer</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>SUCCESS</strong></td><td>The URL was fetched</td><td>Accept as grounding</td></tr>
+<tr><td><strong>ERROR</strong></td><td>The fetch failed</td><td>Do not accept — go to fallback</td></tr>
+<tr><td><strong>UNSAFE</strong></td><td>Excluded for safety</td><td>Do not accept — send to human queue</td></tr>
+<tr><td><strong>(no metadata)</strong></td><td>No fetch was even attempted</td><td>Fail as ungrounded</td></tr>
+</tbody>
+</table>
+
+The trickiest row is the last one: empty metadata. Even when you think you put the URL in the prompt, the model may not attempt a fetch and answer from internal knowledge alone. "No record of retrieval" is easy to mistake for success, so reject it explicitly rather than letting it through.
+
+## Gate: accept only URLs that actually succeeded
+
+Once you can extract the outcomes, you judge them. There is only one rule here: finalize the answer only when enough of the requested URLs were actually read with `SUCCESS`. Anything else does not get adopted; it goes to the fallback.
+
+```python
+def grounding_gate(resp, required_urls: list[str], min_success: int = 1):
+    """Fail if fewer than min_success retrievals succeeded."""
+    retrievals = extract_retrievals(resp)
+    ok = [r for r in retrievals if r["status"].endswith("SUCCESS")]
+    failed = [r for r in retrievals if not r["status"].endswith("SUCCESS")]
+
+    verdict = {
+        "passed": len(ok) >= min_success,
+        "success_urls": [r["url"] for r in ok],
+        "failed_urls": [r["url"] for r in failed],
+        "attempted": len(retrievals),
+        "requested": len(required_urls),
+    }
+
+    # No retrieval record at all = suspected answer from internal knowledge
+    if verdict["attempted"] == 0:
+        verdict["passed"] = False
+        verdict["reason"] = "no_retrieval_attempted"
+    elif not verdict["passed"]:
+        verdict["reason"] = "insufficient_successful_retrieval"
+
+    return verdict
+```
+
+Whether to set `min_success` equal to the number of requested URLs, or loosen it so that a single successful read passes, depends on the job. For a task where reading one page accurately is the whole point — like a changelog — I keep it strict and require successes to match the request. For research that blends several sources, passing when a majority were read turned out to be the practical setting.
+
+The important thing is to never adopt "the body the model returned" when `passed` is false. That body reads convincingly even when the fetch failed, which is exactly why the decision is anchored to retrieval status rather than to how the text looks.
+
+## On failure, escape to an explicit fetch in two stages
+
+Simply discarding a failed response would starve the automation. I use two stages. The first leaves retrieval to url_context; if it fails, the second fetches the page myself and puts the body directly into the context for the model to summarize again. Because I can confirm the fetch outcome in my own hands, no silent failure slips through.
+
+```python
+import httpx
+
+def explicit_fetch(url: str, timeout: float = 10.0) -> str | None:
+    try:
+        r = httpx.get(url, timeout=timeout, follow_redirects=True)
+        r.raise_for_status()
+        text = r.text
+        # Reject pages that render almost empty (client-side rendering)
+        if len(text) < 500:
+            return None
+        return text[:200_000]  # cap to what fits in context
+    except Exception:
+        return None
+
+def answer_grounded(prompt: str, urls: list[str]):
+    # Stage 1: let url_context handle retrieval
+    resp = ask_with_url_context(prompt, urls)
+    gate = grounding_gate(resp, urls, min_success=len(urls))
+    if gate["passed"]:
+        return {"text": resp.text, "source": "url_context", "urls": gate["success_urls"]}
+
+    # Stage 2: fetch myself and put the body directly into context
+    fetched = {u: explicit_fetch(u) for u in urls}
+    ok_pages = {u: t for u, t in fetched.items() if t}
+    if not ok_pages:
+        # Unreadable on both paths: do not generate, send to human queue
+        return {"text": None, "source": "needs_review", "urls": [],
+                "failed_urls": urls}
+
+    joined = "\n\n".join(f"# {u}\n{t}" for u, t in ok_pages.items())
+    resp2 = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=f"{prompt}\n\nAnswer using only the following text as grounding:\n{joined}",
+    )
+    return {"text": resp2.text, "source": "explicit_fetch", "urls": list(ok_pages)}
+```
+
+The point of stage two is to explicitly close the reference scope: "answer using only the following text." That makes it much harder to fill in things not present in what you handed over. For URLs that still could not be read, do not force a generation — send them to a `needs_review` queue. Dropping that one item is healthier for automation than emitting an empty answer, at least the way I see it.
+
+## Put it on automation — idempotent, with no silent failures left behind
+
+Once this runs on a schedule, one more thing needs care: if the same input runs twice, the result must not be applied twice. I build a key from the set of input URLs and store only a finalized answer under that key, exactly once.
+
+```python
+import hashlib, json
+
+def job_key(prompt: str, urls: list[str]) -> str:
+    payload = json.dumps({"p": prompt, "u": sorted(urls)}, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+def run_job(prompt: str, urls: list[str], store: dict):
+    key = job_key(prompt, urls)
+    if key in store:            # already finalized: do nothing (idempotent)
+        return store[key]
+
+    result = answer_grounded(prompt, urls)
+    if result["source"] == "needs_review":
+        # Not finalized, so do not store. Let it be retried next run.
+        log_needs_review(key, urls)
+        return result
+
+    store[key] = result         # store only answers whose sources were confirmed
+    log_success(key, result["source"], result["urls"])
+    return result
+
+def log_needs_review(key, urls):
+    print(f"[needs_review] key={key} urls={urls}")
+
+def log_success(key, source, urls):
+    print(f"[ok] key={key} source={source} grounded_on={urls}")
+```
+
+By not storing `needs_review`, a transient fetch failure recovers naturally on the next run. A finalized answer, meanwhile, is applied exactly once under its idempotency key, so retries or overlapping schedules will not double-apply it. Always log which URLs an answer was grounded on. When you review drafts later, being able to trace the source URLs turned out to be the single biggest help in catching silent failures early.
+
+## What changed after running it
+
+Before this gate, I usually noticed something was off only when I reread the output after publishing. The fact of a failed fetch was not recorded anywhere, so just tracing "why did it come out like this" burned time.
+
+Once I started treating status as a primary signal, triage became instant. Rows of `needs_review` in the log point to a retrieval-side problem; a rise in `source=explicit_fetch` says url_context retrieval is struggling — the cause is separated in the record from the start. Before judging generation quality, look first at whether the sources were truly read. Reordering just that one thing visibly reduced how untrustworthy the automation felt.
+
+url_context is a useful tool, but retrieval is not a promise. Gate answers on retrieval status — solid primary information — rather than on how convincing the returned body reads. Start by dropping `extract_retrievals` into one of your own jobs and logging how many non-`SUCCESS` outcomes are mixed in. You will probably find more silent failures than you expected.
+
+If you run automation the same way, I hope this makes your morning draft review a little easier.
