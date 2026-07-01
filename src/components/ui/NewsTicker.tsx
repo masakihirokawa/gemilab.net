@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "API — Interactions APIが一般提供となり、GeminiモデルとエージェントのためのAI Studio・APIの既定APIになりました",
-    "AGENT — Managed Agentsがパブリックプレビューとなり、Googleホストの隔離Linuxサンドボックスで自律エージェントを動かせます",
-    "SECURITY — 6月19日以降、制限なしのAPIキーからのリクエストが拒否され、キーへの制限付与が前提になりました",
-    "CLI — Gemini CLIが6月18日にEOLとなり、Agentic 2.0（Antigravity CLI）へ置き換わりました",
-    "MODEL — Gemini 3.5 FlashがGAとなり、エージェント処理やコーディングで持続的な高性能を発揮します",
-    "UPDATE — 旧画像プレビューモデル（gemini-3.1-flash-image-preview等）が6月25日に廃止されました",
+    "MODEL — Gemma 4がGoogle AI StudioとGemini APIで利用可能になりました",
+    "AGENT — Managed Agentsが公開プレビューとなり、隔離サンドボックスで自律エージェントを構築できます",
+    "MODEL — Gemini 3.5 FlashがGAとなり、エージェントとコーディング用途に対応します",
+    "STUDIO — Google AI StudioにWorkspace連携とCloud Runへのワンクリックデプロイが加わりました",
+    "STUDIO — AI StudioのbuildタブでネイティブAndroidアプリを生成できるようになりました",
+    "MIGRATE — Gemini Code Assistの個人向けIDE拡張・CLIは6月18日で終了し、Antigravityへ移行します",
   ],
   en: [
-    "API — The Interactions API reaches general availability as the default API for Gemini models and agents",
-    "AGENT — Managed Agents enter public preview, running autonomous agents in Google-hosted isolated Linux sandboxes",
-    "SECURITY — From June 19, requests from unrestricted API keys are rejected, so keys now need restrictions",
-    "CLI — Gemini CLI reaches end-of-life on June 18, replaced by the Agentic 2.0 Antigravity CLI",
-    "MODEL — Gemini 3.5 Flash is generally available for sustained frontier performance on agentic and coding tasks",
-    "UPDATE — Older image preview models such as gemini-3.1-flash-image-preview were shut down on June 25",
+    "MODEL — Gemma 4 is now available in Google AI Studio and the Gemini API",
+    "AGENT — Managed Agents enter public preview, running autonomous agents in isolated sandboxes",
+    "MODEL — Gemini 3.5 Flash reaches GA for agentic and coding tasks",
+    "STUDIO — Google AI Studio adds Workspace integrations and one-click deploy to Cloud Run",
+    "STUDIO — You can now build native Android apps in the AI Studio build tab",
+    "MIGRATE — Gemini Code Assist IDE extensions and CLI ended for individuals on June 18; move to Antigravity",
   ],
 };
 
