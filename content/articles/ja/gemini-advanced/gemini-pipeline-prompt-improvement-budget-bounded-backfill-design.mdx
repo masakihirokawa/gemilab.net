@@ -1,0 +1,221 @@
+---
+title: "プロンプトを直した後、過去の成果物をどこまで作り直すか — 予算で区切る計画的バックフィルの設計"
+slug: "gemini-pipeline-prompt-improvement-budget-bounded-backfill-design"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-02T13:00"
+author: "Gemini Lab"
+description: "プロンプト改善後に残る旧世代の生成物を、全件再生成せず予算と優先度で作り直す設計です。選定スコア・編集検知ハッシュ・置換前ゲート・再開可能なカーソルを実装コード付きで解説します。"
+tags: ["gemini-api", "バックフィル", "運用設計", "コスト最適化", "パイプライン"]
+highlights:
+  - "「作り直す価値」を露出・世代差・品質シグナル・コストの4要素で点数化し、上位から予算内で再生成する選定スコアラーの実装"
+  - "生成時に保存したハッシュで人手修正を検知し、編集済みの成果物を上書きから守る仕組み"
+  - "新旧出力を比較して悪化を弾く置換前ゲートと、日次予算で止まっても翌日そのまま再開できるカーソル設計"
+---
+
+個人開発で運営しているアプリのメタデータ生成パイプラインで、タグ付けプロンプトの改訂に成功した日のことでした。新しいプロンプトで生成したタグは明らかに具体的で、検索との噛み合いも良い。ようやく納得のいく形になった、と一息ついた直後に気づきました。
+
+旧プロンプトで生成した成果物が、およそ4,200件残っている。
+
+改善は「これから作るもの」にしか効きません。過去の成果物は旧世代のまま。ここで「全部作り直せばいい」と考えるのは自然ですが、私自身、この素朴な全件再生成で二度ほど痛い目を見ています。本記事は、その反省から辿り着いた「予算で区切る計画的バックフィル」の設計をまとめたものです。
+
+## 全件再生成が最適解にならない理由
+
+まず費用の概算です。手元のケースでは、1件あたりの入力が画像込みで平均2,800トークン、出力が約400トークン。gemini-3.5-flash 相当の単価で計算すると、4,200件の一括再生成はおよそ数ドル〜十数ドルの範囲に収まります。金額だけ見れば「一晩で流せば終わり」に見えます。
+
+問題は金額ではありませんでした。
+
+第一に、上書きの被害です。過去の成果物の一部には、人の手で直した箇所が含まれています。レビューで指摘を受けて手修正したタグ、法務的な理由で言い回しを変えた説明文。全件再生成はこれらを容赦なく旧に復してしまいます。私はこの事故を一度起こし、どれを手で直したのか記録がないせいで、復旧に生成費用の何倍もの時間を使いました。
+
+第二に、品質が上がる保証のない件が混ざることです。プロンプト改訂は平均を押し上げますが、個々の件では旧出力のほうが良いケースが普通にあります。実測では、改訂後プロンプトでの再生成のうち約8%は、ルールベースの検査で旧出力より劣ると判定されました。
+
+第三に、クォータの食い合いです。再生成トラフィックは日次の定常処理と同じプロジェクトのレート制限を消費します。深夜バッチと重なった日は、定常側が 429 を返し始めました。
+
+<table><thead><tr><th>観点</th><th>全件一括再生成</th><th>計画的バックフィル</th></tr></thead><tbody><tr><td>費用</td><td>一括で発生・上限なし</td><td>日次予算で頭打ち</td></tr><tr><td>人手修正</td><td>無条件に上書き</td><td>編集検知でスキップ</td></tr><tr><td>品質の逆行</td><td>混入する（実測 約8%）</td><td>置換前ゲートで棄却</td></tr><tr><td>定常処理への影響</td><td>レート制限を食い合う</td><td>実行窓と速度を分離</td></tr><tr><td>中断・再開</td><td>途中で止まると状態不明</td><td>カーソルで翌日再開</td></tr></tbody></table>
+
+この比較に行き着いてから、バックフィルは「一度のイベント」ではなく「小さく回り続ける常設の工程」として設計するようになりました。
+
+## 「作り直す価値」を点数にする — 選定スコアラー
+
+全件を対象にしない以上、どの成果物から作り直すかを決める基準が要ります。私は4つの要素を重み付きで合成しています。
+
+1. **露出** — 実際に閲覧・使用されている頻度。使われていない成果物の改善は後回しにします
+2. **世代差** — 現行プロンプトとの版差。2世代以上前のものを優先します
+3. **品質シグナル** — 低評価・報告・検索不一致など、旧出力に問題がある兆候
+4. **コスト** — 入力が重い件（高解像度画像など）は同点なら後ろへ
+
+```python
+# backfill_scorer.py — 再生成候補の点数化
+# 何を解決するか: 「どれから作り直すか」を人の勘でなくスコアで決める
+import sqlite3
+from dataclasses import dataclass
+
+WEIGHTS = {"exposure": 0.4, "gen_gap": 0.3, "quality": 0.2, "cost": 0.1}
+
+@dataclass
+class Candidate:
+    item_id: str
+    exposure_norm: float   # 0..1 直近30日の使用頻度を正規化
+    gen_gap: int           # 現行プロンプト版 - 生成時プロンプト版
+    quality_flags: int     # 低評価・報告などの件数
+    input_tokens: int
+
+def score(c: Candidate, max_gap: int = 5) -> float:
+    gap = min(c.gen_gap, max_gap) / max_gap
+    quality = min(c.quality_flags, 3) / 3
+    cost_penalty = min(c.input_tokens / 8000, 1.0)  # 重い入力ほど減点
+    return (
+        WEIGHTS["exposure"] * c.exposure_norm
+        + WEIGHTS["gen_gap"] * gap
+        + WEIGHTS["quality"] * quality
+        - WEIGHTS["cost"] * cost_penalty
+    )
+
+def top_candidates(db: str, limit: int = 500) -> list[tuple[str, float]]:
+    conn = sqlite3.connect(db)
+    rows = conn.execute(
+        """SELECT item_id, exposure_norm, gen_gap, quality_flags, input_tokens
+           FROM artifacts WHERE gen_gap >= 1 AND human_edited = 0"""
+    ).fetchall()
+    conn.close()
+    scored = [(r[0], score(Candidate(*r))) for r in rows]
+    return sorted(scored, key=lambda x: x[1], reverse=True)[:limit]
+```
+
+重みは最初から正解を狙わず、まず露出を最重視に置くのが実用的です。使われている成果物の改善だけが、体感品質に直結するためです。
+
+スコアには「閾値」も設けます。私の運用では 0.25 を下回る候補は再生成しません。全件消化を目標にすると、価値の薄い再生成に予算が流れ続けます。**バックフィルは終わらせるものではなく、閾値の上が空になったら自然に止まるもの**、という位置づけが長期運用では安定しました。
+
+## 人手で直した成果物を上書きしない — 生成時ハッシュによる編集検知
+
+全件再生成で最も痛かったのは、人手修正の消失でした。対策は単純で、生成した瞬間の内容のハッシュを成果物と一緒に保存しておくことです。再生成の前に現在の内容とハッシュを照合し、一致しなければ「誰かが手を入れた」と判断してスキップします。
+
+```python
+# edit_guard.py — 人手修正の検知
+# 何を解決するか: バックフィルが手修正済みの成果物を旧に復す事故を止める
+import hashlib
+
+def content_hash(text: str) -> str:
+    normalized = " ".join(text.split())  # 空白差で誤検知しない
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+def is_human_edited(current_text: str, stored_hash: str | None) -> bool:
+    if stored_hash is None:
+        # ハッシュ未記録の旧データは「編集済み扱い」に倒す（安全側）
+        return True
+    return content_hash(current_text) != stored_hash
+
+def save_generated(conn, item_id: str, text: str, prompt_ver: int) -> None:
+    conn.execute(
+        """UPDATE artifacts
+           SET body = ?, gen_hash = ?, prompt_version = ?, human_edited = 0
+           WHERE item_id = ?""",
+        (text, content_hash(text), prompt_ver, item_id),
+    )
+```
+
+要点は2つあります。正規化してからハッシュを取ること（改行や空白の揺れで人手修正と誤認しないため）。そしてハッシュが未記録の古いデータは**編集済み扱いに倒す**ことです。判別できないものを守る側に置くと、事故は起きません。導入後の実測では、候補の約6%が編集検知でスキップされました。この6%こそ、以前の私が壊していたものです。
+
+## 予算で区切って回す — 日次上限とカーソルの再開設計
+
+バックフィルの実行単位は「日次予算」で切ります。金額でもトークン数でも構いませんが、上限に達したらその日は止まり、翌日は続きから再開する。この「続きから」を成立させるのがカーソルです。
+
+```python
+# backfill_runner.py — 予算上限つきの再開可能ランナー
+# 何を解決するか: 途中で止まっても状態が壊れない・使いすぎない実行制御
+import json, os, time
+from google import genai
+
+DAILY_TOKEN_BUDGET = 600_000     # 日次予算（入力+出力トークン）
+STATE_PATH = "backfill_state.json"
+
+def load_state() -> dict:
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    return {"date": "", "spent_tokens": 0, "done_ids": []}
+
+def run_batch(candidates: list[str], build_request, apply_result) -> None:
+    state = load_state()
+    today = time.strftime("%Y-%m-%d")
+    if state["date"] != today:
+        state = {"date": today, "spent_tokens": 0, "done_ids": state["done_ids"]}
+
+    client = genai.Client()
+    for item_id in candidates:
+        if item_id in state["done_ids"]:
+            continue  # カーソル: 処理済みは飛ばす
+        if state["spent_tokens"] >= DAILY_TOKEN_BUDGET:
+            break     # 予算到達: 今日はここまで
+        req = build_request(item_id)
+        resp = client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=req["contents"],
+            config=req["config"],
+        )
+        usage = resp.usage_metadata
+        state["spent_tokens"] += (usage.prompt_token_count or 0) + (
+            usage.candidates_token_count or 0
+        )
+        apply_result(item_id, resp.text)
+        state["done_ids"].append(item_id)
+        with open(STATE_PATH, "w") as f:
+            json.dump(state, f)  # 1件ごとに永続化（途中クラッシュに耐える）
+```
+
+usage_metadata の実測値で予算を減らしていくのが肝要です。事前見積りは入力画像の解像度差で簡単に2倍ずれます。見積りで管理していた頃は月末の請求で毎回驚いていましたが、実測消化に変えてからは誤差が数%に収まっております。
+
+急がないバックフィルであれば、Batch API に寄せると単価が下がり、日中の定常処理とレート制限を食い合わない利点もあります。私は「今日の候補上位をまとめて夜に1バッチ」という形に落ち着きました。定常処理が動く時間帯を避けて実行窓を分けるだけで、429 の同時多発はなくなります。
+
+## 置き換える前に新旧を比べる — 悪化を弾くゲート
+
+再生成した結果が旧出力より悪いことは、体感より頻繁にあります。置換の直前に機械検査を挟み、悪化を弾きます。
+
+```python
+# replace_gate.py — 置換前の新旧比較ゲート
+# 何を解決するか: 「新しいほうが良いはず」という思い込みで品質を逆行させない
+BANNED = {"最高の", "究極の", "No.1"}
+
+def gate(old: dict, new: dict) -> str:
+    """'replace' / 'keep' / 'hold' を返す"""
+    # 1) 構造検査: タグ数・説明文長が規定内か
+    if not (3 <= len(new["tags"]) <= 8):
+        return "keep"
+    if not (40 <= len(new["description"]) <= 160):
+        return "keep"
+    # 2) 禁止表現
+    if any(b in new["description"] for b in BANNED):
+        return "keep"
+    # 3) 情報量が明確に痩せたら保留（人の目に回す）
+    if len(set(new["tags"])) < len(set(old["tags"])) - 2:
+        return "hold"
+    return "replace"
+
+def apply_with_archive(conn, item_id: str, old_body: str, new_body: str) -> None:
+    # 旧値をアーカイブしてから原子的に置換（ロールバック可能に）
+    conn.execute(
+        "INSERT INTO artifact_history (item_id, body) VALUES (?, ?)",
+        (item_id, old_body),
+    )
+    conn.execute(
+        "UPDATE artifacts SET body = ? WHERE item_id = ?", (new_body, item_id)
+    )
+    conn.commit()
+```
+
+判定は3値にしています。明確に劣るなら keep（旧を残す）、迷うなら hold（保留キューで人の目に回す）、通ったら replace。そして置換時は必ず旧値をアーカイブします。ゲートをすり抜けた悪化に後から気づいても、履歴があれば1件単位で戻せます。
+
+hold の比率は監視する価値があります。私の環境では平常時 2〜3% ですが、ある改訂の直後に 15% まで跳ねたことがありました。原因はプロンプト改訂そのものの欠陥で、バックフィルを止めて改訂をやり直しました。**ゲートの保留率は、プロンプト改訂の品質を映す遅行指標**でもあります。
+
+## 運用して見えてきたこと
+
+公式ドキュメントには載っていない、数ヶ月回して分かった点を残しておきます。
+
+**スコアの再計算は週1で十分でした。** 毎実行前に再計算すると順位が入れ替わり、カーソルの「処理済み」管理と噛み合わずに同じ件を二度処理しかけます。候補リストは週次で固め、週の途中では順位を動かさないほうが事故がありません。
+
+**「終わらないバックフィル」を許容する設計のほうが健全です。** 全件消化を KPI にすると、閾値を下げてでも消化する誘惑が生まれます。閾値の上が空なら止まる。プロンプトをまた改訂したら世代差が開いて自然に再開する。この呼吸で回すようになってから、予算の無駄がほぼ消えました。
+
+**編集検知のハッシュは、バックフィルを始める前に仕込むものです。** ハッシュのない過去データは全て安全側（スキップ）に倒れるため、導入が遅いほどバックフィルの守備範囲が狭くなります。もし今、生成パイプラインをお持ちなら、バックフィルの計画より先に save_generated 相当のハッシュ記録だけでも先行導入することをおすすめします。数ヶ月後のご自身が助かります。
+
+プロンプトの改善は、過去に遡って初めて資産全体の改善になります。まずは今日のパイプラインに編集検知ハッシュを1行加えるところから始めてみてください。同じ課題に取り組んでいる方の参考になれば幸いです。
