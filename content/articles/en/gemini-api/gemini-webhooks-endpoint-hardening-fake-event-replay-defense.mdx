@@ -1,0 +1,210 @@
+---
+title: "A Webhook Is a Claim, Not a Fact — Three Layers of Defense for Your Gemini Webhooks Endpoint"
+slug: "gemini-webhooks-endpoint-hardening-fake-event-replay-defense"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-03T10:00"
+author: "Gemini Lab"
+description: "Your Gemini Webhooks receiver is a public URL, which means forged events, replays, and duplicate deliveries are all on the table. This walkthrough builds a three-layer defense — reachability checks, dedupe, and a lightweight handler that re-fetches truth from the API — with working FastAPI and SQLite code."
+tags: ["Gemini API", "Webhooks", "security", "idempotency", "automation"]
+highlights:
+  - "You'll be able to harden a wide-open webhook receiver against forged events, replays, and duplicate processing with three inexpensive layers"
+  - "You can implement the 'notification vs. fact' separation — never trusting the payload, always re-fetching state from the API — with working FastAPI and SQLite code"
+  - "You'll take away a cost-vs-benefit table for each defense, adapted from payment-webhook discipline to Gemini automation pipelines"
+---
+
+After I moved my Gemini Batch monitoring from polling to Webhooks, I reread the receiving code and stopped cold. Somewhere along the way I had assumed that only Google would ever POST to that URL. In reality, a webhook receiver is a public internet endpoint. Anyone who finds it can send it any JSON they like.
+
+Webhook receivers in indie projects tend to start life as "whatever works." I would have shipped mine wide open too, if I hadn't spent years operating Stripe webhooks for the membership billing behind my Dolice Labs sites. In the payments world, "trusting the webhook too much" is a textbook failure mode, and the discipline that grew around it transfers directly to Gemini automation pipelines. Here is the three-layer defense I ended up with, along with code that runs.
+
+## What actually goes wrong with an unguarded receiver
+
+Before designing defenses, it helps to name the failure modes. If your receiver believes whatever JSON arrives, three things can happen.
+
+**Forged events.** An attacker — or simply a misconfigured system somewhere else — POSTs a payload dressed up as a "job completed" notification. If the receiver takes it at face value and kicks off downstream work, you end up fetching results that don't exist, saving empty artifacts, or pushing unfinished data into a publish step. No malice is required: staging notifications landing on a production endpoint is a real, mundane accident.
+
+**Replays.** A legitimate event you already handled arrives again. Deliberate replay is one cause, but ordinary delivery retries produce the same effect. The downstream side runs twice, burning compute or overwriting data you already published.
+
+**Duplicate processing.** If your handler responds slowly, the delivery side times out and resends. The heavier the synchronous work inside your handler, the slower it responds, the more retries pile up — a self-reinforcing loop.
+
+Note that the last two happen without any attacker at all. Defending against malice and defending against retries land in almost the same code. I covered event ordering separately in [A Finished Gemini Job Flipped Back to 'Running' — Stopping Out-of-Order Webhooks with Monotonic State Apply](/en/articles/gemini-api/gemini-webhook-out-of-order-monotonic-state-apply-fencing); this piece focuses on the receiving endpoint itself.
+
+## The principle — a payload is a notification, not a fact
+
+One rule underpins all three layers: **never update state from the webhook payload**.
+
+Treat every incoming event as a hint that "something may have changed," and always re-fetch the actual state from the Gemini API. Even if the payload says `state: succeeded`, that is not a reason to run downstream work. You run it only when your own query confirms completion. This single move structurally defuses forged events: the only thing an attacker can fabricate is a *reason to check*, while the facts live solely on the API side.
+
+This is a direct continuation of the reconciliation design I wrote up in [When a Deploy Drops the Webhook: Reconciling Gemini Long-Running Operations with a Belt-and-Suspenders Design](/en/articles/gemini-api/gemini-long-running-operations-webhook-reconciliation). If you already reconcile against the API to catch dropped events, the very same query logic doubles as your "don't trust the payload" mechanism. You barely need any new parts.
+
+## Layer one — reachability: an unguessable path and a shared secret
+
+The first layer rejects traffic from anyone but the legitimate sender before any processing happens. It is unglamorous and has the best cost-benefit ratio of anything here.
+
+First, put a long random token in the URL path itself. Not a guessable `/hooks/gemini`, but something like `/hooks/gemini/f3a9c2e8b1d4...` with 128 bits of randomness. Whoever doesn't know the URL never reaches a valid endpoint in the first place.
+
+Second, use whatever verification the notification configuration offers — always. If you can attach a custom header carrying a secret, do it and verify on receipt; if a signature scheme is available, prefer that. Compare with `hmac.compare_digest` so the check runs in constant time.
+
+I do not recommend source-IP allowlists as a primary defense. Provider IP ranges can change without notice, and a stale allowlist fails in the worst direction: dropping legitimate events. Treat it as a supplementary layer if you use it at all.
+
+## Layer two — stopping replays and duplicates with a UNIQUE constraint
+
+Legitimate events that pass layer one still arrive more than once. A receipt table with a uniqueness constraint folds them flat mechanically.
+
+```sql
+CREATE TABLE processed_events (
+  dedupe_key  TEXT PRIMARY KEY,   -- event ID, or a synthetic key
+  received_at INTEGER NOT NULL    -- UNIX seconds
+);
+```
+
+If events carry a unique ID, use it as `dedupe_key`. If they don't — or you don't fully trust it — synthesize one from `operation name + state`. The semantics become "the same state transition of the same operation is processed once," which covers replays and delivery retries with the same row.
+
+Insert with `INSERT OR IGNORE`, and if zero rows were affected, silently return 200 for the known event. Not returning an error here is an operational detail that matters: responding 4xx or 5xx to duplicates can make some delivery systems retry even harder.
+
+## Layer three — the handler only receives; the work goes on a queue
+
+Limit the handler's job to "verify, record, return 200 immediately." Doing heavy work synchronously — fetching results, kicking off downstream steps — delays the response, invites timeout-driven retries, and breeds the duplicate-processing loop from earlier.
+
+Here is the receiving side with all three layers, using nothing but FastAPI and SQLite.
+
+```python
+import hmac
+import os
+import sqlite3
+import time
+
+from fastapi import FastAPI, Header, HTTPException, Request
+
+app = FastAPI()
+
+HOOK_TOKEN = os.environ["HOOK_PATH_TOKEN"]      # random token embedded in the path
+HOOK_SECRET = os.environ["HOOK_SHARED_SECRET"]  # header value set in the notification config
+DB_PATH = os.environ.get("HOOK_DB", "webhook.db")
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS processed_events ("
+        " dedupe_key TEXT PRIMARY KEY,"
+        " received_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS work_queue ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " operation_name TEXT NOT NULL,"
+        " enqueued_at INTEGER NOT NULL,"
+        " done INTEGER NOT NULL DEFAULT 0)"
+    )
+    return conn
+
+
+@app.post("/hooks/gemini/{token}")
+async def receive(token: str, request: Request,
+                  x_hook_secret: str = Header(default="")):
+    # Layer 1: reachability (path token + shared secret, constant-time compares)
+    if not hmac.compare_digest(token, HOOK_TOKEN):
+        raise HTTPException(status_code=404)
+    if not hmac.compare_digest(x_hook_secret, HOOK_SECRET):
+        raise HTTPException(status_code=401)
+
+    payload = await request.json()
+    # Payload shape varies by notification type and configuration —
+    # adapt these lookups to what your environment actually sends
+    operation = payload.get("operation", {}).get("name") or payload.get("name", "")
+    if not operation:
+        # Unexpected shape still gets a 200, so we never create a retry loop
+        return {"status": "ignored"}
+    event_id = payload.get("event_id") or f"{operation}:{payload.get('state', '')}"
+
+    conn = db()
+    with conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO processed_events (dedupe_key, received_at)"
+            " VALUES (?, ?)",
+            (event_id, int(time.time())),
+        )
+        if cur.rowcount == 0:
+            return {"status": "duplicate"}  # Layer 2: replays fold flat here
+        conn.execute(
+            "INSERT INTO work_queue (operation_name, enqueued_at) VALUES (?, ?)",
+            (operation, int(time.time())),
+        )
+    # Layer 3: no heavy work here — acknowledge and return
+    return {"status": "accepted"}
+```
+
+Expected behavior: a fresh event with the right token and header gets `{"status": "accepted"}`, the same event a second time gets `{"status": "duplicate"}`, and a wrong path token gets a 404. The 404 is deliberate — answering 401 would confirm the endpoint exists, and at the path-token layer I prefer it to simply not exist.
+
+The worker that drains the queue is where the core principle lives:
+
+```python
+import sqlite3
+
+from google import genai
+
+client = genai.Client()  # GEMINI_API_KEY comes from the environment
+
+
+def fetch_authoritative_state(operation_name: str):
+    """Treat the API, not the payload, as the source of truth."""
+    return client.operations.get(name=operation_name)
+
+
+def run_worker(db_path: str = "webhook.db") -> None:
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT id, operation_name FROM work_queue"
+        " WHERE done = 0 ORDER BY id LIMIT 20"
+    ).fetchall()
+    for row_id, operation_name in rows:
+        op = fetch_authoritative_state(operation_name)
+        if not getattr(op, "done", False):
+            # A forged "completed" notification loses its teeth here:
+            # if the facts say not done, nothing happens
+            continue
+        handle_completed(op)  # downstream work: fetch results, persist, etc.
+        with conn:
+            conn.execute("UPDATE work_queue SET done = 1 WHERE id = ?", (row_id,))
+
+
+def handle_completed(operation) -> None:
+    # Retrieve and store results. Keeping this idempotent pays off on re-runs
+    ...
+```
+
+Even if a forged event slips past layer one and dodges the dedupe in layer two, the worker re-queries the API — so a nonexistent operation or an unfinished job produces no action at all. The attacker is left with the ability to trigger one wasted lookup, which rate limits and a bounded queue keep in check.
+
+## The discipline I carried over from payment webhooks
+
+This structure is a transcription of habits I built operating Stripe webhooks. For the membership billing on my Dolice Labs sites, I never grant entitlements off the `checkout.session.completed` payload; the code always re-fetches the session, verifies the payment state and metadata, and only then issues the cookie. In payments, "don't believe arriving JSON" is simply table manners — yet the moment we build generation pipelines, we write pass-through receivers. Noticing that asymmetry is what made me rewrite mine.
+
+A generation pipeline's webhook doesn't move money directly, but a forged completion notice that misfires a publish step damages something just as real: the trust of whoever reads your output. As an indie developer I have limited hours for cleanup, so pinching off these failure modes at the receiving end is the cheap option.
+
+## How far to go — cost versus payoff for each defense
+
+You don't need all of it on day one. Here is the order I actually implemented things in, with rough costs and my verdict.
+
+<table>
+<thead>
+<tr><th>Defense</th><th>What it mainly stops</th><th>Implementation cost</th><th>Verdict</th></tr>
+</thead>
+<tbody>
+<tr><td>Random path token</td><td>Most forged events (blocks reachability)</td><td>Minutes</td><td>Essential — do it first</td></tr>
+<tr><td>Shared-secret header check</td><td>Forged events after a URL leak</td><td>~30 minutes</td><td>Essential</td></tr>
+<tr><td>UNIQUE-constrained receipt table</td><td>Replays and delivery-retry duplicates</td><td>~1 hour</td><td>Essential</td></tr>
+<tr><td>Re-fetching state from the API</td><td>Forged payloads in general, out-of-order events</td><td>~Half a day</td><td>Essential — this is the core</td></tr>
+<tr><td>Source-IP allowlist</td><td>Some forged events at the edge (supplementary)</td><td>Ongoing maintenance</td><td>Optional; never the primary layer</td></tr>
+<tr><td>Dedicated queue infrastructure</td><td>Loss under heavy load</td><td>Days</td><td>Only once volume demands it</td></tr>
+</tbody>
+</table>
+
+Is SQLite enough for the receipt table and queue? In my experience, comfortably yes at indie-scale webhook volume — a few hundred events a day at most. The migration that got me onto webhooks in the first place is documented in [Retiring the Midnight Polling Loop — Rebuilding My Gemini Batch Monitoring Around Webhooks](/en/articles/gemini-api/gemini-batch-webhook-polling-to-event-driven-redesign); these defensive layers stack on top of that design.
+
+## Wrapping up — start with the random path token
+
+Trying to do everything at once is how this kind of work never starts, so pick one first step: add a random token to your webhook receiver's path and update the URL in your notification settings. It takes minutes and cuts off nearly all indiscriminate forged traffic. When you next have a free afternoon, move on to the receipt table and the re-fetching worker — that ordering has served me well.
+
+If you run unattended pipelines of your own, I hope this checklist earns a place in your next maintenance pass.
