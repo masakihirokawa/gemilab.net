@@ -1,0 +1,220 @@
+---
+title: "CI に組み込んだ Gemini 自動レビューが静かに形骸化していたとき — 採用率とカバレッジで立て直す運用メモ"
+slug: "gemini-ci-review-silent-decay-actioned-rate-instrumentation-field-notes"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-02T21:00"
+author: "Gemini Lab"
+description: "GitHub Actions に組み込んだ Gemini の PR 自動レビューは、エラーを出さないまま劣化します。差分の頭切り・モデルエイリアス更新・握りつぶされたパース失敗を1行JSONログと採用率で数値化し、立て直すまでの運用記録です。"
+tags: ["gemini-api", "ci-cd", "github-actions", "code-review", "observability", "運用"]
+highlights:
+  - "レビューbotの空洞化を検知する2つの指標（レビューカバレッジ率と指摘の採用率）の定義と、1行JSONログによる計測コード"
+  - "diff の先頭15,000文字カット・gemini-flash-latest の中身更新・exit 0 で握りつぶされたパース失敗という、緑のまま進行する3つの劣化要因と修正版の実装"
+  - "2026年6月以降の必須対応 — 制限なしAPIキーの拒否へのCIシークレット側の設定と、モデルピン留め＋カナリア比較の運用手順"
+---
+## レビューコメントは毎日付いているのに、誰も直していなかった
+
+PR が開かれるたびに Gemini がレビューコメントを付ける。CI は緑。ワークフローの実行履歴にも失敗はありません。
+
+それなのに、ある時期からコメントの中身が修正コミットにつながっていないことに気づきました。指摘は投稿されているのに、直された形跡がない。よく読むと「エラーハンドリングの追加を検討してください」のような、どのPRに付いても成立する指摘が増えていました。
+
+私自身、個人開発で複数のリポジトリを一人で回しているので、レビューbotは「もう一人の目」として本気で頼っていた時期があります。だからこそ、この空洞化に数ヶ月気づけなかったのは堪えました。壊れて止まったのなら通知が来ます。厄介なのは、**動き続けたまま役に立たなくなる**ことです。
+
+ここでは、GitHub Actions × Gemini API のレビューパイプラインが「緑のまま」劣化していた3つの原因と、それを数値で捕まえるために入れた計測、立て直しの実装をまとめます。
+
+## 「エラーゼロ」はむしろ危険信号 — CI の AI ステップは黙って抜ける設計になりがち
+
+最初に疑うべきは、パイプライン自体の設計です。AI レビューのステップは、本体のビルドを止めないよう「失敗しても続行」で書かれることがほとんどです。私のスクリプトもそうでした。
+
+```python
+# 旧実装の問題箇所 — 失敗がすべて「正常終了」に化ける
+diff = get_pr_diff()
+if not diff.strip():
+    print("No meaningful changes to review")
+    exit(0)  # ← 差分取得の失敗もここに吸い込まれる
+
+try:
+    review = json.loads(response.text)
+except json.JSONDecodeError:
+    exit(0)  # ← パース失敗も無言でスキップ
+```
+
+`git diff` の対象ブランチ指定を誤って空文字が返ってきても、レスポンスが JSON として壊れていても、この実装は正常終了します。GitHub Actions の画面上は全部グリーン。**レビューが付かなかった PR がどれだけあるか、誰も知らない**状態です。
+
+そこで最初に定義したのが**レビューカバレッジ率**です。「レビュー対象とすべき PR のうち、実際に有効なレビューコメントが投稿された割合」。これを取り始めて愕然としました。直近90日で対象 PR は 214 件、コメントが付いたのは 187 件。**約12.6%の PR が、静かにレビューをすり抜けていました**。
+
+## まず1行 JSON ログを仕込む — 判断はすべて後から検証できる形で残す
+
+原因の切り分けに入る前に、実行ごとの記録を残す仕組みを入れます。凝った観測基盤は不要で、ワークフローの成果物として1行 JSON を吐くだけで十分です。
+
+```python
+# .github/scripts/review_metrics.py — レビュー1回ごとの記録
+import json, time, hashlib
+
+def log_run(pr_number: int, model: str, diff_chars: int,
+            truncated: bool, parse_ok: bool,
+            comments: list, usage) -> None:
+    record = {
+        "ts": int(time.time()),
+        "pr": pr_number,
+        "model_requested": model,          # 指定したモデルID
+        "model_served": usage.model_version if usage else None,  # 実際に応答したバージョン
+        "diff_chars": diff_chars,
+        "truncated": truncated,            # 差分をカットしたか
+        "parse_ok": parse_ok,
+        "n_comments": len(comments),
+        # 指摘ごとの指紋 — 後で「採用されたか」を突き合わせる鍵
+        "fingerprints": [
+            hashlib.sha1(f"{c['file']}:{c['description'][:80]}".encode()).hexdigest()[:12]
+            for c in comments
+        ],
+        "prompt_tokens": usage.prompt_token_count if usage else None,
+        "output_tokens": usage.candidates_token_count if usage else None,
+    }
+    with open("review_metrics.jsonl", "a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+```
+
+ポイントは `model_requested` と `model_served` を分けて記録することと、指摘ごとに**指紋（ファイルパス＋指摘文の先頭）**を残すことです。前者はこの後のモデルエイリアス問題の証拠になり、後者は採用率の計測に使います。
+
+ログは `actions/upload-artifact` で成果物にし、週次のワークフローが全 PR 分を集計します。ここまで入れて、ようやく「なぜ12.6%が抜けたのか」を事実で追えるようになりました。
+
+## 原因1: `diff[:15000]` の頭切りが、重要な変更を静かに落としていた
+
+抜けた PR とコメントが薄い PR のログを突き合わせると、`truncated: true` の実行に偏っていました。旧実装は差分をプロンプトに埋め込む際、単純に先頭から切っていました。
+
+```python
+prompt = f"""以下のコード差分をレビューしてください。
+...
+## diff
+{diff[:15000]}
+"""
+```
+
+落とし穴は `git diff` の出力順にあります。ファイルはパスのアルファベット順で並びます。つまり `docs/` や `config/` の変更が先頭に来て、肝心の `src/` の変更が15,000文字の壁の外に落ちる。ロックファイルを除外していても、生成コードやスナップショットが同じことを起こします。集計では、差分が15,000文字を超えた PR は全体の 23%。そのうち本体コードが切り落とされていたケースが半分近くありました。
+
+修正は「切るなら優先順位を付けて切る」です。
+
+```python
+# 差分をファイル単位に分割し、レビュー価値の高い順に詰める
+import re
+
+LOW_PRIORITY = re.compile(
+    r"\.(lock|snap|min\.js|map)$|^(dist|build|__generated__)/"
+)
+
+def build_diff_budget(diff: str, budget: int = 15000) -> tuple[str, bool]:
+    files = re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE)
+    files = [f for f in files if f.strip()]
+    # 生成物・ロック系を後回しにする
+    files.sort(key=lambda f: bool(LOW_PRIORITY.search(f.split("\n", 1)[0])))
+    picked, used, truncated = [], 0, False
+    for f in files:
+        if used + len(f) > budget:
+            truncated = True
+            continue  # 入らないファイルは丸ごと飛ばす（途中で千切らない）
+        picked.append(f)
+        used += len(f)
+    return "".join(picked), truncated
+```
+
+ファイルの途中で千切らないのも意図的です。中途半端に切れた diff はモデルの誤読を誘い、「存在しない行への指摘」というノイズコメントの温床になっていました。この変更だけで、指摘のうち実在の行を指すものの割合が体感でわかるほど改善しています。
+
+## 原因2: `gemini-flash-latest` の中身が変わっていた — エイリアスは CI では使わない
+
+ログの `model_served` を時系列に並べると、はっきりと段差がありました。2026年6月に Gemini 3.5 Flash が GA になり、`gemini-flash-latest` の実体が切り替わったのです。モデル自体は賢くなっているのに、レビューの文体・指摘の粒度・severity の付け方が変わり、Few-shot で調整していた出力の前提が崩れていました。
+
+エイリアスの利便性は開発時のものです。**CI のような無人実行では、モデルはバージョン付きでピン留めし、更新は自分の意思で行う**ほうが結果的に安全だと考えています。個人的には、無人実行の設定にエイリアスが現れた時点でレビューで弾く運用を推奨します。
+
+```yaml
+# ワークフロー側 — モデルIDを設定として外に出す
+env:
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  REVIEW_MODEL: gemini-2.5-flash        # ピン留め本番系
+  CANARY_MODEL: gemini-3.5-flash        # 移行候補
+```
+
+移行判断は勘でやらず、カナリア比較のジョブを週1で回します。直近の PR からサンプリングした差分を新旧両モデルに投げ、構造化出力どうしを突き合わせるだけの素朴なものですが、「切り替えたら何が変わるか」を事前に見られる安心感は大きいです。
+
+```python
+# 週次カナリア — 同じ差分を両モデルでレビューし、差分を記録する
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # APIキーは GEMINI_API_KEY 環境変数から
+
+def review_with(model: str, prompt: str) -> dict:
+    resp = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=REVIEW_SCHEMA,   # 本番と同一スキーマ
+            temperature=0.1,                 # 比較のため揺らぎを抑える
+        ),
+    )
+    return json.loads(resp.text)
+
+for sample in weekly_samples:
+    a = review_with(os.environ["REVIEW_MODEL"], sample.prompt)
+    b = review_with(os.environ["CANARY_MODEL"], sample.prompt)
+    diff_report.append({
+        "pr": sample.pr,
+        "n_issues": (len(a["issues"]), len(b["issues"])),
+        "severity_mix": (count_by(a, "severity"), count_by(b, "severity")),
+    })
+```
+
+6月の切り替えをこの体制で迎えていれば、「いつの間にか文体が変わった」ではなく「来週から変える」と言えたはずです。なお、これから新規に組むなら、6月に GA となった Interactions API に最初から寄せておくと、この先の移行コストを一段減らせます。
+
+## 原因3: 「役に立っているか」を測っていなかった — 採用率という指標
+
+カバレッジとモデルの問題を潰しても、最初の違和感——**指摘が直されていない**——はまだ数値になっていません。そこで入れたのが**採用率（actioned rate）**です。定義は割り切りました。「指摘が指したファイルの該当箇所が、その PR の後続コミットで変更されたら採用とみなす」。
+
+```python
+# 指摘の指紋と後続コミットを突き合わせる（マージ後に実行）
+def actioned_rate(pr_number: int, fingerprints: list[str]) -> float:
+    issues = load_issues(pr_number)          # 指紋 → (file, hunk範囲) の対応
+    later_commits = commits_after_review(pr_number)
+    if not issues:
+        return 0.0
+    actioned = 0
+    for issue in issues:
+        touched = any(
+            issue["file"] in c.files and overlaps(issue["hunk"], c.hunks[issue["file"]])
+            for c in later_commits
+        )
+        actioned += touched
+    return actioned / len(issues)
+```
+
+偶然同じ箇所を触っただけのケースも拾うので、厳密な因果ではありません。それでも傾向を見るには十分でした。導入時点の採用率は 18%。severity 別に割ると critical 指摘ですら 3割程度で、suggestion はほぼ流されていました。
+
+ここから2つの手を打ちました。ひとつは**指摘数の上限**です。1レビューあたり最大5件、確信度の低い指摘はスキーマ側で `confidence` を持たせて閾値未満を捨てる。もうひとつは**汎用指摘のフィルタ**で、過去の指摘文との類似が高いコメント（どのPRにも言える定型文）を投稿前に落とします。指摘の総数は6割減りましたが、採用率は 18% → 41% まで上がりました。少なく鋭く言うほうが、人もbotも聞いてもらえるようです。
+
+## 2026年6月以降の足回り — 制限なしAPIキーは CI から拒否される
+
+運用面で見落とせない変更がもう一つあります。2026年6月19日以降、Gemini API は**制限なし（unrestricted）API キーからのリクエストを拒否**するようになりました。CI のシークレットに入れっぱなしのキーが無制限のままだと、ある日突然レビューbotが止まります。しかも前述のとおり「失敗しても緑」の設計だと、止まったことにすら気づけません。
+
+対処は単純で、CI 用のキーには API 制限（Generative Language API のみ許可）を付け、可能ならリポジトリ単位でキーを分けます。キーを分けておくと、ログ上でどのリポジトリがどれだけトークンを使ったかも自然に分離でき、月次のコスト集計が楽になりました。
+
+コストの話を添えると、`synchronize` イベントで毎 push 全量レビューしていた旧設定は明確に無駄でした。`concurrency` で古い実行をキャンセルし、直前レビュー済みコミットとの差分だけを対象にしたところ、月間の API 呼び出しは約4割減。品質を落とさずに減らせる部分から削るのが、個人開発の予算では特に効きます。
+
+```yaml
+concurrency:
+  group: gemini-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true   # 連続pushの古いレビュー実行を捨てる
+```
+
+## 現在のダッシュボード — 週次で見ている4つの数字
+
+立て直し後、週次ジョブが集計してくれる数字は次の4つだけです。多くを見ようとすると結局見なくなるので、絞っています。
+
+<table><thead><tr><th>指標</th><th>定義</th><th>導入時</th><th>現在</th></tr></thead><tbody><tr><td>レビューカバレッジ率</td><td>対象PRのうち有効レビューが付いた割合</td><td>87.4%</td><td>99%台</td></tr><tr><td>採用率（actioned rate）</td><td>指摘箇所が後続コミットで変更された割合</td><td>18%</td><td>41%</td></tr><tr><td>truncation発生率</td><td>差分カットが発生した実行の割合</td><td>23%</td><td>9%（優先順位詰めで実害減）</td></tr><tr><td>parse失敗率</td><td>構造化出力のパースに失敗した割合</td><td>計測不能（握りつぶし）</td><td>0.8%・全件アラート化</td></tr></tbody></table>
+
+数字そのものより、**この4つに段差が出たら何かが起きた**と分かる状態に価値があります。モデルの中身が変わっても、キーが拒否されても、差分の性質が変わっても、必ずどれかが動きます。
+
+## 次のアクション
+
+すでに Gemini レビューを CI で回しているなら、まず今日のログに `parse_ok` と `truncated` の2フィールドだけ足してください。1週間分たまった時点で、自分のレビューbotが見た目どおり働いているかは判定できます。採用率の計測はその後で十分です。静かに壊れるものは、静かに数えるのが一番の対抗策だと私は考えています。

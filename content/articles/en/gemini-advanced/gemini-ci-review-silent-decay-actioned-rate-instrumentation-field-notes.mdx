@@ -1,0 +1,218 @@
+---
+title: "When the Gemini Review Bot in Your CI Quietly Stops Earning Its Keep — Rebuilding Trust with Coverage and Actioned-Rate Metrics"
+slug: "gemini-ci-review-silent-decay-actioned-rate-instrumentation-field-notes"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-02T21:00"
+author: "Gemini Lab"
+description: "A Gemini-powered PR review bot in GitHub Actions degrades without ever throwing an error. Field notes on catching diff truncation, model alias drift, and swallowed parse failures with one-line JSON logs and an actioned-rate metric."
+tags: ["gemini-api", "ci-cd", "github-actions", "code-review", "observability", "operations"]
+highlights:
+  - "Two metrics that expose a hollowed-out review bot — review coverage rate and actioned rate — with the one-line JSON logging code to measure both"
+  - "Three failure modes that progress while CI stays green — naive diff truncation at 15,000 chars, the gemini-flash-latest alias silently changing models, and parse failures swallowed by exit 0 — each with fixed implementations"
+  - "The June 2026 operational must-dos — restricted API keys now enforced for CI secrets, plus a model-pinning and weekly canary comparison workflow"
+---
+## The review comments kept coming — nobody was acting on them
+
+Every pull request got a Gemini review comment. CI stayed green. The workflow history showed zero failures.
+
+And yet, at some point I noticed the comments had stopped turning into fix commits. The feedback was being posted, but nothing was changing because of it. Reading closer, more and more of the comments were the kind that would apply to any PR — "consider adding error handling" and similar boilerplate observations.
+
+As an indie developer running several repositories alone, I had leaned on that review bot as a second pair of eyes. Which is exactly why it stung to realize the hollowing-out had gone unnoticed for months. When something breaks and stops, you get an alert. The dangerous failure mode is different: **the pipeline keeps running while quietly becoming useless**.
+
+These are my field notes on the three causes that let a GitHub Actions × Gemini API review pipeline decay "in the green," the instrumentation I added to catch it in numbers, and the rebuild.
+
+## "Zero errors" is itself a warning sign — AI steps in CI are designed to fail silently
+
+The first thing to question is the pipeline's own design. AI review steps are almost always written as "continue on failure" so they never block the main build. Mine was no exception.
+
+```python
+# The old implementation — every failure dissolves into a "successful" run
+diff = get_pr_diff()
+if not diff.strip():
+    print("No meaningful changes to review")
+    exit(0)  # <- a broken diff command also falls through here
+
+try:
+    review = json.loads(response.text)
+except json.JSONDecodeError:
+    exit(0)  # <- parse failures skipped in silence
+```
+
+If the branch range passed to `git diff` is wrong and returns an empty string, or the response comes back as malformed JSON, this exits successfully. Everything is green in the Actions UI. **Nobody knows how many PRs went unreviewed.**
+
+So the first metric I defined was **review coverage rate**: of the PRs that should have been reviewed, what fraction actually received a valid review comment? Measuring it was sobering. Over the previous 90 days, 214 PRs qualified and 187 got comments — **roughly 12.6% of PRs had slipped through without review**, silently.
+
+## Start with one-line JSON logs — make every decision verifiable after the fact
+
+Before untangling causes, put per-run records in place. You don't need an observability stack; appending one JSON line per run and uploading it as a workflow artifact is enough.
+
+```python
+# .github/scripts/review_metrics.py — one record per review run
+import json, time, hashlib
+
+def log_run(pr_number: int, model: str, diff_chars: int,
+            truncated: bool, parse_ok: bool,
+            comments: list, usage) -> None:
+    record = {
+        "ts": int(time.time()),
+        "pr": pr_number,
+        "model_requested": model,          # the model ID you asked for
+        "model_served": usage.model_version if usage else None,  # what actually answered
+        "diff_chars": diff_chars,
+        "truncated": truncated,
+        "parse_ok": parse_ok,
+        "n_comments": len(comments),
+        # a fingerprint per finding — the key for matching "was it acted on?" later
+        "fingerprints": [
+            hashlib.sha1(f"{c['file']}:{c['description'][:80]}".encode()).hexdigest()[:12]
+            for c in comments
+        ],
+        "prompt_tokens": usage.prompt_token_count if usage else None,
+        "output_tokens": usage.candidates_token_count if usage else None,
+    }
+    with open("review_metrics.jsonl", "a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+```
+
+Two details matter. Recording `model_requested` and `model_served` separately becomes the evidence for the alias problem below. And the per-finding **fingerprint** (file path plus the head of the finding text) is what makes the actioned-rate metric possible. A weekly workflow aggregates the artifacts. Only with this in place could I trace why 12.6% had slipped through.
+
+## Cause 1: `diff[:15000]` was silently dropping the changes that mattered
+
+Cross-referencing the skipped and thin-review PRs against the logs, they clustered on runs with `truncated: true`. The old implementation embedded the diff into the prompt by slicing from the top:
+
+```python
+prompt = f"""Review the following code diff.
+...
+## diff
+{diff[:15000]}
+"""
+```
+
+`git diff` emits files in alphabetical path order. So changes under `docs/` and `config/` came first, and the actual `src/` changes fell outside the 15,000-character wall. Excluding lockfiles doesn't save you — generated code and snapshots do the same thing. In my aggregate, 23% of PRs exceeded 15,000 diff characters, and in nearly half of those the core code changes were the part being cut.
+
+The fix: if you must cut, cut by priority.
+
+```python
+# Split the diff by file and pack highest-value files first
+import re
+
+LOW_PRIORITY = re.compile(
+    r"\.(lock|snap|min\.js|map)$|^(dist|build|__generated__)/"
+)
+
+def build_diff_budget(diff: str, budget: int = 15000) -> tuple[str, bool]:
+    files = re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE)
+    files = [f for f in files if f.strip()]
+    # push generated and lock-style files to the back
+    files.sort(key=lambda f: bool(LOW_PRIORITY.search(f.split("\n", 1)[0])))
+    picked, used, truncated = [], 0, False
+    for f in files:
+        if used + len(f) > budget:
+            truncated = True
+            continue  # skip whole files that don't fit — never cut mid-file
+        picked.append(f)
+        used += len(f)
+    return "".join(picked), truncated
+```
+
+Never cutting mid-file is deliberate. A diff chopped mid-hunk invites the model to misread context, which was the source of a whole class of noise comments pointing at lines that didn't exist.
+
+## Cause 2: `gemini-flash-latest` changed underneath me — don't use aliases in CI
+
+Plotting `model_served` over time showed a clean step change. Gemini 3.5 Flash went GA in June 2026 and the `gemini-flash-latest` alias switched over to it. The model itself is stronger — but the review tone, finding granularity, and severity assignments all shifted, and the few-shot calibration I had tuned against the old model quietly stopped holding.
+
+Aliases are a development convenience. **For unattended execution like CI, pin the model version and upgrade on your own schedule.**
+
+```yaml
+# Workflow side — lift the model IDs out as configuration
+env:
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  REVIEW_MODEL: gemini-2.5-flash        # pinned production model
+  CANARY_MODEL: gemini-3.5-flash        # migration candidate
+```
+
+Migration decisions shouldn't run on instinct. A weekly canary job samples recent PR diffs, sends them to both models, and diffs the structured outputs against each other. It's crude, but knowing "here is what changes if we switch" before switching is worth a great deal.
+
+```python
+# Weekly canary — review the same diff with both models, record the deltas
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # key comes from the GEMINI_API_KEY env var
+
+def review_with(model: str, prompt: str) -> dict:
+    resp = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=REVIEW_SCHEMA,   # same schema as production
+            temperature=0.1,                 # damp randomness for comparison
+        ),
+    )
+    return json.loads(resp.text)
+
+for sample in weekly_samples:
+    a = review_with(os.environ["REVIEW_MODEL"], sample.prompt)
+    b = review_with(os.environ["CANARY_MODEL"], sample.prompt)
+    diff_report.append({
+        "pr": sample.pr,
+        "n_issues": (len(a["issues"]), len(b["issues"])),
+        "severity_mix": (count_by(a, "severity"), count_by(b, "severity")),
+    })
+```
+
+Had this been in place in June, the model switch would have been "we're upgrading next week" instead of "when did the writing style change?" One more forward-looking note: if you're building this pipeline fresh, start on the Interactions API — GA as of June 2026 and now the default surface — and save yourself a migration later.
+
+## Cause 3: nobody was measuring whether it helped — the actioned-rate metric
+
+Fixing coverage and the model still left the original discomfort — **findings weren't being fixed** — without a number attached. Enter the **actioned rate**. I kept the definition deliberately blunt: a finding counts as actioned if the file location it pointed to was modified in a later commit on that same PR.
+
+```python
+# Match finding fingerprints against subsequent commits (run post-merge)
+def actioned_rate(pr_number: int, fingerprints: list[str]) -> float:
+    issues = load_issues(pr_number)          # fingerprint -> (file, hunk range)
+    later_commits = commits_after_review(pr_number)
+    if not issues:
+        return 0.0
+    actioned = 0
+    for issue in issues:
+        touched = any(
+            issue["file"] in c.files and overlaps(issue["hunk"], c.hunks[issue["file"]])
+            for c in later_commits
+        )
+        actioned += touched
+    return actioned / len(issues)
+```
+
+This over-counts coincidental edits, so it isn't strict causality. For watching trends, it was plenty. At baseline the actioned rate was 18%. Split by severity, even critical findings landed around 30%, and suggestions were being waved through almost entirely.
+
+Two interventions followed. First, **a cap on findings**: at most five per review, with a `confidence` field added to the schema so low-confidence findings get dropped before posting. Second, **a boilerplate filter**: comments too similar to past findings — the kind that fit any PR — are discarded pre-post. Total findings fell by about 60%, and the actioned rate climbed from 18% to 41%. Saying less, more sharply, gets a bot listened to — much like a human reviewer.
+
+## The June 2026 groundwork — unrestricted API keys are now rejected
+
+One more operational change you cannot skip: since June 19, 2026, the Gemini API **rejects requests from unrestricted API keys**. If the key sitting in your CI secrets has no restrictions, your review bot stops one day without warning — and if your pipeline still "fails green," you won't even notice it stopped.
+
+The fix is mundane: restrict the CI key to the Generative Language API only, and where possible issue separate keys per repository. Per-repo keys also give you token usage cleanly split by repository in the logs, which made the monthly cost roll-up easier.
+
+On cost: reviewing the full diff on every `synchronize` event was pure waste. Cancelling superseded runs with `concurrency` and reviewing only the range since the last reviewed commit cut monthly API calls by roughly 40%. For an indie budget, trimming the spend that costs no quality is the trim that matters.
+
+```yaml
+concurrency:
+  group: gemini-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true   # drop stale review runs on rapid pushes
+```
+
+## The current dashboard — four numbers, checked weekly
+
+After the rebuild, the weekly job reports exactly four numbers. Track more and you eventually track none.
+
+<table><thead><tr><th>Metric</th><th>Definition</th><th>At baseline</th><th>Now</th></tr></thead><tbody><tr><td>Review coverage rate</td><td>Share of eligible PRs that received a valid review</td><td>87.4%</td><td>99%+</td></tr><tr><td>Actioned rate</td><td>Share of findings whose location changed in later commits</td><td>18%</td><td>41%</td></tr><tr><td>Truncation rate</td><td>Share of runs where the diff was cut</td><td>23%</td><td>9%, with priority packing removing most harm</td></tr><tr><td>Parse failure rate</td><td>Share of structured outputs that failed to parse</td><td>unknown (swallowed)</td><td>0.8%, every failure alerts</td></tr></tbody></table>
+
+The value isn't the numbers themselves — it's that **a step change in any of the four means something happened**. A model swap, a rejected key, a shift in diff shape: one of these four will always move.
+
+## Your next step
+
+If a Gemini review bot is already running in your CI, add just two fields to today's logs: `parse_ok` and `truncated`. After a week of data you'll know whether your bot is working as well as it looks. The actioned-rate machinery can come later. Things that break silently are best fought by counting silently.
