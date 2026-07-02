@@ -1,0 +1,211 @@
+---
+title: "元データを消しても生成物は残る — Gemini 派生データに削除を伝播させる台帳設計"
+slug: "gemini-derived-data-deletion-propagation-ledger-design"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-07-02T15:55"
+author: "Gemini Lab"
+description: "ユーザーが元データを削除しても、Gemini で生成した埋め込みやキャッシュにはテキストが残り続けます。生成時に由来を記録する provenance 台帳、シンク別の削除伝播ワーカー、取りこぼしを数える検証スイープまで、削除を派生データに追随させる設計をまとめました。"
+tags: ["Gemini API", "Embeddings", "File Search", "データライフサイクル", "運用設計"]
+highlights:
+  - "生成時に由来を記録する provenance 台帳で、後からでも消せる派生データにする実装手順"
+  - "キャッシュ・埋め込み・File Search・ログなどシンク別に「削除の意味」を整理した対応表と優先順位"
+  - "削除の取りこぼしを件数で検出する検証スイープと残存率メトリクスの実装例"
+---
+
+アプリのレビューを Gemini の埋め込みでクラスタリングして、改善要望の優先度を出す仕組みを回しています。ある日、その週のクラスタ要約に見覚えのある一文が引用されていました。投稿者がすでに削除して、ストア上にはもう存在しないレビューの一節です。元データは消えているのに、埋め込みインデックスと要約キャッシュの中では、そのテキストがそのまま生き続けていました。
+
+削除が派生データに届いていない、という問題です。生成 AI を組み込んだシステムは、入力データから埋め込み・キャッシュ・要約・添付ファイルといった「派生物」を静かに増やしていきます。元データの削除処理をどれだけ丁寧に書いても、派生物の側に削除を伝える経路がなければ、消したはずのテキストはシステムのあちこちに残ります。この記事は、私自身がこの取りこぼしを一掃するために作った、削除伝播の台帳設計をまとめたものです。
+
+## 削除されたはずのテキストは、どこに残っていたか
+
+最初に見つけたのは埋め込みインデックスでした。レビュー本文を埋め込みにしてベクトル DB に入れているので、レビューが消えてもベクトルと一緒に保存したメタデータ（本文の抜粋）は残ります。クラスタ要約はこのメタデータを引用するため、削除済みレビューの文面が要約に浮上した、という経路でした。
+
+そこで「他にはどこに残っているのか」を洗い出したところ、想定していたのは 3 箇所だったのに、実際には 7 箇所ありました。レスポンスキャッシュ、埋め込みインデックス、週次要約の保存分、Files API にアップロードした CSV、File Search ストアのドキュメント、リクエストログ、そしてバッチジョブの出力ファイルです。生成のたびに派生物が増える構造なのに、削除はどこにも伝わっていませんでした。
+
+私はこの状態を「削除の非対称性」と呼んでいます。書き込みは自動で増えるのに、削除は手動でも追いつかない。この非対称を埋めるには、削除処理を頑張るのではなく、生成の側に仕掛けを入れる必要があります。
+
+## 派生データの棚卸し — シンクは思ったより多い
+
+まず、自分のシステムで「元データから作られたものが溜まる場所（シンク）」を全部挙げます。私の環境で見つかった 7 種類と、それぞれの性質を表にまとめました。
+
+<table>
+<thead>
+<tr><th>シンク</th><th>中身</th><th>元テキストを含むか</th><th>削除の難易度</th></tr>
+</thead>
+<tbody>
+<tr><td>レスポンスキャッシュ</td><td>プロンプトと生成結果のペア</td><td>含む</td><td>低（キー削除）</td></tr>
+<tr><td>埋め込みインデックス</td><td>ベクトル＋メタデータ</td><td>メタデータに抜粋を含む</td><td>低〜中（ID 指定削除）</td></tr>
+<tr><td>要約・レポート保存分</td><td>生成済みの週次要約など</td><td>引用として含みうる</td><td>中（再生成が必要）</td></tr>
+<tr><td>Files API オブジェクト</td><td>アップロードした入力ファイル</td><td>含む</td><td>低（ただし 48 時間で自動失効）</td></tr>
+<tr><td>File Search ストア</td><td>検索用ドキュメント</td><td>含む</td><td>低〜中（ドキュメント削除 API）</td></tr>
+<tr><td>リクエストログ</td><td>プロンプト全文を含むログ行</td><td>含む</td><td>高（削除でなく黒塗り）</td></tr>
+<tr><td>バッチ出力</td><td>Batch API の結果ファイル</td><td>含む</td><td>中（保存先に依存）</td></tr>
+</tbody>
+</table>
+
+ポイントは 2 つあります。ひとつは、埋め込みのように「本文そのものではない」データでも、運用の都合で付けたメタデータが本文を抱えているケースが多いこと。もうひとつは、シンクごとに削除の意味がまったく違うことです。キャッシュはキーを消せば終わりですが、ログは削除ではなく黒塗り（redaction）ですし、生成済み要約は該当部分を消すだけでは文章が壊れるので再生成が要ります。
+
+この棚卸しをせずに「削除 API を一括で呼ぶ」方向に進むと、シンクごとの意味の違いに足を取られます。先に表を作ることをおすすめします。
+
+## 由来を記録しない生成物は消せない — provenance を生成時に書く
+
+棚卸しの次が本丸です。派生物を後から消すには「このレビューから何が作られたか」を辿れる必要があります。ところが生成時に由来を記録していないと、この対応関係はどこにも存在しません。埋め込みベクトルを前に「これはどのレビュー由来か」を後から復元するのは、実質不可能です。
+
+修正前のコードは、こういう素朴な書き込みでした。
+
+```python
+# Before: 生成物をそのまま保存する（由来の記録なし）
+def cache_summary(cache, prompt_hash: str, summary_text: str):
+    cache.set(f"summary:{prompt_hash}", summary_text)
+
+def index_review(vector_db, review_id: str, text: str, embedding: list):
+    vector_db.upsert(
+        id=f"rev-{review_id}",
+        vector=embedding,
+        metadata={"excerpt": text[:200]},
+    )
+```
+
+これを、生成のたびに provenance（由来）を台帳へ書く形に変えます。
+
+```python
+# After: 書き込みと同時に「source_id → 派生キー」を台帳に記録する
+import sqlite3, time
+
+def _ledger():
+    con = sqlite3.connect("provenance.db")
+    con.execute("""CREATE TABLE IF NOT EXISTS derived (
+        source_id TEXT NOT NULL,
+        sink      TEXT NOT NULL,
+        sink_key  TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        PRIMARY KEY (source_id, sink, sink_key)
+    )""")
+    return con
+
+def record(source_id: str, sink: str, sink_key: str):
+    con = _ledger()
+    con.execute(
+        "INSERT OR IGNORE INTO derived VALUES (?, ?, ?, ?)",
+        (source_id, sink, sink_key, time.time()),
+    )
+    con.commit()
+    con.close()
+
+def cache_summary(cache, prompt_hash: str, summary_text: str, source_ids: list):
+    key = f"summary:{prompt_hash}"
+    cache.set(key, summary_text)
+    for sid in source_ids:
+        record(sid, "response_cache", key)
+
+def index_review(vector_db, review_id: str, text: str, embedding: list):
+    key = f"rev-{review_id}"
+    vector_db.upsert(id=key, vector=embedding,
+                     metadata={"excerpt": text[:200]})
+    record(review_id, "vector_index", key)
+```
+
+Before と After の差分は数行ですが、意味は大きく違います。Before の世界では削除要求が来た時点で対応関係が失われており、After の世界では `SELECT * FROM derived WHERE source_id = ?` の一発で消すべきものが列挙できます。要約のように複数の元データから作られる生成物は、`source_ids` を全部記録しておくのが肝心です。1 件でも削除対象を含む要約は、後述する再生成の対象になります。
+
+導入時のつまずきをひとつ書いておくと、既存の派生物には当然ながら台帳がありません。私は「新規生成分は台帳必須、既存分は検証スイープで拾う」という二段構えにしました。過去分の由来を完全に復元しようとすると止まらなくなるので、割り切りが必要です。
+
+## 削除の入口を一本化する — tombstone と伝播ワーカー
+
+由来が辿れるようになったら、削除要求の受け口を一本化します。各所の削除処理から個別にシンクを触りに行くのではなく、「source_id が削除された」という事実だけを tombstone（墓標）として台帳に積み、シンクごとの伝播ワーカーがそれを消化する構造です。
+
+```python
+def request_deletion(source_id: str, reason: str = "user_delete"):
+    con = _ledger()
+    con.execute("""CREATE TABLE IF NOT EXISTS tombstone (
+        source_id TEXT NOT NULL,
+        sink      TEXT NOT NULL,
+        sink_key  TEXT NOT NULL,
+        reason    TEXT,
+        status    TEXT DEFAULT 'pending',
+        done_at   REAL
+    )""")
+    con.execute("""
+        INSERT INTO tombstone (source_id, sink, sink_key, reason)
+        SELECT source_id, sink, sink_key, ? FROM derived
+        WHERE source_id = ?
+    """, (reason, source_id))
+    con.commit()
+    con.close()
+
+HANDLERS = {
+    "response_cache": lambda key: cache.delete(key),
+    "vector_index":   lambda key: vector_db.delete(id=key),
+    "file_search":    lambda key: fs_client.delete_document(key),
+    "request_log":    lambda key: log_store.redact(key),   # 削除でなく黒塗り
+}
+
+def propagate(batch: int = 200):
+    con = _ledger()
+    rows = con.execute("""
+        SELECT rowid, sink, sink_key FROM tombstone
+        WHERE status = 'pending' LIMIT ?
+    """, (batch,)).fetchall()
+    for rowid, sink, key in rows:
+        try:
+            HANDLERS[sink](key)
+            con.execute("UPDATE tombstone SET status='done', done_at=? WHERE rowid=?",
+                        (time.time(), rowid))
+        except KeyError:
+            con.execute("UPDATE tombstone SET status='no_handler' WHERE rowid=?", (rowid,))
+        except Exception:
+            con.execute("UPDATE tombstone SET status='retry' WHERE rowid=?", (rowid,))
+    con.commit()
+    con.close()
+```
+
+設計上の判断を 3 つ添えます。まず、ワーカーは冪等にします。同じ tombstone を二度処理しても壊れないように、各ハンドラは「もう存在しない」を成功扱いにします。ベクトル DB の delete が 404 を返しても、それは望んだ状態に既に到達しているだけです。次に、削除は同期処理にしません。ユーザーの削除操作の応答時間に 7 シンク分の API 呼び出しをぶら下げると、どれか 1 つの不調で全体が巻き添えになります。tombstone を積むところまでが同期、伝播は cron で十分です。私は 15 分間隔で回しています。最後に、`no_handler` を必ず可視化します。新しいシンクを増やしたのにハンドラを書き忘れた、という事故はこのステータスで捕まえられます。
+
+## シンクごとに「削除」の意味が違う
+
+伝播ワーカーの HANDLERS を書いていくと、シンクごとの削除セマンティクスの違いに必ず突き当たります。私の整理はこうです。
+
+キャッシュとベクトルインデックスは素直な削除で済みます。File Search ストアはドキュメント単位の削除 API があるので、アップロード時にドキュメント名と source_id の対応を台帳に入れておけば同様に消せます。Files API のオブジェクトは 48 時間で自動失効するため、実は放置でも消えますが、失効前に読まれる可能性を塞ぎたければ明示削除します。
+
+厄介なのはログと生成済み要約です。ログは行削除するとトラブル調査の文脈まで失われるので、私は本文フィールドだけを黒塗りに置換し、メタデータ（時刻・トークン数・ステータス）は残す方式にしました。監査の観点でも「そのリクエストが存在した事実」と「その中身」を分けて扱えるほうが健全です。生成済み要約は、削除対象を含むものを台帳から特定して再生成キューに積みます。引用部分だけを機械的に削ると文章が破綻するためで、要約の再生成コストは削除の頻度に比例します。私の場合、週次要約 1 本の再生成は Gemini 3.5 Flash で数円程度なので、ためらわず再生成に倒しました。
+
+バックアップはさらに割り切りが必要です。世代管理されたバックアップの中身を個別に書き換えるのは現実的でないため、「バックアップ保持期間（私は 30 日）を過ぎれば派生物も消える」ことを保持ポリシーとして明文化する、という対応にしています。即時に完全消去できる、と約束しないことが大切です。
+
+## 検証スイープ — 消えたはずのものを探しに行く
+
+台帳と伝播ワーカーだけでは、まだ「消したつもり」の域を出ません。台帳に載る前の過去分、ハンドラのバグ、途中で増えた新シンク。取りこぼしの原因はいくらでもあります。そこで、削除済み source_id を各シンクに定期的に「探しに行く」検証スイープを足します。
+
+```python
+def verify_sweep(deleted_ids: list) -> dict:
+    residuals = {"vector_index": 0, "response_cache": 0, "file_search": 0}
+    for sid in deleted_ids:
+        if vector_db.fetch(id=f"rev-{sid}") is not None:
+            residuals["vector_index"] += 1
+        for key in cache.scan(f"summary:*"):
+            meta = ledger_sources(key)  # 台帳から source_ids を逆引き
+            if sid in meta:
+                residuals["response_cache"] += 1
+        hits = fs_client.search(store="reviews", query=None,
+                                filter={"source_id": sid})
+        residuals["file_search"] += len(hits)
+    return residuals
+```
+
+スイープの結果は残存件数のメトリクスとして毎日記録します。ここがゼロに収束していれば、削除伝播は機能しています。逆にゼロにならないシンクは、ハンドラか台帳のどちらかに穴があります。
+
+初回のスイープ結果は正直なところ堪えました。削除済みレビュー 412 件に対して、埋め込みインデックス側に 37 件（約 9%）が残存していたのです。内訳を追うと、台帳導入前に作られた古いベクトルがほとんどでした。過去分は一括で「台帳なし・作成日が導入日より前」の条件で洗い出し、3 日かけて消化しました。以降のスイープでは残存が 0〜2 件で推移していて、出てきても tombstone の retry 滞留が原因とすぐ特定できるようになっています。
+
+## 実際に回して分かった数字
+
+この仕組みを 2 か月ほど運用した実測を置いておきます。環境は個人開発の規模（レビュー系の元データ約 4 万件、派生物はその 2.4 倍程度）です。
+
+台帳のオーバーヘッドはほぼ無視できました。SQLite の INSERT が生成 1 回あたり平均 1.8ms で、Gemini API の呼び出し時間（数百 ms〜数秒）に対して誤差の範囲です。派生物 1 件あたりのシンク数は平均 2.4。つまり元データ 1 件の削除で、平均 2〜3 箇所の削除が発生します。伝播の所要時間は、15 分間隔の cron 運用で p95 が 16 分。即時性が要る要件ではないので、これで十分と判断しました。tombstone の retry 率は 0.7% で、原因の大半はベクトル DB 側の一時的な 5xx でした。冪等にしてあるので、次の周回で自然に消化されます。
+
+数字として意外だったのは、削除要求の量そのものです。導入前は「削除なんて月に数件だろう」と思っていましたが、実際にはレビューの削除・編集で月 150〜200 件の tombstone が発生していました。編集も「旧本文の削除＋新本文の再生成」なので、削除伝播の経路に乗ります。削除は例外処理ではなく、定常フローだったわけです。
+
+## まとめ — 最初の一歩は台帳のテーブルひとつ
+
+削除伝播の全体像を書きましたが、導入の順序としては、まず provenance 台帳のテーブルをひとつ作り、これから生成する分の書き込みに `record()` を一行足すところから始めるのが現実的です。台帳さえ育ち始めれば、tombstone・伝播ワーカー・検証スイープは後から順に載せられます。逆に、台帳のない期間が長引くほど「消せない過去分」が積み上がります。
+
+埋め込みの運用そのものは [Embedding APIでアプリレビュー1万件を意味クラスタリングして改善優先度を割り出す設計](/articles/gemini-api/gemini-embedding-app-reviews-semantic-clustering-priority-design)、キャッシュ側の設計は [Gemini API のセマンティックキャッシュ設計 — 埋め込みベース回答キャッシュで API コストを実用的に下げる](/articles/gemini-api/gemini-api-semantic-answer-cache-embedding-cost-reduction) にまとめてあります。生成物を増やす仕組みを持っている方は、増やす側と同じ熱量で、消す側の経路も一度点検してみてください。同じ課題に取り組んでいる方の参考になれば幸いです。

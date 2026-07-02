@@ -1,0 +1,211 @@
+---
+title: "Deleting the Source Isn't Enough — A Ledger Design for Propagating Deletes Through Gemini-Derived Data"
+slug: "gemini-derived-data-deletion-propagation-ledger-design"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-07-02T15:55"
+author: "Gemini Lab"
+description: "When a user deletes their data, the embeddings, caches, and File Search documents you generated from it live on. A provenance ledger written at generation time, per-sink propagation workers, and a verification sweep make deletion actually reach your derived data."
+tags: ["Gemini API", "Embeddings", "File Search", "Data Lifecycle", "Operations"]
+highlights:
+  - "A provenance ledger written at generation time that makes derived data deletable after the fact"
+  - "A per-sink map of what deletion actually means across caches, embeddings, File Search stores, and logs"
+  - "A verification sweep that counts residual leftovers so you can prove deletes really landed"
+---
+
+I run a pipeline that clusters app reviews with Gemini embeddings to rank improvement requests. One week, the cluster summary quoted a sentence I recognized — from a review its author had already deleted from the store. The source was gone, but the text was still alive inside my embedding index and my summary cache, and it had just resurfaced in a fresh report.
+
+That is the problem in one sentence: deletion never reached the derived data. Any system built around a generative model quietly multiplies derivatives of its inputs — embeddings, cached responses, summaries, uploaded files. You can write the most careful delete handler for the source records, but if nothing carries that delete downstream, the text you promised to remove keeps living in half a dozen places. This article documents the deletion-propagation ledger I built as an indie developer to close that gap for good.
+
+## Where the deleted text was actually hiding
+
+The embedding index was the first offender. I store review text as vectors, and alongside each vector I keep a metadata excerpt of the original body — convenient for building cluster summaries, and exactly the thing that outlives the review. The summary generator quotes those excerpts, which is how a deleted review's words ended up in a new report.
+
+So I went looking for every other place derived data accumulates. I expected three; I found seven. The response cache, the embedding index, stored weekly summaries, CSVs uploaded through the Files API, documents in a File Search store, request logs, and batch job outputs. Every generation run adds to these sinks automatically. Deletion, meanwhile, was reaching none of them.
+
+I think of this as the asymmetry of deletion: writes scale on their own, deletes don't even keep up manually. And the fix is not a heroic delete script — it is instrumentation on the write path.
+
+## Inventory first — you have more sinks than you think
+
+Start by listing every place where data derived from a source record accumulates. Here are the seven I found in my own setup, with their properties.
+
+<table>
+<thead>
+<tr><th>Sink</th><th>Contents</th><th>Contains source text?</th><th>Deletion difficulty</th></tr>
+</thead>
+<tbody>
+<tr><td>Response cache</td><td>Prompt/response pairs</td><td>Yes</td><td>Low (delete by key)</td></tr>
+<tr><td>Embedding index</td><td>Vectors plus metadata</td><td>Excerpts in metadata</td><td>Low–medium (delete by ID)</td></tr>
+<tr><td>Stored summaries</td><td>Generated weekly reports</td><td>Quotes, possibly</td><td>Medium (needs regeneration)</td></tr>
+<tr><td>Files API objects</td><td>Uploaded input files</td><td>Yes</td><td>Low (auto-expires in 48h)</td></tr>
+<tr><td>File Search store</td><td>Search documents</td><td>Yes</td><td>Low–medium (document delete API)</td></tr>
+<tr><td>Request logs</td><td>Log lines with full prompts</td><td>Yes</td><td>High (redaction, not deletion)</td></tr>
+<tr><td>Batch outputs</td><td>Batch API result files</td><td>Yes</td><td>Medium (depends on storage)</td></tr>
+</tbody>
+</table>
+
+Two things stand out. First, data that is nominally "not the text" — like embeddings — often carries the text anyway, because of metadata you added for convenience. Second, deletion means something different in each sink. A cache entry disappears with one key delete; a log line gets redacted rather than removed; a stored summary can't have a quote surgically excised without breaking the prose, so it has to be regenerated.
+
+If you skip this inventory and jump straight to "call delete APIs in a loop," the per-sink semantics will trip you. Make the table first.
+
+## Derived data without provenance cannot be deleted
+
+Here is the core of it. To delete derivatives later, you must be able to answer "what was generated from this review?" If you didn't record that at generation time, the mapping simply does not exist anywhere. Standing in front of a vector index trying to reconstruct which review produced which embedding is, in practice, hopeless.
+
+My original writes looked innocently like this:
+
+```python
+# Before: store the derivative, record nothing about its origin
+def cache_summary(cache, prompt_hash: str, summary_text: str):
+    cache.set(f"summary:{prompt_hash}", summary_text)
+
+def index_review(vector_db, review_id: str, text: str, embedding: list):
+    vector_db.upsert(
+        id=f"rev-{review_id}",
+        vector=embedding,
+        metadata={"excerpt": text[:200]},
+    )
+```
+
+The fix is to write a provenance record in the same breath as the derivative:
+
+```python
+# After: every write also records source_id -> derived key in a ledger
+import sqlite3, time
+
+def _ledger():
+    con = sqlite3.connect("provenance.db")
+    con.execute("""CREATE TABLE IF NOT EXISTS derived (
+        source_id TEXT NOT NULL,
+        sink      TEXT NOT NULL,
+        sink_key  TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        PRIMARY KEY (source_id, sink, sink_key)
+    )""")
+    return con
+
+def record(source_id: str, sink: str, sink_key: str):
+    con = _ledger()
+    con.execute(
+        "INSERT OR IGNORE INTO derived VALUES (?, ?, ?, ?)",
+        (source_id, sink, sink_key, time.time()),
+    )
+    con.commit()
+    con.close()
+
+def cache_summary(cache, prompt_hash: str, summary_text: str, source_ids: list):
+    key = f"summary:{prompt_hash}"
+    cache.set(key, summary_text)
+    for sid in source_ids:
+        record(sid, "response_cache", key)
+
+def index_review(vector_db, review_id: str, text: str, embedding: list):
+    key = f"rev-{review_id}"
+    vector_db.upsert(id=key, vector=embedding,
+                     metadata={"excerpt": text[:200]})
+    record(review_id, "vector_index", key)
+```
+
+The diff is a few lines; the difference in capability is enormous. Before, a deletion request arrives and the mapping is already lost. After, `SELECT * FROM derived WHERE source_id = ?` enumerates everything that has to go. For derivatives built from many sources — summaries especially — record every contributing `source_id`. Any summary touching even one deleted source becomes a regeneration candidate later.
+
+One honest caveat from rollout: your existing derivatives have no ledger entries. I settled on a two-track policy — the ledger is mandatory for all new generation, and the verification sweep (below) catches the legacy backlog. Trying to reconstruct complete provenance for the past is a rabbit hole; don't.
+
+## One front door for deletion — tombstones and a propagation worker
+
+Once provenance exists, unify the entry point for deletes. Instead of every code path reaching into sinks directly, deletion is recorded as a fact — a tombstone per derived item — and per-sink workers consume the backlog.
+
+```python
+def request_deletion(source_id: str, reason: str = "user_delete"):
+    con = _ledger()
+    con.execute("""CREATE TABLE IF NOT EXISTS tombstone (
+        source_id TEXT NOT NULL,
+        sink      TEXT NOT NULL,
+        sink_key  TEXT NOT NULL,
+        reason    TEXT,
+        status    TEXT DEFAULT 'pending',
+        done_at   REAL
+    )""")
+    con.execute("""
+        INSERT INTO tombstone (source_id, sink, sink_key, reason)
+        SELECT source_id, sink, sink_key, ? FROM derived
+        WHERE source_id = ?
+    """, (reason, source_id))
+    con.commit()
+    con.close()
+
+HANDLERS = {
+    "response_cache": lambda key: cache.delete(key),
+    "vector_index":   lambda key: vector_db.delete(id=key),
+    "file_search":    lambda key: fs_client.delete_document(key),
+    "request_log":    lambda key: log_store.redact(key),   # redact, don't delete
+}
+
+def propagate(batch: int = 200):
+    con = _ledger()
+    rows = con.execute("""
+        SELECT rowid, sink, sink_key FROM tombstone
+        WHERE status = 'pending' LIMIT ?
+    """, (batch,)).fetchall()
+    for rowid, sink, key in rows:
+        try:
+            HANDLERS[sink](key)
+            con.execute("UPDATE tombstone SET status='done', done_at=? WHERE rowid=?",
+                        (time.time(), rowid))
+        except KeyError:
+            con.execute("UPDATE tombstone SET status='no_handler' WHERE rowid=?", (rowid,))
+        except Exception:
+            con.execute("UPDATE tombstone SET status='retry' WHERE rowid=?", (rowid,))
+    con.commit()
+    con.close()
+```
+
+Three design calls worth defending. Make the worker idempotent: processing the same tombstone twice must be harmless, so every handler treats "already gone" as success — a 404 from the vector store just means the desired state was reached earlier. Don't propagate synchronously: hanging seven sink calls off the user's delete button means one flaky dependency stalls the whole request. Writing tombstones is the synchronous part; propagation belongs in cron. I run it every 15 minutes. And surface `no_handler` loudly — it is exactly the status that catches "we added a new sink and forgot to write its handler."
+
+## Deletion does not mean the same thing in every sink
+
+Writing the handlers forces you through the semantic differences. My working notes:
+
+Caches and vector indexes are honest deletes. File Search stores have a per-document delete API, so as long as you ledgered the document name against the source_id at upload time, they behave the same way. Files API objects expire on their own after 48 hours — technically you can do nothing — but if you want to close the window where they could still be read, delete them explicitly.
+
+Logs and stored summaries are the awkward ones. Deleting whole log lines destroys the context you need for incident debugging, so I redact only the body field and keep the metadata — timestamp, token counts, status. Separating "this request happened" from "this is what it contained" is also the healthier posture for auditing. Stored summaries that touch a deleted source go into a regeneration queue; mechanically cutting the quoted fragment out of generated prose leaves broken text. Regenerating one weekly summary costs me a few yen on Gemini 3.5 Flash, so I lean toward regeneration without hesitation.
+
+Backups need a policy decision rather than an engineering one. Rewriting individual records inside versioned backups isn't realistic, so my retention policy states that backups (30 days, in my case) age out together with whatever derivatives they contain. The important part is not promising instant, total erasure that your architecture cannot deliver.
+
+## The verification sweep — go looking for what should be gone
+
+A ledger and a worker still only get you to "we think it's deleted." Legacy items predating the ledger, handler bugs, sinks added later — there is no shortage of ways to leak. So the last component periodically takes the list of deleted source IDs and goes hunting for them in every sink.
+
+```python
+def verify_sweep(deleted_ids: list) -> dict:
+    residuals = {"vector_index": 0, "response_cache": 0, "file_search": 0}
+    for sid in deleted_ids:
+        if vector_db.fetch(id=f"rev-{sid}") is not None:
+            residuals["vector_index"] += 1
+        for key in cache.scan(f"summary:*"):
+            meta = ledger_sources(key)  # reverse-lookup source_ids from the ledger
+            if sid in meta:
+                residuals["response_cache"] += 1
+        hits = fs_client.search(store="reviews", query=None,
+                                filter={"source_id": sid})
+        residuals["file_search"] += len(hits)
+    return residuals
+```
+
+Record the residual counts daily as a metric. Converging to zero means propagation works; a sink that refuses to reach zero has a hole in either its handler or its ledger coverage.
+
+The first sweep was humbling. Against 412 deleted reviews, 37 vectors — about 9 percent — were still sitting in the embedding index, almost all of them created before the ledger existed. I flushed the backlog with a one-off pass over everything unledgered and older than the rollout date, spread across three days. Since then the sweep finds zero to two residuals per run, and when something does show up, it traces to tombstones stuck in retry within minutes.
+
+## Numbers from two months of running it
+
+Some measurements from my setup — indie-developer scale, roughly 40,000 source records on the review side, with derivatives at about 2.4 times that count.
+
+Ledger overhead is negligible: the SQLite insert averages 1.8 ms per generation, noise next to a Gemini API call measured in hundreds of milliseconds or seconds. Each source record fans out to 2.4 sinks on average, so one deletion triggers two to three downstream removals. With the 15-minute cron cadence, propagation completes with a p95 of 16 minutes — fine for my requirements, which have no legal same-second deadline. The tombstone retry rate sits at 0.7 percent, dominated by transient 5xx responses from the vector store; idempotency means the next cycle absorbs them silently.
+
+The surprise was the volume. I assumed deletion would be a rare event, a few per month. In reality, review deletions and edits produce 150 to 200 tombstones monthly — an edit is a delete of the old body plus regeneration from the new one, so it rides the same rails. Deletion turned out to be a steady-state flow, not an exception path.
+
+## Where to start — one table, one extra line
+
+The whole system reduces to a sequence you can adopt incrementally: create the provenance table, add one `record()` call to your write paths, and let the ledger start growing. Tombstones, the worker, and the sweep can all be layered on afterwards. The only thing you cannot recover later is the provenance you didn't write down — every week without the ledger adds to the pile of derivatives nobody can delete.
+
+For the surrounding pieces, the embedding pipeline itself is covered in [Designing a Semantic Clustering Pipeline for App Reviews with Gemini Embeddings](/articles/gemini-api/gemini-embedding-app-reviews-semantic-clustering-priority-design), and the cache design in [Designing a Semantic Cache for the Gemini API — Embedding-based Answer Caching That Actually Pays for Itself](/articles/gemini-api/gemini-api-semantic-answer-cache-embedding-cost-reduction). If your system is good at creating derived data, give the erasure path the same scrutiny — it will not build itself. Thank you for reading, and I hope this helps anyone wrestling with the same gap.
