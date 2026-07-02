@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MODEL — Gemma 4がGoogle AI StudioとGemini APIで利用可能になりました",
-    "AGENT — Managed Agentsが公開プレビューとなり、隔離サンドボックスで自律エージェントを構築できます",
-    "MODEL — Gemini 3.5 FlashがGAとなり、エージェントとコーディング用途に対応します",
-    "STUDIO — Google AI StudioにWorkspace連携とCloud Runへのワンクリックデプロイが加わりました",
-    "STUDIO — AI StudioのbuildタブでネイティブAndroidアプリを生成できるようになりました",
-    "MIGRATE — Gemini Code Assistの個人向けIDE拡張・CLIは6月18日で終了し、Antigravityへ移行します",
+    "API — Gemini APIのスループットが毎分160億トークン超となり、OpenAIとほぼ肩を並べる規模になりました",
+    "ENTERPRISE — Gemini Enterpriseの有料シートが800万を超え、導入企業は2,800社超に拡大しています",
+    "AGENT — Claude Opus 4.8がGemini Enterprise Agent Platformで利用可能になり、マルチベンダー化が進んでいます",
+    "SPEECH — gemini-3.1-flash-tts-previewがstreamGenerateContentでストリーミング音声生成に対応しました",
+    "DATA — CrossbeamデータストアをGemini Enterpriseへ接続できる公開プレビューが始まりました",
+    "MODEL — Gemini 3.5 FlashのGAとGemma 4の提供で、エージェント用途と軽量用途の選択肢が揃いました",
   ],
   en: [
-    "MODEL — Gemma 4 is now available in Google AI Studio and the Gemini API",
-    "AGENT — Managed Agents enter public preview, running autonomous agents in isolated sandboxes",
-    "MODEL — Gemini 3.5 Flash reaches GA for agentic and coding tasks",
-    "STUDIO — Google AI Studio adds Workspace integrations and one-click deploy to Cloud Run",
-    "STUDIO — You can now build native Android apps in the AI Studio build tab",
-    "MIGRATE — Gemini Code Assist IDE extensions and CLI ended for individuals on June 18; move to Antigravity",
+    "API — The Gemini API now processes over 16 billion tokens per minute, roughly on par with OpenAI",
+    "ENTERPRISE — Gemini Enterprise passes 8 million paid seats across more than 2,800 companies",
+    "AGENT — Claude Opus 4.8 arrives on Gemini Enterprise Agent Platform, expanding multi-vendor choices",
+    "SPEECH — gemini-3.1-flash-tts-preview adds streaming speech generation via streamGenerateContent",
+    "DATA — Crossbeam data stores can now connect to Gemini Enterprise in public preview",
+    "MODEL — Gemini 3.5 Flash GA and Gemma 4 round out options for agentic and lightweight workloads",
   ],
 };
 
