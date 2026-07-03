@@ -1,0 +1,226 @@
+---
+title: "Catch Near-Duplicate Posts Before You Publish — a Topic-Cannibalization Gate with Gemini Embeddings"
+slug: "gemini-embedding-article-topic-cannibalization-prepublish-gate"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-04T13:00"
+author: "Gemini Lab"
+description: "Once a blog passes a few hundred posts, new articles start cannibalizing old ones in search. This walks through a pre-publish gate that embeds each post's meaning with gemini-embedding-2 and blocks drafts that sit too close to something you already wrote — with runnable code and how to pick the thresholds."
+tags: ["gemini-api", "embedding", "semantic-search", "seo", "content-pipeline", "python"]
+highlights:
+  - "You can catch 'too semantically close' posts that title matching never sees, using cosine similarity over gemini-embedding-2 vectors, before you hit publish"
+  - "You'll get the thresholds that actually held up on a 670-article corpus (0.88 to review, 0.92 to reject) plus a two-stage design that only asks Gemini to judge the borderline cases"
+  - "You'll be able to run a gate for a continuously growing archive — section-level chunking, incremental reindexing, and SQLite storage included"
+---
+
+Have you ever reached for the publish button and frozen, thinking "wait, didn't I already write something like this"? As an indie developer running several technical blogs, I started hitting that déjà vu constantly once a corpus crossed a few hundred posts.
+
+The tricky part is when the title and slug are completely different, yet to a search engine the two posts answer nearly the same question. In SEO terms this is keyword cannibalization, and it drags both posts into a mediocre middle of the rankings. No human reviewer can reliably check a new draft against 600 existing posts every single time.
+
+So I built a pre-publish gate: before a draft goes live, its meaning vector is compared against the whole existing archive, and anything too close gets sent back. I covered the image side of this in [the near-duplicate image gate article](/articles/gemini-api/gemini-embedding2-image-dedup-prepublish-gate); this is the prose counterpart. It uses gemini-embedding-2, and I'll share the threshold tuning and false-positive handling in the order they actually mattered in production.
+
+## Why keyword matching and title comparison miss the real duplicates
+
+The first thing I tried was string matching on titles and descriptions. It was almost useless. "Cutting Gemini API costs" and "Designing so Gemini billing doesn't balloon at month end" share almost no words, yet the reader's search intent is nearly identical. Meanwhile "Cutting Gemini costs" and "Compressing images with Gemini" share "cost" and "Gemini" but are entirely different articles.
+
+Surface words can't measure semantic distance. That's where embeddings come in. An embedding turns text into a high-dimensional vector, placing semantically similar text closer together in space. Even with zero overlapping words, two posts that "say the same thing in different words" show up close, captured by a single number: cosine similarity.
+
+For me this gap was starkest in my operations posts. Three articles describing similar operational know-how in varied wording never matched on string comparison, yet clustered around 0.9 similarity to each other under embeddings.
+
+## What to embed — the full body is counterproductive
+
+Naively turning the whole article body into one vector actually lowers accuracy. Long posts get diluted by code samples and asides, and the core topic drowns inside the vector. After some trial and error, I settled on this:
+
+1. The title
+2. The description (the article's thesis compressed into ~160 characters)
+3. Every H2 and H3 heading (the skeleton of the piece itself)
+
+I embed a "topic summary text" that concatenates these three. Headings are the blueprint the author deliberately laid out, so they capture the semantic core far better than the surrounding prose. Code samples and quotes are intentionally excluded.
+
+```python
+import re
+from pathlib import Path
+
+def build_topic_text(mdx_path: Path) -> str:
+    """Assemble a topic-summary text (title + description + headings) from MDX."""
+    text = mdx_path.read_text(encoding="utf-8")
+    m = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.DOTALL)
+    front, body = m.group(1), m.group(2)
+
+    def fm(key: str) -> str:
+        mm = re.search(rf'^{key}:\s*"?(.*?)"?\s*$', front, re.MULTILINE)
+        return mm.group(1) if mm else ""
+
+    # strip code blocks before extracting headings
+    body_no_code = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+    headings = re.findall(r"^#{2,3}\s+(.*)$", body_no_code, re.MULTILINE)
+
+    parts = [fm("title"), fm("description")] + headings
+    return "\n".join(p for p in parts if p)
+```
+
+The output is a single text with "title + thesis + all headings" on separate lines. That gets vectorized in the next step.
+
+## Vectorizing with gemini-embedding-2
+
+I use the `google-genai` SDK for embeddings. The key is setting `task_type` to `SEMANTIC_SIMILARITY`. Omit it and you get a general-purpose embedding whose accuracy drops a notch when the job is "how close are two texts." The model supports Matryoshka representation learning, so you can truncate the dimensions and trade storage against fidelity. I run it at 768 dimensions.
+
+```python
+from google import genai
+from google.genai import types
+import numpy as np
+
+client = genai.Client()  # reads GEMINI_API_KEY from the environment
+
+def embed(text: str) -> np.ndarray:
+    resp = client.models.embed_content(
+        model="gemini-embedding-2",
+        contents=text,
+        config=types.EmbedContentConfig(
+            task_type="SEMANTIC_SIMILARITY",
+            output_dimensionality=768,  # 3072 -> 768 cuts storage to a quarter
+        ),
+    )
+    v = np.array(resp.embeddings[0].values, dtype=np.float32)
+    # when you truncate dimensions, you must re-apply L2 normalization
+    return v / np.linalg.norm(v)
+```
+
+Forget to re-normalize after truncating and cosine similarity drifts slightly. This is an easy detail to miss even in the official docs; I lost some time to a shifting threshold before I added normalization. The dimension-reduction idea itself is spelled out in [the Matryoshka dimension-reduction and vector-DB cost article](/articles/gemini-advanced/gemini-embedding-matryoshka-dimension-reduction-vector-db-cost).
+
+## Indexing the existing corpus
+
+Even at 670 articles, 768-dim float32 is about 3KB per post and roughly 2MB total. There's no need to stand up a dedicated vector database — storing the vectors as BLOBs in SQLite is plenty. The embedding calls finish for a few hundred posts in one pass, even on the free tier.
+
+```python
+import sqlite3
+
+def build_index(articles_dir: Path, db_path: str = "topics.db") -> None:
+    conn = sqlite3.connect(db_path)
+    conn.execute("""CREATE TABLE IF NOT EXISTS topics(
+        slug TEXT PRIMARY KEY, vec BLOB)""")
+
+    for mdx in articles_dir.glob("**/*.mdx"):
+        slug = mdx.stem
+        cur = conn.execute("SELECT 1 FROM topics WHERE slug=?", (slug,))
+        if cur.fetchone():
+            continue  # skip already-indexed posts (incremental index)
+        vec = embed(build_topic_text(mdx))
+        conn.execute("INSERT INTO topics(slug, vec) VALUES(?, ?)",
+                     (slug, vec.tobytes()))
+        conn.commit()
+        print(f"indexed: {slug}")
+    conn.close()
+```
+
+Skipping existing slugs with `SELECT 1` looks trivial but pays off in operation. Re-embedding everything each time a post is added wastes both API cost and time. An incremental index that only adds the delta keeps the load flat even when it runs inside a daily publishing pipeline.
+
+## The pre-publish gate — surface the top cosine matches
+
+Embed the new draft, compute cosine similarity against every existing vector, and surface the top few. Even a brute-force pass over 670 posts is a single matrix product on normalized vectors — a few milliseconds.
+
+```python
+def check_draft(draft_mdx: Path, db_path: str = "topics.db", top_k: int = 5):
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT slug, vec FROM topics").fetchall()
+    slugs = [r[0] for r in rows]
+    mat = np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in rows])
+
+    q = embed(build_topic_text(draft_mdx))
+    sims = mat @ q  # all vectors normalized, so dot product = cosine similarity
+    order = np.argsort(-sims)[:top_k]
+
+    print(f"draft: {draft_mdx.stem}")
+    for i in order:
+        verdict = "REJECT" if sims[i] >= 0.92 else \
+                  "REVIEW" if sims[i] >= 0.88 else "OK"
+        print(f"  {sims[i]:.3f} {verdict}  {slugs[i]}")
+    return sims[order[0]], slugs[order[0]]
+```
+
+A run looks something like this:
+
+```
+draft: gemini-embedding-article-topic-cannibalization-prepublish-gate
+  0.905 REVIEW  gemini-embedding2-image-dedup-prepublish-gate
+  0.837 OK      gemini-embeddings-semantic-search-production
+  0.812 OK      gemini-embedding-app-reviews-semantic-clustering-priority-design
+```
+
+The top hit landing near 0.90 in "REVIEW" is expected: the sister article (the image version) shares an approach, so the meaning comes out close. That's where a human — or the Gemini judgment below — takes over.
+
+## How I picked the thresholds
+
+Thresholds are best decided by measurement, not theory. I computed pairwise similarity across the existing corpus, then looked at the distributions of known cannibalizing pairs versus pairs I was sure were distinct, and drew the lines there. Here's what settled out at 670 articles.
+
+<table>
+  <thead>
+    <tr><th>Cosine similarity</th><th>Verdict</th><th>Action</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>0.92 and up</td><td>Reject</td><td>Nearly the same topic. Merge, or change one article's angle at the root.</td></tr>
+    <tr><td>0.88 to 0.92</td><td>Review</td><td>Borderline. Let Gemini or the author decide "complementary or duplicate."</td></tr>
+    <tr><td>Below 0.88</td><td>Allow</td><td>Related but fine to publish as an independent article.</td></tr>
+  </tbody>
+</table>
+
+These numbers reflect my corpus and my writing voice. The more consistent a site's tone, the higher the baseline similarity across everything, so lifting these straight into another site will be too strict or too loose. If you adopt this, I strongly recommend calibrating once against your own known cannibalizing pairs first.
+
+## Let Gemini judge only the borderline band
+
+The 0.88 to 0.92 band can't be settled by cosine similarity alone. Whether it's a complementary piece that digs into the same subject from another angle, or a duplicate that merely rephrases the same thing, requires reading subtle differences in meaning. Handing just this band to Gemini cuts the manual review burden sharply.
+
+```python
+def adjudicate(draft_mdx: Path, rival_mdx: Path) -> dict:
+    prompt = f"""Do these two articles overlap enough in subject to cannibalize
+each other in search? If the reader's search intent is effectively the same,
+answer "duplicate"; if they are related but each holds independent value,
+answer "complementary".
+
+# Article A
+{build_topic_text(draft_mdx)}
+
+# Article B
+{build_topic_text(rival_mdx)}"""
+
+    resp = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema={
+                "type": "object",
+                "properties": {
+                    "verdict": {"type": "string",
+                                "enum": ["duplicate", "complementary"]},
+                    "reason": {"type": "string"},
+                    "suggested_angle": {"type": "string"},
+                },
+                "required": ["verdict", "reason"],
+            },
+        ),
+    )
+    import json
+    return json.loads(resp.text)
+```
+
+Because structured output pins `verdict` to an enum, the result drops straight into a pipeline branch condition. When it returns `complementary`, I leave `suggested_angle` (the axis to differentiate on) as a note at the top of the draft and steer the body to avoid overlap. The pitfalls of structured output itself come up in [the production semantic-search article](/articles/gemini-api/gemini-embeddings-semantic-search-production).
+
+A lightweight `gemini-3.5-flash` gives plenty of accuracy. Only the handful of borderline cases reach it, so the cost stays negligible. In my operation, Gemini adjudication runs on fewer than one new article per day on average.
+
+## What surprised me when wiring it into the pipeline
+
+Dropping this gate into an automated publishing pipeline turned up a few production-only traps.
+
+First, at the draft stage the headings aren't filled in yet. Since the design leans heavily on headings, a first draft with only two or three H2s produces unstable similarity. I landed on running the gate exactly once, after the body is fully written.
+
+Second, vectors for deleted articles linger. If a post I removed with a 410 still has its vector in the index, the gate warns about cannibalizing an article that no longer exists. Always add a step during index refresh to sweep out rows whose source file has vanished.
+
+Third, the threshold isn't fixed. The larger the corpus grows, the higher the odds that *something* sits close to any new post. I revisit the threshold once a quarter against known verdicts. That unglamorous tuning is what keeps false positives from stopping the writer's hand.
+
+## If you want to try it
+
+Pick about 30 posts from your own archive, build an index with `build_index`, and look at the similarities among existing articles. Find where the pairs you instinctively call "cannibalizing" actually land, and back out your own threshold from there. That first calibration decides the accuracy of the whole gate.
+
+When you run media solo on the assumption that the archive keeps growing — as I do with Dolice Labs — a mechanism for not colliding with your past self matters as much as the ability to write something new. Just having a machine flag cannibalization first gave me back real time to focus on the writing itself. I hope it helps anyone else wrestling with an ever-growing post count.
