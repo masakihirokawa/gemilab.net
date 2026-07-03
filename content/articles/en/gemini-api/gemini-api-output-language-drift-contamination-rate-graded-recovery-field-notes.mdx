@@ -1,0 +1,216 @@
+---
+title: "When Gemini API Leaks Japanese Into Your English Output Once in a While — Field Notes on Measuring the Contamination Rate and Tightening It in Stages"
+slug: "gemini-api-output-language-drift-contamination-rate-graded-recovery-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-04T13:30"
+author: "Gemini Lab"
+description: "You told Gemini to answer in English, and 3 out of 100 runs slip a Japanese sentence into the tail. Here is why you cannot stop that 'once in a while', and a production pattern that measures the contamination rate as an SLO and tightens it with graded recovery, with working code."
+tags: ["gemini-api", "python", "multilingual", "observability", "production"]
+highlights:
+  - "A detector and logging design that treats language leakage as a continuous contamination rate, not a yes or no flag"
+  - "A measured comparison of where System Instructions, few-shot, and response_schema each work and where each breaks"
+  - "Graded recovery that quotes the offending span instead of blindly retrying, plus a clear line for handing off to humans"
+---
+
+I wrote what looked like a trivial handler that returns an English summary. Run it a hundred times and about three of them slip a single Japanese sentence into the tail. Twenty local runs never reproduced it; I found out days into production, from a reader. Of everything I ran into while letting Gemini API generate multilingual content as an indie developer, this "leaks once in a while" was the one that cost me the most.
+
+What makes it nasty is that it does not look like a bug. No exception is thrown, the JSON is valid, and the overwhelming majority of outputs are flawless English. That is exactly why tests miss it and monitoring never fires while it slips through production. This piece treats "English was requested but Japanese leaks in" in a specific order: measure it before you try to stop it. Once leakage is observable as a continuous quantity, we layer System Instructions, few-shot, schema validation, and graded recovery — measuring the effect of each as we go.
+
+## Why "Once in a While" — It Happens Probabilistically, Not as a Binary
+
+The direct cause is that Gemini is trained on a huge multilingual corpus and its attention is pulled strongly toward long Japanese input. A short `Answer in English` appended to the prompt loses relative strength as the body grows. On top of that, spans the model judges "more accurate to keep verbatim" — proper nouns, quotations — stay in the source language unless you push harder.
+
+The easy thing to miss is that this behavior is not deterministic. For the same input, sampling noise means some runs leak and some do not. So the real quantity is not "does it leak or not" but "how many leaks per thousand outputs." In my translation pipeline, leakage became noticeable on Gemini 2.0 Flash past roughly 2,000 input tokens, and it never dropped to exactly zero on 2.5 Pro or 3.1 Pro either. That is why "just use a stronger model" is the wrong instinct. If the adversary is a probability, the countermeasure has to be "measure it and drive it below a threshold."
+
+## Measure the Leakage First — A Binary Detector and a Contamination Ratio
+
+Before stacking fixes, make outputs countable. A lightweight function that detects the hiragana, katakana, and kanji Unicode ranges — and returns the *fraction* of contaminated characters — lets you draw thresholds later.
+
+```python
+import re
+from dataclasses import dataclass
+
+JP_RANGE = re.compile(r"[぀-ヿ一-鿿]")
+
+@dataclass
+class LangCheck:
+    contaminated: bool      # did any Japanese char appear
+    jp_chars: int
+    total_chars: int
+    ratio: float            # contamination ratio (0.0-1.0)
+    sample: str             # context around the first offending span
+
+def check_english_output(text: str) -> LangCheck:
+    matches = list(JP_RANGE.finditer(text))
+    total = len(text) or 1
+    sample = ""
+    if matches:
+        i = matches[0].start()
+        sample = text[max(0, i - 20): i + 20]
+    return LangCheck(bool(matches), len(matches), total,
+                     len(matches) / total, sample)
+```
+
+The `ratio` field is the point. If you lump a mild case — one trailing Japanese sentence — together with a severe one — a fully Japanese response — under the same "contaminated" flag, you will make the wrong downstream call. Keeping `sample` (the context around the leak) lets you tell "a proper noun survived" from "the instruction was ignored" straight from the logs.
+
+Then run this check on every production call and record the rate over time. I emit one line per request and aggregate the daily "share of contaminated requests" — the contamination rate. Treating it as an SLO (say, keep it under 0.5%) lets you talk about a fix's effect in numbers rather than vibes.
+
+```python
+import json, time
+
+def log_lang_metric(request_id, model, in_tokens, chk: LangCheck):
+    print(json.dumps({
+        "ts": time.time(), "request_id": request_id, "model": model,
+        "in_tokens": in_tokens, "contaminated": chk.contaminated,
+        "jp_ratio": round(chk.ratio, 4), "sample": chk.sample,
+    }, ensure_ascii=False))
+```
+
+Always keep `in_tokens` alongside it. Aggregate later and you will see leakage correlates strongly with input length — and once you see the correlation, you can spend effort where it pays: harden only the long inputs.
+
+## Write System Instructions as the Top-Priority Constraint
+
+With the measurement in place, System Instructions is the first thing that works. Instead of tacking "in English" onto the prompt body, write it as a strong constraint in the System Instructions, which are weighted more heavily than the body. Spell out the allowlist and the failure behavior right there.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+SYSTEM_INSTRUCTION = """
+You are a professional English-language technical editor.
+RULES:
+1. Respond entirely in English. Do not output any hiragana, katakana, or kanji.
+2. If a Japanese proper noun is essential, transliterate to romaji and add an English gloss in parentheses.
+3. If you cannot comply, output exactly "UNABLE_TO_COMPLY" and nothing else.
+""".strip()
+
+resp = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="Summarize the following Japanese article in English, under 300 words:\n\n" + article_body,
+    config=types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.2,
+    ),
+)
+```
+
+An explicit allowlist (romaji plus an English gloss is fine) lets the model escape via transliteration instead of forcing Japanese through. The `UNABLE_TO_COMPLY` token matters too: it turns severe cases into an explicit failure rather than "broken English," which flows cleanly into recovery. Lowering `temperature` to 0.2–0.4 raises instruction-following; for a task that wants consistency over creativity, low temperature is the right trade.
+
+In my measurements, moving from an appended note to a System Instruction alone cut the long-input contamination rate to a fraction. But that is "lower," not "gone" — which is exactly why we keep stacking layers while measuring.
+
+## Few-Shot and Schema Validation — Where Each Works and Where Each Breaks
+
+Tighten the remainder with two more layers: few-shot exemplars and `response_schema`. The important thing is not to confuse which layer works under which condition. My measurements shook out like this.
+
+<table>
+  <thead>
+    <tr><th>Measure</th><th>Works well when</th><th>Breaks when</th><th>Cost</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Stronger System Instructions</td><td>Short to medium inputs</td><td>Input dwarfs the instruction</td><td>Near zero</td></tr>
+    <tr><td>Few-shot (1-2 examples)</td><td>Long, complex tasks</td><td>Token budget is tight</td><td>Extra input tokens</td></tr>
+    <tr><td>response_schema validation</td><td>Structured-output handlers</td><td>Residue inside a free-text field</td><td>Validator maintenance</td></tr>
+  </tbody>
+</table>
+
+Few-shot leans on the general rule that "showing an example" beats "stating a rule" for compliance. The effect is clearest on long, complex tasks; in my pipeline, two examples dropped the contamination rate by an order of magnitude by feel. It costs tokens, though, so short inputs do fine on System Instructions alone.
+
+```python
+EXAMPLES = [
+    ("東京の天気について教えて",
+     "Tokyo has four distinct seasons, with hot humid summers near 30 degC and mild winters."),
+    ("このアプリの料金プラン",
+     "The app has three tiers: Free, Pro (USD 5/month), and Team (USD 20/month per seat)."),
+]
+few_shot = "\n\n".join(
+    f"### Example\nInput (Japanese): {q}\nOutput (English only): {a}" for q, a in EXAMPLES
+)
+prompt = f"{few_shot}\n\n### Task\nInput (Japanese): {user_input}\nOutput (English only):"
+```
+
+When you receive structured output, embed the check in the schema and reject on arrival. A Pydantic `field_validator` mechanically confirms no Japanese remains in text fields and raises if it finds any, routing to recovery.
+
+```python
+from pydantic import BaseModel, Field, field_validator
+
+class EnglishSummary(BaseModel):
+    language: str = Field(description="Must be 'en'")
+    title: str
+    summary: str = Field(description="English summary, 100-300 words")
+
+    @field_validator("title", "summary")
+    @classmethod
+    def no_japanese(cls, v: str) -> str:
+        if JP_RANGE.search(v):
+            raise ValueError("Japanese characters detected in output field")
+        return v
+
+resp = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="Summarize the following article in English:\n\n" + article_body,
+    config=types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=EnglishSummary,
+    ),
+)
+parsed = resp.parsed  # a validated EnglishSummary
+```
+
+Schema validation's weakness is that it is a field-level gatekeeper: it will not catch a single sentence slipping inside a free-text field. That is precisely why you run the continuous `check_english_output` measurement alongside it — tolerate low-`ratio` mild cases, reject only high-`ratio` severe ones. A two-tier stance is the realistic one.
+
+## Don't Retry Blindly — Quote the Offending Span and Tighten
+
+When validation catches a leak, resubmitting the same prompt tends to reproduce it. What works is graded recovery that quotes the previous failure concretely before tightening. Showing the model the actual offending fragment changes its behavior.
+
+```python
+def generate_english_graded(article_body: str, max_retries: int = 2) -> EnglishSummary:
+    base = f"Summarize the following article in English:\n\n{article_body}"
+    reinforcement = ""
+    last_sample = ""
+    for attempt in range(max_retries + 1):
+        resp = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=reinforcement + base,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=EnglishSummary,
+                temperature=0.2,
+            ),
+        )
+        chk = check_english_output(resp.text or "")
+        if not chk.contaminated:
+            return resp.parsed
+        last_sample = chk.sample
+        reinforcement = (
+            "Your previous response contained Japanese text: "
+            f"\"{chk.sample}\". This is forbidden. "
+            "Rewrite entirely in English this time.\n\n"
+        )
+    raise LanguageDriftError(f"gave up after {max_retries} retries; sample={last_sample}")
+```
+
+You grade the steps because recovery costs too: the first call is bare, the second quotes the offending fragment, and if that still fails you give up and route it to human review as an `UNABLE_TO_COMPLY` equivalent. Drawing that line up front keeps an infinite-retry loop from quietly running up the bill. Hand off with the `request_id` and `sample` from the earlier log attached, and a human can reconstruct the situation in seconds.
+
+## The Last Move in Production — Watch the Rate Change
+
+Stacking fixes is not the end. A model swap or a shift in input distribution can quietly push the contamination rate back up. I aggregate it daily and alert when it jumps a set amount above the trailing 7-day median. Holding a single continuous quantity turns "something feels off lately" into a threshold breach you can act on.
+
+```python
+def daily_contamination_rate(log_lines: list[dict]) -> float:
+    if not log_lines:
+        return 0.0
+    bad = sum(1 for r in log_lines if r["contaminated"])
+    return bad / len(log_lines)
+```
+
+Watching it, degradation becomes visible in numbers before a reader points it out. Lifting "leaks once in a while" from a silent probability into an observable metric is the whole point of this operating pattern.
+
+## Your Next Move
+
+Drop `check_english_output` into whatever code returns English today and record your real contamination rate for a few days. The moment you have a number, the correlation with input length shows you where to harden first. Tightening can wait until then. When the adversary is a probability, the first move is not a stronger instruction — it is quiet measurement.

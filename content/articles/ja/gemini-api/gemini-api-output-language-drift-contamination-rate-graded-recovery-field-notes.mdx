@@ -1,0 +1,226 @@
+---
+title: "Gemini API の英語出力に日本語が『たまに』混ざるとき — 混入率を計測して段階的に締める運用メモ"
+slug: "gemini-api-output-language-drift-contamination-rate-graded-recovery-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-04T13:30"
+author: "Gemini Lab"
+description: "英語出力を指示したGemini APIが、100回に数回だけ日本語を混ぜてくる——この『たまに』を止められない本当の理由と、混入率をSLOとして計測し、段階的リカバリで本番品質まで締める運用パターンを実装コード付きで整理します。"
+tags: ["gemini-api", "python", "multilingual", "observability", "production"]
+highlights:
+  - "出力言語の混入を『0か1か』ではなく混入率という連続量として計測する検出器とログ設計"
+  - "System Instructions・Few-shot・response_schema それぞれが『どの条件で効いてどこで破れるか』の実測比較"
+  - "盲目的な再試行ではなく、違反箇所を引用して締める段階的リカバリの実装と人手エスカレーションの線引き"
+---
+
+英語サマリーを返すだけの単純な処理を書いたつもりが、100 本流すと 3 本ほど、末尾の一文だけ日本語が顔を出す。ローカルで 20 回試したときは一度も再現せず、本番で数日回してから読者の指摘で気づく——個人開発で多言語のコンテンツ生成を Gemini API に任せていて、私自身が一番手を焼いたのはこの「たまに混ざる」でした。
+
+厄介なのは、これがバグらしいバグに見えないことです。例外は飛ばず、JSON も壊れず、大半の出力は完璧な英語。だからこそ、テストでは捕まらず、監視にも引っかからないまま本番をすり抜けます。ここでは「英語で出力させても日本語が混ざる」現象を、止める前にまず計測するという順番で扱います。混入を連続量として観測できるようにしてから、System Instructions・Few-shot・スキーマ検証・段階的リカバリを、それぞれの効き目を測りながら重ねていきます。
+
+## なぜ「たまに」なのか — 二値ではなく確率で起きている
+
+英語を指示しても日本語が混ざる直接の原因は、Gemini が大量の多言語コーパスで学習されており、長い日本語入力に注意（attention）が強く引かれることにあります。プロンプト末尾に短く `Answer in English` と添えても、入力本文が長いほど指示の相対的な強度は下がります。加えて、固有名詞や引用のように「そのまま保持したほうが正確だ」とモデルが判断した箇所は、指示を強めない限り原語で残ります。
+
+ここで見落としやすいのが、この現象が決定論的ではないという点です。同じ入力でも、温度やサンプリングの揺らぎによって、混ざる回もあれば混ざらない回もあります。つまり本質は「混入するか否か」という二値ではなく、「1,000 出力あたり何回混ざるか」という確率です。私の翻訳パイプラインの実測では、入力が 2,000 トークンを超えるあたりから Gemini 2.0 Flash で混入が目立ち始め、2.5 Pro でも 3.1 Pro でも完全にゼロにはなりませんでした。「モデルを上げれば直る」という発想を捨てるべき理由がここにあります。相手が確率なら、対策も「計測して閾値まで下げる」という形にせざるを得ません。
+
+## まず混入を計測する — 二値の検出器と混入率
+
+対策を積む前に、出力を数えられる状態にします。ひらがな・カタカナ・漢字の Unicode 範囲を検出する軽量な関数を用意し、混入した「文字数の割合」まで返すようにしておくと、後で閾値を引けます。
+
+```python
+import re
+from dataclasses import dataclass
+
+JP_RANGE = re.compile(r"[぀-ヿ一-鿿]")
+
+@dataclass
+class LangCheck:
+    contaminated: bool      # 日本語が1文字でも混入したか
+    jp_chars: int           # 日本語文字数
+    total_chars: int        # 全文字数
+    ratio: float            # 混入率（0.0-1.0）
+    sample: str             # 最初に見つかった混入箇所の周辺
+
+def check_english_output(text: str) -> LangCheck:
+    matches = list(JP_RANGE.finditer(text))
+    total = len(text) or 1
+    sample = ""
+    if matches:
+        i = matches[0].start()
+        sample = text[max(0, i - 20): i + 20]
+    return LangCheck(
+        contaminated=bool(matches),
+        jp_chars=len(matches),
+        total_chars=total,
+        ratio=len(matches) / total,
+        sample=sample,
+    )
+```
+
+`ratio` を持たせるのが要点です。末尾に一文だけ日本語が残る軽症と、丸ごと日本語で返ってくる重症を、同じ「混入」で括ってしまうと後段の判断を誤ります。`sample` に混入箇所の周辺を残しておくと、ログを見ただけで「固有名詞が残っただけか、指示自体が無視されたのか」を切り分けられます。
+
+そのうえで、本番の各呼び出しにこの検査を通し、混入率を時系列で残します。私は 1 リクエストごとに 1 行のログを出し、日次で「混入したリクエストの割合（contamination rate）」を集計しています。これを一種の SLO として扱い、たとえば「0.5% 未満」を維持目標に置くと、対策の効果を体感ではなく数字で語れるようになります。
+
+```python
+import json, time
+
+def log_lang_metric(request_id: str, model: str, in_tokens: int, chk: LangCheck):
+    print(json.dumps({
+        "ts": time.time(),
+        "request_id": request_id,
+        "model": model,
+        "in_tokens": in_tokens,
+        "contaminated": chk.contaminated,
+        "jp_ratio": round(chk.ratio, 4),
+        "sample": chk.sample,
+    }, ensure_ascii=False))
+```
+
+`in_tokens` を必ず一緒に残すのがコツです。後で集計すると、混入は入力長と強く相関しているのが見えてきます。相関が見えれば、「長い入力だけ対策を厚くする」という費用対効果の高い打ち手に進めます。
+
+## System Instructions を「最優先の制約」として書く
+
+計測基盤ができたら、まず効くのは System Instructions です。本文末尾に `英語で` と添えるのではなく、System Instructions に強い制約として書きます。System Instructions は本文プロンプトより重く扱われる設計で、ここに許可リストと違反時の動作まで書き切るのがポイントです。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+SYSTEM_INSTRUCTION = """
+You are a professional English-language technical editor.
+RULES:
+1. Respond entirely in English. Do not output any hiragana, katakana, or kanji.
+2. If a Japanese proper noun is essential, transliterate it to romaji and add an English gloss in parentheses.
+3. If you cannot comply, output exactly "UNABLE_TO_COMPLY" and nothing else.
+""".strip()
+
+resp = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="以下の日本語記事を英語で300語以内に要約してください。\n\n" + article_body,
+    config=types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.2,
+    ),
+)
+```
+
+許可リスト（ローマ字＋英語の注釈なら可）を明示しておくと、モデルが「無理に日本語を残す」代わりに音訳で逃がしてくれます。違反時に `UNABLE_TO_COMPLY` を返させておくのも重要で、こうすると重症ケースを「壊れた英語」ではなく明示的な失敗として受け取れ、後段のリカバリに素直に流せます。`temperature` は 0.2〜0.4 に下げると指示追従性が上がります。一貫性が欲しいタスクなので、創造性より低温を優先する判断です。
+
+私の実測では、末尾添え書きから System Instructions への移行だけで、長文入力の混入率が数分の一まで落ちました。ただしこれは「下がる」であって「消える」ではありません。だからこそ、次の層を測りながら積みます。
+
+## Few-shot とスキーマ検証 — どこで効いてどこで破れるか
+
+System Instructions で止まりきらない残りを、Few-shot 例示と `response_schema` の二層で締めます。ここで大切なのは、どの層がどの条件で効くのかを混同しないことです。実測をまとめると次のようになりました。
+
+<table>
+  <thead>
+    <tr><th>対策</th><th>よく効く条件</th><th>破れやすい条件</th><th>コスト</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>System Instructions 強化</td><td>短〜中程度の入力全般</td><td>入力が指示より遥かに長いとき</td><td>ほぼゼロ</td></tr>
+    <tr><td>Few-shot 例示（1〜2組）</td><td>長文・複雑タスク</td><td>トークン予算が厳しいとき</td><td>入力トークン増</td></tr>
+    <tr><td>response_schema 検証</td><td>構造化出力を受ける処理</td><td>自由文の本文フィールド内の残留</td><td>検証コードの保守</td></tr>
+  </tbody>
+</table>
+
+Few-shot は「ルールを書く」より「例を見せる」ほうが追従性が高いという一般則をそのまま使います。効果が顕著なのは長文＋複雑タスクで、私の翻訳パイプラインでは 2 組入れるだけで混入率が体感で一桁下がりました。ただしトークンを食うので、短い入力なら System Instructions だけで十分です。
+
+```python
+EXAMPLES = [
+    ("東京の天気について教えて",
+     "Tokyo has four distinct seasons, with hot humid summers near 30 degC and mild winters."),
+    ("このアプリの料金プラン",
+     "The app has three tiers: Free, Pro (USD 5/month), and Team (USD 20/month per seat)."),
+]
+few_shot = "\n\n".join(
+    f"### Example\nInput (Japanese): {q}\nOutput (English only): {a}" for q, a in EXAMPLES
+)
+prompt = f"{few_shot}\n\n### Task\nInput (Japanese): {user_input}\nOutput (English only):"
+```
+
+構造化出力を受けるなら、スキーマ側に検証を埋め込んで受け取った瞬間に弾きます。Pydantic の `field_validator` で本文フィールドに日本語が残っていないかを機械的に確認し、見つかれば例外にしてリカバリへ回します。
+
+```python
+from pydantic import BaseModel, Field, field_validator
+
+class EnglishSummary(BaseModel):
+    language: str = Field(description="Must be 'en'")
+    title: str
+    summary: str = Field(description="English summary, 100-300 words")
+
+    @field_validator("title", "summary")
+    @classmethod
+    def no_japanese(cls, v: str) -> str:
+        if JP_RANGE.search(v):
+            raise ValueError("Japanese characters detected in output field")
+        return v
+
+resp = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents="以下の記事を英語で要約してください:\n\n" + article_body,
+    config=types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=EnglishSummary,
+    ),
+)
+parsed = resp.parsed  # 検証を通過した EnglishSummary
+```
+
+スキーマ検証の弱点は、あくまで「フィールド単位の門番」であって、自由文フィールドの中に一文だけ紛れ込む残留までは防げないことです。だからこそ、先に作った `check_english_output` の連続量計測を併走させ、`ratio` が小さい軽症は許容、大きい重症だけ弾く、といった二段構えにしておくと現実的です。
+
+## 盲目的な再試行ではなく、違反箇所を引用して締める
+
+検証で混入を捕まえたとき、同じプロンプトをそのまま投げ直しても同じ結果になりがちです。効くのは、前回の失敗を具体的に引用してから締め直す段階的リカバリです。混入した実際の断片を見せると、モデルの挙動が変わります。
+
+```python
+def generate_english_graded(article_body: str, max_retries: int = 2) -> EnglishSummary:
+    base = f"以下の記事を英語で要約してください:\n\n{article_body}"
+    reinforcement = ""
+    last_sample = ""
+    for attempt in range(max_retries + 1):
+        resp = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=reinforcement + base,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=EnglishSummary,
+                temperature=0.2,
+            ),
+        )
+        chk = check_english_output(resp.text or "")
+        if not chk.contaminated:
+            return resp.parsed
+        last_sample = chk.sample
+        # 次の試行では実際に混入した断片を引用して締める
+        reinforcement = (
+            "Your previous response contained Japanese text: "
+            f"\"{chk.sample}\". This is forbidden. "
+            "Rewrite entirely in English this time.\n\n"
+        )
+    raise LanguageDriftError(f"gave up after {max_retries} retries; sample={last_sample}")
+```
+
+段階を踏むのは、リカバリにも費用がかかるからです。1 回目は素の呼び出し、2 回目は違反断片を引用、それでも駄目なら諦めて `UNABLE_TO_COMPLY` 相当として人手レビューに回す——この線引きを決めておくと、無限リトライで課金だけ膨らむ事故を避けられます。エスカレーション先に渡すときは、先ほどのログの `request_id` と `sample` を添えておくと、人間が状況を再構成する手間が激減します。
+
+## 本番で回すときの最後の一手 — 混入率の変化を監視する
+
+対策を積んだら終わり、ではありません。モデルの差し替えや入力分布の変化で、混入率は静かにずり上がることがあります。私は日次で contamination rate を集計し、直近 7 日の中央値から一定以上跳ねたらアラートを出しています。混入率という一本の連続量を持っておくと、「なんとなく最近おかしい」という体感を、閾値超過という判断に落とし込めます。
+
+```python
+def daily_contamination_rate(log_lines: list[dict]) -> float:
+    if not log_lines:
+        return 0.0
+    bad = sum(1 for r in log_lines if r["contaminated"])
+    return bad / len(log_lines)
+```
+
+これを見ていると、対策の劣化が「読者に指摘される前」に数字で見えてきます。テストで捕まらず監視も素通りしていた「たまに混ざる」を、静かな確率から観測できる指標へ引き上げるのが、この運用の目的です。
+
+## 次の一手
+
+まずは、いま英語出力を返している自分のコードに `check_english_output` を一本差し込み、本番の混入率を数日ぶん記録してみてください。数字が出た時点で、対策を「どこから厚くすべきか」が入力長との相関から見えてきます。締めるのはそのあとで十分です。相手が確率である以上、最初にやるべきは強い指示ではなく、静かな計測だと考えています。
