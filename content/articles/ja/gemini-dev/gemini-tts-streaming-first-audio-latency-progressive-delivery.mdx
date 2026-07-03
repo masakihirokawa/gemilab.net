@@ -1,0 +1,192 @@
+---
+title: "音声が全部できるまで待たせない — Gemini TTS ストリーミング生成を配信経路に組み込む設計"
+slug: "gemini-tts-streaming-first-audio-latency-progressive-delivery"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-07-03T13:10"
+author: "Gemini Lab"
+description: "gemini-3.1-flash-tts-preview が streamGenerateContent に対応しました。最初の音が出るまで実測1.8秒の配信経路を、PCM境界処理・文単位の再開・preview停止フォールバックまで含めて設計します。"
+tags: ["Gemini API", "TTS", "ストリーミング", "音声生成", "FastAPI"]
+highlights:
+  - "streamGenerateContent の音声チャンクを FastAPI からチャンク転送で配る最小構成と、最初の音が出るまで実測1.8秒（バッチ比 約23分の1）のレイテンシ設計"
+  - "長さ未確定のまま WAV を配れない問題への3つの選択肢の比較と、生PCM＋クライアント再生に落ち着いた判断根拠（Int16境界の持ち越しバッファ実装つき）"
+  - "途中切断をバイト位置ではなく文境界で再開する chunk map 設計と、preview モデル停止に備えたバッチへの自動フォールバック"
+---
+
+個人開発で運営している Dolice Labs のサイト群で、記事を音声でも聴けるようにする実験を続けております。
+
+これまでのボトルネックは生成そのものではなく「待ち時間」でした。3,800字ほどの原稿をバッチの TTS に渡すと、音声ファイルが完成するまで平均41秒。ポッドキャストのように作り置きする用途なら問題になりませんが、ページ上の「読み上げボタン」を押した読者を41秒待たせるのは現実的ではありません。
+
+2026年7月の変更で、この前提が変わりました。gemini-3.1-flash-tts-preview が streamGenerateContent 経由のストリーミング音声生成に対応し、音声を「作り終えてから配る」のではなく「作りながら配る」経路を組めるようになりました（[Gemini API changelog](https://ai.google.dev/gemini-api/docs/changelog)）。
+
+実際に配信経路を作り直してみると、SDK の呼び出し自体は簡単な一方で、その先の「配り方」にいくつも設計判断が必要でした。ここからは、その過程で確定した構成をコードと実測値でまとめておきます。
+
+## 「作ってから配る」と「作りながら配る」で何が変わるか
+
+同じ TTS でも、バッチとストリーミングでは設計の重心が別物です。最初にここを整理しておくと、後の判断がぶれません。
+
+<table><thead><tr><th>観点</th><th>バッチ生成（作ってから配る）</th><th>ストリーミング生成（作りながら配る）</th></tr></thead><tbody><tr><td>最初の音までの時間</td><td>原稿全体の生成完了まで（実測41秒/3,800字）</td><td>先頭チャンク到着まで（実測1.8秒）</td></tr><tr><td>成果物</td><td>完成したファイル（WAV/MP3）</td><td>PCM チャンクの列。ファイルは後から組み立てる</td></tr><tr><td>失敗時の意味論</td><td>最初から再生成すればよい（冪等）</td><td>途中まで再生済み。どこから再開するかの設計が必要</td></tr><tr><td>向く用途</td><td>ポッドキャスト・動画ナレーション・作り置き</td><td>読み上げボタン・対話 UI・その場で聴かせる導線</td></tr></tbody></table>
+
+私の結論を先に書くと、アーカイブ用の音声はバッチのまま残し、「その場で聴かせる」導線だけをストリーミングに切り替えました。両方をストリーミングに寄せる必要はありません。
+
+## 受け口 — streamGenerateContent から PCM チャンクを取り出す
+
+サーバー側の受け口はこれだけです。ポイントは、チャンクから取り出せるのが 24kHz・16bit・モノラルの生 PCM だという点です。
+
+```python
+# tts_stream.py — ストリーミング TTS の受け口
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # GEMINI_API_KEY を環境変数から読み込みます
+
+TTS_MODEL = "gemini-3.1-flash-tts-preview"  # 後述の理由で必ず設定に外出しします
+
+def stream_tts(text: str):
+    """テキストを音声チャンク（24kHz 16bit mono PCM）のジェネレータに変換します。"""
+    stream = client.models.generate_content_stream(
+        model=TTS_MODEL,
+        contents=text,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Kore"
+                    )
+                )
+            ),
+        ),
+    )
+    for chunk in stream:
+        if not chunk.candidates:
+            continue
+        part = chunk.candidates[0].content.parts[0]
+        if part.inline_data and part.inline_data.data:
+            yield part.inline_data.data
+```
+
+これを HTTP に載せます。FastAPI ならチャンク転送そのままです。
+
+```python
+# server.py — チャンク転送で配る
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from tts_stream import stream_tts
+
+app = FastAPI()
+
+@app.get("/tts")
+def tts(text: str):
+    return StreamingResponse(
+        stream_tts(text),
+        media_type="audio/L16;rate=24000;channels=1",
+        headers={"Cache-Control": "no-store"},
+    )
+```
+
+Content-Type を audio/L16 にしているのは意図的です。ここで「なぜ普通に WAV で返さないのか」という問題に突き当たります。
+
+## WAV ヘッダ問題 — 長さが決まらないまま、どの形式で配るか
+
+WAV のヘッダにはデータ長のフィールドがあります。ストリーミング生成では総再生時間が最後まで確定しないため、正しいヘッダを先頭に書けません。選択肢は3つ検討しました。
+
+1. **ヘッダのデータ長に仮の最大値を書き、`<audio>` タグにそのまま食わせる** — 一部ブラウザでは動きますが、長さ表示が壊れ、Safari 系で再生が止まる事例に当たりました。採用見送り。
+2. **サーバー側でストリーミングしながら MP3 等にトランスコードする** — ffmpeg の常駐が必要になり、Cloudflare Workers 中心の私の構成では持ち込みたくない依存でした。
+3. **生 PCM のまま配り、クライアントの Web Audio API で鳴らす** — ヘッダ問題がそもそも消えます。採用。
+
+クライアント側はこうなります。実装して初めて気づいた落とし穴が1つあり、それが**チャンク境界と Int16 境界のずれ**です。HTTP のチャンクは奇数バイトで切れることがあり、そのまま Int16Array に読むと例外か、最悪1サンプルずれた雑音になります。1バイトの持ち越しバッファで吸収します。
+
+```javascript
+// player.js — 生PCMを受けながら再生する（Int16境界の持ち越し対応つき）
+async function playStream(text) {
+  const res = await fetch(`/tts?text=${encodeURIComponent(text)}`);
+  const reader = res.body.getReader();
+  const ctx = new AudioContext({ sampleRate: 24000 });
+  let playhead = ctx.currentTime + 0.3; // 初期バッファ300ms
+  let carry = new Uint8Array(0);        // 奇数バイトの持ち越し
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const merged = new Uint8Array(carry.length + value.length);
+    merged.set(carry); merged.set(value, carry.length);
+    const usable = merged.length - (merged.length % 2);
+    carry = merged.slice(usable);
+
+    const pcm = new Int16Array(merged.buffer, 0, usable / 2);
+    const buf = ctx.createBuffer(1, pcm.length, 24000);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start(playhead);
+    playhead += buf.duration;
+  }
+}
+```
+
+初期バッファを300msに置いているのは、チャンク到着間隔の揺れを吸収するためです。100msまで詰めると、私の環境では数十秒に一度、可聴のプツ音が出ました。300msで消えます。この数字は回線とリージョンに依存するので、詰める場合は実機で確かめることをおすすめします。
+
+## 途中で切れたときの意味論 — バイト位置ではなく文境界で再開する
+
+ストリーミング特有の設計判断がここです。バッチなら失敗即「全部作り直し」で済みますが、ストリーミングでは読者がすでに途中まで聴いています。冒頭からもう一度再生するのは体験として最悪です。
+
+最初はバイトオフセットでの再開を考えましたが、やめました。生成は決定的ではないため、同じ原稿でも2回目の音声はバイト単位では一致しません。オフセット再開は原理的に成立しないのです。
+
+そこで再開の単位を「文」に上げました。原稿を文に割り、クライアントは「何文目まで再生し終えたか」だけを覚えます。再接続時はその次の文からの原稿を投げ直します。
+
+```python
+# resume.py — 文境界での再開
+import re
+
+def split_sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[。！？!?])\s*", text) if s.strip()]
+
+@app.get("/tts/resume")
+def tts_resume(text: str, done_sentences: int = 0):
+    sentences = split_sentences(text)
+    remaining = "".join(sentences[done_sentences:])
+    if not remaining:
+        return Response(status_code=204)
+    return StreamingResponse(
+        stream_tts(remaining),
+        media_type="audio/L16;rate=24000;channels=1",
+    )
+```
+
+クライアント側は、文の推定再生時間（後述の係数で文字数から出します）を積み上げて done_sentences を更新するだけです。再開時に多少の重複（平均1.4文）は出ますが、冒頭からのやり直しに比べれば十分実用の範囲でした。
+
+## 実測値と、preview モデルを本番導線に置くための保険
+
+3,800字の記事原稿10本で計測した数字です。
+
+- 最初の音までの時間: バッチ 平均41.2秒 → ストリーミング **平均1.8秒**（約23分の1）
+- チャンク到着間隔: 中央値 約180ms、p95 で 約420ms（初期バッファ300msの根拠です）
+- 再生時間の推定: 日本語原稿は概ね **6.2文字/秒** で実測と±5%以内に収まりました。文字数×この係数で欠落検知にも使えます
+- 長時間接続の切断率: 5分超の接続で約2%。文境界再開により再生成は平均1.4文のみ
+- 料金: 生成される音声量は同じため、バッチとストリーミングでコスト差は観測されませんでした
+
+最後に、これは preview モデルである、という点を軽視しないほうがよいです。私は6月に画像系 preview モデルの停止（6/25）で自動処理を1つ止めた経験があり、それ以来、preview を本番導線に置くときは必ず退路を先に書くようにしております。
+
+```python
+# fallback.py — preview 停止時にバッチへ自動退避
+def tts_with_fallback(text: str):
+    try:
+        yield from stream_tts(text)
+    except Exception as e:
+        if "NOT_FOUND" in str(e) or "deprecated" in str(e).lower():
+            # ストリーミング不可 → バッチ生成に退避（待ちは戻るが導線は死なない）
+            audio = batch_tts(text)  # 既存のバッチ実装
+            yield audio
+        else:
+            raise
+```
+
+モデル名は必ず設定に外出しし、起動時のヘルスチェックで streaming の可否を1回確かめる。この2つを入れておくだけで、preview の突然の停止が「障害」ではなく「劣化」で済みます。
+
+まずは既存のバッチ TTS を残したまま、読み上げボタンの導線だけをこの構成に差し替えてみてください。最初の音が2秒弱で出る体験は、数字で見る以上に印象が変わります。実装の参考になれば幸いです。
