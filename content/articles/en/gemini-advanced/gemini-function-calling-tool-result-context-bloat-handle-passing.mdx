@@ -1,0 +1,174 @@
+---
+title: "Your Tool Results Are Quietly Eating the Conversation — Handle Passing to Keep Gemini Function Calling Contexts Lean"
+slug: "gemini-function-calling-tool-result-context-bloat-handle-passing"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-03T19:45"
+author: "Gemini Lab"
+description: "Tool results linger in Function Calling history and compound your input tokens every turn. Two implementations — a token-budgeted compactor and handle passing — cut my measured input by roughly 8x, with the pitfalls I hit along the way."
+tags: ["Gemini API", "Function Calling", "agents", "context management", "cost optimization"]
+highlights:
+  - "You'll be able to diagnose why your agent gets slower and pricier with every turn, using countTokens to chart per-turn input growth instead of guessing"
+  - "You can drop in two copy-paste implementations — a token-budgeted compactor and handle passing — that cut a review-analysis agent's input tokens by roughly 8x in my measurements"
+  - "You'll sidestep the traps of context compaction ahead of time: breaking thought signatures, over-compaction re-fetch loops, and parallel-call response ordering"
+---
+
+When I pointed an agent at 312 app reviews, everything slowed down from turn three onward. Responses that came back in two seconds early in the loop were taking over ten by the end, and at month's close, this one job's line on the invoice looked oddly inflated.
+
+As an indie developer, I run a nightly agent that classifies and aggregates reviews for my apps using Gemini's Function Calling. The naive implementation — stuff whatever `fetch_reviews` returns straight into the `functionResponse` — worked fine while review counts were small. Then a busy month arrived, and the behavior flipped. The culprit wasn't generation output at all: **the huge JSON my tool returned was sitting in the conversation history and getting re-sent as input on every subsequent turn**.
+
+In a Function Calling loop, you append the model's `functionCall` and your `functionResponse` to `contents` and send the whole thing again. So a tool result weighing 48,000 tokens gets billed five more times across a six-turn loop. If you only watch output tokens, this input-side compounding is easy to miss.
+
+## Measure Input Tokens per Turn — the Culprit Is Residency
+
+Before fixing anything, put numbers on it. On each turn, run the full `contents` you're about to send through `count_tokens`.
+
+```python
+# turn_meter.py — chart per-turn input token growth in your agent loop
+# Solves: turning "the later turns feel slow" into a number
+from google import genai
+
+client = genai.Client()  # API key from GEMINI_API_KEY env var
+MODEL = "gemini-flash-latest"
+
+def log_turn_tokens(turn: int, contents: list) -> int:
+    """Record token count of the full contents just before sending"""
+    result = client.models.count_tokens(model=MODEL, contents=contents)
+    print(f"turn={turn} input_tokens={result.total_tokens}")
+    return result.total_tokens
+```
+
+Counting is free-tier friendly and it's one extra line in the loop. My review-analysis agent (a six-turn run that fetches reviews from two stores, classifies, and aggregates) looked like this before any fixes:
+
+<table><thead><tr><th>Turn</th><th>What's in context</th><th>Input tokens (measured)</th></tr></thead><tbody><tr><td>1</td><td>Instructions only</td><td>1,240</td></tr><tr><td>2</td><td>+ fetch_reviews result (store A, 312 rows)</td><td>49,800</td></tr><tr><td>3</td><td>+ intermediate classification output</td><td>52,300</td></tr><tr><td>4</td><td>+ fetch_reviews result (store B, 287 rows)</td><td>101,900</td></tr><tr><td>5</td><td>+ intermediate aggregation output</td><td>104,500</td></tr><tr><td>6</td><td>Final report generation</td><td>105,100</td></tr></tbody></table>
+
+One run consumed about 410,000 input tokens in total, and roughly 80% of that was re-sent review JSON. I was paying most of the job's latency and cost for repetition that contributed nothing to output quality.
+
+## Three Ways to Hand Over a Tool Result — Full, Compacted, or by Handle
+
+How a tool result reaches the model is a design choice, even though it rarely gets treated as one. I've settled on this three-way framing:
+
+<table><thead><tr><th>Approach</th><th>What the model sees</th><th>Good fit</th><th>Risk</th></tr></thead><tbody><tr><td>Full payload</td><td>The entire result JSON</td><td>Small results (roughly under 2,000 tokens)</td><td>History residency compounds input</td></tr><tr><td>Budgeted compaction</td><td>A slimmed version keeping priority fields</td><td>Only some fields matter to the task</td><td>A dropped field turns out to be needed later</td></tr><tr><td>Handle passing</td><td>Row count, schema, digest + a reference ID</td><td>Large results, detail lookups are rare</td><td>Each detail lookup costs an extra turn</td></tr></tbody></table>
+
+The deciding question is simple: **does the model genuinely need to read the full payload?** Data like reviews — processed once, never re-read — has no business living in the history.
+
+## Implementation 1: a Token-Budgeted Compactor — Stop Sending Everything First
+
+The first move is a layer that shrinks results to a budget before they go into `functionResponse`.
+
+```python
+# compactor.py — shrink tool results to a token budget before functionResponse
+# Solves: compounding input growth from re-sending fields nobody uses
+import json
+from google import genai
+
+client = genai.Client()
+MODEL = "gemini-flash-latest"
+
+def count(text: str) -> int:
+    return client.models.count_tokens(model=MODEL, contents=text).total_tokens
+
+def compact_tool_result(rows: list[dict], keep_fields: list[str],
+                        budget_tokens: int = 6000) -> dict:
+    """Keep only priority fields; trim rows if still over budget.
+    Always tell the model that trimming happened."""
+    slim = [{k: r.get(k) for k in keep_fields} for r in rows]
+    kept = len(slim)
+    while kept > 1 and count(json.dumps(slim[:kept], ensure_ascii=False)) > budget_tokens:
+        kept = int(kept * 0.8)  # shave 20% at a time until under budget
+    return {
+        "rows": slim[:kept],
+        "total_rows": len(rows),
+        "returned_rows": kept,
+        "truncated": kept < len(rows),
+        "note": "If truncated=true and you need all rows, call fetch_more",
+    }
+
+# Usage: keep only text and rating for reviews
+# compacted = compact_tool_result(reviews, keep_fields=["text", "rating"])
+# → 312 rows / 48,200 tokens fits within 6,000 tokens
+```
+
+Two things matter here. First, **always disclose the trim via the `truncated` flag and counts**. Trim silently and the model will aggregate under the false belief that "there are only 287 reviews," producing a quietly wrong report. Second, cut fields before rows. Dropping rows first biases the sample; fields irrelevant to the task can go safely.
+
+## Implementation 2: Handle Passing — Keep the Payload Local, Give the Model a Table of Contents
+
+When compaction isn't enough, flip the model of ownership: store the full result locally, and return only a count, a schema, a short digest, and a reference ID. The model pulls details through a second tool only when it actually needs them.
+
+```python
+# handle_passing.py — pass tool results by reference
+# Solves: keeping huge payloads out of history, fetching fragments on demand
+import uuid
+
+class ResultStore:
+    """A store scoped to one run. Cross-run references fail loudly."""
+    def __init__(self):
+        self._data: dict[str, list[dict]] = {}
+
+    def put(self, rows: list[dict]) -> str:
+        handle = f"res_{uuid.uuid4().hex[:8]}"
+        self._data[handle] = rows
+        return handle
+
+    def slice(self, handle: str, offset: int = 0, limit: int = 40) -> dict:
+        if handle not in self._data:
+            return {"error": f"handle {handle} does not exist in this run"}
+        rows = self._data[handle][offset:offset + limit]
+        return {"rows": rows, "offset": offset,
+                "total": len(self._data[handle])}
+
+store = ResultStore()
+
+def fetch_reviews(store_id: str) -> dict:
+    """Only this return value reaches the model. Full data goes to ResultStore."""
+    rows = load_reviews_from_db(store_id)  # your data access here
+    handle = store.put(rows)
+    return {
+        "handle": handle,
+        "total_rows": len(rows),
+        "schema": ["text", "rating", "date", "lang"],
+        "digest": summarize_locally(rows),  # light stats only, e.g. counts per star
+        "note": "Call fetch_rows(handle, offset, limit) if you need raw rows",
+    }
+
+def fetch_rows(handle: str, offset: int, limit: int) -> dict:
+    """The second tool, called only when the model asks for detail"""
+    return store.slice(handle, offset, min(limit, 40))
+```
+
+Capping `limit` (40 rows here) is the operational trick. Without a cap, the model will politely ask for everything, and handle passing degenerates back into full-payload passing.
+
+Tasks that genuinely need to touch every row — classification, say — shouldn't ride the conversation loop at all. Feed the handle's contents to a local batch process (small per-row calls or the Batch API) instead. The agent conversation keeps the judgment; the work happens outside the history.
+
+## Folding Old Turns — in an Order That Doesn't Break Thought Signatures
+
+If you're retrofitting a running agent, cleaning up the history itself also pays off: before assembling the next request, replace the body of spent `functionResponse` parts with a stub like `{"status": "processed", "handle": "res_xxxx"}`.
+
+One caution for Gemini 3-family models: thought signatures, used to validate multi-turn integrity, must not be deleted or altered. **Only fold the `functionResponse` bodies you authored**; leave model-produced parts, signatures included, untouched. I've written up the details in [keeping thought signatures intact across multi-turn Function Calling](/articles/gemini-api/gemini-3-thought-signatures-function-calling-production).
+
+And if what you actually want to compress is a long user conversation, that's a different problem with different constraints — covered in [compressing Gemini chat history with rolling summaries](/articles/gemini-api/gemini-api-rolling-summary-chat-history-compression). This article is strictly about the residency of machine-made payloads.
+
+## Measured Results: Input Tokens Down ~8x, p95 from 34s to 9s
+
+After two weeks of running the review agent with handle passing plus stub folding:
+
+<table><thead><tr><th>Metric</th><th>Before</th><th>After</th></tr></thead><tbody><tr><td>Total input tokens per run</td><td>~414,000</td><td>~52,000</td></tr><tr><td>p95 latency, full run</td><td>34s</td><td>9s</td></tr><tr><td>Monthly cost of this job (Flash-tier, measured then)</td><td>~¥1,340</td><td>~¥180</td></tr><tr><td>Extra fetch_rows calls</td><td>—</td><td>avg 1.3 per run</td></tr></tbody></table>
+
+To be honest, it isn't all upside. Those `fetch_rows` calls add an average of 1.3 extra turns per run, so the loop is longer. But eliminating the re-sends dominates: total time and cost both dropped sharply. The richer your local digest, the fewer detail fetches you'll see — I treat that as a dial to tune in production rather than something to get right up front.
+
+## Pitfalls — Compact Too Hard and the Model Comes Back for More
+
+Three I actually hit:
+
+**Over-tightening the budget creates a re-fetch loop.** At a 2,000-token budget, the model called `fetch_more` four times in a row, and turn count went up instead of down. Start the budget at "all rows of the fields the task needs," and only tighten while measuring.
+
+**Vague handle lifetimes.** My store wasn't persisted across process restarts, so a retried run dereferenced a stale handle and got nothing. Making `ResultStore` fail loudly ("does not exist in this run") let the model recover naturally by calling `fetch_reviews` again.
+
+**Breaking correspondence under parallel function calls.** When multiple `functionCall` parts arrive in one turn, your `functionResponse` parts must match them in order and name. My stub-folding once disturbed that pairing and earned an `INVALID_ARGUMENT`. Fold bodies only; never touch part ordering.
+
+If you also want a hard ceiling on spend before submitting work, the budget gate in [stopping cost overruns before batch submission with countTokens](/articles/gemini-api/gemini-counttokens-batch-budget-gate-model-swap) composes cleanly with everything above.
+
+## Wrapping Up — Chart One Run First
+
+Before debating designs, add the one-line `log_turn_tokens` to your existing loop and look at a single run's trajectory. If input jumps in a staircase from turn two onward, the compaction and handle passing here will apply directly. If it doesn't, your loop is still healthy — and confirming that takes five minutes, which is the safest possible place to start.

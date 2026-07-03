@@ -1,0 +1,174 @@
+---
+title: "ツール結果が会話を静かに食いつぶす — Gemini Function Calling の巨大レスポンスをハンドル渡しで軽くする設計"
+slug: "gemini-function-calling-tool-result-context-bloat-handle-passing"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-03T19:45"
+author: "Gemini Lab"
+description: "Function Calling のツール結果が会話履歴に滞留し、入力トークンを複利で膨らませる問題を分解します。トークン予算つき圧縮とハンドル渡しの2実装で、実測で入力を約1/8に抑えた手順と落とし穴をまとめます。"
+tags: ["Gemini API", "Function Calling", "エージェント", "コンテキスト管理", "コスト最適化"]
+highlights:
+  - "ターンを重ねるほど遅く・高くなる自作エージェントの原因を「ツール結果の履歴滞留」として特定し、countTokens でターン毎の入力トークン推移を計測できるようになる"
+  - "トークン予算つきコンパクタとハンドル渡し（参照渡し）の2実装をコピペで導入し、レビュー分析エージェントの入力トークンを実測で約1/8に抑えられる"
+  - "thought signature を壊さない履歴の畳み方や、圧縮しすぎによる再取得ループなど、コンテキスト圧縮で踏みやすい落とし穴を先回りして避けられる"
+---
+
+エージェントに 312 件のアプリレビューを分析させたら、3 ターン目から急に遅くなりました。最初のターンは 2 秒台で返っていた応答が、ループの後半では 10 秒を超え、月末の請求もこのジョブだけ不自然に膨らんでいました。
+
+私自身、個人開発で運営しているアプリのレビューを Gemini の Function Calling で分類・集計するエージェントを毎晩回しています。`fetch_reviews` ツールが返す JSON をそのまま `functionResponse` に詰めて返す素朴な実装で、件数が少ないうちは何の問題もありませんでした。ところがレビューが溜まった月に挙動が一変し、調べてみると原因は生成の出力側ではなく、**ツールが返した巨大な JSON が会話履歴に残り続け、以降の全ターンで毎回「入力」として再送されていたこと**でした。
+
+Function Calling のループでは、モデルの関数呼び出し（`functionCall`）とその実行結果（`functionResponse`）を `contents` に積み上げて次のリクエストを投げます。つまりツールが一度返した 48,000 トークンの JSON は、ループが 6 ターン続けば残り 5 ターンぶん繰り返し課金されます。出力トークンばかり監視していると、この入力側の複利にはなかなか気づけません。
+
+## ターンごとの入力トークンを測る — 犯人は「滞留」
+
+対策の前に、まず現状を数字にします。エージェントループの各ターンで、送信直前の `contents` 全体を `count_tokens` に通すだけです。
+
+```python
+# turn_meter.py — エージェントループの入力トークン推移を計測する
+# 何を解決するか: 「なぜか後半のターンだけ遅い」を感覚ではなく数字にする
+from google import genai
+
+client = genai.Client()  # APIキーは環境変数 GEMINI_API_KEY から
+MODEL = "gemini-flash-latest"
+
+def log_turn_tokens(turn: int, contents: list) -> int:
+    """送信直前の contents 全体のトークン数を記録する"""
+    result = client.models.count_tokens(model=MODEL, contents=contents)
+    print(f"turn={turn} input_tokens={result.total_tokens}")
+    return result.total_tokens
+```
+
+計測は無料枠で回せるうえ、ループに 1 行足すだけです。私のレビュー分析エージェント（2 ストア分のレビューを取得して分類・集計する 6 ターン構成）では、導入前はこう推移していました。
+
+<table><thead><tr><th>ターン</th><th>内容</th><th>入力トークン（実測）</th></tr></thead><tbody><tr><td>1</td><td>指示のみ</td><td>1,240</td></tr><tr><td>2</td><td>+ fetch_reviews 結果（ストアA・312件）</td><td>49,800</td></tr><tr><td>3</td><td>+ 分類の中間出力</td><td>52,300</td></tr><tr><td>4</td><td>+ fetch_reviews 結果（ストアB・287件）</td><td>101,900</td></tr><tr><td>5</td><td>+ 集計の中間出力</td><td>104,500</td></tr><tr><td>6</td><td>最終レポート生成</td><td>105,100</td></tr></tbody></table>
+
+1 回の実行で合計約 41 万トークンを「入力」に使っていました。うちレビュー JSON の再送分がおよそ 8 割です。生成物の品質にはまったく寄与しない再送に、実行時間と費用の大半を払っていたことになります。
+
+## 渡し方は 3 つある — 全文・要約・ハンドル
+
+ツール結果をモデルにどう見せるかは、実際には設計の選択です。私はこの 3 択で整理するようになりました。
+
+<table><thead><tr><th>方式</th><th>モデルに渡すもの</th><th>向いている場面</th><th>リスク</th></tr></thead><tbody><tr><td>全文渡し</td><td>ツール結果の JSON 全体</td><td>結果が小さい（目安 2,000 トークン未満）</td><td>履歴滞留で入力が複利増加</td></tr><tr><td>予算つき圧縮</td><td>優先フィールドだけ残した縮約版</td><td>結果の一部フィールドしか使わない</td><td>落としたフィールドが後で必要になる</td></tr><tr><td>ハンドル渡し</td><td>件数・スキーマ・要約＋参照ID</td><td>結果が大きく、詳細参照が稀</td><td>詳細が要るたびに追加ターンが発生</td></tr></tbody></table>
+
+判断基準はシンプルで、**「モデルがこの結果の全文を本当に読む必要があるか」**です。レビュー分類のように「1 件ずつ処理するが、処理後は二度と見ない」データは、全文を履歴に置いておく理由がありません。
+
+## 実装 1: トークン予算つきコンパクタ — まず全文渡しをやめる
+
+最初の一手として、`functionResponse` に詰める前に予算内へ縮約する層を挟みます。
+
+```python
+# compactor.py — ツール結果をトークン予算内に縮約してから functionResponse に詰める
+# 何を解決するか: 使わないフィールドの再送で入力トークンが複利増加する問題
+import json
+from google import genai
+
+client = genai.Client()
+MODEL = "gemini-flash-latest"
+
+def count(text: str) -> int:
+    return client.models.count_tokens(model=MODEL, contents=text).total_tokens
+
+def compact_tool_result(rows: list[dict], keep_fields: list[str],
+                        budget_tokens: int = 6000) -> dict:
+    """優先フィールドのみ残し、予算を超えたら行数を切り詰める。
+    切り詰めたことは必ずメタ情報としてモデルに伝える。"""
+    slim = [{k: r.get(k) for k in keep_fields} for r in rows]
+    kept = len(slim)
+    while kept > 1 and count(json.dumps(slim[:kept], ensure_ascii=False)) > budget_tokens:
+        kept = int(kept * 0.8)  # 2割ずつ削って予算内に収める
+    return {
+        "rows": slim[:kept],
+        "total_rows": len(rows),
+        "returned_rows": kept,
+        "truncated": kept < len(rows),
+        "note": "truncated=true の場合、全件が必要なら fetch_more を呼んでください",
+    }
+
+# 使用例: レビューは text と rating だけ残す
+# compacted = compact_tool_result(reviews, keep_fields=["text", "rating"])
+# → 312件 48,200トークン が 6,000トークン以内に収まる
+```
+
+ポイントは 2 つあります。第一に、**切り詰めた事実を必ず `truncated` フラグと件数で明示する**こと。黙って削ると、モデルは「287 件しかない」という誤った前提で集計し、静かに間違ったレポートを出します。第二に、削る単位を「フィールド → 行数」の順にすること。行を先に削ると標本が偏りますが、フィールドはタスクに不要なものから確実に落とせます。
+
+## 実装 2: ハンドル渡し — 全文はローカルに置き、モデルには目次を渡す
+
+圧縮でも足りない規模なら、発想を変えて**参照渡し**にします。ツール結果の全文はローカルのストアに保管し、モデルには「件数・スキーマ・短い要約・参照 ID」だけを返します。詳細が必要になったときだけ、モデルが別のツールで取りに来る構成です。
+
+```python
+# handle_passing.py — ツール結果の参照渡し（ハンドル渡し）
+# 何を解決するか: 巨大な結果を履歴に置かず、必要な断片だけ後から取得する
+import uuid
+
+class ResultStore:
+    """run 単位で生きる一時ストア。run を跨いだ参照は明示的にエラーにする"""
+    def __init__(self):
+        self._data: dict[str, list[dict]] = {}
+
+    def put(self, rows: list[dict]) -> str:
+        handle = f"res_{uuid.uuid4().hex[:8]}"
+        self._data[handle] = rows
+        return handle
+
+    def slice(self, handle: str, offset: int = 0, limit: int = 40) -> dict:
+        if handle not in self._data:
+            return {"error": f"handle {handle} はこの実行内に存在しません"}
+        rows = self._data[handle][offset:offset + limit]
+        return {"rows": rows, "offset": offset,
+                "total": len(self._data[handle])}
+
+store = ResultStore()
+
+def fetch_reviews(store_id: str) -> dict:
+    """モデルに渡るのはこの戻り値だけ。全文は ResultStore に退避"""
+    rows = load_reviews_from_db(store_id)  # 実データ取得（各自の実装）
+    handle = store.put(rows)
+    return {
+        "handle": handle,
+        "total_rows": len(rows),
+        "schema": ["text", "rating", "date", "lang"],
+        "digest": summarize_locally(rows),  # 星別件数など軽い統計のみ
+        "note": "本文が必要な場合は fetch_rows(handle, offset, limit) を呼んでください",
+    }
+
+def fetch_rows(handle: str, offset: int, limit: int) -> dict:
+    """モデルが詳細を要求したときだけ呼ばれる第二のツール"""
+    return store.slice(handle, offset, min(limit, 40))
+```
+
+`fetch_rows` の `limit` に上限（ここでは 40 行）を掛けておくのが本番運用のコツです。個人的には 40 行前後で足りています。上限がないと、モデルは律儀に「全件ください」と言ってきて、結局ハンドル渡しが全文渡しに退化します。
+
+分類のように全件を舐める必要があるタスクは、そもそも会話ループに載せず、ハンドルの中身をローカルのバッチ処理（1 件ずつの軽い呼び出しや Batch API）に回します。エージェントの会話には「判断」だけを残し、「作業」は履歴の外で行う、という分担です。
+
+## 過去ターンの結果を畳む — thought signature を壊さない順序
+
+すでに動いているエージェントに手を入れる場合は、履歴そのものの後始末も効きます。役目を終えたターンの `functionResponse` の中身を、`{"status": "processed", "handle": "res_xxxx"}` のようなスタブに置換してから次のリクエストを組み立てる方法です。
+
+ここで一点だけ、Gemini 3 系で Function Calling を使っている場合の注意があります。マルチターンの整合性検証に使われる thought signature を含むパートを削除・改変すると、以降のターンでエラーや品質劣化を招きます。**畳んでよいのは自分が作った `functionResponse` の中身だけ**で、モデル側が返したパートは署名ごとそのまま残します。この挙動の詳細は [Gemini 3 の thought signatures を保持してマルチターン Function Calling を安定させる実装](/articles/gemini-api/gemini-3-thought-signatures-function-calling-production) にまとめています。
+
+なお、ユーザーとの長い対話履歴そのものを圧縮したい場合は問題の性質が別で、[Gemini API の会話履歴をローリングサマリで圧縮する設計](/articles/gemini-api/gemini-api-rolling-summary-chat-history-compression) の守備範囲になります。本記事が扱うのは、あくまでツール結果という「機械が作った巨大パート」の滞留です。
+
+## 実測: 入力トークンは約 1/8、p95 は 34 秒から 9 秒に
+
+レビュー分析エージェントをハンドル渡し＋スタブ置換に切り替えて 2 週間運用した結果です。
+
+<table><thead><tr><th>指標</th><th>切替前</th><th>切替後</th></tr></thead><tbody><tr><td>1 実行の合計入力トークン</td><td>約 414,000</td><td>約 52,000</td></tr><tr><td>実行全体の p95 レイテンシ</td><td>34 秒</td><td>9 秒</td></tr><tr><td>このジョブの月額（Flash 系・当時の実測）</td><td>約 1,340 円</td><td>約 180 円</td></tr><tr><td>fetch_rows の追加呼び出し</td><td>—</td><td>平均 1.3 回/実行</td></tr></tbody></table>
+
+正直に書くと、良いことばかりではありません。`fetch_rows` の追加ターンが平均 1.3 回発生しており、その分だけループは長くなっています。それでも再送が消えた効果が圧倒的で、総和では時間も費用も大きく下がりました。digest（ローカル集計の統計）を充実させるほど追加取得は減るので、ここは運用しながら調整する場所だと考えています。
+
+## 落とし穴 — 圧縮しすぎると、モデルは取りに戻ってくる
+
+導入時に私が実際に踏んだものを 3 つ挙げます。
+
+**予算を絞りすぎて再取得ループになる。** コンパクタの予算を 2,000 トークンまで絞ったところ、モデルが `fetch_more` を 4 連続で呼び、かえってターン数が増えました。予算は「タスクに必要なフィールドが全行ぶん入る量」から始めて、削るのは計測しながらにすべきでした。
+
+**ハンドルの寿命を曖昧にする。** ストアをプロセス跨ぎで永続化していなかったため、リトライで再起動した実行が古いハンドルを参照して空振りしました。`ResultStore` のエラーメッセージを「存在しない」と明示する形にし、モデルが自然に `fetch_reviews` を呼び直せるようにして解決しています。
+
+**並列 Function Calling で対応関係を崩す。** 複数の `functionCall` が 1 ターンで返るケースでは、`functionResponse` を呼び出しと同じ順序・同じ名前で返す必要があります。スタブ置換をこの対応関係ごと崩してしまい、`INVALID_ARGUMENT` を出したことがあります。畳むのは中身だけ、パートの並びは触らない、が原則です。
+
+なお、投入前にコストの上限を機械的に守りたい場合は、[countTokens でバッチ投入前にコスト超過を止める設計](/articles/gemini-api/gemini-counttokens-batch-budget-gate-model-swap) の予算ゲートがそのまま併用できます。
+
+## まとめ — まず 1 本、ターン推移を測ってください
+
+設計の議論より先に、いま動いているエージェントループに `log_turn_tokens` を 1 行足して、1 実行ぶんの推移を眺めてみてください。ターン 2 以降で入力が階段状に跳ねていれば、この記事の圧縮とハンドル渡しがそのまま効きます。跳ねていなければ、あなたのループはまだ健全です。その確認が 5 分で終わるところから始めるのが、いちばん安全な入り口だと考えています。
