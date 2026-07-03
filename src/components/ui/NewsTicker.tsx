@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "API — Gemini APIのスループットが毎分160億トークン超となり、OpenAIとほぼ肩を並べる規模になりました",
-    "ENTERPRISE — Gemini Enterpriseの有料シートが800万を超え、導入企業は2,800社超に拡大しています",
-    "AGENT — Claude Opus 4.8がGemini Enterprise Agent Platformで利用可能になり、マルチベンダー化が進んでいます",
-    "SPEECH — gemini-3.1-flash-tts-previewがstreamGenerateContentでストリーミング音声生成に対応しました",
-    "DATA — CrossbeamデータストアをGemini Enterpriseへ接続できる公開プレビューが始まりました",
-    "MODEL — Gemini 3.5 FlashのGAとGemma 4の提供で、エージェント用途と軽量用途の選択肢が揃いました",
+    "MODEL — Gemini 3.5 FlashがGA（正式版）となり、gemini-flash-latestの実体になりました",
+    "AGENT — Managed AgentsがGemini APIで公開プレビュー入り。分離されたGoogleホストのLinuxサンドボックスで自律エージェントを動かせます",
+    "SEARCH — File Searchがマルチモーダル検索に対応し、gemini-embedding-2で画像も直接埋め込み・検索できます",
+    "WEBHOOK — Batch APIや長時間処理向けにイベント駆動のWebhookが追加され、ポーリングを置き換えられます",
+    "EMBED — gemini-embedding-2がGAとなり、埋め込みの本番利用が安定しました",
+    "DEPRECATION — 一部の画像生成モデルが8月17日に提供終了となるため、移行の準備が必要です",
   ],
   en: [
-    "API — The Gemini API now processes over 16 billion tokens per minute, roughly on par with OpenAI",
-    "ENTERPRISE — Gemini Enterprise passes 8 million paid seats across more than 2,800 companies",
-    "AGENT — Claude Opus 4.8 arrives on Gemini Enterprise Agent Platform, expanding multi-vendor choices",
-    "SPEECH — gemini-3.1-flash-tts-preview adds streaming speech generation via streamGenerateContent",
-    "DATA — Crossbeam data stores can now connect to Gemini Enterprise in public preview",
-    "MODEL — Gemini 3.5 Flash GA and Gemma 4 round out options for agentic and lightweight workloads",
+    "MODEL — Gemini 3.5 Flash reaches GA and now powers gemini-flash-latest",
+    "AGENT — Managed Agents enter public preview in the Gemini API, running in isolated Google-hosted Linux sandboxes",
+    "SEARCH — File Search adds multimodal search, embedding and searching images natively via gemini-embedding-2",
+    "WEBHOOK — Event-driven webhooks arrive for the Batch API and long-running operations, replacing polling",
+    "EMBED — gemini-embedding-2 is now generally available for production embeddings",
+    "DEPRECATION — Several image generation models shut down on August 17, so plan migrations now",
   ],
 };
 
