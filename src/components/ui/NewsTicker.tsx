@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "TTS — gemini-3.1-flash-tts-previewが音声生成のストリーミングに対応し、streamGenerateContentから逐次再生できます",
+    "TRANSLATE — Gemini 3.5 Live Translateが登場。70以上の言語を自動判定し、話者の抑揚を保ったまま音声から音声へ翻訳します",
+    "IMAGE — Nano Banana 2 Liteが提供開始となり、最も高速かつ低コストなGemini画像モデルになりました",
+    "OMNI — Gemini Omni Flashが公開プレビュー入りし、動画ワークフローを組めるネイティブマルチモーダルモデルとして使えます",
     "MODEL — Gemini 3.5 FlashがGA（正式版）となり、gemini-flash-latestの実体になりました",
     "AGENT — Managed AgentsがGemini APIで公開プレビュー入り。分離されたGoogleホストのLinuxサンドボックスで自律エージェントを動かせます",
-    "SEARCH — File Searchがマルチモーダル検索に対応し、gemini-embedding-2で画像も直接埋め込み・検索できます",
-    "WEBHOOK — Batch APIや長時間処理向けにイベント駆動のWebhookが追加され、ポーリングを置き換えられます",
-    "EMBED — gemini-embedding-2がGAとなり、埋め込みの本番利用が安定しました",
-    "DEPRECATION — 一部の画像生成モデルが8月17日に提供終了となるため、移行の準備が必要です",
   ],
   en: [
+    "TTS — gemini-3.1-flash-tts-preview now streams speech generation via streamGenerateContent for lower latency",
+    "TRANSLATE — Gemini 3.5 Live Translate arrives, auto-detecting 70+ languages for speech-to-speech while preserving intonation",
+    "IMAGE — Nano Banana 2 Lite launches as the fastest and most cost-efficient Gemini image model",
+    "OMNI — Gemini Omni Flash enters public preview as a natively multimodal model for custom video workflows",
     "MODEL — Gemini 3.5 Flash reaches GA and now powers gemini-flash-latest",
     "AGENT — Managed Agents enter public preview in the Gemini API, running in isolated Google-hosted Linux sandboxes",
-    "SEARCH — File Search adds multimodal search, embedding and searching images natively via gemini-embedding-2",
-    "WEBHOOK — Event-driven webhooks arrive for the Batch API and long-running operations, replacing polling",
-    "EMBED — gemini-embedding-2 is now generally available for production embeddings",
-    "DEPRECATION — Several image generation models shut down on August 17, so plan migrations now",
   ],
 };
 
