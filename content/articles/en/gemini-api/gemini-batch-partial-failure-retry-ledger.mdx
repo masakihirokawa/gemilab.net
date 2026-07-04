@@ -1,0 +1,288 @@
+---
+title: "Catching the Rows That Quietly Failed Overnight: A Per-Row Retry Ledger for the Gemini Batch API"
+slug: "gemini-batch-partial-failure-retry-ledger"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-04T13:00"
+author: "Gemini Lab"
+description: "A SUCCEEDED batch job is not the same as all-rows-succeeded. From running nightly batches as a solo developer, here is a per-row result ledger, a transient-vs-permanent failure classifier, selective retries, and a guard against retrying permanent failures forever, with a working SQLite state machine."
+tags: ["gemini-api", "batch-api", "retry-design", "idempotency", "indie-dev", "operations"]
+highlights:
+  - "Build a SQLite ledger with four states (pending / succeeded / retryable / permanent) that reconciles the Batch output JSONL by custom_id, in copy-paste-ready code"
+  - "Learn to separate transient failures (429, 503) from permanent ones (safety blocks, invalid input) and set a stop condition so permanent rows are never retried forever"
+  - "See how to resubmit only the failed rows on night two and three, and how the ledger absorbs the cost-accounting drift that spans retry attempts"
+---
+
+In the morning, the batch job status read `SUCCEEDED`. I wrote the results back with a clear conscience and moved on to other work for the day.
+
+A few days later, while scanning the classifications, I noticed something. One cluster of reviews had landed in Firestore with an empty category. A few dozen rows. The job as a whole had "succeeded," yet some of the rows inside it had quietly failed.
+
+As an indie developer running several apps and four sites, the nightly batch becomes a "start it and go to sleep" tool. In my own case, classifying the reviews that pile up in App Store Connect and Google Play Console, I built the next stage of processing on the assumption that everything would be present by morning. That is exactly why a partial failure like this leaks downstream and contaminates later steps.
+
+This article is about dropping the habit of reading a batch completion as "all rows succeeded," and instead **recording results per row in a ledger and picking up only the rows that fell through**. It focuses not on the first implementation of nightly processing, but on the question that always follows it: how do you recover the few dozen rows that failed?
+
+## "Completed" and "all succeeded" are different
+
+The state of a batch job and the success or failure of each individual request inside it live on different layers. The job can finish cleanly while the output JSONL mixes successful responses and errors line by line.
+
+A single output line usually takes one of the two shapes below. Key names shift a little between SDK versions, so I recommend peeking at your actual output with `head` before you build against it.
+
+```jsonl
+{"key": "review-000512", "response": {"candidates": [ ... ]}}
+{"key": "review-000513", "error": {"code": 400, "message": "..."}}
+```
+
+In other words, even when the job is `SUCCEEDED`, rows carrying an `error` are perfectly normal. What I dropped were an aggressive review body caught by the safety filter, and a body made up entirely of emoji that failed schema extraction.
+
+Here is one idea worth holding onto: **record the job's outcome and each row's outcome separately.** Mix the two layers into "the job succeeded, so insert everything," and a hole will always open up.
+
+## Keep a per-row ledger
+
+So we prepare a ledger that holds a state for every request we submit. The key is the `custom_id` (here, `key`). I narrowed the states down to four.
+
+<table>
+  <thead>
+    <tr><th>State</th><th>Meaning</th><th>What to do next</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>pending</strong></td><td>No result received yet</td><td>Include in the next batch</td></tr>
+    <tr><td><strong>succeeded</strong></td><td>A valid structured output was obtained</td><td>Nothing (finalized)</td></tr>
+    <tr><td><strong>retryable</strong></td><td>Transient failure (429 / 503, etc.)</td><td>Resubmit up to the attempt cap</td></tr>
+    <tr><td><strong>permanent</strong></td><td>Input- or safety-driven; a retry will not fix it</td><td>Do not resubmit; route to a human</td></tr>
+  </tbody>
+</table>
+
+I chose SQLite because, for a solo developer's nightly batch, "one portable file that survives a mid-run crash" matters more than anything. The ledger schema and initialization are just this.
+
+```python
+import sqlite3
+import time
+
+def open_ledger(path: str = "batch_ledger.db") -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rows (
+            key           TEXT PRIMARY KEY,
+            payload       TEXT NOT NULL,   -- input request (JSON string)
+            status        TEXT NOT NULL DEFAULT 'pending',
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            last_error    TEXT,
+            result        TEXT,            -- extracted result on success (JSON string)
+            updated_at    REAL NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def enroll(conn: sqlite3.Connection, key: str, payload: str) -> None:
+    """Register as pending on first submission. Do not touch on resubmit."""
+    conn.execute(
+        "INSERT OR IGNORE INTO rows(key, payload, updated_at) VALUES (?, ?, ?)",
+        (key, payload, time.time()),
+    )
+    conn.commit()
+```
+
+The `INSERT OR IGNORE` is the crucial part. Resubmitting the same `key` on night two must not roll a succeeded row back to pending. The ledger exists to **protect a success once it is finalized**.
+
+## Separate failures into "transient" and "permanent"
+
+The accident that hurts most in retry design is mistaking a permanent failure for a transient one and throwing it forever. A safety-blocked review will be blocked all 100 times you send it. That is where cost and time quietly melt away.
+
+So we insert one classifier that decides the state by reading the output row's `error`. The evidence is the HTTP-status-equivalent code and the shape of the message.
+
+```python
+# Codes treated as transient (a resubmit may fix them)
+TRANSIENT_CODES = {429, 500, 502, 503, 504}
+
+# Codes treated as permanent (input/permission/spec-driven; a resubmit will not help)
+PERMANENT_CODES = {400, 403, 404, 422}
+
+
+def classify_error(error: dict) -> str:
+    code = error.get("code")
+    message = (error.get("message") or "").lower()
+
+    if code in TRANSIENT_CODES:
+        return "retryable"
+    if code in PERMANENT_CODES:
+        return "permanent"
+
+    # Safety blocks may not surface as a code, so judge by message too
+    if "safety" in message or "blocked" in message or "recitation" in message:
+        return "permanent"
+
+    # When undecidable, lean to retryable and let the attempt cap be the ceiling
+    return "retryable"
+```
+
+Leaning undecidable errors toward `retryable` is deliberate. Discard an unknown failure as permanent and you lose rows that were genuinely transient. Treat it as transient and the **attempt cap** described below still becomes the final brake, so nothing runs away. When in doubt, lean to the side that recovers the row. That is an operational judgment.
+
+## Reconcile the output against the ledger
+
+Once the job finishes, read the output JSONL line by line and update the ledger by `key`. On success, mark `succeeded`; on failure, drop to `retryable` or `permanent` per the classifier.
+
+```python
+import json
+
+MAX_ATTEMPTS = 4  # after this many transient resubmits, drop to permanent
+
+
+def reconcile(conn: sqlite3.Connection, output_path: str) -> dict:
+    counts = {"succeeded": 0, "retryable": 0, "permanent": 0}
+
+    with open(output_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            key = record["key"]
+
+            if "response" in record and "error" not in record:
+                extracted = extract_structured(record["response"])
+                if extracted is None:
+                    # response arrived but schema extraction failed -> permanent
+                    _mark(conn, key, "permanent", "schema_extract_failed")
+                    counts["permanent"] += 1
+                else:
+                    _mark(conn, key, "succeeded", None,
+                          result=json.dumps(extracted, ensure_ascii=False))
+                    counts["succeeded"] += 1
+                continue
+
+            # error-row handling
+            error = record.get("error", {"message": "unknown"})
+            verdict = classify_error(error)
+            row = conn.execute(
+                "SELECT attempts FROM rows WHERE key = ?", (key,)
+            ).fetchone()
+            attempts = (row[0] if row else 0)
+
+            if verdict == "retryable" and attempts + 1 >= MAX_ATTEMPTS:
+                # once the cap is reached, stop sending it
+                verdict = "permanent"
+
+            _mark(conn, key, verdict, json.dumps(error, ensure_ascii=False))
+            counts[verdict] += 1
+
+    return counts
+
+
+def _mark(conn, key, status, last_error, result=None):
+    conn.execute(
+        """
+        UPDATE rows
+           SET status = ?,
+               last_error = ?,
+               result = COALESCE(?, result),
+               attempts = attempts + CASE WHEN ? = 'retryable' THEN 1 ELSE 0 END,
+               updated_at = ?
+         WHERE key = ?
+        """,
+        (status, last_error, result, status, time.time(), key),
+    )
+    conn.commit()
+```
+
+Replace `extract_structured` with a function that pulls the category (and so on) out of `response` per your schema. The key point here is to **not count "a response came back but does not match the schema" as a success**. The emoji-only bodies I dropped at first were exactly this shape: a 200 arrives but the content is empty. That failure is harder to spot than an error row.
+
+## Resubmit only the failed rows
+
+The next night, pull only the `pending` and `retryable` rows from the ledger, build a fresh JSONL, and submit it. Leave `succeeded` and `permanent` untouched. This is the heart of selective retries.
+
+```python
+def build_retry_batch(conn: sqlite3.Connection, out_path: str) -> int:
+    rows = conn.execute(
+        "SELECT key, payload FROM rows WHERE status IN ('pending', 'retryable')"
+    ).fetchall()
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        for key, payload in rows:
+            f.write(json.dumps(
+                {"key": key, "request": json.loads(payload)},
+                ensure_ascii=False,
+            ) + "\n")
+
+    return len(rows)
+```
+
+On resubmit, reuse the same `key` as the first time. Because the ledger is keyed on `key`, the same row cannot be duplicated. Idempotency rests on a single point: keep using the same `key`. That simplicity is what pays off when it runs unattended overnight.
+
+The submission code is shared with the first run. Upload the generated JSONL and create the batch job.
+
+```python
+from google import genai
+
+client = genai.Client(api_key="YOUR_GEMINI_API_KEY")
+
+
+def submit_batch(src_path: str, model: str = "gemini-flash-latest") -> str:
+    uploaded = client.files.upload(
+        file=src_path,
+        config={"mime_type": "application/jsonl"},
+    )
+    job = client.batches.create(model=model, src=uploaded.name)
+    return job.name  # keep this job name in a separate jobs table, apart from the ledger
+```
+
+I point the model at `gemini-flash-latest`, but as of July 2026 the GA Gemini 3.5 Flash is the concrete model behind that alias. Aliases swap their underlying model, so it is reassuring to check on every run — with the handful of golden cases mentioned below — whether the classification tendencies have shifted.
+
+## Receive completion via a webhook, not polling
+
+In June 2026, event-driven webhooks arrived for the Batch API, so you no longer need to poll to learn a job has completed. For unattended operation this pays off well. Instead of hammering `batches.get` in a `while True` loop the next morning, you can start reconciliation the moment the completion notice arrives.
+
+The receiver just verifies the job name in the notification, downloads the output, and calls `reconcile`.
+
+```python
+from flask import Flask, request, abort
+
+app = Flask(__name__)
+
+
+@app.post("/gemini/batch-complete")
+def on_batch_complete():
+    # signature verification is mandatory (details omitted; HMAC with a shared secret recommended)
+    if not verify_signature(request):
+        abort(401)
+
+    job_name = request.json.get("name")
+    job = client.batches.get(name=job_name)
+    if job.state != "JOB_STATE_SUCCEEDED":
+        # a failed job is handled separately; ledger rows all stay pending
+        return ("noted", 200)
+
+    output_path = download_output(job)   # from dest to local
+    conn = open_ledger()
+    counts = reconcile(conn, output_path)
+    app.logger.info("reconciled: %s", counts)
+    return ("ok", 200)
+```
+
+Build the webhook assuming it is delivered at least once. If the same completion notice arrives twice, `reconcile` merely overwrites idempotently by `key`, so there is no double processing. Making the ledger a state machine gives you resilience to duplicate delivery for free.
+
+## Pitfalls I only saw in operation
+
+Running unattended for several nights surfaced holes the first implementation never showed.
+
+First, **leave permanent failures alone and the notifications never stop.** Permanent rows are not resubmitted, but they accumulate. I set it up so that once permanent rows exceed a threshold, a daily summary is sent to me, and a human eyes the safety-block tendencies (particular languages, particular phrasings). Neither discarding nor throwing forever — dropping them into a "box a human reviews" is the sweet spot.
+
+Second, **cost accounting drifts across attempts.** Throw the same row three nights and that row carries three charges. Summing `attempts` in the ledger yields a number close to the actual billed count, so I use it for the daily estimate. Estimate by "success count × unit price" and you will always undershoot by the retry volume.
+
+Third, **do not make MAX_ATTEMPTS too large.** If a transient failure is truly transient, two or three attempts recover it. What is not recovered in four usually has a permanent failure mixed in. Set the cap to something like ten and you just throw permanent failures listlessly, wasting cost and notifications. In my operation, four settled in as the right spot.
+
+Fourth, **separate the ledger from the jobs table.** Row states (rows) and the history of submitted jobs (which JSONL was sent when, and what job name it became) belong in different tables. The redundancy of being able to trace from one even if you delete the other pays off in unattended operation.
+
+## What the ledger protects
+
+A per-row ledger is not a flashy mechanism. One SQLite file and four states, that is all. Yet it quietly and reliably prevents the assumption that "completed equals all-rows-succeeded."
+
+The value of a nightly batch is that you get to sleep while it runs. So that sleep does not turn into "cleaning up dropped rows in the morning," hold a mechanism for picking up the failed few dozen from the very start. That alone changes how much you can trust an unattended run.
+
+As a first step today, peek at the output JSONL of a batch you are running now with `head`, and count how many rows carry an `error`. It is probably more than you think. That number is your reason to keep a ledger.
+
+I hope this helps with your own implementation. Thank you for reading.
