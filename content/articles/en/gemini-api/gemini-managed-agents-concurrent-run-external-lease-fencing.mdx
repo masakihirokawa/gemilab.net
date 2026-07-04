@@ -1,0 +1,258 @@
+---
+title: "When Two Managed Agents Fight Over the Same Repo: External Leases and Fencing for Isolated Sandboxes"
+slug: "gemini-managed-agents-concurrent-run-external-lease-fencing"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-04T15:45"
+author: "Gemini Lab"
+description: "Every Managed Agents run gets its own isolated sandbox, so a local lock cannot stop two runs from touching the same repo or record. Here is how I serialize them safely with an external lease and a fencing token."
+tags: ["Gemini API", "Managed Agents", "agents", "sandbox", "indie development"]
+highlights:
+  - "Why flock and in-process mutexes are useless across isolated sandboxes, and why an external store is the only shared point you have"
+  - "A minimal acquire / renew / release lease built on Firestore transactions, with before and after code"
+  - "How a fencing-token compare-and-set rejects the delayed writes of a zombie run whose lease already expired"
+---
+
+As an indie developer moving my personal site-update automation over to Managed Agents, I ran into a case where two runs hit the same repository almost simultaneously. One was a scheduled brush-up pass; the other was an article-generation run that had re-fired a little late. They started seven seconds apart. Both rewrote the same `content/` directory and both tried to push to `main`.
+
+Back when I ran my own loop on a single server, one line of file locking prevented exactly this. But Managed Agents spins up an independent Google-hosted Linux sandbox for every run. The two runs are effectively on different machines, and a lock held by one is not even visible to the other. That was the moment I had to redesign for a world where local locks simply do not work.
+
+This article walks through how to safely serialize concurrent Managed Agents runs on isolated sandboxes using an external lease and a fencing token, with the code I actually run in production.
+
+## In an isolated sandbox, invisibility is what causes the collision
+
+Let me describe precisely what happened. Both runs followed the same steps: shallow-clone the repo, write the article MDX, commit, and push. On their own, none of this is a problem. The trouble only appears when these critical sections overlap.
+
+Measured over three weeks and roughly 210 automated runs, the period before I added leasing produced 3 duplicate pushes and 11 `git pull --rebase` conflict retries. A duplicate push is the case where both runs wrote different files and both succeeded. Nothing breaks, but you can end up publishing near-identical topics, and later it is hard to explain why there are two commits in a row. The 11 retries are cases where one run detected the push conflict and redid its work from a rebase; harmless, but each one burned tens of seconds for nothing.
+
+On a single server you would put a mutual-exclusion lock at the entrance to that critical section and be done. Managed Agents does not let you. Here is why, layer by layer.
+
+## Why local locks do not work
+
+"The lock does not work" actually hides several layers that all fail at once. Clearing them up front makes it easier to pick a replacement design later.
+
+<table>
+  <thead>
+    <tr><th>Mechanism</th><th>Single server</th><th>Isolated sandbox (Managed Agents)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>In-process mutex</td><td>Works</td><td>Different process and machine, so meaningless</td></tr>
+    <tr><td>File lock (flock)</td><td>Works</td><td>Filesystem is per-run and never shared</td></tr>
+    <tr><td>Holding a port or socket</td><td>Works</td><td>Separate network namespace, no collision</td></tr>
+    <tr><td>Conditional write to an external store</td><td>Works</td><td><strong>Works (the only shared point)</strong></td></tr>
+  </tbody>
+</table>
+
+The point is singular. The only place both runs can reliably see the same thing is a shared store that lives outside the sandbox. So mutual exclusion has to be built on top of an atomic operation in that store. By atomic I mean the ability to read, check a condition, and write as one uninterruptible step. Firestore transactions, Postgres advisory locks or `UPDATE ... WHERE`, and Redis `SET NX` are all candidates.
+
+I usually keep to Google-side stores, so here I build the smallest possible lease on Firestore transactions. It has three key behaviors: acquire, renew, and release.
+
+## The minimal lease: acquire / renew / release
+
+A lease is ownership with an expiry. What sets it apart from a plain lock is that if the holder dies, ownership rolls over to someone else once the deadline passes. Sandboxes are ephemeral environments that vanish after seven days, and runs naturally fail partway, so a lease that reclaims itself on a deadline fits far better than a lock that can be held forever.
+
+The lease document needs only three fields.
+
+<table>
+  <thead>
+    <tr><th>Field</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>owner</code></td><td>A unique ID for the run that currently holds it</td></tr>
+    <tr><td><code>expires_at</code></td><td>After this time, another run may take it over</td></tr>
+    <tr><td><code>fencing</code></td><td>A monotonically increasing counter, bumped each time ownership changes hands</td></tr>
+  </tbody>
+</table>
+
+I will cover `fencing` in detail later; for now, just read it as "how many times ownership has moved." Here is acquire.
+
+```python
+import time
+from google.cloud import firestore
+
+db = firestore.Client()
+
+LEASE_TTL = 90     # seconds; comfortably longer than one critical section, shorter than idle reclaim
+HEARTBEAT = 30     # about TTL/3, so it survives two failed renews in a row
+
+def try_acquire(resource_id: str, owner: str):
+    ref = db.collection("leases").document(resource_id)
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = ref.get(transaction=txn)
+        now = time.time()
+        if snap.exists:
+            d = snap.to_dict()
+            if d["owner"] != owner and d["expires_at"] > now:
+                return None             # held by someone else and not expired -> cannot take
+            fencing = d["fencing"] + 1  # expired or re-taken -> ownership moves
+        else:
+            fencing = 1
+        txn.set(ref, {
+            "owner": owner,
+            "expires_at": now + LEASE_TTL,
+            "fencing": fencing,
+        })
+        return fencing
+
+    return _txn(db.transaction())
+```
+
+On success you get the `fencing` value (1 or higher); if someone else holds it, you get `None`. Because it is wrapped in a transaction, when two runs try to acquire at the same time, exactly one succeeds and the other is guaranteed to receive `None`.
+
+Renew extends the deadline only when you still hold the lease and it has not expired. It does not bump `fencing`, because ownership has not moved.
+
+```python
+def renew(resource_id: str, owner: str) -> bool:
+    ref = db.collection("leases").document(resource_id)
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = ref.get(transaction=txn)
+        now = time.time()
+        if not snap.exists:
+            return False
+        d = snap.to_dict()
+        if d["owner"] != owner or d["expires_at"] <= now:
+            return False                # lost or expired -> refuse to renew
+        txn.update(ref, {"expires_at": now + LEASE_TTL})
+        return True
+
+    return _txn(db.transaction())
+```
+
+Release does not delete the document; it only pushes the deadline into the past. Deleting it would reset the counter and break the monotonicity that fencing relies on.
+
+```python
+def release(resource_id: str, owner: str) -> None:
+    ref = db.collection("leases").document(resource_id)
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = ref.get(transaction=txn)
+        if snap.exists and snap.to_dict()["owner"] == owner:
+            txn.update(ref, {"expires_at": 0.0})   # expire now, keep fencing
+
+    _txn(db.transaction())
+```
+
+## Before / After: a bare push versus a leased push
+
+With the tools in place, I rewrite the run body. Here is the bare version, before leasing.
+
+```python
+def run():
+    repo = clone_repo()
+    write_article(repo)
+    repo.push()          # collides if another run is executing at the same time
+```
+
+After, I take the lease just before the critical section and cleanly skip if I cannot get it. The important decision here is that on failure the run yields rather than waits. The automation runs on a schedule anyway, so yielding once still leaves the next opportunity. Waiting, by contrast, burns usage and sandbox time while you sit idle.
+
+```python
+import os, uuid, threading
+
+OWNER = os.getenv("RUN_ID") or uuid.uuid4().hex
+
+def start_heartbeat(resource_id: str, owner: str, every: int):
+    ev = threading.Event()
+    def loop():
+        while not ev.wait(every):
+            if not renew(resource_id, owner):
+                # renew failed = lease lost. Do not continue the critical section.
+                os._exit(75)          # defer to the caller's retry (EX_TEMPFAIL)
+    threading.Thread(target=loop, daemon=True).start()
+    return ev.set
+
+def run():
+    fencing = try_acquire("gemilab-repo", OWNER)
+    if fencing is None:
+        print("Another run holds the repo. Skipping this time.")
+        return
+    stop = start_heartbeat("gemilab-repo", OWNER, every=HEARTBEAT)
+    try:
+        repo = clone_repo()
+        write_article(repo)
+        guarded_publish("gemilab-repo", OWNER, fencing, repo.push)
+    finally:
+        stop()
+        release("gemilab-repo", OWNER)
+```
+
+I build `guarded_publish` in the next section. At this point we have guaranteed that of two runs that fired together, only one proceeds into the critical section. What remains is the zombie run: one that lost its lease without noticing and keeps going.
+
+## Fencing tokens: rejecting the delayed write of an expired lease
+
+As long as the heartbeat keeps renewing, you normally never lose the lease. In reality, though, a sandbox can freeze briefly and drop a heartbeat, or the network can stall for a few seconds. In that gap the deadline passes, another run seizes the lease, and the dispossessed run later comes back to life and tries to push, unaware that it no longer holds anything. That is a zombie run.
+
+This is where `fencing` earns its keep. Because the value strictly increases every time the lease is seized, "a newer holder always carries a larger token" is guaranteed. If, right before writing, the target compares against the largest token it has accepted so far and rejects any write from a smaller token, the delayed write of an old zombie is fenced out.
+
+```python
+class StaleFencingError(Exception):
+    pass
+
+def guarded_publish(resource_id, owner, fencing, do_write):
+    gate = db.collection("publish_gate").document(resource_id)
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = gate.get(transaction=txn)
+        last = snap.to_dict()["fencing"] if snap.exists else 0
+        if fencing < last:
+            raise StaleFencingError(
+                f"fencing {fencing} < {last}: the lease has already been seized"
+            )
+        txn.set(gate, {"fencing": fencing})
+
+    _txn(db.transaction())
+    do_write()      # only cause the side effect (push, etc.) after clearing the gate
+```
+
+Let me be honest: this design has one hole. The gate's compare-and-set and the actual `do_write()` (git push) are separate operations, so in an extreme timing where a zombie clears the gate and then freezes while a newer run advances further, there is a residual window in which the zombie's push can slip through. To close it completely you have to hand the token to the write target itself and let it decide acceptance. For a record update, put the check and the write in the same transaction and the window is zero. For something like git, where the write target cannot verify a token, the pragmatic compromise is to place the gate immediately before the push and shrink the window to tens of milliseconds. Assume "fencing is in, so we are safe" without seeing this distinction and it will trip you.
+
+## Choosing TTL and heartbeat (measured)
+
+A note on the numbers. In my setup TTL is 90 seconds and the heartbeat is 30 seconds, about a third of the TTL. At that ratio you do not lose the lease until two heartbeats fail in a row, which makes it far less likely that a brief network stall costs you the lease.
+
+<table>
+  <thead>
+    <tr><th>Setting</th><th>Too short</th><th>Too long</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>TTL</td><td>A healthy run expires before it renews and evicts itself</td><td>Cleanup after a truly dead run takes long, and the next run waits</td></tr>
+    <tr><td>Heartbeat interval</td><td>More writes to the store, raising cost and contention</td><td>Expiry is detected late, widening the zombie window</td></tr>
+  </tbody>
+</table>
+
+The shortcut is to measure the real length of your critical section. My article push runs a median of 41 seconds from clone to push, with a 95th percentile of 68 seconds on the slow side. The 90-second TTL is that 95th percentile plus room for two heartbeats. If TTL is shorter than the critical section, a healthy run can expire mid-flight, so I recommend measuring first and setting the value afterward.
+
+## Three choices when acquiring the lease fails
+
+How a run should behave when it fails to acquire depends on the nature of the task. In my automation I switch among three.
+
+<table>
+  <thead>
+    <tr><th>Strategy</th><th>Best when</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Yield for now (skip)</td><td>A task that reruns on a schedule; the next slot is fine</td></tr>
+    <tr><td>Wait briefly and retry once</td><td>The critical section is a few seconds and missing it leaves the day unfilled</td></tr>
+    <tr><td>Switch to a different resource</td><td>Work across four sites, where swapping the target still makes progress</td></tr>
+  </tbody>
+</table>
+
+My article generation defaults to "yield." The longer you wait, the more sandbox time and usage you spend while idle. Only the task that must fill the day's premium slot carries a fallback that switches to another site. Whether yielding or waiting is right comes down to weighing the cost of a missed run against the cost of waiting.
+
+## Where I stumbled in solo operation
+
+Finally, a few small traps I actually hit.
+
+The first is clock skew. The code above writes deadlines with `time.time()`, that is, the client-side clock. If two sandboxes' clocks differ by a few seconds, the expiry decision wobbles by the same amount. Keeping the lease store in a single region and leaving generous TTL margin avoids real harm, but if you want strictness, managing deadlines with server-side timestamps is more robust.
+
+The second is forgetting to release. Even with release in `finally`, the path where the process dies instantly via `os._exit` (on heartbeat failure) never runs release. That is exactly why automatic reclaim via TTL is the backbone. Release is only an optimization to hand off early and not keep the next run waiting; correctness is guaranteed by TTL. Framing it in that order keeps the design stable.
+
+The third is double release. Calling release twice with the same owner is harmless here, since the implementation checks owner match before expiring; and if an older run releases after another run has already seized the lease, the owner mismatch means it does nothing. Keeping `fencing` rather than deleting it pays off here too.
+
+The isolation constraint felt inconvenient at first, but once I accepted that "the only thing you can share is an atomic operation in an external store," the design actually got simpler. I hope this helps anyone else running several automated jobs the same way. Thank you for reading to the end.

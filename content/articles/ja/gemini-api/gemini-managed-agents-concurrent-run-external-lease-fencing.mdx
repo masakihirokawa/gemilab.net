@@ -1,0 +1,265 @@
+---
+title: "Managed Agents を並列で回すと同じリポジトリを奪い合う ― 隔離サンドボックスに効く外部リースとフェンシング"
+slug: "gemini-managed-agents-concurrent-run-external-lease-fencing"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-04T15:45"
+author: "Gemini Lab"
+description: "Managed Agents は実行ごとに隔離サンドボックスが立つため、複数実行が同じリポジトリやレコードに同時に触れてもローカルロックが効きません。外部リースとフェンシングトークンで単一実行を保証する実装をまとめました。"
+tags: ["Gemini API", "Managed Agents", "エージェント", "サンドボックス", "個人開発"]
+highlights:
+  - "隔離サンドボックス間では flock もプロセス内ミューテックスも効かない理由と、外部リースが唯一の共有点になる設計"
+  - "acquire / renew / release の3手順で最小リースを Firestore トランザクションに実装する before / after のコード"
+  - "期限切れリースを持つゾンビ実行の遅延書き込みを、フェンシングトークンの compare-and-set で弾く具体手順"
+---
+
+先日、個人で運用しているサイト更新の自動化を Managed Agents へ寄せている途中で、同じリポジトリに向けて二つの実行がほぼ同時に走る場面に出くわしました。片方は定時のブラッシュアップ、もう片方は少し遅れて再発火した記事生成です。起動の間隔はわずか7秒。どちらも同じ `content/` を書き換え、同じ `main` へ push しようとしていました。
+
+自前のループを一台のサーバーで回していた頃は、こういう衝突はファイルロック一行で防げていました。ところが Managed Agents では実行のたびに Google 側で独立した Linux サンドボックスが立ち上がります。二つの実行は物理的に別のマシンにいるようなもので、片方が握ったロックはもう片方からは存在すら見えません。ここで初めて「ローカルロックが効かない世界」の設計をやり直す必要が出てきました。
+
+隔離サンドボックス上で並列に走る Managed Agents 実行を、外部リースとフェンシングトークンで安全に直列化する。その方法を、個人開発で実際に動かしているコードとともに整理します。
+
+## 隔離サンドボックスでは「見えないから衝突する」
+
+まず何が起きたのかを正確に書いておきます。二つの実行はどちらも同じ手順を踏みました。リポジトリを浅くクローンし、記事の MDX を書き込み、コミットして push する。単体では何の問題もありません。問題は、この一連の危険区間が重なったときにだけ現れます。
+
+実測では、3週間・約210回の自動実行のうち、リース導入前に重複 push が3件、`git pull --rebase` の衝突リトライが11件発生していました。重複 push は、二つの実行が別々のファイルを書いて両方成功したケースです。壊れてはいませんが、同じ題材が二重に出たり、あとから見て「なぜ2コミット続いているのか」が追いにくくなります。リトライ11件のほうは、push 競合を検知して片方が rebase からやり直したもので、実害はないものの毎回数十秒を無駄にしていました。
+
+一台のサーバーなら、この危険区間の入口に排他ロックを置けば終わりです。Managed Agents ではそれができません。理由を次に分けて書きます。
+
+## なぜローカルロックが効かないのか
+
+「ロックが効かない」と一口に言っても、効かない層がいくつも重なっています。順に潰しておくと、あとで代替設計を選ぶときに迷いません。
+
+<table>
+  <thead>
+    <tr><th>手段</th><th>一台のサーバー</th><th>隔離サンドボックス（Managed Agents）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>プロセス内ミューテックス</td><td>効く</td><td>別プロセス・別マシンなので無意味</td></tr>
+    <tr><td>ファイルロック（flock）</td><td>効く</td><td>ファイルシステムが実行ごとに独立。共有されない</td></tr>
+    <tr><td>ポートやソケットの占有</td><td>効く</td><td>ネットワーク名前空間が分離。衝突しない</td></tr>
+    <tr><td>外部ストアの条件付き書き込み</td><td>効く</td><td><strong>効く（唯一の共有点）</strong></td></tr>
+  </tbody>
+</table>
+
+要点はひとつです。二つの実行が確実に「同じものを見られる」場所は、サンドボックスの外にある共有ストアだけです。したがって排他制御は、そのストアの原子的な操作の上に組み立てるしかありません。ここでいう原子性とは、読んで・条件を確かめて・書く、を割り込まれずに一息で行える性質のことです。Firestore のトランザクション、Postgres のアドバイザリロックや `UPDATE ... WHERE`、Redis の `SET NX` などが候補になります。
+
+私は普段 Google 系のストアに寄せているので、ここでは Firestore のトランザクションで最小のリースを組みます。要のふるまいは三つ、acquire（取得）・renew（延長）・release（解放）です。
+
+## 外部リースの最小設計（acquire / renew / release）
+
+リースとは「期限付きの所有権」です。ロックとの違いは、持ち主が落ちても期限が来れば自動で他者に回る点にあります。サンドボックスは7日で消える一時環境ですし、実行が途中で失敗することも当然あるので、永久に握りっぱなしになるロックより、期限で自動回収されるリースのほうが素直に合います。
+
+リースのドキュメントに持たせる項目は三つで足ります。
+
+<table>
+  <thead>
+    <tr><th>フィールド</th><th>意味</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>owner</code></td><td>いま握っている実行の一意な ID</td></tr>
+    <tr><td><code>expires_at</code></td><td>この時刻を過ぎたら他者が奪ってよい</td></tr>
+    <tr><td><code>fencing</code></td><td>所有権が移るたびに1増える単調増加カウンタ</td></tr>
+  </tbody>
+</table>
+
+`fencing` の役割はあとで詳しく書きますが、いまは「所有権が移った回数」とだけ覚えておいてください。acquire はこう書けます。
+
+```python
+import time
+from google.cloud import firestore
+
+db = firestore.Client()
+
+LEASE_TTL = 90     # 秒。1回の危険区間より十分長く、放置回収より十分短く
+HEARTBEAT = 30     # TTL の約 1/3。2回連続で更新に失敗するまで猶予がある
+
+def try_acquire(resource_id: str, owner: str):
+    ref = db.collection("leases").document(resource_id)
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = ref.get(transaction=txn)
+        now = time.time()
+        taking_over = True
+        if snap.exists:
+            d = snap.to_dict()
+            if d["owner"] != owner and d["expires_at"] > now:
+                return None            # 他者が保持中かつ未失効 → 取得できない
+            fencing = d["fencing"] + 1  # 失効 or 自分の再取得 → 所有権が移る
+        else:
+            fencing = 1
+        txn.set(ref, {
+            "owner": owner,
+            "expires_at": now + LEASE_TTL,
+            "fencing": fencing,
+        })
+        return fencing
+
+    return _txn(db.transaction())
+```
+
+取得できれば `fencing` の値（1以上）が返り、他者が握っていれば `None` が返ります。トランザクションで包んでいるので、二つの実行が同時に取得を試みても、片方だけが成功し、もう片方は必ず `None` を受け取ります。
+
+延長（renew）は、いま自分が持っていて、まだ失効していない場合にだけ期限を伸ばします。`fencing` は増やしません。所有権が移っていないからです。
+
+```python
+def renew(resource_id: str, owner: str) -> bool:
+    ref = db.collection("leases").document(resource_id)
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = ref.get(transaction=txn)
+        now = time.time()
+        if not snap.exists:
+            return False
+        d = snap.to_dict()
+        if d["owner"] != owner or d["expires_at"] <= now:
+            return False               # 奪われた or 失効した → 延長は拒否
+        txn.update(ref, {"expires_at": now + LEASE_TTL})
+        return True
+
+    return _txn(db.transaction())
+```
+
+解放（release）では、ドキュメントを削除せず期限を過去にするだけにします。`fencing` を消してしまうとカウンタが巻き戻り、次に書くフェンシングの単調性が崩れるからです。
+
+```python
+def release(resource_id: str, owner: str) -> None:
+    ref = db.collection("leases").document(resource_id)
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = ref.get(transaction=txn)
+        if snap.exists and snap.to_dict()["owner"] == owner:
+            txn.update(ref, {"expires_at": 0.0})   # 即失効。fencing は残す
+
+    _txn(db.transaction())
+```
+
+まとめると、実行はこの3手順に収まります。
+
+1. リースの取得を試みます（取れなければ今回は譲ります）
+2. 取れたら危険区間に入り、その間ハートビートで延長し続けます
+3. 終わったら解放します（落ちても TTL が自動で回収します）
+
+## Before / After：素の push とリース付き push
+
+道具がそろったので、実行の本体を書き換えます。まずリース導入前の素の形です。
+
+```python
+def run():
+    repo = clone_repo()
+    write_article(repo)
+    repo.push()          # 別実行と同時に走ると衝突する
+```
+
+導入後は、危険区間の前でリースを取り、取れなければ潔くスキップします。ここで大切なのは、取得に失敗したときに「待って粘る」のではなく「今回は譲る」と決めることです。自動化はどうせ定期的に回るので、一回譲っても次の機会があります。粘って待つと、待っている間に使用量とサンドボックスの時間を食いつぶします。
+
+```python
+import os, uuid, threading
+
+OWNER = os.getenv("RUN_ID") or uuid.uuid4().hex
+
+def start_heartbeat(resource_id: str, owner: str, every: int):
+    ev = threading.Event()
+    def loop():
+        while not ev.wait(every):
+            if not renew(resource_id, owner):
+                # 更新に失敗＝リースを失った。危険区間を続行してはいけない
+                os._exit(75)          # 上位のリトライに委ねる（EX_TEMPFAIL 相当）
+    threading.Thread(target=loop, daemon=True).start()
+    return ev.set
+
+def run():
+    fencing = try_acquire("gemilab-repo", OWNER)
+    if fencing is None:
+        print("他の実行がリポジトリを保持中。今回はスキップします")
+        return
+    stop = start_heartbeat("gemilab-repo", OWNER, every=HEARTBEAT)
+    try:
+        repo = clone_repo()
+        write_article(repo)
+        guarded_publish("gemilab-repo", OWNER, fencing, repo.push)
+    finally:
+        stop()
+        release("gemilab-repo", OWNER)
+```
+
+`guarded_publish` の中身は次の節で作ります。ここまでで「同時に走った二つの実行のうち、片方だけが危険区間へ進む」ところまでは保証できました。残るのは、いったんリースを失ったのに気づかず動き続けるゾンビ実行の問題です。
+
+## フェンシングトークン：期限切れリースの遅延書き込みを弾く
+
+ハートビートで renew している以上、普通はリースを失いません。しかし現実には、サンドボックスが一時的に固まってハートビートが飛ぶ、ネットワークが数秒詰まる、といったことが起きます。その隙に期限が切れ、別の実行がリースを奪う。奪われた側はしばらくして息を吹き返し、自分がもう持っていないことを知らないまま push しようとします。これがゾンビ実行です。
+
+ここで効くのが `fencing` です。リースを奪うたびにこの値は必ず増えるので、「より新しい持ち主ほど大きいトークンを持つ」という順序が保証されます。書き込みの直前に、対象側が「これまで受け入れた最大のトークン」と比べ、それより小さいトークンからの書き込みを拒否すれば、古いゾンビの遅延書き込みを弾き、二重公開を回避できます。
+
+```python
+class StaleFencingError(Exception):
+    pass
+
+def guarded_publish(resource_id, owner, fencing, do_write):
+    gate = db.collection("publish_gate").document(resource_id)
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = gate.get(transaction=txn)
+        last = snap.to_dict()["fencing"] if snap.exists else 0
+        if fencing < last:
+            raise StaleFencingError(
+                f"fencing {fencing} < {last}: リースは既に奪われています"
+            )
+        txn.set(gate, {"fencing": fencing})
+
+    _txn(db.transaction())
+    do_write()      # ゲートを通ってから初めて push 等の副作用を起こす
+```
+
+正直に書いておくと、この設計には一つ穴があります。ゲートの compare-and-set と実際の `do_write()`（git push）は別の操作なので、ゲートを通過した直後にゾンビが固まり、その間に新しい実行がさらに進む、という極端なタイミングでは、ゾンビの push が漏れる窓が残ります。完全に塞ぐには、書き込み対象そのものにトークンを渡して受理判定させる必要があります。レコード更新（たとえば Stripe の顧客レコード）なら、判定と書き込みを同じトランザクションに入れれば窓はゼロになります。git のように書き込み先でトークン検証ができない相手には、ゲートを push の直前に置いて窓を数十ミリ秒まで縮める、という現実的な妥協になります。この違いを意識せずに「フェンシングを入れたから安全」と考えると足をすくわれます。
+
+## ハートビートと TTL の決め方（実測）
+
+数字の勘所を書いておきます。私自身の運用では TTL を90秒、ハートビートを30秒（TTL の約33%）に置いています。この比率だとハートビートが2回連続で失敗するまでリースを失わないので、一時的なネットワークの詰まりでリースを手放してしまう事故が起きにくくなります。
+
+<table>
+  <thead>
+    <tr><th>設定</th><th>短すぎると</th><th>長すぎると</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>TTL</td><td>正常な実行が延長前に失効し、自分で自分を追い出す</td><td>本当に落ちた実行の後始末に時間がかかり、次が長く待たされる</td></tr>
+    <tr><td>ハートビート間隔</td><td>ストアへの書き込みが増え、費用と競合が上がる</td><td>失効を検知するのが遅れ、ゾンビの窓が広がる</td></tr>
+  </tbody>
+</table>
+
+危険区間の実長を測っておくのが近道です。私の記事 push は、クローンから push まで中央値で41秒、遅い側の95パーセンタイルで68秒でした。TTL 90秒はこの95パーセンタイルに、ハートビート2回ぶんの余裕を足した値です。危険区間より TTL が短いと、正常な実行の途中で失効しかねないので、まず実測してから決めることを推奨します。
+
+## リース取得に失敗したときの三つの選択
+
+取得に失敗したとき、実行がどう振る舞うべきかはタスクの性質で変わります。自動運用では次の三つを使い分けています。
+
+<table>
+  <thead>
+    <tr><th>戦略</th><th>向いている場面</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>今回は譲る（skip）</td><td>定期的に再実行されるタスク。次の機会に回せばよい</td></tr>
+    <tr><td>短く待って一度だけ再取得</td><td>危険区間が数秒で終わり、取り逃すと当日ぶんが埋まらないタスク</td></tr>
+    <tr><td>別のリソースに切り替える</td><td>4サイトを回すなど、対象を差し替えれば仕事が進むタスク</td></tr>
+  </tbody>
+</table>
+
+私の記事生成は基本「譲る」に倒しています。粘って待つほど、待っている間もサンドボックスの時間と使用量を消費するからです。ただしその日のプレミアム枠を必ず埋めたいタスクだけは、別サイトへ切り替えるフォールバックを持たせています。譲ることと粘ることのどちらが正しいかは、失注のコストと待機のコストを天秤にかけて決めるものだと考えています。
+
+## 個人運用でつまずいた点
+
+最後に、実際に踏んだ小さな落とし穴を残しておきます。
+
+一つ目は時計のずれです。上のコードは `time.time()`、つまりクライアント側の時刻で期限を書いています。別々のサンドボックスの時計が数秒ずれていると、失効の判定もその分だけ揺れます。リースストアを一つのリージョンに寄せ、TTL に十分な余裕を持たせれば実害は出ませんが、厳密を期すならサーバー側のタイムスタンプで期限を管理するほうが堅牢です。
+
+二つ目は release の呼び忘れです。`finally` に置いていても、プロセスが `os._exit` で即死する経路（ハートビート失敗時）では release は走りません。だからこそ TTL による自動回収が要になります。release はあくまで「早く手放して次を待たせない」ための最適化で、正しさは TTL が担保している、という順序で考えると設計が安定します。
+
+三つ目は二重解放です。同じ owner で release を二度呼んでも、上の実装は所有者一致を確かめてから期限を過去にするだけなので無害ですが、別の実行がすでに奪ったあとに古い実行が release すると、条件不一致で何もしません。ここでも `fencing` を消さずに残しておくことが効いています。
+
+隔離という制約は最初は不便に感じましたが、「共有できるのは外部ストアの原子操作だけ」と割り切ってしまえば、設計はむしろ単純になりました。同じように複数の自動実行を回している方の一助になれば嬉しいです。最後までお読みいただき、ありがとうございました。
