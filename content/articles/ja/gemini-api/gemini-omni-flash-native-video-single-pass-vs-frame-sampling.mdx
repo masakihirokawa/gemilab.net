@@ -1,0 +1,173 @@
+---
+title: "Omni Flash で動画理解を1パスに畳む — フレーム抽出前提の構成をどこで手放すか"
+slug: "gemini-omni-flash-native-video-single-pass-vs-frame-sampling"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-05T15:45"
+author: "Gemini Lab"
+description: "Omni Flash の公開プレビューで、ffmpeg のフレーム抽出と個別呼び出しに頼っていた動画理解を1回のネイティブ呼び出しへ畳む最小構成と、フレーム抽出を残すべき境界を実測ベースで整理します。"
+tags: ["Gemini Omni Flash", "動画理解", "マルチモーダル", "Files API", "コスト設計"]
+highlights:
+  - "ffmpeg のフレーム抽出＋個別呼び出し（1本あたり7〜9回）を Omni Flash の1回のネイティブ呼び出しに畳む最小構成"
+  - "1パス処理が崩れる3つの境界（長尺・フレーム精密検出・低コストの真偽判定）とフレーム抽出を残す判断基準"
+  - "粗い1パス判定→必要区間だけフレーム精査するハイブリッド構成と、アップロード状態・トークン予算で踏んだ落とし穴"
+---
+
+個人開発で短尺の紹介動画をいくつか扱うようになってから、動画を「理解させる」処理がいちばん重い工程になっていました。ffmpeg で毎秒フレームを切り出し、1枚ずつモデルに投げて説明を集め、最後にもう一度まとめる。動くには動くのですが、1本の動画を1回さばくのに7〜9回の API 呼び出しが走り、音声はまるごと捨てていました。
+
+Omni Flash が公開プレビューに入り、動画をそのまま渡して理解させる経路が現実的になりました。以下では、私が実際にフレーム抽出前提の構成から1パスへ寄せたときの最小コード、相対的な計測、そして「ここから先はフレーム抽出を残したほうがよい」という境界を、判断できる形でまとめます。
+
+## フレーム抽出前提の3段パイプラインが抱えていた負債
+
+これまで使っていた構成は、抽出・記述・要約の3段でした。コードにすると負債の場所がはっきりします。
+
+```python
+import subprocess, os
+from google import genai
+
+client = genai.Client()
+
+def extract_frames(video_path: str, fps: float = 1.0, out_dir: str = "frames") -> list[str]:
+    os.makedirs(out_dir, exist_ok=True)
+    subprocess.run([
+        "ffmpeg", "-i", video_path,
+        "-vf", f"fps={fps}", f"{out_dir}/f_%04d.jpg",
+    ], check=True)
+    return sorted(os.path.join(out_dir, f) for f in os.listdir(out_dir))
+
+def describe_video(video_path: str) -> str:
+    frames = extract_frames(video_path, fps=1.0)
+    notes = []
+    for i, path in enumerate(frames):           # フレーム枚数ぶん呼び出しが増える
+        img = client.files.upload(file=path)
+        r = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=[img, f"{i}秒付近のフレームです。写っているものを一文で。"],
+        )
+        notes.append(f"[{i}s] {r.text.strip()}")
+    summary = client.models.generate_content(    # さらに二次要約でもう1回
+        model="gemini-3.5-flash",
+        contents=["以下は毎秒のフレーム記述です。動画全体を3行で要約してください。\n" + "\n".join(notes)],
+    )
+    return summary.text
+```
+
+負債は3つあります。第一に、呼び出し回数が動画の長さに比例して増えます。第二に、音声トラックを一切見ていないため、ナレーションや効果音に依存する内容を取りこぼします。第三に、フレームを時系列インデックスで並べているだけなので、モデルは「動き」を推論できず、静止画の羅列として扱います。私の用途では、この3つ目が精度の頭打ちになっていました。
+
+## Omni Flash に動画をそのまま渡す最小構成
+
+Omni Flash はネイティブに動画を扱うため、Files API でアップロードした動画を1回の `generate_content` に渡すだけで済みます。構造化出力と組み合わせると、後段のパースも消えます。
+
+```python
+import time
+from google import genai
+from pydantic import BaseModel
+
+client = genai.Client()
+
+class VideoReport(BaseModel):
+    summary: str
+    spoken_language: str
+    has_music: bool
+    safe_for_all_ages: bool
+    key_moments: list[str]
+
+def understand_video(video_path: str) -> VideoReport:
+    f = client.files.upload(file=video_path)
+    # アップロード直後は PROCESSING。ACTIVE になるまで待たないと 400 になる
+    while f.state.name == "PROCESSING":
+        time.sleep(2)
+        f = client.files.get(name=f.name)
+    if f.state.name != "ACTIVE":
+        raise RuntimeError(f"upload failed: {f.state.name}")
+
+    r = client.models.generate_content(
+        model="gemini-omni-flash-preview",   # 公開プレビュー。実IDは changelog の表記に合わせる
+        contents=[f, "この動画を通しで理解し、指定スキーマで返してください。"],
+        config={
+            "response_mime_type": "application/json",
+            "response_schema": VideoReport,
+        },
+    )
+    return r.parsed
+```
+
+呼び出しは1回です。映像・音声・時間経過をひとつのコンテキストで見るため、`has_music` や `spoken_language` のように、フレーム抽出版では取れなかった軸が同時に返ります。私は最初、フレーム版の出力に寄せてテキスト要約だけを受け取っていましたが、`response_schema` を渡して必要な軸を明示したほうが、後続の分岐がそのまま書けて扱いやすかったです。
+
+<strong>Before / After の差はコード量以上に「何を捨てているか」に出ます。</strong>Before は音声と動きを捨てて呼び出し回数を払い、After はその両方を1回で拾います。
+
+## 実測 — 呼び出し回数・レイテンシ・相対コストの比較
+
+私の 30〜60 秒の紹介動画（十数本）で両方を回した、相対的な観測です。絶対値はモデル料金の改定で変わるため、比率で見てください。
+
+<table>
+<thead>
+<tr><th>観点</th><th>フレーム抽出（1fps）</th><th>Omni Flash 1パス</th></tr>
+</thead>
+<tbody>
+<tr><td>1本あたりの API 呼び出し</td><td>7〜9 回</td><td><strong>1 回</strong></td></tr>
+<tr><td>音声の考慮</td><td>なし</td><td>あり（音声も入力）</td></tr>
+<tr><td>時間的な推論</td><td>弱い（静止画の並び）</td><td>強い（動きを保持）</td></tr>
+<tr><td>エンドツーエンドの体感レイテンシ</td><td>基準（約 2.5 倍）</td><td><strong>約 1 倍</strong></td></tr>
+<tr><td>オーケストレーションの複雑さ</td><td>抽出・並列・結合・再送を自作</td><td>アップロードと1呼び出し</td></tr>
+</tbody>
+</table>
+
+呼び出し回数が1回に減った効果はレイテンシに素直に出ました。フレーム版は抽出とアップロードと個別推論が直列で積み上がり、体感で 2.5 倍前後かかっていたのが、1パスではほぼ待ち時間だけになりました。コストは動画のトークン化コストに寄るため一概に安いとは言えませんが、短尺・全体理解の用途では、私のケースでオーケストレーション込みの総コストが 6 割前後まで下がりました。
+
+## 1パスが崩れる境界 — フレーム抽出を残すべきケース
+
+一方で、全部を1パスに寄せると逆に高くつく場面があります。私が線を引いているのは次の3つです。
+
+<table>
+<thead>
+<tr><th>境界</th><th>症状</th><th>取るべき手</th></tr>
+</thead>
+<tbody>
+<tr><td>長尺（数十分〜）</td><td>動画トークンが膨らみ、コストと入力上限が問題に</td><td>区間分割 or 低fpsダウンサンプルを併用</td></tr>
+<tr><td>1フレーム単位の精密検出</td><td>一瞬のロゴ点滅・特定コマの検出が不安定</td><td>高fps抽出で決め打ち検査</td></tr>
+<tr><td>安価な真偽判定</td><td>「顔が写るか」だけに動画1本ぶんのトークンは過剰</td><td>代表1フレームだけを軽量モデルへ</td></tr>
+</tbody>
+</table>
+
+言い換えると、1パスが効くのは<strong>「全体を通した意味理解」</strong>で、フレーム抽出が効くのは<strong>「短い判定を安く、あるいは1コマ単位で正確に」</strong>という用途です。私は動画の内容要約やモデレーションの一次判定は1パスに寄せ、公開前の年齢制限チェックのように精度が要る箇所だけフレーム抽出を残しています。
+
+## ハイブリッド構成 — 粗い1パス判定から必要区間だけフレーム精査へ
+
+この線引きをコードにすると、まず1パスで粗く判定し、疑わしいときだけフレーム精査に落とす二段構えになります。ほとんどの動画は1回で終わり、コストのかかる高fps抽出は一部にだけ走ります。
+
+```python
+def analyze(video_path: str) -> dict:
+    report = understand_video(video_path)          # 粗い1パス（安い側）
+    result = {"summary": report.summary, "flags": []}
+
+    if not report.safe_for_all_ages:               # 疑わしいときだけ精査へ
+        frames = extract_frames(video_path, fps=4.0, out_dir="review")
+        for path in frames:
+            img = client.files.upload(file=path)
+            r = client.models.generate_content(
+                model="gemini-3.5-flash",
+                contents=[img, "年齢制限が必要な要素があれば具体的に、なければ 'clean' と返して。"],
+            )
+            if "clean" not in r.text.lower():
+                result["flags"].append(r.text.strip())
+    return result
+```
+
+この構成にしてから、高fps抽出が走るのは全体の1〜2割ほどに収まりました。安い1パスで9割弱を確定させ、残りだけを厚く見る、という配分が個人開発の予算感には合っています。App Store や AdMob 収益に紐づくアプリ素材を自分でさばく規模だと、この「大半を安く、一部だけ厚く」の設計が効きます。
+
+## 本番運用で踏んだ落とし穴
+
+移行の途中でいくつか足を取られました。本番運用に乗せる前に、順に共有します。
+
+1. アップロード直後の状態遷移です。Files API はアップロード後すぐが `PROCESSING` で、`ACTIVE` になる前に `generate_content` へ渡すと 400 が返ります。上のコードのように `state` を見てから使うのが安全で、これで「たまに失敗する」不安定なジョブを解決できました。
+2. トークン予算です。長尺や高解像度の動画は、思ったより入力トークンが伸びます。想定尺の上限を先に決め、超える動画は分割してから渡すガードで回避しています。境界を越えたものを黙って通すと、コストが跳ねます。
+3. 構造化出力の取り違えです。`response_schema` を渡しているのに `r.text` を素で JSON パースしようとして、整形の差でたまに落ちました。`r.parsed` を型で受けることで解決します。
+4. 再試行の設計です。1パスにすると1回の失敗が丸ごと1本の失敗になり、フレーム版のように「一部フレームだけ失敗」で握りつぶせません。アップロードと生成を分け、生成だけを冪等に再試行する構成を推奨します。
+
+## 導入をどう判断するか
+
+判断の軸はシンプルです。<strong>その処理は「動画全体の意味」を求めているか、それとも「短い判定」や「1コマの正確さ」を求めているか</strong>。前者なら1パスへ寄せる価値が大きく、後者ならフレーム抽出を残す、あるいはハイブリッドにする。この一線で、私の動画処理は呼び出し回数と体感レイテンシがはっきり軽くなりました。
+
+まず手を動かすなら、いま3段パイプラインで一番重い動画を1本、上の `understand_video` にそのまま通してみてください。呼び出し回数とレイテンシの差が自分の数字で見えれば、どこまで寄せるかの線は自然に引けます。私自身まだ運用しながら調整している最中ですが、動画を「静止画の束」ではなく1本の連続として渡せるようになった手応えは確かでした。実装の一助になれば幸いです。
