@@ -1,0 +1,212 @@
+---
+title: "Building Conversational Translation Into an App: Speech-to-Speech With the Live API"
+slug: "gemini-live-translate-voice-app-session-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-05T13:00"
+author: "Gemini Lab"
+description: "A design walkthrough for adding speech-to-speech conversational translation to an app with Gemini 3.5 Live Translate and the Live API, covering session lifetime, automatic language switching, latency budgets, and streaming cost, with working code."
+tags: ["Gemini Live API", "Live Translate", "voice translation", "real-time", "architecture"]
+highlights:
+  - "A working minimal setup: opening a Live API session and streaming audio in to get audio back"
+  - "How to break down a latency budget and design reconnection that survives drops and session limits"
+  - "Why streaming audio cost accrues quietly, and when to drop Live in favor of batch transcription"
+---
+
+I still regret the years I thought about localization only in terms of text.
+
+I run a few small, calming apps on my own, and one day an overseas user told me they wished the audio guidance could speak in their own language. At the time, the only approach I could imagine was translating text and reading it aloud. What came back was a stranger's voice, stripped of the pauses and inflection that make speech feel human.
+
+Gemini 3.5 Live Translate, released in July 2026, quietly rewrites that premise. It detects the spoken language automatically across more than 70 languages and translates speech into speech while preserving the speaker's intonation. The single fact that it never routes through text changes the quality of the experience entirely.
+
+This article lays out how to build conversational translation into an app using the Live API that underpins Live Translate. Rather than just how to call it, I focus on the four things you will always hit in production: latency, language switching, disconnection, and cost.
+
+## The design fork: never routing through text
+
+The traditional translation flow chained three independent stages in series: speech recognition, translation, and speech synthesis. Each stage adds waiting time, and the pauses and emotion get sanded off as everything passes through text.
+
+What Live Translate and the Live API change is that they fold those three stages into a single persistent session. You stream audio in, and the model returns translated audio. Intermediate text is available if you want it, but it is no longer the star of the experience.
+
+For a designer, the implication is concrete. We no longer live in a world where we tune recognition accuracy and synthesis naturalness separately. Instead, the center of gravity shifts to a networking and session problem: how to keep one stream flowing without interruption, and how to keep it flowing cheaply.
+
+## The minimal setup: open a session, stream audio in, get audio back
+
+Here is the skeleton. The Live API communicates bidirectionally over WebSockets, but the `google-genai` SDK abstracts it as an asynchronous session.
+
+```python
+import asyncio
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+MODEL = "gemini-3.1-flash-live-preview"
+
+config = {
+    "response_modalities": ["AUDIO"],
+    "system_instruction": (
+        "You are a simultaneous interpreter. Detect the language the "
+        "speaker uses. Interpret English into Japanese and Japanese into "
+        "English, preserving intonation and tone, in speech. Do not "
+        "summarize or add anything; translate only what was said."
+    ),
+    "input_audio_transcription": {},
+    "output_audio_transcription": {},
+}
+
+
+async def translate_stream(mic_frames):
+    async with client.aio.live.connect(model=MODEL, config=config) as session:
+        async def pump_audio():
+            async for chunk in mic_frames:  # 16-bit PCM / 16kHz / little-endian
+                await session.send_realtime_input(
+                    audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
+                )
+
+        sender = asyncio.create_task(pump_audio())
+
+        async for response in session.receive():
+            content = response.server_content
+            if not content:
+                continue
+            if content.input_transcription:
+                print(f"[source] {content.input_transcription.text}")
+            if content.output_transcription:
+                print(f"[target] {content.output_transcription.text}")
+            if content.model_turn:
+                for part in content.model_turn.parts:
+                    if part.inline_data:
+                        yield part.inline_data.data  # 24kHz PCM audio
+
+        await sender
+```
+
+Three things matter here. Input audio is sent as raw 16kHz PCM, output comes back as native audio in chunks, and transcriptions arrive separately from the audio.
+
+Enabling `input_audio_transcription` and `output_audio_transcription` gives you a hook for captions, logs, and the language detection discussed below. Even if you only plan to handle audio, I recommend leaving these on. Your operational observability improves dramatically.
+
+## When the language switches mid-conversation
+
+The first thing that breaks in real conversational translation is usually a "fixed language" assumption. Conversations go back and forth. You speak in Japanese, get a reply in English, then respond in Japanese again. An implementation that pins the translation direction cannot handle speakers alternating languages.
+
+Live Translate's automatic language detection follows that back-and-forth for you. But if your app holds an explicit translation direction, you kill that advantage. The clean design is to not fix the direction: delegate "translate to the opposite of the detected language" to the system prompt, and let the app merely observe the detection result.
+
+You can pick up the result from the input-side transcription. Updating the speaker label in the UI the moment the language flips looks like this:
+
+```python
+def detect_lang(text: str) -> str:
+    # Rough check for Japanese kana / kanji
+    for ch in text:
+        if "぀" <= ch <= "ヿ" or "一" <= ch <= "鿿":
+            return "ja"
+    return "en"
+
+
+class SpeakerTracker:
+    def __init__(self):
+        self.current = None
+
+    def observe(self, transcript: str) -> bool:
+        lang = detect_lang(transcript)
+        changed = lang != self.current
+        self.current = lang
+        return changed  # True means switch the speaker label
+```
+
+The judgment call here is to not decide the translation direction in code. Pre-empting what you could delegate to the model means taking on, yourself, the very variability that Live Translate is meant to absorb.
+
+## Breaking down the latency budget
+
+"Real-time" is a felt word. To turn it into a design, you have to break the time from closing your mouth to hearing the translation into segments and allocate a budget to each.
+
+<table>
+  <thead>
+    <tr><th>Segment</th><th>What happens</th><th>Rough budget</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Capture / encode</td><td>Getting mic input into 16kHz PCM</td><td>20-40ms</td></tr>
+    <tr><td>Send</td><td>Emitting the chunk until it reaches the server</td><td>Network-dependent (tens of ms)</td></tr>
+    <tr><td>End-of-speech detection</td><td>VAD confirming the speaker finished</td><td>200-500ms</td></tr>
+    <tr><td>Model processing</td><td>Until the translated audio starts returning</td><td>300-700ms</td></tr>
+    <tr><td>Playback buffer</td><td>Jitter buffer to prevent dropouts</td><td>80-150ms</td></tr>
+  </tbody>
+</table>
+
+The biggest factor in perceived quality is, surprisingly, end-of-speech detection. The sooner voice activity detection confirms the end of an utterance, the faster the response, but too soon and you start translating while the speaker is still catching their breath. There is room to tune this to the rhythm of the conversation.
+
+One more: do not trim the playback jitter buffer too far. If audio stutters the instant the network wobbles, it feels "slow" even when average latency is short. I once tightened the buffer looking only at the average and made the experience worse. In design, dropout frequency is a more accurate target than the mean.
+
+## Surviving disconnection and session lifetime
+
+Live API sessions are not permanent. A momentary network drop, a server-side connection time limit, a mobile network handoff. The longer the conversation, the more you should assume it will be cut at least once.
+
+The key is to treat disconnection as a normal path, not an exception. When the receive loop ends, reconnect and carry over the prior context. The goal is for the user never to notice the connection broke.
+
+```python
+async def resilient_translate(mic_frames, max_retries=5):
+    backoff = 0.5
+    attempt = 0
+    while attempt <= max_retries:
+        try:
+            async for audio in translate_stream(mic_frames):
+                yield audio
+            return  # clean finish
+        except (ConnectionError, asyncio.TimeoutError) as e:
+            attempt += 1
+            wait = min(backoff * (2 ** (attempt - 1)), 8.0)
+            print(f"Reconnecting (attempt {attempt}, in {wait:.1f}s): {e}")
+            await asyncio.sleep(wait)
+    raise RuntimeError("Reconnection retry limit reached")
+```
+
+In a client-direct setup, avoid embedding the API key on the device by using ephemeral tokens, reissued server-side on each reconnect. Thinking of key lifetime and session lifetime as separate concerns pays off in long-running operation.
+
+The exponential backoff has a cap because, if you retry endlessly while out of coverage, the moment service returns a flood of requests converges at once and spikes both cost and load. Designing the recovery behavior too is what makes an operation something you can leave alone.
+
+## Streaming audio cost accrues quietly
+
+This is the part indie developers most easily overlook. Unlike batch processing, the Live API accrues audio input and output tokens by the second the whole time the session is open.
+
+To get a sense of cost, work backward from the audio seconds per conversation. Assuming input and output together cost X per minute, a 180-second average conversation happening 100 times a day comes out roughly like this:
+
+<table>
+  <thead>
+    <tr><th>Variable</th><th>Value</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Avg seconds per conversation</td><td>180s</td></tr>
+    <tr><td>Conversations per day</td><td>100</td></tr>
+    <tr><td>Monthly audio minutes</td><td>180 x 100 x 30 / 60 = 9,000 min</td></tr>
+    <tr><td>Monthly cost</td><td>9,000 x X</td></tr>
+  </tbody>
+</table>
+
+More important than the formula is knowing which variable to cut. What works comes down to one thing: never leave a session open during silence or idle time. The tens of seconds a user spends thinking in silence are billable if the session stays open. Close the session when speech pauses for a set interval, and reopen on the next utterance. That switch alone matters most in apps with a lot of waiting.
+
+And recognize the cases where you do not need Live at all. If a real-time round trip is not the core of the experience, recording first and transcribing and translating in batch is an order of magnitude cheaper. I split them by these criteria:
+
+<table>
+  <thead>
+    <tr><th>Requirement</th><th>Better approach</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Face-to-face conversation, interpreting, service desk</td><td>Live API (bidirectional streaming)</td></tr>
+    <tr><td>Pre-translating video or narration</td><td>Batch transcription + synthesis</td></tr>
+    <tr><td>Voice replies to inquiries</td><td>Live for short utterances, batch for long ones</td></tr>
+  </tbody>
+</table>
+
+## Operational notes the docs do not mention
+
+Finally, a few things I only learned by building it.
+
+Transcriptions can arrive later than the audio. If you need captions and audio strictly synced, stamp audio chunks with sequence numbers and align the transcription after it arrives. Deciding to play audio first and show captions slightly behind is also a valid answer.
+
+If you allow barge-in (interrupting the model's speech), you need to be able to stop currently-playing audio instantly. If the user starts talking while the previous translation is still playing, two voices overlap and the conversation falls apart. Keep the playback buffer discardable at any moment.
+
+And state explicitly in the system prompt that it should not summarize or embellish. Leave the interpreting instruction vague and the model, out of helpfulness, tends to add paraphrases and asides that become noise for interpretation. Pinning the scope of translation narrowly makes the result more faithful.
+
+Speech-to-speech translation feels like a technology that has finally come close to delivering a person's words as they are. Start by opening a single session with the minimal Live API setup and experience your own voice returning in another language. The design instincts will come naturally from there.
+
+I hope it helps with your implementation. Thank you for reading.
