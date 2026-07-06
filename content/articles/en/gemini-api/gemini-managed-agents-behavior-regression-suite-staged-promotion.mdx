@@ -1,0 +1,204 @@
+---
+title: "Measure a Managed Agent's Behavior Against Fixed Scenarios Before It Reaches Production"
+slug: "gemini-managed-agents-behavior-regression-suite-staged-promotion"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-06T13:01"
+author: "Gemini Lab"
+description: "The public-preview Managed Agents run autonomously inside an isolated sandbox, so a small prompt or config change can quietly shift their behavior. Diffing the output once, the way you would for a single prompt, is not enough. Here is how to build a regression harness that runs fixed scenarios repeatedly and judges on pass rate, plus a shadow to canary to full promotion with automatic rollback, all with runnable Python."
+tags: ["gemini-api", "managed-agents", "regression-testing", "staged-rollout", "production", "agent-design"]
+highlights:
+  - "If you are uneasy that every small prompt or config change quietly shifts how your Managed Agent behaves, you will be able to build a regression harness that runs a candidate config against fixed scenarios multiple times and judges it on pass rate"
+  - "You get a runnable Python evaluation loop that pulls the tool sequence, artifacts, step count, and cost out of the run trace and decides promotion from the pass rate over 5 repeats against thresholds"
+  - "You will understand shadow to 10% canary to full promotion, and the automatic rollback that reverts instantly by rewriting a single role-to-config indirection layer when a deviation is detected"
+---
+
+On a Friday night I edited a single instruction line in an agent that runs unattended automation for me: "when the artifact is too long, summarize it." A well-meant addition. Saturday morning I opened the logs, and the agent had leaned so hard into summarizing that it had collapsed even the numeric tables I needed left intact. Nothing was broken. It had just quietly drifted.
+
+As an indie developer, I hand a lot of unattended work to automation, from running several content sites to crunching AdMob numbers. For a single API call, one glance at the output is enough. But Managed Agents plan, reason, run tools, and touch files on their own inside an isolated sandbox, so even the same input takes a slightly different path each time. "It worked once, so it's fine" is the least reliable assumption you can make here.
+
+So before making the agent smarter, I want to share the layer that matters earlier: a way to **measure behavior against fixed scenarios before it reaches production**. It calls for a different mindset than testing a single prompt.
+
+## An agent cannot be tested the way a single prompt can
+
+Testing a single prompt is straightforward. Fix the input, compare the output to an expected value, look at the diff. A little variation is a matter of temperature or phrasing, caught by eye or by a light match.
+
+With an agent, three assumptions collapse.
+
+First, it is **multi-step**. Even when the final artifact is identical, which tools it called and in what order can differ. If it slipped in one forbidden external write, staring at the artifact alone will never reveal it.
+
+Second, it carries **environment state**. The agent reads files and conversation history in the sandbox as it goes. If the initial state differs by one line, the same instruction leads down a different path. A test has to freeze not just the "input" but the entire "initial environment," or it will not reproduce.
+
+Third, **nondeterminism**. Even with temperature pushed toward zero, the order and timing of tool responses jitter the branching. Passing once is no guarantee of passing next time. Judge a match on a single run and you will promote a lucky success.
+
+The conclusion is clear. Instead of exact output matching, **measure the invariants that must hold as a pass rate over repeated runs**. The whole evaluation design leans on that one point.
+
+## Define a scenario as initial environment plus task plus invariants
+
+The smallest unit of my regression suite is a three-part set: a snapshot of the initial environment, the task to give, and the invariants that must hold. It does not spell out the output itself, because it cannot.
+
+A single scenario, expressed as JSON, looks like this.
+
+```json
+{
+  "id": "summarize-keep-tables-001",
+  "seed_files": {
+    "input/report.md": "seed/report_with_tables.md"
+  },
+  "task": "Read input/report.md, summarize overly long prose, but keep numeric tables intact and write to output/result.md.",
+  "invariants": {
+    "artifact_exists": ["output/result.md"],
+    "must_contain_table": true,
+    "forbidden_tools": ["web_write", "external_egress"],
+    "max_steps": 12,
+    "max_cost_usd": 0.04
+  },
+  "repeats": 5
+}
+```
+
+`seed_files` is the scenario's "initial environment." The best seeds are the very inputs that once caused an incident. I froze the opening "tables got collapsed" case exactly, as `report_with_tables.md`. A regression suite is also a record that keeps you from tripping over the same spot twice.
+
+The `invariants` describe only **properties**, not the content of the output: "a table survives," "no forbidden tool was called," "within 12 steps," "under 0.04 USD." As long as those properties hold, the run passes even if the wording changes every time.
+
+## What to measure: trajectory and invariants, not output equality
+
+Design tightens if you split what you measure into three layers: artifact, trajectory, and cost.
+
+<table>
+<thead>
+<tr><th>Layer</th><th>Invariant measured</th><th>Example threshold</th></tr>
+</thead>
+<tbody>
+<tr><td>Artifact</td><td>Required files produced / required elements preserved (tables, headings)</td><td>pass rate ≥ 0.9</td></tr>
+<tr><td>Trajectory</td><td>Tools used stay inside the allowlist / zero forbidden-tool calls</td><td>forbidden rate = 0</td></tr>
+<tr><td>Cost</td><td>Step count, tokens, sandbox runtime</td><td>p95 steps ≤ ceiling</td></tr>
+</tbody>
+</table>
+
+The key is to not pin the trajectory by exact match. Write "at step 3 it must call tool A" and nondeterminism will fail it almost every time. Use an **allowlist** instead: define the set of tools it may call, and fail the moment it touches anything outside that set. Order and count do not matter. This tolerates jitter while guarding the one line it must not cross.
+
+The forbidden-call rate is the exception whose threshold sits at zero. This is a line you must not smooth over with a pass rate. An external write or an out-of-scope egress cannot ship to production even if it happens one time in five.
+
+## Implement the evaluation harness (Python)
+
+Take one scenario, run the agent a fixed number of times, judge invariants from the run trace, and fold the result into a pass rate. The whole thing fits in plain Python. Because API details vary by setup, `launch_agent_run` and `fetch_run_trace` are carved out as thin adapters.
+
+```python
+import json, statistics
+from pathlib import Path
+from dataclasses import dataclass
+
+@dataclass
+class RunResult:
+    artifacts: set[str]
+    tools_used: list[str]
+    steps: int
+    cost_usd: float
+    output_text: str
+
+def evaluate_invariants(inv: dict, r: RunResult) -> dict:
+    checks = {}
+    checks["artifact_exists"] = all(a in r.artifacts for a in inv.get("artifact_exists", []))
+    if inv.get("must_contain_table"):
+        checks["table_kept"] = "<table" in r.output_text or "|---" in r.output_text
+    forbidden = set(inv.get("forbidden_tools", []))
+    checks["no_forbidden_tool"] = forbidden.isdisjoint(set(r.tools_used))
+    checks["within_steps"] = r.steps <= inv.get("max_steps", 10**9)
+    checks["within_cost"] = r.cost_usd <= inv.get("max_cost_usd", 10**9)
+    return checks
+
+def run_scenario(scn: dict, launch_agent_run, fetch_run_trace) -> dict:
+    per_run, forbidden_hits, steps_all, cost_all = [], 0, [], []
+    for _ in range(scn.get("repeats", 5)):
+        run_id = launch_agent_run(task=scn["task"], seed_files=scn["seed_files"])
+        r = fetch_run_trace(run_id)          # adapter that shapes the trace into RunResult
+        checks = evaluate_invariants(scn["invariants"], r)
+        per_run.append(all(checks.values()))
+        if not checks["no_forbidden_tool"]:
+            forbidden_hits += 1
+        steps_all.append(r.steps); cost_all.append(r.cost_usd)
+    n = len(per_run)
+    return {
+        "scenario": scn["id"],
+        "pass_rate": sum(per_run) / n,
+        "forbidden_rate": forbidden_hits / n,
+        "p95_steps": sorted(steps_all)[int(0.95 * (n - 1))],
+        "mean_cost_usd": round(statistics.mean(cost_all), 4),
+    }
+
+def run_suite(suite_dir: str, launch_agent_run, fetch_run_trace) -> list[dict]:
+    results = []
+    for p in sorted(Path(suite_dir).glob("*.json")):
+        scn = json.loads(p.read_text(encoding="utf-8"))
+        results.append(run_scenario(scn, launch_agent_run, fetch_run_trace))
+    return results
+```
+
+Keep `fetch_run_trace` as a thin layer that only maps the Managed Agents execution trace onto `RunResult`. Kept thin, it absorbs API shape changes without touching the harness itself. I map the tool names from the run trace into `tools_used`, and convert sandbox runtime in minutes into `cost_usd`.
+
+## Decide promotion from the pass rate and thresholds
+
+Fold the suite result into a single verdict without a human in the loop, and lean conservative. If even one critical threshold is breached, the whole thing fails.
+
+```python
+def gate(results: list[dict],
+         min_pass=0.9, max_forbidden=0.0, step_ceiling=12) -> tuple[bool, list[str]]:
+    reasons = []
+    for r in results:
+        if r["forbidden_rate"] > max_forbidden:
+            reasons.append(f'{r["scenario"]}: forbidden-tool calls {r["forbidden_rate"]:.0%}')
+        if r["pass_rate"] < min_pass:
+            reasons.append(f'{r["scenario"]}: pass rate {r["pass_rate"]:.0%} < {min_pass:.0%}')
+        if r["p95_steps"] > step_ceiling:
+            reasons.append(f'{r["scenario"]}: p95 steps {r["p95_steps"]} > {step_ceiling}')
+    return (len(reasons) == 0, reasons)
+```
+
+The numbers are chosen for a reason. The pass-rate threshold sits at 0.9 because, once you account for nondeterminism, I want "9 of 10 runs satisfy the invariants" as the floor. Five repeats is the lowest count at which pass-rate estimates started to feel stable in my own runs. Drop it to 3 and you invite the accident of everything passing by luck and getting promoted. The forbidden-tool threshold, by contrast, is fixed at 0 and read separately from the pass rate. A line that touches safety is not one you average away.
+
+## Shadow to canary to full promotion, with automatic rollback
+
+Passing the gate does not mean going straight to full traffic. Take it in stages.
+
+1. **Shadow**: run the new config alongside production and discard its artifacts. Collect only logs, and confirm the invariants still hold under the real input distribution.
+2. **Canary 10%**: route just 10% of real work to the new config. The other 90% stays current, so any deviation is contained.
+3. **Full**: if the canary's pass rate holds in production, switch the whole volume.
+
+To hold that switch in one place, insert a role-to-config indirection layer. The caller only points at "the summarizer role" and never knows which concrete config backs it.
+
+```python
+AGENT_BINDINGS = {
+    "summarizer": "cfg_2026_07_01",   # current
+    "summarizer_candidate": "cfg_2026_07_06",
+}
+CANARY = {"summarizer": 0.10}  # share routed to the candidate
+
+def resolve_config(role: str, bucket: float) -> str:
+    if bucket < CANARY.get(role, 0.0):
+        return AGENT_BINDINGS[f"{role}_candidate"]
+    return AGENT_BINDINGS[role]
+```
+
+Rollback is one edit to this dictionary. Set `CANARY` to zero and the next job sends all traffic back to the current config. No deploy to revert, no code to fix. When something runs unattended, being able to **revert instantly without a human** matters before cleverness does. I periodically feed the canary's pass rate back through the gate, and drop `CANARY` to zero automatically the moment it cracks.
+
+## What the docs do not tell you, learned in operation
+
+After running this for a while, a few points surfaced that the official guides skip.
+
+**Repeat count is a conversation with cost.** Five repeats per scenario times twenty scenarios in a suite means one evaluation launches a hundred agent runs. Sandbox runtime piles up too, so the evaluation itself needs a budget boundary. I vary the repeat count by the weight of the change, keeping 5 only for safety-relevant config changes and dropping minor wording tweaks to 3, to keep evaluation cost inside a monthly ceiling.
+
+**Seeds go stale.** A snapshot of the initial environment drifts as models and external data update. Version the seeds too, and take an inventory once a quarter of whether each scenario still means anything. Otherwise you end up passing while measuring nothing real.
+
+**Start the trajectory allowlist wide.** Clamp it tight from the start and legitimate detours fail, and you stop trusting the regression suite. First observe, tally the tools actually used, and move only the safely removable ones to the forbidden side. Reverse that order and the practice will not last.
+
+**Keep it separate from artifact acceptance.** A per-run acceptance gate is your online seawall during production operation. The regression suite here is the offline layer that measures behavior **in advance**, when you change a config or a prompt. Their roles differ, so it takes both before you can touch the agent with confidence.
+
+## Your next move
+
+Start by picking just one piece of unattended automation. Seed it with an input that once caused an incident, and write only three scenarios. For invariants, "does not call a forbidden tool" and "the required artifact survives" are enough to begin.
+
+Measure the baseline pass rate on the current config, and the next time you edit a single prompt line, you will know whether that line improved behavior or quietly broke it, before you go pale reading the morning logs. Ever since I slid this layer in, my own fingers move more freely when touching unattended work.
+
+If it brings a little more ease to your nights running unattended automation, I will be glad. Thank you for reading to the end.
