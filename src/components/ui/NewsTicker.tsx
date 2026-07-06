@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "TTS — gemini-3.1-flash-tts-previewが音声生成のストリーミングに対応し、streamGenerateContentから逐次再生できます",
-    "TRANSLATE — Gemini 3.5 Live Translateが登場。70以上の言語を自動判定し、話者の抑揚を保ったまま音声から音声へ翻訳します",
-    "IMAGE — Nano Banana 2 Liteが提供開始となり、最も高速かつ低コストなGemini画像モデルになりました",
-    "OMNI — Gemini Omni Flashが公開プレビュー入りし、動画ワークフローを組めるネイティブマルチモーダルモデルとして使えます",
     "MODEL — Gemini 3.5 FlashがGA（正式版）となり、gemini-flash-latestの実体になりました",
-    "AGENT — Managed AgentsがGemini APIで公開プレビュー入り。分離されたGoogleホストのLinuxサンドボックスで自律エージェントを動かせます",
+    "AGENT — Managed AgentsがGemini APIで公開プレビュー入り。分離されたGoogleホストのLinuxサンドボックスで自律・ステートフルなエージェントを動かせます",
+    "ANTIGRAVITY — Antigravity Agent（マネージドエージェント）が公開プレビュー。サンドボックス内で計画・推論・コード実行・ファイル操作・Web閲覧を行います",
+    "DEPRECATION — 画像生成モデルは2026年8月17日に提供終了予定です。依存パイプラインは移行先の確認を",
+    "TTS — gemini-3.1-flash-tts-previewが音声生成のストリーミングに対応し、streamGenerateContentから逐次再生できます",
+    "ENTERPRISE — Gemini 3.5 FlashがGlobal・US・EUのGemini Enterpriseで一般提供されました",
   ],
   en: [
-    "TTS — gemini-3.1-flash-tts-preview now streams speech generation via streamGenerateContent for lower latency",
-    "TRANSLATE — Gemini 3.5 Live Translate arrives, auto-detecting 70+ languages for speech-to-speech while preserving intonation",
-    "IMAGE — Nano Banana 2 Lite launches as the fastest and most cost-efficient Gemini image model",
-    "OMNI — Gemini Omni Flash enters public preview as a natively multimodal model for custom video workflows",
     "MODEL — Gemini 3.5 Flash reaches GA and now powers gemini-flash-latest",
-    "AGENT — Managed Agents enter public preview in the Gemini API, running in isolated Google-hosted Linux sandboxes",
+    "AGENT — Managed Agents enter public preview in the Gemini API, running autonomous, stateful agents in isolated Google-hosted Linux sandboxes",
+    "ANTIGRAVITY — The Antigravity Agent managed agent hits public preview, planning, coding, managing files, and browsing the web in its sandbox",
+    "DEPRECATION — Image generation models are scheduled to shut down on August 17, 2026; plan your migration",
+    "TTS — gemini-3.1-flash-tts-preview now streams speech generation via streamGenerateContent for lower latency",
+    "ENTERPRISE — Gemini 3.5 Flash is generally available across the Global, US, and EU regions on Gemini Enterprise",
   ],
 };
 
