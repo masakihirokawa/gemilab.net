@@ -1,0 +1,136 @@
+---
+title: "When Context Caching Didn't Lower My Gemini Bill — Field Notes on Measuring the Real Hit Rate"
+slug: "gemini-context-cache-savings-shortfall-hit-rate-instrumentation-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-06T13:00"
+author: "Gemini Lab"
+description: "When Context Caching is enabled but the Gemini API bill barely drops, this field note measures the real hit rate from usage_metadata, separates TTL churn from fragmentation, and walks through a staged recovery."
+tags: ["Gemini API", "Context Caching", "cost optimization", "usage_metadata", "TTL", "instrumentation", "operations"]
+highlights:
+  - "A tiny meter built on usage_metadata.cached_content_token_count to measure the effective hit rate"
+  - "The break-even math: how many hits inside one TTL window make caching profitable"
+  - "Separating the three silent causes: TTL churn, per-user fragmentation, and leaning on implicit caching"
+---
+## Only the invoice said it wasn't working
+
+I turned on Context Caching because my system prompt had grown to 8,000 tokens and the input charges were no longer something I could ignore. As an indie developer running a micro-SaaS, every unit of cost feeds straight into the gross margin. I built the explicit cache exactly as documented, switched to passing `cached_content`, and waited two weeks. Then I opened the first invoice of the month and my finger stopped on the trackpad.
+
+The input charges had barely moved. I had expected roughly a 60% drop; the reality was closer to 10%. The code looked correct. No errors. And yet the numbers were quietly insisting that nothing was working.
+
+In moments like this, I stop suspecting the code first. What I suspect is my own assumption that "it must be working." Whether a cache actually took effect is never a feeling — it is written into the response metadata. So the recovery began by building a meter to read exactly that.
+
+## Confirming "it must be working" from the response
+
+Every Gemini API response carries `usage_metadata`. Inside it is a field called `cached_content_token_count`, which tells you how many tokens of that request's prompt were served from the cache. If it reads 0, the cache did nothing — no matter how correct the implementation looks.
+
+I started with the smallest possible check, printing the breakdown of a single request.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+# Cache ONLY the fixed part shared by all users
+cache = client.caches.create(
+    model="gemini-2.5-flash",
+    config=types.CreateCachedContentConfig(
+        system_instruction=SYSTEM_PROMPT,  # the 8,000-token shared instruction
+        ttl="3600s",
+    ),
+)
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents=user_message,                 # only the per-user part
+    config=types.GenerateContentConfig(cached_content=cache.name),
+)
+
+u = resp.usage_metadata
+print("prompt:", u.prompt_token_count)
+print("cached:", u.cached_content_token_count)  # this is the real signal
+print("output:", u.candidates_token_count)
+```
+
+In my environment, some requests returned the expected `cached` value of around 8,000 — and others, inexplicably, returned 0. "Usually working, but sometimes not." That "sometimes" was piling up into a 10% invoice reduction. If you only watch the average, this flicker stays invisible.
+
+## Standing up a single hit-rate meter
+
+One manual look can't reveal what "sometimes" really is. I slipped a meter into the request path that keeps the breakdown of every call and aggregates it into a hit rate. You don't need a heavy dashboard — one structured log line is enough.
+
+```python
+def log_cache_stats(resp, sink):
+    u = resp.usage_metadata
+    cached = u.cached_content_token_count or 0
+    prompt = u.prompt_token_count or 0
+    sink.emit({
+        "cached_tokens": cached,
+        "prompt_tokens": prompt,
+        # token-weighted ratio: what share of input came from cache this call
+        "cache_ratio": (cached / prompt) if prompt else 0.0,
+        "hit": 1 if cached > 0 else 0,
+        "output_tokens": u.candidates_token_count or 0,
+    })
+```
+
+Two aggregates matter. One is the <strong>hit rate</strong> (the mean of `hit` — how often the cache took effect at all). The other is the <strong>token-weighted effective hit rate</strong> (sum of `cached_tokens` divided by sum of `prompt_tokens`). The first captures the frequency of "hit or miss"; the second captures how much the cache actually moved cost.
+
+My hit rate was 78% — a respectable number. But the token-weighted effective rate was only 34%. That gap was the whole mystery. The cache was working on most requests yet not touching cost, because frequent rewrites were eating back the savings.
+
+## Three silent causes of a bill that won't fall
+
+Once the meter filled in, the causes narrowed to three. None of them throws an error, so each stays silent until you measure it. In production, this "loss that never errors" is the most dangerous kind.
+
+<strong>The first is TTL churn.</strong> A cache entry expires, and the next call rewrites it. The write price is roughly the same as normal input — far higher than the read price (about a quarter of input). If access is sparse but the TTL is short, you repeat "create, barely read, expire, create again," and only the write cost accumulates. My TTL was 3,600 seconds, but overnight the gaps between requests exceeded it, so I was rebuilding the entry on nearly every call. The fix comes later.
+
+<strong>The second is per-user fragmentation.</strong> My first implementation created a cache entry per user. The system prompt is identical for everyone, yet there was one entry per person. Write count scaled with user count, each entry got too few reads to pay itself back, and most expired first. The fix was to have a <strong>single shared entry for the common part</strong>, used by everyone.
+
+<strong>The third is leaning on implicit caching.</strong> Gemini 2.5 models apply implicit caching automatically when prefixes match, but it won't fire below a minimum token threshold (roughly 1,000–2,000 tokens depending on the model) or when the leading content changes per request. A few paths where I had dropped explicit caching "because implicit would handle it" were, in fact, passing through at full price.
+
+## Putting a number on the break-even point
+
+Whether TTL churn helps or hurts is a break-even question, not a feeling. It comes down to <strong>how many hits inside one TTL window are needed to recover the write cost</strong>.
+
+I express prices as ratios. Set normal input to 1, cache read to 0.25, and a write to 1.0 (one-time). For an 8,000-token system prompt, one hit saves `8,000 × (1 − 0.25) = 6,000` input units, while a write costs 8,000 units. So the hits needed to break even are `8,000 ÷ 6,000 ≈ 1.34`. <strong>Unless you average more than about 1.4 hits within a TTL window, adding the cache makes you spend more, not less.</strong>
+
+Laying out relative cost by hits-per-window (cache-less = 100) makes the call obvious at a glance.
+
+<table>
+<tr><th>Hits per TTL window</th><th>Relative input cost (none = 100)</th><th>Verdict</th></tr>
+<tr><td>1 (write + read)</td><td>~125</td><td>Counterproductive (loss)</td></tr>
+<tr><td>2</td><td>~88</td><td>Near break-even to slight gain</td></tr>
+<tr><td>5</td><td>~50</td><td>Profitable</td></tr>
+<tr><td>20</td><td>~29</td><td>As designed</td></tr>
+</table>
+
+The moment I drew this table, the overnight losses jumped out. Time windows with only one hit were consuming the savings. The fix wasn't "extend the TTL" — it was "match the TTL to call density": shorter during the busy daytime, and skip the cache entirely overnight, sending plain input instead.
+
+## Tracking average cost and margin daily
+
+Whether the hit rate is truly fixed shows up, in the end, in the average cost per request (ACR). I convert reads, writes, and output into unit prices, compute the effective cost of one request, and track it daily. Watching the hit-rate chart alone lulls you into missing a swelling write cost.
+
+Across the whole service, I derive gross margin from monthly cost per user divided by the monthly price. What matters here is not the average but the <strong>cost share of the top 5% of heavy users</strong>. Once that group starts taking more than 30% of total cost, you are past the point where hit rate is the issue — you are in the territory of designing a higher tier or a usage cap for them. Cost optimization and pricing always become the same road eventually.
+
+## Tightening it one step at a time
+
+Rebuilding everything at once hides which change actually helped. I applied one move at a time and watched the ACR after each.
+
+First, I split the system prompt into fixed and dynamic parts and moved the fixed part into a <strong>single shared cache</strong>. Per-user data now only gets appended to `contents`, fixing the entry count at one. This alone cut write count to a fraction and sent the effective hit rate climbing.
+
+Next, I matched the TTL to call density. I dropped the fixed 3,600 seconds, estimated expected hits per window from the recent average request interval, and added a branch that skips the cache during windows likely to fall below 1.4 hits.
+
+Finally, I hunted down the paths that had been leaning on implicit caching — anything still flowing through with `cached_content_token_count` at 0 — and moved them to explicit caches. Short prompts that fall below the threshold I removed from caching entirely, reaching instead for a model swap to Flash or another lever. In that case, optimizing the output side pays off more directly than caching.
+
+## Keeping the decision to not cache
+
+Measuring taught me that Context Caching is not universal. It fits poorly with services whose system prompt is under 1,000 tokens, personalization types where the entire premise changes per request, and one-off tools used only a few times a month. In each, the window closes before the write cost is recovered.
+
+For those, rather than forcing a cache, it's cleaner to open a different tap: tightening the output format to cut output tokens, using structured output to prevent double-billing from retries, or mixing in the Flash model. Caching turned out to be not "cache and win" but "cache when density clears the break-even point."
+
+## The next move
+
+If you've enabled Context Caching but the bill hasn't dropped as much as you expected, before adding a single dashboard, just print `cached_content_token_count` for one request. If it's 0, you're passing through on implicit caching; if it's smaller than expected, it's fragmentation or a threshold miss; if the hit rate is high but cost won't fall, it's TTL churn. There are only three causes, and the triage starts from one metadata field.
+
+I'm still tuning how I match TTL to density myself. If this gives you a starting point for the same triage, I'll be glad. Thank you for reading.
