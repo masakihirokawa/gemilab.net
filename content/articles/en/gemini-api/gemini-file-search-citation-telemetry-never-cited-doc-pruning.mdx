@@ -1,0 +1,279 @@
+---
+title: "Ingested but Never Cited: Pruning a File Search Store with Citation Logs and a Quarantine Window"
+slug: "gemini-file-search-citation-telemetry-never-cited-doc-pruning"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-06T12:00"
+author: "Gemini Lab"
+description: "Most documents in a File Search store are never cited, quietly draining both cost and retrieval quality. Learn to log grounding metadata, surface never-cited documents from real usage data, and prune them safely with a quarantine window — with working code."
+tags: ["gemini", "file-search", "grounding", "rag", "cost-optimization"]
+highlights:
+  - "Identify the never-cited documents piling up in your File Search store from real citation logs instead of guesswork"
+  - "Get copy-paste code to record and aggregate citation telemetry, ready to drop into a weekly cleanup job"
+  - "Avoid the classic mistake of deleting rarely-but-critically used documents, using a quarantine window and an allowlist guard"
+---
+
+I had been running an indie FAQ assistant on File Search for about six months when a store billing detail stopped me cold. Of the 320 documents I had ingested, only around 70 had actually been cited as the basis for an answer in the last 90 days. Nearly 80% of the rest had been sitting there — silently paying embedding and storage costs — without ever being pulled once.
+
+The awkward part was that this was not purely a cost problem. As unused documents accumulate, they inflate the pool of candidate chunks that retrieval considers, which makes the genuinely useful documents less likely to surface near the top. A bloated store was slowly eroding both my wallet and my answer quality.
+
+Here I want to build the operational loop I actually use for the assistant I run at Dolice: record the real citation data — the grounding metadata — on every call, and use it to prune "ingested but never cited" documents safely, behind a quarantine window. It is written so you can lift the design straight into your own setup.
+
+## Why "never-cited" documents hurt you twice
+
+File Search store cost comes in two layers: a one-time charge when embeddings are generated, and an ongoing storage charge for keeping the document around. From the moment of ingestion, a document accrues storage cost whether or not it is ever cited.
+
+The effect that is easy to miss is on retrieval accuracy. Vector search returns the top-k results, but when semantically-near-yet-stale, duplicated, or off-target documents are mixed into the store, they occupy those top slots and push the real answer out. In my own environment, three leftover duplicate copies of an old manual version knocked the latest version out of the top-k, so the assistant quietly answered with outdated steps — a subtle but real failure.
+
+In other words, unused documents make you pay storage while simultaneously diluting answer quality. It is more accurate to treat pruning not as belt-tightening but as raising the signal-to-noise ratio of retrieval.
+
+## The shape of the design — measure, quarantine, and verify before deleting
+
+Safe pruning breaks into three stages. The crucial rule is: never delete outright.
+
+<table>
+<thead>
+<tr><th>Stage</th><th>What it does</th><th>What it protects</th></tr>
+</thead>
+<tbody>
+<tr><td>Measure</td><td>Append the cited file_id of every query to a ledger</td><td>Grounds the decision in real data</td></tr>
+<tr><td>Surface</td><td>Compare the store listing against the ledger; flag documents that are uncited and older than a threshold</td><td>Avoids misfiring on freshly ingested documents</td></tr>
+<tr><td>Quarantine &amp; verify</td><td>Instead of deleting candidates, pull them from the store for a set period, then delete only if nothing breaks</td><td>Prevents losing rarely-used documents</td></tr>
+</tbody>
+</table>
+
+The reason this design is necessary at all is the existence of documents that are cited rarely but are decisive when they are. A pricing-change notice referenced once a quarter, or a fix note for an error that only appears on one device model, may look uncited within a 90-day observation window — but must not be deleted. The quarantine window is the grace period that lets you catch those misses.
+
+## Recording citation telemetry — pulling file_id from grounding metadata
+
+First, every time you generate with File Search, record which documents were cited. In the google-genai SDK, the response's `grounding_metadata` carries the retrieved context. The catch is that the presence of these fields varies by model and request, so reading them defensively is the real-world knack.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # reads GEMINI_API_KEY from the environment
+STORE_NAME = "fileSearchStores/faq-assistant-01"
+
+
+def ask_with_citations(question: str) -> dict:
+    """Ask a question; return the answer text and the ids of cited documents."""
+    response = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=question,
+        config=types.GenerateContentConfig(
+            tools=[
+                types.Tool(
+                    file_search=types.FileSearch(
+                        file_search_store_names=[STORE_NAME]
+                    )
+                )
+            ],
+        ),
+    )
+
+    cited = set()
+    # grounding_metadata / grounding_chunks may be absent — always guard.
+    for cand in (response.candidates or []):
+        meta = getattr(cand, "grounding_metadata", None)
+        if not meta:
+            continue
+        for chunk in (getattr(meta, "grounding_chunks", None) or []):
+            ctx = getattr(chunk, "retrieved_context", None)
+            if not ctx:
+                continue
+            # File Search returns a document name or title; check both for safety.
+            doc_id = getattr(ctx, "document_name", None) or getattr(ctx, "title", None)
+            if doc_id:
+                cited.add(doc_id)
+
+    return {"answer": response.text, "cited_docs": sorted(cited)}
+
+
+if __name__ == "__main__":
+    result = ask_with_citations("Is my data kept after cancellation?")
+    print(result["answer"])
+    print("cited:", result["cited_docs"])
+    # cited: ['documents/policy-cancellation-2026', 'documents/data-retention-note']
+```
+
+The `cited_docs` returned here is the primary source for your cleanup. I often see implementations that use only the answer text and throw the citation metadata away — but that metadata is exactly the asset that will later tell you what is working and what is dead.
+
+## Accumulating citation logs into a ledger
+
+A single citation is not enough to decide anything. Build a ledger that appends daily queries. SQLite works, but for a start, an append-friendly JSONL file was plenty.
+
+```python
+import json
+import time
+from pathlib import Path
+
+LEDGER = Path("citation_ledger.jsonl")
+
+
+def record_citation(question: str, cited_docs: list[str]) -> None:
+    """Append one query's citation record. Light enough for indie use."""
+    entry = {
+        "ts": int(time.time()),
+        "q_hash": hash(question) & 0xFFFFFFFF,  # store a hash, not the raw question
+        "cited": cited_docs,
+    }
+    with LEDGER.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def coverage_since(days: int = 90) -> dict[str, int]:
+    """Count how many times each document was cited in the last `days` days."""
+    cutoff = int(time.time()) - days * 86400
+    counts: dict[str, int] = {}
+    if not LEDGER.exists():
+        return counts
+    for line in LEDGER.read_text(encoding="utf-8").splitlines():
+        row = json.loads(line)
+        if row["ts"] < cutoff:
+            continue
+        for doc in row["cited"]:
+            counts[doc] = counts.get(doc, 0) + 1
+    return counts
+```
+
+Note that the raw question text is not stored in the ledger — only a hash. What cleanup needs is "which document was cited," not the verbatim text of what users asked. Not holding personal data you do not need for the task protects you later.
+
+## Surfacing "never-cited" documents safely
+
+Now compare the ledger aggregation against the documents that actually live in the store. The key here is to cut off by age since ingestion. A document ingested yesterday being uncited is obviously expected, and including it as a candidate is a misfire.
+
+```python
+import datetime as dt
+
+# List documents in the store (assumed to include ingestion time).
+def list_store_docs() -> list[dict]:
+    docs = []
+    for d in client.file_search_stores.documents.list(parent=STORE_NAME):
+        docs.append({
+            "id": d.name,
+            "created": d.create_time,  # datetime
+        })
+    return docs
+
+
+def find_prune_candidates(min_age_days: int = 90) -> list[dict]:
+    """Flag documents uncited AND older than min_age_days since ingestion."""
+    counts = coverage_since(days=min_age_days)
+    now = dt.datetime.now(dt.timezone.utc)
+    candidates = []
+    for doc in list_store_docs():
+        age_days = (now - doc["created"]).days
+        cited = counts.get(doc["id"], 0)
+        if cited == 0 and age_days >= min_age_days:
+            candidates.append({"id": doc["id"], "age_days": age_days})
+    # Oldest first.
+    return sorted(candidates, key=lambda x: -x["age_days"])
+```
+
+The point of this cutoff is that the observation window equals the age threshold. It makes no sense to judge a 30-day-old document as uncited when you only have 90 days of citation logs — it might have been cited during a period you never observed. By setting the window and the age threshold to the same value, you reach a state where you can confidently say "this document was not cited even once across the entire period we could observe."
+
+## Don't delete right away — prune behind a quarantine window
+
+Once candidates appear, quarantine rather than delete. Pull them from the File Search store, but keep the source files in a separate quarantine store (or holding area) and watch for a set period. During that window, use a shadow check to confirm no question arrived that would have needed the document.
+
+```python
+QUARANTINE_STORE = "fileSearchStores/quarantine-01"
+ALLOWLIST = {
+    "documents/policy-cancellation-2026",  # rare but decisive; protect permanently
+    "documents/legal-tokushoho-notice",
+}
+
+
+def quarantine(doc_id: str) -> None:
+    """Remove from the production store and move to quarantine. Never delete the source."""
+    if doc_id in ALLOWLIST:
+        return  # never touch protected documents
+    # Move (copy across stores) then delete from production.
+    _copy_document(doc_id, src=STORE_NAME, dst=QUARANTINE_STORE)
+    client.file_search_stores.documents.delete(name=doc_id)
+
+
+def promote_deletion(grace_days: int = 30) -> list[str]:
+    """Hard-delete only if grace_days elapsed with no shadow hit meanwhile."""
+    deleted = []
+    now = dt.datetime.now(dt.timezone.utc)
+    for d in client.file_search_stores.documents.list(parent=QUARANTINE_STORE):
+        age = (now - d.create_time).days
+        if age >= grace_days and not _shadow_hit(d.name, since_days=grace_days):
+            client.file_search_stores.documents.delete(name=d.name)
+            deleted.append(d.name)
+    return deleted
+```
+
+The `ALLOWLIST` is the safety valve of this design. Documents like a legally-required disclosure or a cancellation policy — indispensable whether or not they get cited once a month — are protected permanently even when their citation count looks like zero. The more you automate pruning, the more this explicit "never touch" list matters.
+
+## Protecting rare-but-decisive documents — the shadow check as a grace period
+
+The "shadow check" during quarantine is the last line of defense before deletion. Replay the same body of real questions against the quarantine store in the background, and confirm whether a question that should have cited the quarantined document actually arrived.
+
+```python
+def _shadow_hit(doc_id: str, since_days: int) -> bool:
+    """Replay recent real queries against the quarantine store; did doc_id get cited?"""
+    cutoff = int(time.time()) - since_days * 86400
+    recent_q_hashes = _recent_question_hashes(since=cutoff)
+    for q in _sample_questions_for(recent_q_hashes):
+        resp = client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=q,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(file_search=types.FileSearch(
+                    file_search_store_names=[QUARANTINE_STORE]))],
+            ),
+        )
+        for cand in (resp.candidates or []):
+            meta = getattr(cand, "grounding_metadata", None)
+            chunks = getattr(meta, "grounding_chunks", None) or [] if meta else []
+            for c in chunks:
+                ctx = getattr(c, "retrieved_context", None)
+                name = getattr(ctx, "document_name", None) if ctx else None
+                if name == doc_id:
+                    return True  # needed during quarantine — should be restored
+    return False
+```
+
+Why go to this length? I once hard-deleted a document that only gets cited a few times a year, outside my observation window, and when a seasonal inquiry arrived the answer clearly degraded. Vector search will "substitute a slightly more distant document when no close one exists, and answer plausibly anyway," so the degradation creeps in silently — which is the scary part. The shadow check is the insurance that breaks that silence.
+
+## Putting it into operation — the weekly job and how to choose thresholds
+
+Assemble the pieces above into a weekly batch. Here is the execution order and the starting values I use.
+
+<table>
+<thead>
+<tr><th>Job</th><th>Frequency</th><th>Starting threshold</th></tr>
+</thead>
+<tbody>
+<tr><td>Citation recording</td><td>Per query (real-time)</td><td>—</td></tr>
+<tr><td>Candidate surfacing</td><td>Weekly</td><td>90-day window / age ≥ 90 days</td></tr>
+<tr><td>Quarantine</td><td>Weekly (top candidates only)</td><td>Max 20 per run</td></tr>
+<tr><td>Promote to hard delete</td><td>Weekly</td><td>30 days quarantined + no shadow hit</td></tr>
+</tbody>
+</table>
+
+Thresholds should be tuned to your environment, but the principle for choosing them is shared. Set the observation window longer than the seasonality of your usage. For inquiries with a monthly rhythm, 90 days; with a quarterly rhythm, you want at least 180. Capping the number of quarantines per run keeps the blast radius small if pruning ever runs away. The more unattended the pipeline, the safer it is to structurally limit how much a single run can break. The same thinking applies to cost: much like the design in [stopping unattended-pipeline cost incidents twice with Project Spend Caps and a soft governor](/articles/gemini-api/gemini-api-spend-cap-soft-governor-unattended-pipeline), you decide "how much can break at once" up front.
+
+If you want to raise the trustworthiness of the citation metadata itself — tracing down to which page or which figure is the basis — [making File Search sources verifiable with visual citation metadata](/articles/gemini-api/gemini-file-search-visual-citation-media-id-page-numbers) is the foundation. And to monitor drift between the store and the source data along a separate axis, combining this with [operational notes on File Search catalog sync and drift detection](/articles/gemini-api/gemini-file-search-store-catalog-sync-drift-detection) lets you run pruning and freshness as two wheels of the same cart.
+
+## Common mistakes and pitfalls
+
+Let me share the holes I stepped in while actually building this loop.
+
+The first is cutting off by an age shorter than the observation window. Deciding to delete a 30-day-old document "because it is uncited" when you only have 30 days of citation logs erases, without basis, documents that were cited before that. Always match the window and the age threshold.
+
+The second is reading grounding metadata non-defensively. `grounding_metadata` and `grounding_chunks` can be absent depending on the model and request, and a naive access like `meta.grounding_chunks[0]` will raise `AttributeError` in production. Always wrap it with `getattr` and empty-list guards.
+
+The third is full automation without an allowlist. "Zero citations equals unnecessary" is often right, but there will always be documents — legal disclosures, emergency manuals — whose citation frequency and importance are inversely related. Before automating, hand-build the list of documents you will never touch.
+
+The fourth is skipping quarantine and deleting immediately. Because vector-search degradation progresses in silence, you cannot notice the harm of a deletion until an incident occurs. The grace period of a quarantine window looks tedious but prevents incidents most cheaply.
+
+## Wrapping up
+
+Before implementing pruning at all, drop just `record_citation` into your assistant today and start accumulating citation logs. Once you have a few weeks of logs, you will see in hard numbers what fraction of your store is actually working. Deciding whether to move on to quarantine and pruning after seeing that number is entirely sufficient.
+
+I am still tuning the thresholds on my own File Search cleanup, but simply keeping the order "measure before you delete" dropped my incident rate sharply. I would be glad to keep working through this alongside you and find better operations together. Thank you for reading.

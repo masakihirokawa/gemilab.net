@@ -1,0 +1,279 @@
+---
+title: "取り込んだのに一度も引かれない資料 — File Search ストアを引用ログで棚卸しする隔離つき剪定設計"
+slug: "gemini-file-search-citation-telemetry-never-cited-doc-pruning"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-06T12:00"
+author: "Gemini Lab"
+description: "File Search ストアに積んだドキュメントの多くは一度も引用されないまま費用と検索精度を蝕みます。grounding metadata から引用ログを取り、一度も引かれない資料を隔離期間つきで安全に剪定する運用設計を、動くコードとともに解説します。"
+tags: ["gemini", "file-search", "grounding", "rag", "cost-optimization"]
+highlights:
+  - "半年で320件まで膨らんだ File Search ストアから、一度も引用されない資料を勘ではなく grounding metadata の実データで特定できるようになる"
+  - "コピペで動く引用テレメトリの記録・集計コードを手に入れ、90日の観測窓で回す週次の棚卸しジョブに組み込める"
+  - "即削除で稀に効く資料を失う事故を、隔離期間つき剪定と allowlist ガードで防げる"
+---
+
+半年ほど個人開発のFAQアシスタントを File Search で回していて、ある日ストアの明細を見て手が止まりました。取り込んだ 320 ドキュメントのうち、直近 90 日で実際に回答の根拠として引用されたのは 70 件ほど。残りの 8 割近くは、一度も引かれないまま埋め込み費用とストレージ費用を静かに払い続けていたのです。
+
+厄介なのは、これがコストだけの問題ではないところでした。使われない資料が増えると、検索が拾う候補チャンクの母数が膨らみ、本当に効く資料が上位に来にくくなります。太ったストアは、財布と回答品質の両方をゆっくり削っていました。
+
+そこで組み立てたのが、引用の実データ、つまり grounding metadata を毎回記録し、「取り込んだのに一度も引かれない資料」を隔離期間つきで安全に剪定する運用です。Dolice で運用しているアシスタントで実際に使っている設計を、そのまま持ち出せる形にしました。
+
+## なぜ「一度も引かれない資料」が二重に効くのか
+
+File Search ストアの費用は、埋め込み生成時の一回きりの課金と、保管し続けるストレージ課金の二層になっています。取り込んだ瞬間から、そのドキュメントは引用されようがされまいが保管費を発生させ続けます。
+
+さらに見落としやすいのが検索精度への影響です。ベクトル検索は上位 k 件を返しますが、意味的に近いが古い・重複した・的外れな資料がストアに混ざっていると、それらが上位を占めて本命を押し出します。私の環境では、重複した旧バージョンのマニュアルが3件残っていたせいで、最新版が top-k から外れて回答が古い手順を返す、という地味な事故が起きていました。
+
+つまり使われない資料は、保管費を払わせながら、同時に回答の質を薄めます。剪定は節約というより、検索の信号対雑音比を上げる作業だと捉えたほうが実態に合います。
+
+## 設計の全体像 — 消す前に「測って、隔離して、確かめる」
+
+安全な剪定は3つの段階に分かれます。いきなり削除しないことが肝心です。
+
+<table>
+<thead>
+<tr><th>段階</th><th>やること</th><th>守るもの</th></tr>
+</thead>
+<tbody>
+<tr><td>測る</td><td>毎クエリの引用 file_id を台帳に追記する</td><td>判断の根拠を実データにする</td></tr>
+<tr><td>洗い出す</td><td>ストア一覧と台帳を突き合わせ、未引用かつ経過日数が閾値超の資料を候補にする</td><td>新しく入れたばかりの資料を誤爆しない</td></tr>
+<tr><td>隔離して確かめる</td><td>候補を即削除せず一定期間ストアから外し、影響が出なければ削除する</td><td>稀にしか効かない資料を失わない</td></tr>
+</tbody>
+</table>
+
+「稀にしか引かれないが、引かれるときには決定的に効く資料」の存在が、この設計を必要とする理由です。四半期に一度だけ参照される料金改定の告知や、特定機種でしか出ないエラーの対処メモは、90 日の観測窓では未引用に見えても消してはいけません。隔離期間は、その取りこぼしを検知するための猶予です。
+
+## 引用テレメトリを取る — grounding metadata から file_id を拾う
+
+まず、File Search を使った生成のたびに「どの資料が引用されたか」を記録します。google-genai SDK では、レスポンスの `grounding_metadata` に検索で引かれた文脈が入ります。ただしフィールドの有無はモデルやリクエストによって揺れるので、防御的に読むのが実運用のコツです。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # GEMINI_API_KEY を環境変数から読む
+STORE_NAME = "fileSearchStores/faq-assistant-01"
+
+
+def ask_with_citations(question: str) -> dict:
+    """質問を投げ、回答本文と引用された資料の識別子を返す。"""
+    response = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=question,
+        config=types.GenerateContentConfig(
+            tools=[
+                types.Tool(
+                    file_search=types.FileSearch(
+                        file_search_store_names=[STORE_NAME]
+                    )
+                )
+            ],
+        ),
+    )
+
+    cited = set()
+    # grounding_metadata / grounding_chunks は存在しないことがあるため必ずガードする
+    for cand in (response.candidates or []):
+        meta = getattr(cand, "grounding_metadata", None)
+        if not meta:
+            continue
+        for chunk in (getattr(meta, "grounding_chunks", None) or []):
+            ctx = getattr(chunk, "retrieved_context", None)
+            if not ctx:
+                continue
+            # File Search はドキュメント名や title を返す。環境差に備え両方見る
+            doc_id = getattr(ctx, "document_name", None) or getattr(ctx, "title", None)
+            if doc_id:
+                cited.add(doc_id)
+
+    return {"answer": response.text, "cited_docs": sorted(cited)}
+
+
+if __name__ == "__main__":
+    result = ask_with_citations("解約後もデータは残りますか？")
+    print(result["answer"])
+    print("引用:", result["cited_docs"])
+    # 引用: ['documents/policy-cancellation-2026', 'documents/data-retention-note']
+```
+
+ここで返す `cited_docs` が棚卸しの一次情報になります。回答本文だけを使って引用メタデータを捨ててしまう実装をよく見かけますが、そのメタデータこそが後で「何が働いていて何が死んでいるか」を教えてくれる資産です。
+
+## 引用ログを台帳に貯める
+
+一回の引用だけでは判断できません。日々のクエリを追記していく台帳を作ります。SQLite でも良いのですが、まずは追記が壊れにくい JSONL で十分でした。
+
+```python
+import json
+import time
+from pathlib import Path
+
+LEDGER = Path("citation_ledger.jsonl")
+
+
+def record_citation(question: str, cited_docs: list[str]) -> None:
+    """1クエリ分の引用実績を追記する。個人開発ならこれで十分軽い。"""
+    entry = {
+        "ts": int(time.time()),
+        "q_hash": hash(question) & 0xFFFFFFFF,  # 質問の生文は残さずハッシュのみ
+        "cited": cited_docs,
+    }
+    with LEDGER.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def coverage_since(days: int = 90) -> dict[str, int]:
+    """直近 days 日で、各資料が何回引用されたかを集計する。"""
+    cutoff = int(time.time()) - days * 86400
+    counts: dict[str, int] = {}
+    if not LEDGER.exists():
+        return counts
+    for line in LEDGER.read_text(encoding="utf-8").splitlines():
+        row = json.loads(line)
+        if row["ts"] < cutoff:
+            continue
+        for doc in row["cited"]:
+            counts[doc] = counts.get(doc, 0) + 1
+    return counts
+```
+
+質問の生文をそのまま台帳に残さず、ハッシュだけを保存している点に注意してください。棚卸しに必要なのは「どの資料が引かれたか」であって、利用者が何を聞いたかの原文ではありません。目的に不要な個人情報を持たない設計は、後で自分を守ります。
+
+## 「一度も引かれない資料」を安全に洗い出す
+
+台帳の集計と、ストアに実在するドキュメント一覧を突き合わせます。ここで大切なのは、取り込み日からの経過日数で足切りをかけることです。昨日入れたばかりの資料が未引用なのは当然で、それを候補に含めると誤爆します。
+
+```python
+import datetime as dt
+
+# ストア内ドキュメントの一覧を取得する（取り込み日を含む想定）
+def list_store_docs() -> list[dict]:
+    docs = []
+    for d in client.file_search_stores.documents.list(parent=STORE_NAME):
+        docs.append({
+            "id": d.name,
+            "created": d.create_time,  # datetime
+        })
+    return docs
+
+
+def find_prune_candidates(min_age_days: int = 90) -> list[dict]:
+    """未引用かつ取り込みから min_age_days 以上経過した資料を候補にする。"""
+    counts = coverage_since(days=min_age_days)
+    now = dt.datetime.now(dt.timezone.utc)
+    candidates = []
+    for doc in list_store_docs():
+        age_days = (now - doc["created"]).days
+        cited = counts.get(doc["id"], 0)
+        if cited == 0 and age_days >= min_age_days:
+            candidates.append({"id": doc["id"], "age_days": age_days})
+    # 古いものから順に並べる
+    return sorted(candidates, key=lambda x: -x["age_days"])
+```
+
+この足切りは「観測窓 = 足切り日数」で揃えている点がポイントです。90 日の引用ログしか見ていないのに 30 日前の資料を未引用と断じるのは筋が通りません。観測できていない期間に引かれていたかもしれないからです。窓と経過日数を同じ値にすることで、「この資料は少なくとも観測できた全期間で一度も引かれていない」と胸を張って言える状態にします。
+
+## すぐ消さない — 隔離期間つきで剪定する
+
+候補が出たら、削除ではなく隔離します。File Search ストアからは外すが、元ファイルは別の隔離ストア（または退避領域）に保持し、一定期間だけ様子を見ます。この期間中に「本来ならこの資料が必要だった」質問が来ていないかを、影の照合で確認します。
+
+```python
+QUARANTINE_STORE = "fileSearchStores/quarantine-01"
+ALLOWLIST = {
+    "documents/policy-cancellation-2026",  # 稀だが決定的。恒久保護
+    "documents/legal-tokushoho-notice",
+}
+
+
+def quarantine(doc_id: str) -> None:
+    """本番ストアから外し、隔離ストアへ退避する。元は消さない。"""
+    if doc_id in ALLOWLIST:
+        return  # 保護対象は絶対に触らない
+    # 退避（実装はストア間のコピー）→ 本番から削除
+    _copy_document(doc_id, src=STORE_NAME, dst=QUARANTINE_STORE)
+    client.file_search_stores.documents.delete(name=doc_id)
+
+
+def promote_deletion(grace_days: int = 30) -> list[str]:
+    """隔離から grace_days 経過し、その間に影の照合ヒットが無ければ本削除する。"""
+    deleted = []
+    now = dt.datetime.now(dt.timezone.utc)
+    for d in client.file_search_stores.documents.list(parent=QUARANTINE_STORE):
+        age = (now - d.create_time).days
+        if age >= grace_days and not _shadow_hit(d.name, since_days=grace_days):
+            client.file_search_stores.documents.delete(name=d.name)
+            deleted.append(d.name)
+    return deleted
+```
+
+`ALLOWLIST` は、この設計の安全弁です。特定商取引法の表記や解約ポリシーのように、月に一度引かれるかどうかでも欠かせない資料は、引用回数がゼロに見えても恒久的に保護します。剪定を自動化するほど、この「絶対に触らない」明示リストの重要性が増します。
+
+## 稀だが決定的な資料を守る — 影の照合という猶予
+
+隔離期間中の「影の照合」は、削除の最終防波堤です。隔離ストアに対しても本番と同じ質問群を裏で流し、隔離した資料が引用されるべき質問が実際に来ていたかを確認します。
+
+```python
+def _shadow_hit(doc_id: str, since_days: int) -> bool:
+    """隔離期間中の実クエリを隔離ストアに流し、doc_id が引かれたか確認する。"""
+    cutoff = int(time.time()) - since_days * 86400
+    recent_q_hashes = _recent_question_hashes(since=cutoff)
+    for q in _sample_questions_for(recent_q_hashes):
+        resp = client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=q,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(file_search=types.FileSearch(
+                    file_search_store_names=[QUARANTINE_STORE]))],
+            ),
+        )
+        for cand in (resp.candidates or []):
+            meta = getattr(cand, "grounding_metadata", None)
+            chunks = getattr(meta, "grounding_chunks", None) or [] if meta else []
+            for c in chunks:
+                ctx = getattr(c, "retrieved_context", None)
+                name = getattr(ctx, "document_name", None) if ctx else None
+                if name == doc_id:
+                    return True  # 隔離中に必要とされた。復帰させるべき
+    return False
+```
+
+なぜここまで手間をかけるのか。私は一度、観測窓の外で年に数回だけ引かれる資料を即削除してしまい、季節性のある問い合わせが来たときに回答が明確に劣化した経験があります。ベクトル検索は「近い資料が無ければ、少し遠い資料で代替して、それらしく答えてしまう」ため、劣化が沈黙のうちに進むのが怖いところでした。影の照合は、その沈黙を破るための保険です。
+
+## 運用に載せる — 週次ジョブと閾値の決め方
+
+ここまでの部品を週次のバッチに組みます。実行の順序と、私が使っている初期値を示します。
+
+<table>
+<thead>
+<tr><th>ジョブ</th><th>頻度</th><th>初期閾値</th></tr>
+</thead>
+<tbody>
+<tr><td>引用記録</td><td>クエリ毎（リアルタイム）</td><td>—</td></tr>
+<tr><td>候補洗い出し</td><td>週次</td><td>観測窓 90 日 / 経過 90 日以上</td></tr>
+<tr><td>隔離実行</td><td>週次（候補の上位のみ）</td><td>1 回あたり最大 20 件</td></tr>
+<tr><td>本削除への昇格</td><td>週次</td><td>隔離 30 日 + 影の照合ヒット無し</td></tr>
+</tbody>
+</table>
+
+閾値は環境で調整すべきですが、決め方の原則は共通です。観測窓は、あなたの利用の季節性より長く取ります。月次で波がある問い合わせなら 90 日、四半期の波があるなら 180 日は欲しいところです。1 回あたりの隔離件数に上限を設けるのは、剪定が暴走したときの被害を小さく保つためです。無人で回すパイプラインほど、一度の実行で壊せる範囲を構造的に絞っておくのが安全でした。この考え方は費用面でも同じで、[Project Spend Caps とソフト上限で無人パイプラインの費用事故を二重に止める設計](/articles/gemini-api/gemini-api-spend-cap-soft-governor-unattended-pipeline)と同じく、「一度に壊せる量」を先に決めておく発想です。
+
+引用メタデータそのものの信頼性を上げたい場合は、どのページ・どの図が根拠かまで辿れる[視覚引用メタデータで File Search の出典を検証可能にする方法](/articles/gemini-api/gemini-file-search-visual-citation-media-id-page-numbers)が土台になります。また、ストアと元データの同期ズレを別軸で監視するなら、[File Search のカタログ同期とドリフト検知の運用メモ](/articles/gemini-api/gemini-file-search-store-catalog-sync-drift-detection)と組み合わせると、剪定と鮮度維持を両輪で回せます。
+
+## よくある間違いと落とし穴
+
+実際にこの運用を組む中で踏んだ穴を、先に共有します。
+
+一つ目は、観測窓より短い経過日数で足切りをかけることです。30 日分の引用ログしか無いのに 30 日前の資料を「未引用だから消す」と判断すると、それ以前に引かれていた資料を根拠なく消します。窓と経過日数は必ず揃えてください。
+
+二つ目は、grounding metadata を非防御的に読むことです。`grounding_metadata` や `grounding_chunks` はモデルやリクエストによって欠けることがあり、`meta.grounding_chunks[0]` のような素朴なアクセスは本番で `AttributeError` を起こします。必ず `getattr` と空リストのガードを噛ませます。
+
+三つ目は、allowlist を作らずに全自動化することです。「引用ゼロ = 不要」は多くの場合正しくても、法定表記や緊急時マニュアルのように、引かれる頻度と重要度が反比例する資料が必ず存在します。自動化の前に、絶対に触らないリストを人の手で作ることが先決です。
+
+四つ目は、隔離を飛ばして即削除することです。ベクトル検索の劣化は沈黙のうちに進むため、削除の悪影響は事故が起きるまで気づけません。隔離期間という猶予は、面倒に見えて最も安く事故を防いでくれます。
+
+## まとめ
+
+まずは剪定を実装する前に、今日から `record_citation` だけをアシスタントに差し込んで、引用ログを貯め始めてみてください。数週間分のログが溜まった時点で、あなたのストアのうち何割が実際に働いているかが数字で見えます。その数字を見てから、隔離と剪定に進むかを判断すれば十分です。
+
+File Search の棚卸しは、私自身まだ閾値を調整しながら運用している途中ですが、「測ってから消す」という順番を守るだけで、事故の確率は大きく下がりました。共に手を動かしながら、より良い運用を見つけていけたら嬉しいです。お読みいただきありがとうございました。
