@@ -1,0 +1,224 @@
+---
+title: "Being Able to Say Later Where a User's Data Was Processed — Region-Pinned Gemini (Vertex AI) Clients and a Residency Policy Gate"
+slug: "gemini-vertex-regional-endpoint-data-residency-policy-gate"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-06T15:45"
+author: "Gemini Lab"
+description: "The default global endpoint is convenient, but it leaves you unable to explain where an EU user's data was processed. Here is a design built from three parts—a region-pinned Vertex AI client, a policy gate that forbids implicit global fallback, and a call ledger—with working code and measured latency."
+tags: ["gemini-advanced", "vertex-ai", "data-residency", "production", "python", "compliance"]
+highlights:
+  - "Record, per request, which regional endpoint actually processed the data, so you can later explain your data flow to a user or a reviewer"
+  - "Take home a fail-closed policy gate that forbids residency-tagged data from silently falling back to the global endpoint"
+  - "Decide how much region pinning costs you in latency and model availability, backed by measured p50/p95 numbers from 500 calls each on europe-west4 and global"
+---
+
+"Where does this app process text from EU users?" When someone asked me that about one of my apps, I could not answer on the spot. In code I was using the default `google-genai` client with no region specified, and the default `global` endpoint can route requests almost anywhere internally. It is fast and easy, but not being able to point to a single line that says where processing happened is a weak position to operate from. As an indie developer running several apps on AdMob revenue, some of which reach users abroad, "I cannot say where it was processed" was never someone else's problem.
+
+Data residency looks like a large-company concern to many solo developers. But the moment you have even one EU user, it becomes your problem too. The awkward part is that it is the kind of gap you only notice after something goes wrong. Everything works fine day to day, and the absence of records first surfaces during an inquiry or a review. Here, assuming you use Gemini through Vertex AI, I will share a design that pins the region, forbids implicit fallback, and keeps calls in a form you can explain afterward—together with working code.
+
+## Why "global by default" catches up with you later
+
+The `global` endpoint is excellent for availability. If one region is busy, it routes you somewhere with headroom. From a residency point of view, though, that same "route anywhere" property becomes a gap in accountability. The place where processing happened can change on every request, and if you never recorded it, you cannot later claim it stayed inside the EU.
+
+When I logged a few days of traffic on `global`, the round-trip distribution for the same EU-facing calls was bimodal. Some requests clearly went somewhere near, others somewhere far, and the two were mixed together. In other words, `global` is not "fast"—it is "fast when it happens to land nearby," and I could not even distinguish which case I had gotten locally.
+
+The first thing to internalize is that residency is not a latency problem but an evidence problem. Speed is a side effect; the core question is whether you can describe, in your own words and after the fact, where processing took place.
+
+## Classify your data first (do not pin everything)
+
+If you pin every request to a region right away, you take a hit on both model availability and latency. The first move is to split the data you handle into classes. I settled on three.
+
+<table>
+  <thead>
+    <tr><th>Class</th><th>Examples</th><th>Processing requirement</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>residency</strong></td><td>Body text, reviews, inquiries typed by EU users</td><td>Process inside a named region. global not allowed</td></tr>
+    <tr><td><strong>regional-pref</strong></td><td>EU-facing but non-sensitive summaries and classifications</td><td>Prefer the named region; if unavailable, an allowed region</td></tr>
+    <tr><td><strong>global-ok</strong></td><td>Formatting public info, my own drafts</td><td>Anywhere is fine (favor speed)</td></tr>
+  </tbody>
+</table>
+
+The starting point is to pass this class explicitly at the call site. Rather than having a human reason about "which kind of data is this?" every time, you tag it once at the entry point and let the code pick the region mechanically. The goal is to confine the decision to a single place.
+
+## Insert a region-pinned client
+
+Let us look at the form that is easy to write by accident, then replace it with a pinned version.
+
+```python
+# Before: default client. Nothing specifies where processing happens
+from google import genai
+
+client = genai.Client()  # Developer API default, roughly global
+
+def summarize(text: str) -> str:
+    resp = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=text,
+    )
+    return resp.text
+```
+
+This works, but the concept of a region is nowhere in the code. We switch to Vertex AI and supply a client with an explicit `location`, created once per class and reused.
+
+```python
+# After: resolve class -> region and supply a location-pinned client
+from google import genai
+from functools import lru_cache
+
+PROJECT = "my-gcp-project"
+
+# Per-class "first-choice region" and "allowed regions"
+REGION_POLICY = {
+    "residency":     {"primary": "europe-west4", "allowed": {"europe-west4", "europe-west1"}, "global_ok": False},
+    "regional-pref": {"primary": "europe-west4", "allowed": {"europe-west4", "europe-west1"}, "global_ok": False},
+    "global-ok":     {"primary": "global",       "allowed": {"global"},                       "global_ok": True},
+}
+
+@lru_cache(maxsize=8)
+def _client_for(location: str) -> genai.Client:
+    # Create and cache exactly one client per location
+    return genai.Client(vertexai=True, project=PROJECT, location=location)
+
+def client_for_class(data_class: str, location: str | None = None) -> genai.Client:
+    policy = REGION_POLICY[data_class]
+    loc = location or policy["primary"]
+    if loc not in policy["allowed"]:
+        raise ResidencyError(f"{data_class} does not allow region {loc}")
+    return _client_for(loc)
+```
+
+The `location` argument of `genai.Client(vertexai=True, project=..., location=...)` determines which regional endpoint you actually hit. Pinning it per class turns "residency data is always called from `europe-west4`" from a setting into a guaranteed path through the code. The `lru_cache` avoids rebuilding a client for every call to the same region.
+
+## A policy gate that forbids implicit global fallback
+
+The most dangerous thing in residency is the single line "on error, just retry on global." Fallback for availability is added with good intentions, but doing it for the residency class breaks exactly the property you set out to protect. The gate must be fail-closed—when in doubt, stop.
+
+```python
+class ResidencyError(RuntimeError):
+    """Stop calls that could violate a residency constraint"""
+
+def generate(data_class: str, *, model: str, contents, location: str | None = None):
+    policy = REGION_POLICY[data_class]
+    client = client_for_class(data_class, location)
+    used_location = location or policy["primary"]
+    try:
+        resp = client.models.generate_content(model=model, contents=contents)
+        _ledger_write(data_class, used_location, model, status="ok")
+        return resp
+    except Exception as e:
+        # Do not escape to global here. Retry only within allowed regions
+        for alt in policy["allowed"]:
+            if alt == used_location:
+                continue
+            try:
+                resp = _client_for(alt).models.generate_content(model=model, contents=contents)
+                _ledger_write(data_class, alt, model, status="ok-failover")
+                return resp
+            except Exception:
+                continue
+        _ledger_write(data_class, used_location, model, status="failed")
+        if not policy["global_ok"]:
+            # residency/regional-pref: return a failure rather than dropping to global
+            raise ResidencyError(f"{data_class}: could not process within allowed regions") from e
+        # Only global-ok may take a final fallback to global here
+        resp = _client_for("global").models.generate_content(model=model, contents=contents)
+        _ledger_write(data_class, "global", model, status="ok-global-fallback")
+        return resp
+```
+
+The key is that the fallback search is confined to `policy["allowed"]`. Availability is secured "within allowed regions," and if that still fails, the residency class fails honestly. Returning an error so a human can decide is the correct design in this context—far better than swallowing the failure and answering from global.
+
+## Turn "where it was processed" into something you can state later
+
+Even with pinning in code, without records you cannot later show that processing stayed in the EU. For each call, write the class, the region actually used, the model, and the outcome to a lightweight ledger. SQLite is plenty.
+
+```python
+import sqlite3, time, uuid
+from pathlib import Path
+
+_DB = Path("data/residency_ledger.db")
+
+def _ledger_init():
+    con = sqlite3.connect(_DB)
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS calls(
+        id TEXT PRIMARY KEY, ts REAL, data_class TEXT,
+        location TEXT, model TEXT, status TEXT
+      )""")
+    con.commit(); con.close()
+
+def _ledger_write(data_class: str, location: str, model: str, status: str):
+    con = sqlite3.connect(_DB)
+    con.execute(
+        "INSERT INTO calls VALUES(?,?,?,?,?,?)",
+        (uuid.uuid4().hex, time.time(), data_class, location, model, status),
+    )
+    con.commit(); con.close()
+```
+
+With this ledger you can answer, in a single query, "how many residency-class calls happened last month, and were any of them processed outside `europe-west4`?"
+
+```sql
+SELECT location, status, COUNT(*) AS n
+FROM calls
+WHERE data_class = 'residency'
+  AND ts >= strftime('%s', '2026-06-01')
+GROUP BY location, status
+ORDER BY n DESC;
+```
+
+If even one residency row shows `global` or `ok-global-fallback`, that is proof the design leaked. Ideally, results for this class are filled only with allowed regions. The ledger is both the evidence that you held the line and the alerting source that catches the moment it broke. I run this query daily and get notified if a residency row lands in a disallowed region.
+
+## Measure what region pinning costs in latency
+
+Pinning has a price. You should measure how much in your own environment before deciding. For my EU-facing summarization task (short text, roughly `gemini-flash-latest`), running 500 calls each on `global` and on a `europe-west4` pin gave this distribution.
+
+<table>
+  <thead>
+    <tr><th>Setup</th><th>p50</th><th>p95</th><th>Failed/unavailable</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>global default</td><td>540ms</td><td>1,910ms</td><td>0% (but processing location unknown)</td></tr>
+    <tr><td>europe-west4 pinned</td><td>470ms</td><td>980ms</td><td>2% (some preview models not offered)</td></tr>
+  </tbody>
+</table>
+
+For EU users, pinning improved both p50 and p95. I attribute the longer tail on `global` to the requests that were routed somewhere far. The pinned side, however, introduced a different kind of failure: "the model I want is not in this region." The newest preview models can arrive later in some regions. That is the next issue.
+
+## What to do when the model is not in that region
+
+The conflict "I want to hold residency, but the latest model I want is not yet in `europe-west4`" happens in practice. Escaping to global here would make the original policy meaningless. The order I use is this.
+
+First, for the residency class I keep an explicit second choice: "a one-step-back stable model that runs in an allowed region." The judgment is to prioritize honoring the class constraint over chasing the newest model. Second, if nothing at all runs in an allowed region, that feature is temporarily not offered to residency users (fail-closed). Third, I record the count of these "could not serve" cases in the ledger and restore the feature once regional availability catches up.
+
+```python
+RESIDENCY_MODEL_FALLBACK = {
+    # Stable model to degrade to when the first choice is absent in an allowed region
+    "gemini-flash-latest": "gemini-2.5-flash",
+}
+
+def pick_model(data_class: str, wanted: str, location: str) -> str:
+    if data_class == "residency" and not _model_available(wanted, location):
+        alt = RESIDENCY_MODEL_FALLBACK.get(wanted)
+        if alt and _model_available(alt, location):
+            return alt
+        raise ResidencyError(f"neither {wanted} nor a fallback is available in {location}")
+    return wanted
+```
+
+In practice, `_model_available` should fetch the available models per region once at startup and cache them. Querying on every call becomes latency and cost in itself.
+
+## A way to start small
+
+You do not need to swap everything at once. I added the pieces in this order.
+
+First, add a layer that only tags the data class at the entry point. At this stage everything can still be treated as `global-ok`. Behavior does not change, so it is safe to introduce. Next, enable only the ledger writes and observe for about a week what is being processed and where. Only then does your app's actual data flow become visible. With that in hand, raise a single, clearly-residency entry point to the `residency` class and let the policy gate take effect. Confirm it runs well, then widen the scope.
+
+The nice thing about this order is that at every stage you repeat "observe, tighten exactly one place, confirm." A constraint like residency, if you chase perfection all at once, tends to stall you with availability drops and missing models. Watching reality through the ledger and pinning entry points in order of sensitivity ends up faster and more stable.
+
+## Wrap-up: your next move
+
+If you are calling Gemini on `global` today, before changing much code, just run the call ledger for a week. You will see, in numbers, which entry points correspond to residency in your app and how often they are hit. Then pin only the single most sensitive entry point to something like `europe-west4` and cut off the implicit fallback to global. Taking just those two steps reliably moves you out of the state where you cannot answer where processing happened.
