@@ -4,19 +4,19 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MODEL — Gemini 3.5 FlashがGA（正式版）となり、gemini-flash-latestの実体になりました",
     "AGENT — Managed AgentsがGemini APIで公開プレビュー入り。分離されたGoogleホストのLinuxサンドボックスで自律・ステートフルなエージェントを動かせます",
-    "ANTIGRAVITY — Antigravity Agent（マネージドエージェント）が公開プレビュー。サンドボックス内で計画・推論・コード実行・ファイル操作・Web閲覧を行います",
+    "SEARCH — File Searchがマルチモーダル対応となり、gemini-embedding-2（GA）で画像をネイティブに埋め込み・検索できます",
+    "TTS — gemini-3.1-flash-tts-previewが音声生成のストリーミングに対応し、逐次再生できます",
+    "MODEL — Gemini 3.5 FlashがGA（正式版）となり、gemini-flash-latestの実体になりました",
     "DEPRECATION — 画像生成モデルは2026年8月17日に提供終了予定です。依存パイプラインは移行先の確認を",
-    "TTS — gemini-3.1-flash-tts-previewが音声生成のストリーミングに対応し、streamGenerateContentから逐次再生できます",
     "ENTERPRISE — Gemini 3.5 FlashがGlobal・US・EUのGemini Enterpriseで一般提供されました",
   ],
   en: [
-    "MODEL — Gemini 3.5 Flash reaches GA and now powers gemini-flash-latest",
     "AGENT — Managed Agents enter public preview in the Gemini API, running autonomous, stateful agents in isolated Google-hosted Linux sandboxes",
-    "ANTIGRAVITY — The Antigravity Agent managed agent hits public preview, planning, coding, managing files, and browsing the web in its sandbox",
+    "SEARCH — File Search now supports multimodal search, natively embedding and searching images with gemini-embedding-2 (GA)",
+    "TTS — gemini-3.1-flash-tts-preview now streams speech generation for lower-latency playback",
+    "MODEL — Gemini 3.5 Flash reaches GA and now powers gemini-flash-latest",
     "DEPRECATION — Image generation models are scheduled to shut down on August 17, 2026; plan your migration",
-    "TTS — gemini-3.1-flash-tts-preview now streams speech generation via streamGenerateContent for lower latency",
     "ENTERPRISE — Gemini 3.5 Flash is generally available across the Global, US, and EU regions on Gemini Enterprise",
   ],
 };
