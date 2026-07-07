@@ -1,0 +1,254 @@
+---
+title: "複数アプリのFAQを1つの File Search ストアに同居させる — customMetadata と chunk 設定で検索を分ける"
+slug: "gemini-file-search-multi-app-metadata-filter-chunk-tuning"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-08T10:45"
+author: "Gemini Lab"
+description: "複数アプリのFAQを1つの File Search ストアにまとめると、metadataFilter が無言で空を返したり、回答がチャンク境界で割れて引用されなかったりします。customMetadata の設計、AIP-160 フィルタ構文の落とし穴、chunkingConfig の実測チューニングを実装ベースでまとめました。"
+tags: ["Gemini API", "File Search", "RAG", "customMetadata", "個人開発"]
+highlights:
+  - "アプリごとに File Search ストアを増やして管理が膨らんでいた人が、1ストア同居＋メタデータ分離の設計に切り替えられる"
+  - "metadataFilter が例外を出さずに空の grounding を返す原因を、AIP-160 構文の切り分け手順で自力で特定できるようになる"
+  - "FAQ の回答がチャンク境界で割れて引用されない問題を、max_tokens_per_chunk と overlap の実測調整で減らせる"
+---
+
+複数のアプリのヘルプFAQを Gemini の File Search に載せようとしたとき、私は最初、アプリごとにストアを分けました。壁紙アプリ、癒し系アプリ、それぞれ別のストア。素直な発想です。
+
+ところが運用に入ると、ストアの数だけ再インデックスのジョブとコストが増えていきました。FAQを1行直すたびに、どのストアだったかを思い出す作業も地味に効いてきます。
+
+そこで「1つのストアに全アプリのFAQを同居させ、クエリのときだけアプリで絞る」構成に切り替えました。File Search には `customMetadata` と `metadataFilter` があります。ドキュメントに `app_id` を付けておき、問い合わせのときに `app_id` で絞れば、1ストアでも回答は混ざらないはずでした。
+
+はずでした、と書いたのは、`metadataFilter` が例外も警告も出さないまま、空の回答を返し続けたからです。この記事は、その原因の切り分けと、ついでに見つかった「回答がチャンク境界で割れて引用されない」問題の実測チューニングまでを、実装ベースでまとめたものです。
+
+## なぜ1ストアに寄せるのか — 個人開発での判断
+
+ストアを分けるか、1つに寄せるか。個人開発だと、この判断は「正しさ」より「運用が続けられるか」で決まります。
+
+File Search のストアは、埋め込みを永続保持するコンテナです。生ファイルは48時間で消えますが、ストアに取り込んだ埋め込みは手動削除するまで残ります。つまりストアは「増やしたら増えたぶんだけ、削除と再取り込みの管理対象が増える」オブジェクトです。
+
+公式ドキュメントには、ストアのサイズは「入力データ＋生成された埋め込み」でおおよそ入力の約3倍になり、1ストアあたり20GB未満を推奨、と書かれています。個人開発のFAQ程度ならサイズは問題になりません。問題になるのは数のほうです。
+
+私の判断はこうでした。<strong>データ量ではなく、更新頻度と分離要件で分ける</strong>。FAQのように頻繁に直し、アプリ間で厳密に混ざってはいけないものは、1ストアに同居させて `app_id` で論理分離します。逆に、埋め込みモデルを変えたい・再インデックス戦略が違う塊は、物理的にストアを分けます。この「物理分離は最小限、論理分離はメタデータで」という線引きが、私には一番続けやすいものでした。
+
+ストアの陳腐化そのものは別の論点で、[File Search のストアが本番で静かに陳腐化する運用メモ](/articles/gemini-api/gemini-file-search-store-catalog-sync-drift-detection)にドリフト検知の設計を書いています。本記事は「1ストア同居」に絞ります。
+
+## customMetadata でアプリを区別する
+
+分離の起点は、取り込み時に付ける `customMetadata` です。キーと値のペアで、1ドキュメントあたり最大20件まで付けられます。
+
+```python
+from google import genai
+import time
+
+client = genai.Client()
+
+# マルチモーダル対応の埋め込みモデルでストアを作成（画像も同居させたいため）
+store = client.file_search_stores.create(
+    config={
+        "display_name": "app-faqs-shared",
+        "embedding_model": "models/gemini-embedding-2",
+    }
+)
+
+def import_faq(path: str, app_id: str, kind: str, lang: str):
+    # まず Files API にアップロード → ストアへ import
+    src = client.files.upload(file=path, config={"name": f"faq-{app_id}"})
+    op = client.file_search_stores.import_file(
+        file_search_store_name=store.name,
+        file_name=src.name,
+        # ここが分離の鍵。app_id / kind / lang を付けておく
+        custom_metadata=[
+            {"key": "app_id", "string_value": app_id},
+            {"key": "kind", "string_value": kind},
+            {"key": "lang", "string_value": lang},
+        ],
+    )
+    while not op.done:
+        time.sleep(5)
+        op = client.operations.get(op)
+    return op
+
+import_faq("faq_wallpaper_ja.md", app_id="wallpaper", kind="faq", lang="ja")
+import_faq("faq_healing_ja.md",   app_id="healing",   kind="faq", lang="ja")
+# 期待: 2ドキュメントが同一ストアに入り、各チャンクに app_id が紐づく
+```
+
+キー設計で一点だけ、後悔しないための注意があります。<strong>値の型を最初に決めておく</strong>ことです。`app_id` を文字列にするか数値にするかで、後述の `metadataFilter` の書き方が変わります。私は識別子は常に `string_value`、しきい値で絞りたい年や版番号だけ `numeric_value` にする、と決めました。混在させると、フィルタ側で型を思い出せなくなります。
+
+## metadataFilter の落とし穴 — 例外を出さずに空を返す
+
+ここが本題です。取り込みは成功しているのに、`metadataFilter` を付けたクエリが、エラーも投げずに空の回答を返しました。
+
+まず、正しく動く形を示します。
+
+```python
+from google.genai import types
+
+resp = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents="壁紙が保存できないときの対処は？",
+    config=types.GenerateContentConfig(
+        tools=[types.Tool(
+            file_search=types.FileSearch(
+                file_search_store_names=[store.name],
+                # AIP-160 のリスト filter 構文。文字列値はダブルクォートで囲む
+                metadata_filter='app_id="wallpaper"',
+            )
+        )],
+    ),
+)
+print(resp.text)
+```
+
+私が最初に書いていたのは、値を引用符で囲まない形でした。`metadata_filter='app_id=wallpaper'`。これが沈黙の空返しの正体です。`metadata_filter` は [AIP-160 のフィルタ構文](https://google.aip.dev/160)に従い、<strong>文字列の値はダブルクォートで囲む必要があります</strong>。囲まないと、多くのケースで「一致ゼロ」として扱われ、例外ではなく空の grounding が返ります。
+
+厄介なのは、これが例外ではないことです。`try/except` では捕まりません。`resp.text` が薄い一般論を返すだけなので、フィルタが原因だと気づくまでに時間を溶かしました。
+
+同じ沈黙を生む間違いは、少なくとも3種類あります。
+
+<table>
+<thead>
+<tr><th>症状</th><th>原因</th><th>直し方</th></tr>
+</thead>
+<tbody>
+<tr><td>常に空 / 一般論</td><td>文字列値を引用符で囲んでいない（<code>app_id=wallpaper</code>）</td><td><code>app_id="wallpaper"</code> と囲む</td></tr>
+<tr><td>常に空</td><td>キー名が取り込み時と不一致（<code>appId</code> vs <code>app_id</code>）</td><td>取り込み時の <code>key</code> と1文字単位で合わせる</td></tr>
+<tr><td>常に空</td><td>数値を文字列として取り込み、フィルタで数値比較している</td><td>型を揃える（識別子は <code>string_value</code> で統一）</td></tr>
+</tbody>
+</table>
+
+原因の切り分けは、必ず<strong>フィルタなしのクエリと比べる</strong>ところから始めます。次のヘルパは、同じ問い合わせをフィルタあり・なしで撃ち、grounding chunk の数を並べて返します。
+
+```python
+def diagnose_filter(question: str, metadata_filter: str):
+    def run(mf):
+        resp = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=question,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(file_search=types.FileSearch(
+                    file_search_store_names=[store.name],
+                    metadata_filter=mf,
+                ))],
+            ),
+        )
+        gm = resp.candidates[0].grounding_metadata
+        chunks = getattr(gm, "grounding_chunks", None) or []
+        return len(chunks)
+
+    no_filter = run(None)
+    with_filter = run(metadata_filter)
+    print(f"filter=None       -> chunks={no_filter}")
+    print(f"filter={metadata_filter!r} -> chunks={with_filter}")
+    # 判定: フィルタなしで chunks>0 なのにありで 0 なら、フィルタ構文が原因
+    if no_filter > 0 and with_filter == 0:
+        print("=> 取り込みは成功。フィルタ構文かキー名を疑う")
+    elif no_filter == 0:
+        print("=> そもそも取り込み or 質問側の問題。フィルタ以前を疑う")
+
+diagnose_filter("壁紙が保存できないときの対処は？", 'app_id="wallpaper"')
+```
+
+「フィルタなしで chunk が返るのに、ありでゼロ」という切り分けができれば、原因はフィルタ構文かキー名だと即断できます。この一手間があるだけで、沈黙の空返しに費やす時間が桁で変わりました。
+
+## chunkingConfig で「回答が2チャンクに割れる」を直す
+
+metadataFilter を直したあと、もう一段の取りこぼしに気づきました。特定のFAQだけ、フィルタが正しくても回答が引用されないのです。
+
+原因は、取り込み時のチャンク分割でした。File Search はデフォルトで自動チャンク化しますが、`chunking_config` で1チャンクの最大トークン数と重複トークン数を指定できます。
+
+```python
+op = client.file_search_stores.upload_to_file_search_store(
+    file="faq_wallpaper_ja.md",
+    file_search_store_name=store.name,
+    config={
+        "custom_metadata": [{"key": "app_id", "string_value": "wallpaper"}],
+        "chunking_config": {
+            "white_space_config": {
+                "max_tokens_per_chunk": 200,
+                "max_overlap_tokens": 20,
+            }
+        },
+    },
+)
+```
+
+各チャンクは独立して埋め込まれます。つまり、ひとつの手順の説明が2つのチャンクにまたがると、そのどちらの埋め込みも「手順の半分」しか意味を持たず、クエリとの類似度が下がって拾われにくくなります。短い overlap は、この「境界で割れる」現象を吸収するための保険です。
+
+どのくらいの overlap があれば足りるのか。実データで詰める前に、チャンク境界の当たり方だけをローカルで再現して当たりを付けました。ホワイトスペース分割を模した小さなシミュレータで、520トークンのFAQ本文の中にある「90トークンの手順スパン（トークン170〜260）」が、単一チャンクに収まるかどうかを設定ごとに調べたものです。
+
+<table>
+<thead>
+<tr><th>max_tokens_per_chunk</th><th>overlap</th><th>チャンク数</th><th>手順が単一チャンクに収まるか</th></tr>
+</thead>
+<tbody>
+<tr><td>200</td><td>20</td><td>3</td><td>いいえ（180〜200 の境界で割れる）</td></tr>
+<tr><td>200</td><td>40</td><td>3</td><td>はい</td></tr>
+<tr><td>200</td><td>80</td><td>4</td><td>はい（ただしチャンク数が増える）</td></tr>
+<tr><td>120</td><td>20</td><td>5</td><td>いいえ</td></tr>
+<tr><td>120</td><td>40</td><td>6</td><td>はい</td></tr>
+<tr><td>300</td><td>40</td><td>2</td><td>はい</td></tr>
+</tbody>
+</table>
+
+読み取れることは単純です。`max_tokens_per_chunk=200 / overlap=20` では、境界の直前から始まる手順が割れます。overlap を 20 から 40 に上げるだけで、チャンク数を増やさずに手順が単一チャンクへ収まりました。逆に overlap を 80 まで盛ると、収まりはするもののチャンク数が増え、埋め込みのコストと保存量が膨らみます。
+
+この結果を根拠に、私は<strong>「重要な手順やコードスニペットが割れないだけの overlap を、必要最小限だけ足す」</strong>という方針にしました。目安として、FAQ のように短い手順が多いドキュメントは overlap を厚め（40前後）に、散文中心で一文が独立しているドキュメントはデフォルト寄りにします。短い手順が多いこの場合は、overlap を 40 前後にすることを推奨します。チャンクを闇雲に小さくすると、境界が増えて逆に割れやすくなる、というのも上の表が示しています。
+
+なお、埋め込みの保存量そのものを削りたい場合は、次元の切り詰めという別のレバーがあります。[Gemini Embedding の次元を 3072 から 768 へ切り詰める Matryoshka 設計](/articles/gemini-advanced/gemini-embedding-matryoshka-dimension-reduction-vector-db-cost)にコストとレイテンシの実測を置いています。
+
+## grounding から customMetadata を回収してアプリ側に返す
+
+分離の仕上げは、回答が「どのアプリのどのドキュメントから来たか」をアプリ側で受け取ることです。付けておいた `customMetadata` は、grounding chunk からそのまま回収できます。
+
+```python
+resp = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents="壁紙が保存できないときの対処は？",
+    config=types.GenerateContentConfig(
+        tools=[types.Tool(file_search=types.FileSearch(
+            file_search_store_names=[store.name],
+            metadata_filter='app_id="wallpaper"',
+        ))],
+    ),
+)
+
+for chunk in resp.candidates[0].grounding_metadata.grounding_chunks:
+    rc = getattr(chunk, "retrieved_context", None)
+    if not rc:
+        continue
+    meta = {m.key: (m.string_value or m.numeric_value)
+            for m in (rc.custom_metadata or [])}
+    # 期待: {'app_id': 'wallpaper', 'kind': 'faq', 'lang': 'ja'} が返る
+    print(meta.get("app_id"), "->", rc.title)
+```
+
+これで、回答に「このアプリのFAQのどのファイルが根拠か」を添えて返せます。私はこの `app_id` を、アプリ内ヘルプの導線（該当FAQへのディープリンク）に使っています。フィルタで絞り、grounding で回収し、アプリの画面に戻す。この一往復がそろって、はじめて「1ストア同居」が本番運用に耐えます。
+
+引用が一度も発生しないドキュメントの棚卸しについては、[取り込んだのに一度も引かれない資料を引用ログで剪定する設計](/articles/gemini-api/gemini-file-search-citation-telemetry-never-cited-doc-pruning)に別途まとめています。
+
+## 同居させる前に知っておきたい制約
+
+1ストア同居を選ぶ前に、いまの File Search の制約を確認しておくと後悔が減ります。
+
+<table>
+<thead>
+<tr><th>制約</th><th>実務への影響</th></tr>
+</thead>
+<tbody>
+<tr><td>File Search は Google 検索・URL Context 等と併用不可</td><td>「社内FAQ＋Web最新情報」を同一呼び出しで混ぜられません。役割で呼び出しを分けます</td></tr>
+<tr><td>埋め込みはモデル廃止時に無効化される</td><td>埋め込みモデルの提供終了に合わせた再インデックス計画が必要です。TTL は無いものの永久でもありません</td></tr>
+<tr><td>生ファイルは48時間で削除、ストアの埋め込みは永続</td><td>再取り込みには元ファイルの保管が別途必要です。ストア側だけを正本にはしません</td></tr>
+<tr><td>1ドキュメントの customMetadata は最大20件</td><td>分離キーは絞ります。<code>app_id / kind / lang</code> のような少数の軸に設計します</td></tr>
+</tbody>
+</table>
+
+とくに1つ目は設計を左右します。File Search は他ツールと混ぜられないので、「ストア内のFAQで答える経路」と「Web で最新情報を取る経路」は、呼び出しレベルで分けておくのが素直です。
+
+## まとめ
+
+まずは手元の一番小さなアプリのFAQを、`app_id` 付きで既存ストアに1本 import し、フィルタあり・なしで grounding chunk の数を比べる `diagnose_filter` を回してみてください。metadataFilter の沈黙は、この比較さえ習慣にすれば、ほとんど数分で切り分けられます。
+
+1ストア同居は万能ではありません。けれど、更新頻度の高いFAQを個人で回すなら、ストアを増やし続けるより、メタデータで論理分離するほうが確実に長続きすると、私自身は感じています。まだ運用しながら詰めている最中ですが、同じところで詰まる方の遠回りが少しでも減れば嬉しいです。お読みいただきありがとうございました。

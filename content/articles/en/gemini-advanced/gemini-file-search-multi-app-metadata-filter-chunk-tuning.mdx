@@ -1,0 +1,254 @@
+---
+title: "One File Search Store for Many Apps: Splitting Retrieval With customMetadata and Chunk Config"
+slug: "gemini-file-search-multi-app-metadata-filter-chunk-tuning"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-08T10:45"
+author: "Gemini Lab"
+description: "Put several apps' FAQs in a single Gemini File Search store and metadataFilter can silently return empty grounding, or answers get split across chunk boundaries. Here is the customMetadata design, the AIP-160 filter-syntax trap, and measured chunkingConfig tuning."
+tags: ["Gemini API", "File Search", "RAG", "customMetadata", "indie development"]
+highlights:
+  - "If you have been spinning up one File Search store per app and drowning in upkeep, you can switch to a single shared store with metadata-based isolation"
+  - "You will be able to diagnose why metadataFilter returns empty grounding with no exception, using an AIP-160 syntax isolation procedure"
+  - "You can stop FAQ answers from being dropped when they straddle a chunk boundary, by tuning max_tokens_per_chunk and overlap against measured results"
+---
+
+When I first moved my apps' help FAQs into Gemini's File Search, I gave each app its own store. Wallpaper app, relaxation app, one store each. It felt like the obvious layout.
+
+In practice, every extra store meant another re-indexing job and another thing to track. Fixing a single FAQ line meant first remembering which store it lived in. As an indie developer running several apps alone, that small tax adds up.
+
+So I switched to putting every app's FAQ in one store and narrowing by app only at query time. File Search offers `customMetadata` and `metadataFilter`. Tag each document with `app_id`, filter on `app_id` at query time, and a single store should never bleed one app's answers into another.
+
+Should. I say "should" because `metadataFilter` kept returning empty answers with no exception and no warning. This article walks through how I isolated that, plus a second issue I found along the way: answers getting dropped when they split across a chunk boundary, and how I tuned it with real numbers.
+
+## Why merge into one store — an indie developer's call
+
+Split stores or one shared store? For a solo developer, that decision is settled less by "what is correct" and more by "what I can keep maintaining."
+
+A File Search store is a container that persists embeddings. Raw files are deleted after 48 hours, but the embeddings you import stay until you delete them manually. So a store is an object where every new one adds another target for deletion and re-import.
+
+The docs note that a store's size is roughly three times the input (input plus generated embeddings), and recommend keeping each store under 20 GB. For indie-scale FAQs, size is never the problem. The count is.
+
+My rule became: <strong>split by update frequency and isolation requirements, not by data volume</strong>. Things I edit constantly and must never mix between apps — like FAQs — go into one shared store and are separated logically by `app_id`. Blocks that need a different embedding model or a different re-indexing strategy get their own physical store. "Physical split only when forced, logical split by metadata" is the line I found easiest to sustain.
+
+Store staleness itself is a separate topic; I wrote up drift detection in [a note on File Search stores quietly going stale in production](/articles/gemini-api/gemini-file-search-store-catalog-sync-drift-detection). This article stays focused on the shared-store case.
+
+## Separating apps with customMetadata
+
+Isolation starts with the `customMetadata` you attach at import time — key/value pairs, up to 20 per document.
+
+```python
+from google import genai
+import time
+
+client = genai.Client()
+
+# Use the multimodal embedding model so images can live here too
+store = client.file_search_stores.create(
+    config={
+        "display_name": "app-faqs-shared",
+        "embedding_model": "models/gemini-embedding-2",
+    }
+)
+
+def import_faq(path: str, app_id: str, kind: str, lang: str):
+    # Upload via the Files API, then import into the store
+    src = client.files.upload(file=path, config={"name": f"faq-{app_id}"})
+    op = client.file_search_stores.import_file(
+        file_search_store_name=store.name,
+        file_name=src.name,
+        # The key to separation: attach app_id / kind / lang
+        custom_metadata=[
+            {"key": "app_id", "string_value": app_id},
+            {"key": "kind", "string_value": kind},
+            {"key": "lang", "string_value": lang},
+        ],
+    )
+    while not op.done:
+        time.sleep(5)
+        op = client.operations.get(op)
+    return op
+
+import_faq("faq_wallpaper_en.md", app_id="wallpaper", kind="faq", lang="en")
+import_faq("faq_healing_en.md",   app_id="healing",   kind="faq", lang="en")
+# Expect: two documents in one store, each chunk tied to an app_id
+```
+
+One design note that saves regret later: <strong>decide the value type up front</strong>. Whether `app_id` is a string or a number changes how you write the `metadataFilter` below. My rule is that identifiers are always `string_value`, and only thresholds I want to compare — a year or a version number — use `numeric_value`. Mix them and you will forget which type a key is when you write the filter.
+
+## The metadataFilter trap — empty results, no exception
+
+This is the heart of it. Import succeeded, yet a query with `metadataFilter` returned an empty answer without throwing anything.
+
+First, the form that works:
+
+```python
+from google.genai import types
+
+resp = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents="What should I do if a wallpaper won't save?",
+    config=types.GenerateContentConfig(
+        tools=[types.Tool(
+            file_search=types.FileSearch(
+                file_search_store_names=[store.name],
+                # AIP-160 list-filter syntax: string values must be quoted
+                metadata_filter='app_id="wallpaper"',
+            )
+        )],
+    ),
+)
+print(resp.text)
+```
+
+What I had written first left the value unquoted: `metadata_filter='app_id=wallpaper'`. That is the source of the silent empty answer. `metadata_filter` follows the [AIP-160 filter syntax](https://google.aip.dev/160), and <strong>string values must be wrapped in double quotes</strong>. Leave them off and, in many cases, the filter is treated as matching nothing — you get empty grounding, not an exception.
+
+The nasty part is precisely that it is not an exception. `try/except` never catches it. `resp.text` just returns a thin, generic answer, so it took me a while to suspect the filter at all.
+
+There are at least three mistakes that produce the same silence.
+
+<table>
+<thead>
+<tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr>
+</thead>
+<tbody>
+<tr><td>Always empty / generic</td><td>String value not quoted (<code>app_id=wallpaper</code>)</td><td>Quote it: <code>app_id="wallpaper"</code></td></tr>
+<tr><td>Always empty</td><td>Key name differs from import (<code>appId</code> vs <code>app_id</code>)</td><td>Match the import-time <code>key</code> character for character</td></tr>
+<tr><td>Always empty</td><td>Number imported as string, but filtered as a number</td><td>Align the types (keep identifiers on <code>string_value</code>)</td></tr>
+</tbody>
+</table>
+
+Always begin isolation by <strong>comparing against the same query with no filter</strong>. The helper below fires the same question with and without a filter and prints the grounding-chunk count side by side.
+
+```python
+def diagnose_filter(question: str, metadata_filter: str):
+    def run(mf):
+        resp = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=question,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(file_search=types.FileSearch(
+                    file_search_store_names=[store.name],
+                    metadata_filter=mf,
+                ))],
+            ),
+        )
+        gm = resp.candidates[0].grounding_metadata
+        chunks = getattr(gm, "grounding_chunks", None) or []
+        return len(chunks)
+
+    no_filter = run(None)
+    with_filter = run(metadata_filter)
+    print(f"filter=None       -> chunks={no_filter}")
+    print(f"filter={metadata_filter!r} -> chunks={with_filter}")
+    # Verdict: chunks>0 without the filter but 0 with it => filter syntax
+    if no_filter > 0 and with_filter == 0:
+        print("=> Import is fine. Suspect filter syntax or key name.")
+    elif no_filter == 0:
+        print("=> Problem is before the filter (import or the question).")
+
+diagnose_filter("What should I do if a wallpaper won't save?", 'app_id="wallpaper"')
+```
+
+Once you can say "chunks come back without the filter but zero with it," you can immediately conclude the cause is the filter syntax or the key name. That single habit changed the time I spend on silent empty results by an order of magnitude.
+
+## Fixing "the answer split into two chunks" with chunkingConfig
+
+After fixing metadataFilter, I noticed a second kind of drop. For certain FAQs, even with a correct filter, the answer was never cited.
+
+The cause was chunking at import time. File Search auto-chunks by default, but `chunking_config` lets you set the maximum tokens per chunk and the overlap.
+
+```python
+op = client.file_search_stores.upload_to_file_search_store(
+    file="faq_wallpaper_en.md",
+    file_search_store_name=store.name,
+    config={
+        "custom_metadata": [{"key": "app_id", "string_value": "wallpaper"}],
+        "chunking_config": {
+            "white_space_config": {
+                "max_tokens_per_chunk": 200,
+                "max_overlap_tokens": 20,
+            }
+        },
+    },
+)
+```
+
+Each chunk is embedded independently. So when one procedure's explanation spans two chunks, neither embedding carries more than half of it, its similarity to the query drops, and it is less likely to be retrieved. A small overlap is the insurance that absorbs this boundary splitting.
+
+How much overlap is enough? Before pinning it against live data, I reproduced only the chunk-boundary behavior locally to get a first read. Using a tiny simulator of whitespace chunking, I checked whether a "90-token procedure span (tokens 170-260)" inside a 520-token FAQ body fits inside a single chunk, per setting.
+
+<table>
+<thead>
+<tr><th>max_tokens_per_chunk</th><th>overlap</th><th>chunks</th><th>procedure fits in one chunk?</th></tr>
+</thead>
+<tbody>
+<tr><td>200</td><td>20</td><td>3</td><td>No (splits at the 180-200 boundary)</td></tr>
+<tr><td>200</td><td>40</td><td>3</td><td>Yes</td></tr>
+<tr><td>200</td><td>80</td><td>4</td><td>Yes (but the chunk count grows)</td></tr>
+<tr><td>120</td><td>20</td><td>5</td><td>No</td></tr>
+<tr><td>120</td><td>40</td><td>6</td><td>Yes</td></tr>
+<tr><td>300</td><td>40</td><td>2</td><td>Yes</td></tr>
+</tbody>
+</table>
+
+The reading is simple. At `max_tokens_per_chunk=200 / overlap=20`, a procedure that starts just before a boundary gets split. Raising overlap from 20 to 40 alone let the procedure fit in a single chunk without adding chunks. Push overlap up to 80 and it fits, but the chunk count rises, inflating embedding cost and storage.
+
+On that basis, my policy became: <strong>add only the minimum overlap needed so that important procedures or code snippets don't split</strong>. As a rule of thumb, documents full of short procedures (like FAQs) get thicker overlap (around 40), while prose where each sentence stands alone can stay near the default. Shrinking chunks blindly adds boundaries and makes splitting more likely — which the table above also shows.
+
+If what you really want is to shrink the stored embeddings themselves, dimension truncation is a different lever. I put measured cost and latency in [truncating Gemini Embedding from 3072 to 768 dimensions with a Matryoshka design](/articles/gemini-advanced/gemini-embedding-matryoshka-dimension-reduction-vector-db-cost).
+
+## Recovering customMetadata from grounding back into the app
+
+The finishing touch on isolation is letting the app receive "which app, which document" an answer came from. The `customMetadata` you attached comes straight back from the grounding chunks.
+
+```python
+resp = client.models.generate_content(
+    model="gemini-3.5-flash",
+    contents="What should I do if a wallpaper won't save?",
+    config=types.GenerateContentConfig(
+        tools=[types.Tool(file_search=types.FileSearch(
+            file_search_store_names=[store.name],
+            metadata_filter='app_id="wallpaper"',
+        ))],
+    ),
+)
+
+for chunk in resp.candidates[0].grounding_metadata.grounding_chunks:
+    rc = getattr(chunk, "retrieved_context", None)
+    if not rc:
+        continue
+    meta = {m.key: (m.string_value or m.numeric_value)
+            for m in (rc.custom_metadata or [])}
+    # Expect: {'app_id': 'wallpaper', 'kind': 'faq', 'lang': 'en'}
+    print(meta.get("app_id"), "->", rc.title)
+```
+
+Now I can return an answer with "which FAQ file in which app grounds this." I use that `app_id` to drive the in-app help path — a deep link to the relevant FAQ. Filter to narrow, grounding to recover, hand it back to the app screen. Only when that round trip is complete does a single shared store hold up in real use.
+
+For pruning documents that are never cited at all, I wrote that up separately in [pruning a File Search store from citation logs](/articles/gemini-api/gemini-file-search-citation-telemetry-never-cited-doc-pruning).
+
+## Constraints worth knowing before you merge
+
+Before choosing a single shared store, checking today's File Search constraints saves regret.
+
+<table>
+<thead>
+<tr><th>Constraint</th><th>Practical impact</th></tr>
+</thead>
+<tbody>
+<tr><td>File Search can't combine with Google Search / URL Context</td><td>You can't mix "internal FAQ + fresh web info" in one call. Split the calls by role</td></tr>
+<tr><td>Embeddings are invalidated when the model is deprecated</td><td>You need a re-index plan tied to embedding-model end-of-life. No TTL, but not forever either</td></tr>
+<tr><td>Raw files deleted after 48h; store embeddings persist</td><td>Re-import needs the original files kept elsewhere. Don't treat the store as the source of truth</td></tr>
+<tr><td>customMetadata is capped at 20 entries per document</td><td>Keep separation keys few — design around a small set like <code>app_id / kind / lang</code></td></tr>
+</tbody>
+</table>
+
+The first one shapes design the most. Since File Search can't be mixed with other tools, keep "answer from the store's FAQ" and "fetch fresh info from the web" separated at the call level.
+
+## Wrapping up
+
+Start by importing a single FAQ from your smallest app into your existing store with an `app_id`, then run the `diagnose_filter` helper to compare grounding-chunk counts with and without the filter. Make that comparison a habit and the metadataFilter silence usually resolves in minutes.
+
+A single shared store is not a cure-all. But for running frequently edited FAQs solo, I've come to feel that logical separation by metadata lasts far longer than endlessly adding stores. I'm still refining this in production, but if it spares someone the same detour, I'll be glad. Thank you for reading.
