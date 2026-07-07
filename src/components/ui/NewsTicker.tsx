@@ -4,19 +4,19 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "AGENT — Managed AgentsがGemini APIで公開プレビュー入り。分離されたGoogleホストのLinuxサンドボックスで自律・ステートフルなエージェントを動かせます",
-    "SEARCH — File Searchがマルチモーダル対応となり、gemini-embedding-2（GA）で画像をネイティブに埋め込み・検索できます",
-    "TTS — gemini-3.1-flash-tts-previewが音声生成のストリーミングに対応し、逐次再生できます",
-    "MODEL — Gemini 3.5 FlashがGA（正式版）となり、gemini-flash-latestの実体になりました",
-    "DEPRECATION — 画像生成モデルは2026年8月17日に提供終了予定です。依存パイプラインは移行先の確認を",
-    "ENTERPRISE — Gemini 3.5 FlashがGlobal・US・EUのGemini Enterpriseで一般提供されました",
+    "SPARK — GoogleのエージェントアシスタントGemini SparkがmacOSのGeminiアプリに登場し、タスクを自律的に代行します",
+    "BRIEF — Personal Intelligenceを活用したDaily BriefがGmailやカレンダーから優先事項をまとめ、次の一手を提案します",
+    "MODEL — Gemini 3.5 FlashがGA（正式版）となり、100万トークンのコンテキストで低コスト・高速な処理に対応します",
+    "GROWTH — Geminiアプリの月間アクティブユーザーが9億人を突破し、1年前の4億人から大きく成長しました",
+    "APPS — SparkはGoogle TasksやGoogle Keepと連携し、話題をリアルタイムに追いかけられるようになりました",
+    "ENTERPRISE — Gemini 3.5 FlashがGlobal・US・EUのGemini Enterpriseで一般提供されています",
   ],
   en: [
-    "AGENT — Managed Agents enter public preview in the Gemini API, running autonomous, stateful agents in isolated Google-hosted Linux sandboxes",
-    "SEARCH — File Search now supports multimodal search, natively embedding and searching images with gemini-embedding-2 (GA)",
-    "TTS — gemini-3.1-flash-tts-preview now streams speech generation for lower-latency playback",
-    "MODEL — Gemini 3.5 Flash reaches GA and now powers gemini-flash-latest",
-    "DEPRECATION — Image generation models are scheduled to shut down on August 17, 2026; plan your migration",
+    "SPARK — Gemini Spark, Google's agentic assistant, arrives in the Gemini app for macOS and works on tasks on your behalf",
+    "BRIEF — Daily Brief, powered by Personal Intelligence, distills priorities from Gmail and Calendar with suggested next steps",
+    "MODEL — Gemini 3.5 Flash reaches GA, offering faster, lower-cost AI with a 1M-token context window",
+    "GROWTH — The Gemini app has passed 900 million monthly active users, up from 400 million a year earlier",
+    "APPS — Spark now connects to Google Tasks and Google Keep and stays up to date on topics in real time",
     "ENTERPRISE — Gemini 3.5 Flash is generally available across the Global, US, and EU regions on Gemini Enterprise",
   ],
 };
