@@ -1,0 +1,189 @@
+---
+title: "When My Paid Gemini Chat Bill Came in at Double the Estimate — Field Notes on Per-Request Token Accounting to Plug the Cost Leaks"
+slug: "gemini-25-pro-chat-service-cost-overrun-per-request-token-accounting-field-notes"
+category: "gemini-api"
+level: "intermediate"
+premium: true
+date: "2026-07-08T13:00"
+author: "Gemini Lab"
+description: "From a real overrun where my paid Gemini chat SaaS bill nearly doubled the estimate, here is how I logged token usage per request, traced where cost was leaking, and plugged three specific gaps. Recording usage_metadata and reconciling it against the invoice is the starting point."
+tags: ["Gemini 2.5 Pro", "Gemini API", "cost management", "usage_metadata", "SaaS operations"]
+highlights:
+  - "A token_ledger design that records usage_metadata per request and reconciles it against the monthly invoice to the cent"
+  - "A procedure that splits the gap from the estimate into three lanes: conversation-history bloat, cache writes that never get read, and retry double-billing"
+  - "How to protect margin using effective cost per request rather than the unit price table, after each leak is plugged"
+---
+I opened the Gemini invoice on the first of the month and just stared at it for a while. My estimate had put it around $60. The actual number was $128. Nearly double.
+
+Usage had grown exactly as expected. I checked the price table several times. Still it did not add up.
+
+The culprit was not the unit price. It was that I had trusted my paper assumption of "what one request costs" instead of measuring it. When you run a small paid chat service as an indie developer, that gap quietly eats your margin.
+
+This is a record of making that gap visible through per-request token accounting, finding three places where cost was leaking, and plugging them.
+
+## Face the gap with numbers, not feelings
+
+The first thing I did was stop reasoning by intuition.
+
+Every Gemini API response includes `usageMetadata`, carrying `promptTokenCount` (input), `candidatesTokenCount` (output), and `cachedContentTokenCount` (the cache-hit portion). I now save all of it, on every request, without exception.
+
+```javascript
+// A thin wrapper that accounts for tokens on every chat response
+async function generateWithAccounting({ model, contents, systemInstruction, userId, requestId }) {
+  const res = await model.generateContent({ contents, systemInstruction });
+  const u = res.response.usageMetadata ?? {};
+
+  // Rates are USD per 1M tokens (Gemini 2.5 Pro as of July 2026)
+  const RATE = { input: 1.5, output: 6.0, cacheHit: 0.375, cacheWrite: 2.25 };
+  const cached = u.cachedContentTokenCount ?? 0;
+  const inputBillable = (u.promptTokenCount ?? 0) - cached;
+  const costUsd =
+    (inputBillable / 1e6) * RATE.input +
+    (cached / 1e6) * RATE.cacheHit +
+    ((u.candidatesTokenCount ?? 0) / 1e6) * RATE.output;
+
+  await db.insert('token_ledger', {
+    request_id: requestId,
+    user_id: userId,
+    prompt_tokens: u.promptTokenCount ?? 0,
+    cached_tokens: cached,
+    output_tokens: u.candidatesTokenCount ?? 0,
+    est_cost_usd: costUsd,
+    created_at: new Date(),
+  });
+  return res;
+}
+```
+
+The important detail is subtracting `cachedContentTokenCount` from input before computing the billable amount. If you count the cache-hit portion at the full input rate, you swing the other way and overstate your cost.
+
+I let this `token_ledger` accumulate for a week and reconciled it against the pro-rated monthly invoice. In my environment the ledger total and the invoice differed by under 3%. So the ledger was trustworthy. That is where the real work began.
+
+## Bet that the culprit is one of three lanes
+
+Once I knew the ledger was trustworthy, I made a bet from my own experience as an indie developer. When the estimate and the invoice diverge, the cause almost always collapses into three lanes outside the unit price: input-token bloat, cache misses, and retry double-billing.
+
+From here I verify each of the three in the ledger, in order. Rather than suspecting everything by feel, narrowing to measurable hypotheses before touching code was the shortest way to avoid a detour.
+
+The design of recording `usage_metadata` itself is covered in [Tracking cost with Gemini API usage metadata in production](/articles/gemini-api/gemini-api-usage-metadata-cost-tracking-production). This piece is the sequel that turns that ledger into a hunt for the leak.
+
+## Leak 1: conversation history inflated every request's input
+
+I sorted the ledger by `prompt_tokens` descending, and had to look twice.
+
+The top requests were logging 8,000–12,000 tokens of input, almost across the board. My estimate had assumed 3,500 tokens of input per request.
+
+The culprit was conversation history. My implementation was stacking every message of the session into `contents` each time. After 20 turns, 20 turns of history are billed as input on every request.
+
+<table>
+  <thead>
+    <tr><th>Turns in the conversation</th><th>Input tokens per request</th><th>Input cost ($1.5/1M)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>3 turns</td><td>~3,500</td><td>$0.0053</td></tr>
+    <tr><td>10 turns</td><td>~7,800</td><td>$0.0117</td></tr>
+    <tr><td>20 turns</td><td>~12,400</td><td>$0.0186</td></tr>
+  </tbody>
+</table>
+
+The longer the conversation, the more expensive a single request. And the more engaged the user, the longer the conversation. In other words, my most valuable users were driving my cost the hardest.
+
+The fix was to stop stacking raw history, keep only the last few turns, and summarize everything before that.
+
+```javascript
+// Compress history into "recent turns verbatim + everything else summarized"
+function buildContents(history, summary, userMessage) {
+  const RECENT = 6; // keep the last 6 messages verbatim
+  const recent = history.slice(-RECENT);
+  const contents = [];
+  if (summary) {
+    // stack the summary once, as prior context
+    contents.push({ role: 'user', parts: [{ text: `Summary so far:\n${summary}` }] });
+  }
+  contents.push(...recent, { role: 'user', parts: [{ text: userMessage }] });
+  return contents;
+}
+```
+
+Summarizing costs API money too, but you summarize once every several turns. That is an order of magnitude cheaper than billing full history on every request. In my environment, the average input for long conversations dropped from 12,400 to 4,600 tokens, about a 63% reduction.
+
+## Leak 2: I was writing the cache but never reading it
+
+Next I suspected Context Caching. I thought I had it in place.
+
+But when I looked at `cached_tokens` in the ledger, most requests showed 0. Cache hits were barely happening. Meanwhile cache writes (Write, $2.25/1M) were occurring. Writing without ever reading — the worst of both worlds.
+
+There were two causes. First, the cache TTL was shorter than the average gap between turns in a session. If a user stepped away for a few minutes, the entry expired, and their next message triggered a rewrite. Second, the cached system prompt was being generated slightly dynamically per request. One character of difference makes it a different content and it never hits.
+
+```javascript
+// Cache only the truly fixed portion
+const STABLE_SYSTEM_PROMPT = readFileSync('./prompts/system.txt', 'utf-8'); // no dynamic parts
+
+const cache = await cacheManager.create({
+  model: 'gemini-2.5-pro',
+  systemInstruction: STABLE_SYSTEM_PROMPT, // fixed string; no username or timestamp injected
+  ttl: '1800s', // extended to 30 minutes to match session cadence
+});
+// User-specific variable data goes in contents, kept out of the cache target
+```
+
+You can check the cache hit rate straight from the ledger. If the hit rate stays low while Write keeps climbing, that is not saving — it is pure added cost. The approach of measuring hit rate to rebuild your caching is written up in [When context caching didn't cut the bill: measuring hit rate](/articles/gemini-api/gemini-api-context-caching-cost-optimization).
+
+After the fix, the cache hit rate for those sessions rose from 11% to 74%, and the input cost for the fixed prompt fell by roughly 80% in practice.
+
+## Leak 3: retries were quietly billing twice
+
+The third one took the longest to find.
+
+The total request count in the ledger was about 10% higher than the number of user messages in the app log. The difference was retries.
+
+On a timeout or a rate limit (429), my client re-sent automatically. But if the first request had already completed server-side and the connection dropped before the client received the response, the re-send billed the same generation again. Output tokens are not final until they return, so billing can occur even when it looks like a failure.
+
+```javascript
+// Wrap retries in an idempotency key so double generation is not billed
+async function generateIdempotent({ requestId, ...args }) {
+  const done = await db.get('token_ledger', { request_id: requestId });
+  if (done) return done; // already accounted = server processed it; do not re-send
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await generateWithAccounting({ requestId, ...args });
+    } catch (e) {
+      if (e.status === 429) {
+        // Exponential backoff, but re-check the ledger before re-sending
+        await sleep(2 ** attempt * 500);
+        const late = await db.get('token_ledger', { request_id: requestId });
+        if (late) return late;
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+```
+
+Issue one `requestId` per user message, and if it already exists in the ledger, do not re-send. That single change all but eliminated retry-driven extra billing on a ledger basis. The way retries amplify cost is also touched on in [Flash retry amplification and the break-even record](/articles/gemini-api/gemini-35-flash-effective-cost-retry-amplification-breakeven).
+
+## Watch margin by effective cost, not unit price
+
+After plugging the three leaks, the monthly invoice fell from $128 back to $61 — essentially matching the estimate.
+
+What I learned is that the price table is only a starting point. What actually protects the business is the effective cost per request: the ledger that tells you what "that user, that conversation, that one call" actually cost.
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>Before</th><th>After</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Avg input tokens for long conversations</td><td>~12,400</td><td>~4,600</td></tr>
+    <tr><td>Cache hit rate</td><td>11%</td><td>74%</td></tr>
+    <tr><td>Retry-driven surplus requests</td><td>~10%</td><td>under 1%</td></tr>
+    <tr><td>Monthly API invoice</td><td>$128</td><td>$61</td></tr>
+  </tbody>
+</table>
+
+These days, when I set a price plan, I pull "the monthly effective cost of one heavy Pro-plan user" from the ledger and check it. An estimate built from unit price times expected calls always leans optimistic. The ledger does not.
+
+The margin of a small paid service is protected not by flashy features but by this quiet reconciliation. If your estimate and your invoice ever diverge, start by accounting per request. The culprit is usually just outside the price table.
+
+I hope this helps anyone who has been surprised by their own invoice. With a single ledger, the first of next month arrives a lot more quietly.

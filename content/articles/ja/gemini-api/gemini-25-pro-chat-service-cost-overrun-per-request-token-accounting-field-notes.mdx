@@ -1,0 +1,189 @@
+---
+title: "有料チャットの Gemini 請求が見積りの倍になっていたとき — リクエスト単位でトークンを計上して原価の漏れを塞ぐ運用メモ"
+slug: "gemini-25-pro-chat-service-cost-overrun-per-request-token-accounting-field-notes"
+category: "gemini-api"
+level: "intermediate"
+premium: true
+date: "2026-07-08T13:00"
+author: "Gemini Lab"
+description: "有料チャットSaaSの Gemini 請求が見積りの倍に膨らんだ実体験から、リクエスト単位でトークンを計上し、原価が漏れている箇所を特定して塞ぐ運用手順をまとめました。usage_metadata の記録と請求の突き合わせが起点です。"
+tags: ["Gemini 2.5 Pro", "Gemini API", "コスト管理", "usage_metadata", "SaaS運用"]
+highlights:
+  - "usage_metadata をリクエストごとに保存し、月次請求と 1 円単位で突き合わせる記録テーブルの設計"
+  - "見積りとの乖離を「会話履歴の肥大」「キャッシュ書き込みの空振り」「リトライの二重課金」の 3 系統に切り分ける手順"
+  - "原価が漏れる 3 系統をそれぞれ塞いだ後の、単価ではなく実効原価で粗利を守る運用の勘所"
+---
+月初に届いた Gemini の請求を開いて、しばらく画面を見つめていました。見積りの段階では月 $60 前後のはずでした。実際の数字は $128。倍近い。
+
+利用者は想定どおりのペースで増えていました。単価表は何度も確認しました。それでも合わない。
+
+原因は単価ではありませんでした。「1 リクエストがいくらか」を、私が実測ではなく紙の上の前提で信じていたことでした。個人開発で運営している小さな有料チャットだからこそ、この差は粗利を静かに削っていきます。
+
+この記事は、その乖離をリクエスト単位のトークン計上で可視化し、原価が漏れている箇所を 3 つ見つけて塞いだときの記録です。
+
+## 見積りが合わない、を数字で受け止める
+
+最初にやったのは、感覚で語るのをやめることでした。
+
+Gemini API のレスポンスには `usageMetadata` が含まれます。ここに `promptTokenCount`（入力）、`candidatesTokenCount`（出力）、`cachedContentTokenCount`（キャッシュヒット分）が入っています。これを毎リクエスト、必ず保存します。
+
+```javascript
+// 全チャット応答でトークンを計上する薄いラッパ
+async function generateWithAccounting({ model, contents, systemInstruction, userId, requestId }) {
+  const res = await model.generateContent({ contents, systemInstruction });
+  const u = res.response.usageMetadata ?? {};
+
+  // 単価は 1M トークンあたりの USD（2026 年 7 月時点の Gemini 2.5 Pro）
+  const RATE = { input: 1.5, output: 6.0, cacheHit: 0.375, cacheWrite: 2.25 };
+  const cached = u.cachedContentTokenCount ?? 0;
+  const inputBillable = (u.promptTokenCount ?? 0) - cached;
+  const costUsd =
+    (inputBillable / 1e6) * RATE.input +
+    (cached / 1e6) * RATE.cacheHit +
+    ((u.candidatesTokenCount ?? 0) / 1e6) * RATE.output;
+
+  await db.insert('token_ledger', {
+    request_id: requestId,
+    user_id: userId,
+    prompt_tokens: u.promptTokenCount ?? 0,
+    cached_tokens: cached,
+    output_tokens: u.candidatesTokenCount ?? 0,
+    est_cost_usd: costUsd,
+    created_at: new Date(),
+  });
+  return res;
+}
+```
+
+ここで大事なのは、`cachedContentTokenCount` を入力から差し引いてから課金対象を計算している点です。キャッシュヒット分を通常入力単価で二重に数えると、今度は原価を過大に見積もってしまいます。
+
+この `token_ledger` を一週間ためて、月次請求の日割りと突き合わせました。私の環境では記録合計と請求の差は 3% 以内。つまり台帳は信頼できる。ここからが本題です。
+
+## 疑うべきは 3 系統だと当たりをつける
+
+台帳が信頼できると分かった時点で、私自身の経験から当たりをつけました。見積りと請求がずれるとき、原因はたいてい単価の外側にある 3 系統に集約されます。ひとつは入力トークンの肥大、ふたつめはキャッシュの空振り、みっつめはリトライの二重課金です。
+
+以降はこの 3 つを台帳で順に検証していきます。感覚で全部を疑うのではなく、計測できる仮説に絞ってから手を動かすのが、遠回りを避ける近道でした。
+
+なお、`usage_metadata` の記録そのものの設計は [Gemini API の使用量メタデータで原価を追跡する本番設計](/articles/gemini-api/gemini-api-usage-metadata-cost-tracking-production) に土台を書いています。本稿はその台帳を「乖離の犯人探し」に使う続きにあたります。
+
+## 漏れ①：会話履歴が毎リクエスト入力を押し上げていた
+
+台帳を `prompt_tokens` の降順で並べて、まず目を疑いました。
+
+上位のリクエストが軒並み 8,000〜12,000 tokens の入力を計上していたのです。見積りでは 1 リクエストの入力を 3,500 tokens と置いていました。
+
+犯人は会話履歴でした。私の実装は、セッションの全メッセージを毎回そのまま `contents` に積んでいました。会話が 20 往復すれば、20 往復分の履歴が毎リクエスト入力として課金されます。
+
+<table>
+  <thead>
+    <tr><th>会話の往復数</th><th>1 リクエストの入力トークン</th><th>入力原価（$1.5/1M）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>3 往復</td><td>約 3,500</td><td>$0.0053</td></tr>
+    <tr><td>10 往復</td><td>約 7,800</td><td>$0.0117</td></tr>
+    <tr><td>20 往復</td><td>約 12,400</td><td>$0.0186</td></tr>
+  </tbody>
+</table>
+
+長い会話ほど 1 リクエストが高くなる。しかも継続利用してくれる熱心なユーザーほど会話が長い。つまり最も大切な利用者が最も原価を押し上げていました。
+
+対策は、履歴をそのまま積むのをやめて、直近数往復だけを残し、それ以前は要約してから積む方式に変えました。
+
+```javascript
+// 履歴を「直近そのまま + それ以前は要約」で圧縮する
+function buildContents(history, summary, userMessage) {
+  const RECENT = 6; // 直近 6 メッセージは原文のまま
+  const recent = history.slice(-RECENT);
+  const contents = [];
+  if (summary) {
+    // 要約はシステム側の前提として 1 度だけ積む
+    contents.push({ role: 'user', parts: [{ text: `これまでの要約:\n${summary}` }] });
+  }
+  contents.push(...recent, { role: 'user', parts: [{ text: userMessage }] });
+  return contents;
+}
+```
+
+要約自体にも API 費用はかかりますが、要約は数往復に 1 回。毎リクエストで全履歴を課金するより桁で安く済みます。私の環境では、長い会話の平均入力が 12,400 → 4,600 tokens に下がりました。約 63% の削減です。
+
+## 漏れ②：キャッシュを書いているのに読めていなかった
+
+次に疑ったのは Context Caching です。導入済みのつもりでした。
+
+ところが台帳の `cached_tokens` を見ると、大半のリクエストで 0。キャッシュヒットがほとんど起きていませんでした。それでいてキャッシュ書き込み（Write、$2.25/1M）は発生している。つまり書くだけ書いて読めていない、最悪の状態です。
+
+原因は 2 つありました。ひとつは、キャッシュの有効期間（TTL）がセッションの平均間隔より短かったこと。ユーザーが数分席を外すと期限切れになり、次の発言で書き直しになっていました。もうひとつは、キャッシュ対象のシステムプロンプトを、リクエストごとにわずかに動的生成していたこと。1 文字でも違えば別コンテンツ扱いで、ヒットしません。
+
+```javascript
+// キャッシュは「完全に固定な部分」だけを対象にする
+const STABLE_SYSTEM_PROMPT = readFileSync('./prompts/system.txt', 'utf-8'); // 動的要素を混ぜない
+
+const cache = await cacheManager.create({
+  model: 'gemini-2.5-pro',
+  systemInstruction: STABLE_SYSTEM_PROMPT, // 固定文字列。ユーザー名や時刻を差し込まない
+  ttl: '1800s', // セッション間隔に合わせて 30 分に延長
+});
+// ユーザー固有の可変情報は contents 側に置き、キャッシュ対象から外す
+```
+
+キャッシュヒット率は台帳ですぐ確認できます。ヒット率が低いまま Write だけ増えているなら、それは節約ではなく純粋な追加コストです。キャッシュの命中率を計測して立て直す考え方は [Context Caching を入れても請求が減らなかったときのヒット率計測メモ](/articles/gemini-api/gemini-api-context-caching-cost-optimization) に詳しく書きました。
+
+修正後、対象セッションのキャッシュヒット率は 11% から 74% に上がり、固定プロンプト分の入力原価は実測で 8 割ほど落ちました。
+
+## 漏れ③：リトライが静かに二重課金していた
+
+3 つ目は見つけるのに一番時間がかかりました。
+
+台帳の総リクエスト数が、アプリのログに残るユーザー発言数より 1 割ほど多かったのです。差分はリトライでした。
+
+タイムアウトやレート制限（429）で失敗したとき、私のクライアントは自動再送していました。ところが最初のリクエストがサーバー側で完了していても、クライアントが応答を受け取る前に切れると、再送で「同じ生成をもう一度」課金されます。出力トークンは戻ってくるまで確定しないので、失敗に見えても課金は発生していることがあります。
+
+```javascript
+// リトライを冪等キーで包み、二重生成を課金しない
+async function generateIdempotent({ requestId, ...args }) {
+  const done = await db.get('token_ledger', { request_id: requestId });
+  if (done) return done; // 既に計上済み = サーバーは処理済み。再送しない
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await generateWithAccounting({ requestId, ...args });
+    } catch (e) {
+      if (e.status === 429) {
+        // Exponential backoff。ただし再送前に台帳を再確認
+        await sleep(2 ** attempt * 500);
+        const late = await db.get('token_ledger', { request_id: requestId });
+        if (late) return late;
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+```
+
+`requestId` をユーザー発言ごとに 1 つ発行し、台帳に既にあれば再送しない。この 1 点で、リトライ由来の余分な課金は台帳ベースでほぼ消えました。リトライがコストを増幅させる構造は [Flash のリトライ増幅と損益分岐の記録](/articles/gemini-api/gemini-35-flash-effective-cost-retry-amplification-breakeven) でも触れています。
+
+## 単価ではなく「実効原価」で粗利を見る
+
+3 つの漏れを塞いだ後、月次請求は $128 から $61 に戻りました。見積りにほぼ一致します。
+
+ここで学んだのは、単価表は出発点でしかないということです。実際に事業を守るのは、リクエスト単位の実効原価、つまり「そのユーザーの、その会話の、その 1 回」がいくらだったかという台帳です。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>塞ぐ前</th><th>塞いだ後</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>長い会話の平均入力トークン</td><td>約 12,400</td><td>約 4,600</td></tr>
+    <tr><td>キャッシュヒット率</td><td>11%</td><td>74%</td></tr>
+    <tr><td>リトライ由来の余剰リクエスト</td><td>約 10%</td><td>1% 未満</td></tr>
+    <tr><td>月次 API 請求</td><td>$128</td><td>$61</td></tr>
+  </tbody>
+</table>
+
+私は今、価格プランを決めるときも「Pro プランのヘビーユーザー 1 人の月間実効原価」を台帳から引いて確認しています。単価 × 想定回数で置いた見積りは、いつも楽観に傾きます。台帳は楽観をしません。
+
+小さな有料サービスの粗利は、派手な機能ではなく、この地味な突き合わせで守られます。見積りと請求がずれたと感じたら、まずリクエスト単位で計上すること。犯人はたいてい、単価表の外側にいます。
+
+同じように請求で驚いた方の役に立てば幸いです。台帳ひとつで、次の月初は静かに迎えられるようになります。
