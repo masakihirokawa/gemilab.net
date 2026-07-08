@@ -1,0 +1,231 @@
+---
+title: "When Your Knowledge Base Shifts Mid-Run: Pinning File Search to an Execution Epoch for Consistent Agent Grounding"
+slug: "gemini-managed-agent-file-search-grounding-snapshot-consistency"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-08T13:10"
+author: "Gemini Lab"
+description: "When a File Search store is updated while a Managed Agent is running, a single execution can mix old and new grounding. Borrowing MVCC ideas, pinning an execution epoch keeps one agent run's evidence consistent. Here is the design and implementation."
+tags: ["Gemini API", "Managed Agents", "File Search", "RAG", "Architecture"]
+highlights:
+  - "A concrete implementation that pins an execution epoch so a single agent run always sees one consistent snapshot of search results"
+  - "The write-side design that turns updates and deletes into soft deletes, with a cost estimate for when to prune"
+  - "How to build drift detection and a fail-safe for when grounding shifts mid-run"
+---
+
+I was tracing an agent run that a nightly batch had produced, and I stopped cold.
+
+The generated artifact justified its conclusion using a passage from an internal document. But that document had already been retired by a separate update process running at the same moment. The first half of the run cited the old revision; the second half cited the new one. Within a single execution, the grounding had swapped underneath it.
+
+Managed Agents now run autonomously inside Google-hosted, isolated sandboxes, and File Search has reached GA with multimodal support. Behind the comfort of handing off the runtime, there is an easy trap to miss: a single agent run stretches from tens of seconds to several minutes, and the knowledge base keeps moving the entire time.
+
+This article lays out a design for treating an agent execution as a single consistent snapshot, together with the implementation. It is an attempt to bring MVCC — multiversion concurrency control, familiar from databases — into File Search. As an indie developer running apps solo at Dolice, I welcome handing off the runtime; grounding consistency, though, is the one piece I still want to hold in my own hands.
+
+## Why an Agent Run Needs a Consistency Boundary
+
+For a one-shot question, this problem never surfaces. Search, answer, done. It takes milliseconds, and the odds of a store mutating in that window are low.
+
+An agent execution is different. It plans, searches several times, runs code partway through, then searches again. This whole sequence behaves like a single transaction, yet each intermediate search independently reaches for the latest store.
+
+The result is inconsistency like this:
+
+<table>
+<thead>
+<tr><th>Time</th><th>Agent side</th><th>Store side</th><th>Read result</th></tr>
+</thead>
+<tbody>
+<tr><td>T0</td><td>Run starts, searches doc-A</td><td>—</td><td>doc-A v1 (old)</td></tr>
+<tr><td>T1</td><td>—</td><td>doc-A updated to v2, v1 retired</td><td>—</td></tr>
+<tr><td>T2</td><td>Searches doc-A again</td><td>—</td><td>doc-A v2 (new)</td></tr>
+<tr><td>T3</td><td>Blends v1 and v2 into a conclusion</td><td>—</td><td>Contradictory artifact</td></tr>
+</tbody>
+</table>
+
+In distributed-systems terms, this is a torn read. Without read consistency, the agent cannot notice that the premise of its own reasoning changed midway.
+
+The key is not to solve this with full concurrency control. Freezing writes to the store while the agent runs is impractical — it would mean stopping the production app that is your revenue's front door. What you actually need is a mechanism that lets writes continue freely while the reader — the agent — keeps seeing "the world as it was the instant the run began."
+
+## Give Metadata a Version History
+
+File Search lets you attach metadata to chunks and filter on it at query time. We repurpose that mechanism for versioning.
+
+Each chunk carries two fields describing its validity window:
+
+- `active_from`: the logical time the chunk became active (a monotonically increasing integer epoch)
+- `retired_at`: the logical time it was invalidated. A large sentinel value (e.g., 9999999999) while still live.
+
+An update is no longer an overwrite; it becomes "retire the old revision, add the new one." A delete is not a physical removal but a soft delete that sets `retired_at` to the current epoch. With this, the state at any past point can be reconstructed from a filter expression alone.
+
+Use a logical counter that increments per write, not wall-clock time — clocks can go backward under skew. Stand up a single counter (a transactional Firestore increment, or an atomic KV add) as your one "version issuer."
+
+```python
+# Version issuer: hands out a monotonically increasing epoch on each write.
+# Assumes an atomic KV increment (Firestore / Redis / Durable Object all work).
+
+def next_epoch(kv) -> int:
+    # Atomic add. Returns a monotonic value with no duplicates under concurrency.
+    return kv.incr("filesearch:epoch")
+
+def now_epoch(kv) -> int:
+    v = kv.get("filesearch:epoch")
+    return int(v) if v is not None else 0
+```
+
+## Implementation: Pin the Execution Epoch to Snapshot Every Search
+
+At the instant an agent run starts, read the epoch exactly once and reuse it for the whole execution. This is "pinning the snapshot."
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+class GroundingSnapshot:
+    """A pinned evidence view used by one agent execution."""
+
+    SENTINEL = 9_999_999_999  # sentinel value for retired_at
+
+    def __init__(self, kv, store_name: str):
+        # Fix the epoch exactly once, at run start.
+        self.epoch = now_epoch(kv)
+        self.store_name = store_name
+
+    def _snapshot_filter(self) -> str:
+        # Only chunks where active_from <= run epoch < retired_at.
+        e = self.epoch
+        return f"active_from <= {e} AND retired_at > {e}"
+
+    def search(self, query: str, top_k: int = 8):
+        tool = types.Tool(
+            file_search=types.FileSearch(
+                file_search_store_names=[self.store_name],
+                metadata_filter=self._snapshot_filter(),
+            )
+        )
+        resp = client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=query,
+            config=types.GenerateContentConfig(tools=[tool]),
+        )
+        return resp
+```
+
+The crux is that `metadata_filter` is bound to a constant — the execution epoch. No matter how many times `search()` is called later in the run, the filter always references the same `self.epoch`. If v2 lands in the store partway through, its `active_from` is greater than the execution epoch, so this snapshot never sees it. The retired v1 stays visible as long as its `retired_at` exceeds the execution epoch.
+
+As a result, the agent observes "the world as it was at run start" consistently to the end. The write side never has to pause.
+
+## The Write Side: Soft Delete Preserves the Past
+
+Reader consistency only holds if writers never destroy the past. We unify updates and deletes into operations that append versions.
+
+```python
+def upsert_document(client, store_name, kv, doc_id, new_chunks):
+    """Retire the old revision, add the new one. Never physically delete."""
+    e = next_epoch(kv)
+
+    # 1) Set retired_at on the old-revision chunks to the current epoch.
+    for chunk in list_active_chunks(client, store_name, doc_id):
+        client.file_search_stores.update_chunk_metadata(
+            store=store_name,
+            chunk_name=chunk.name,
+            metadata={"retired_at": e},
+        )
+
+    # 2) Add the new-revision chunks with active_from = e.
+    for c in new_chunks:
+        client.file_search_stores.upload_chunk(
+            store=store_name,
+            content=c["text"],
+            metadata={
+                "doc_id": doc_id,
+                "rev": c["rev"],
+                "active_from": e,
+                "retired_at": GroundingSnapshot.SENTINEL,
+            },
+        )
+```
+
+A delete becomes a retire-only operation with no accompanying add. Now, whichever execution epoch you read from, the set of chunks that were live at that moment is uniquely determined.
+
+Note that the signatures of `update_chunk_metadata` and `upload_chunk` vary by release. I have written them here as adapters to show the skeleton of the design. In a real project, wrap these two calls in a thin layer so that API changes stay contained in one place — it makes operations far easier.
+
+## Drift Detection and a Fail-Safe Mid-Run
+
+A snapshot preserves consistency, but a separate risk remains: an agent running on too old a view of the world. The longer the run, the wider the gap between the pinned epoch and the latest one.
+
+So at execution checkpoints, measure the drift and switch strategy once it crosses a threshold.
+
+```python
+def drift_guard(kv, snapshot, max_lag: int = 200):
+    """Measure the gap between pinned and latest epoch; decide on deviation."""
+    current = now_epoch(kv)
+    lag = current - snapshot.epoch
+    if lag <= max_lag:
+        return {"action": "continue", "lag": lag}
+    # If the gap is too wide, it is safer to discard partial work and
+    # restart under a fresh epoch.
+    return {
+        "action": "restart",
+        "lag": lag,
+        "reason": "grounding snapshot too stale",
+    }
+```
+
+You decide `max_lag` per domain. Make it large for gently changing areas like a catalog, small for areas where freshness is everything, like pricing or inventory. What matters is baking the premise into the design explicitly: freshness and consistency are a trade-off. `drift_guard` is the guardian that keeps you from silently sacrificing one for the other.
+
+Beyond that, always stamp the pinned epoch onto the artifact itself. When you trace a run later, "which version of the world did this agent see?" becomes instantly answerable. Investigating an inconsistency like the one I opened with turns from guesswork into fact-checking.
+
+## Cost and Pruning: You Cannot Stack Soft Deletes Forever
+
+Soft deletes preserve the past, which grows both storage and the search surface. Leave retired chunks around and every search pays to filter them out — waste that compounds.
+
+Here is a rough estimate for a store of 100,000 live chunks averaging 800 tokens, assuming a 5% daily update rate.
+
+<table>
+<thead>
+<tr><th>Elapsed (no pruning)</th><th>Cumulative chunks</th><th>Retired share</th><th>Search filter load</th></tr>
+</thead>
+<tbody>
+<tr><td>Day 1</td><td>100,000</td><td>0%</td><td>Baseline</td></tr>
+<tr><td>After 30 days</td><td>~250,000</td><td>~60%</td><td>~2.5x</td></tr>
+<tr><td>After 90 days</td><td>~550,000</td><td>~82%</td><td>~5.5x</td></tr>
+</tbody>
+</table>
+
+The pruning principle is simple: "a chunk retired before the epoch of the oldest run that could still be executing will never be read again." So track the minimum epoch across all in-flight runs as a `low_watermark`, and physically delete only retired chunks older than that.
+
+```python
+def prune_below_watermark(client, store_name, active_runs):
+    """Physically delete chunks retired below the minimum epoch of all runs."""
+    if not active_runs:
+        return 0
+    low_watermark = min(r.epoch for r in active_runs)
+    deleted = 0
+    for chunk in list_retired_chunks(client, store_name):
+        if chunk.metadata["retired_at"] < low_watermark:
+            client.file_search_stores.delete_chunk(
+                store=store_name, chunk_name=chunk.name
+            )
+            deleted += 1
+    return deleted
+```
+
+Run this once a day in a lull between updates, and the retired share stays within a few percent. As long as the low watermark is your reference, you will never mistakenly delete a chunk that a running agent depends on. Delete only what is safe to delete, reliably. That is the operational heart of it.
+
+## Adoption Checklist
+
+I recommend introducing this in stages. Rather than applying it wholesale to an existing store at once, narrow the blast radius and widen it as you confirm results.
+
+1. Stand up one version issuer (monotonic epoch) and verify its atomicity
+2. Switch to always attaching `active_from` / `retired_at` to new chunks
+3. Replace updates and deletes with soft deletes (retire + add)
+4. Create `GroundingSnapshot` exactly once at the agent's entry point and share it across every search
+5. Stamp the pinned epoch onto the artifact and the trace
+6. Set the `drift_guard` threshold per domain
+7. Run a low-watermark pruning job daily
+
+Now that we can hand the runtime off to Managed Agents, what remains ours to design is "what we let the agent see." We can offload the care of the execution environment, but the consistency of the grounding stays our responsibility.
+
+Consistency is expensive to add after the fact. Pinning a snapshot starts with just two versioning fields. Introduce it small, and see how much more readable your traces become. Thank you for reading.

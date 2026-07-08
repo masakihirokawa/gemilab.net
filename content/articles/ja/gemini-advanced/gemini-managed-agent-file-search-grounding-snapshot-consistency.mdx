@@ -1,0 +1,232 @@
+---
+title: "Managed Agent の実行中に知識ベースが書き換わる問題 — File Search を実行エポックで固定する一貫性設計"
+slug: "gemini-managed-agent-file-search-grounding-snapshot-consistency"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-08T13:10"
+author: "Gemini Lab"
+description: "Managed Agents の自律実行中に File Search ストアが更新されると、同じ実行の中で古い根拠と新しい根拠が混ざります。MVCCに倣った実行エポックの固定で、エージェント1回分の根拠を一貫させる設計と実装をまとめました。"
+tags: ["Gemini API", "Managed Agents", "File Search", "RAG", "アーキテクチャ"]
+highlights:
+  - "実行エポックを固定して、エージェント1回分の検索結果を一貫したスナップショットに揃える具体的な実装"
+  - "更新・削除をソフトデリート化する書き込み側の設計と、剪定タイミングのコスト試算"
+  - "実行中に根拠がずれたときのドリフト検知とフェイルセーフの組み方"
+---
+
+深夜のバッチが吐いたエージェントの実行トレースを追っていて、手が止まりました。
+
+生成された成果物は、ある社内向けドキュメントの記述を根拠に結論を出しています。ところが、そのドキュメントは同じ時刻に走っていた別の更新処理で、すでに retired 扱いにしたはずのものでした。エージェントの前半では旧版を引き、後半では新版を引いている。1回の実行の中で、根拠が入れ替わっていたのです。
+
+Managed Agents が Google ホストの隔離サンドボックスで自律的に走るようになり、File Search はマルチモーダル対応の GA へと進みました。実行環境を預けられる安心感の裏で、見落としやすい落とし穴があります。エージェントの1回の実行は数十秒から数分に及び、その間もナレッジベースは動き続けているということです。
+
+ここで扱うのは、エージェント実行を「一貫したスナップショット」として扱うための設計です。実装まで含めて整理いたします。データベースの世界で言うところの、MVCC（多版型同時実行制御）の発想を File Search に持ち込む試みでもあります。個人開発でアプリを回している私自身にとって、実行環境を預けられる流れは歓迎したいものです。ただ、根拠の一貫性だけは自分の手で握っておきたい。そう感じた記録でもあります。
+
+## なぜエージェント実行に一貫性の境界が要るのか
+
+単発の質問応答であれば、この問題は表面化しません。検索して、答えて、終わり。所要時間はミリ秒単位で、その間にストアが書き換わる確率は低いからです。
+
+エージェントの実行は事情が違います。計画を立て、複数回検索し、途中でコードを実行し、また検索する。この一連の流れが一つの「トランザクション」のように振る舞うにもかかわらず、途中の各検索は独立して最新のストアを見にいきます。
+
+結果として、次のような不整合が生まれます。
+
+<table>
+<thead>
+<tr><th>時刻</th><th>エージェント側</th><th>ストア側</th><th>読み取り結果</th></tr>
+</thead>
+<tbody>
+<tr><td>T0</td><td>実行開始・doc-A を検索</td><td>—</td><td>doc-A v1（旧版）</td></tr>
+<tr><td>T1</td><td>—</td><td>doc-A を v2 に更新、v1 を retire</td><td>—</td></tr>
+<tr><td>T2</td><td>doc-A を再検索</td><td>—</td><td>doc-A v2（新版）</td></tr>
+<tr><td>T3</td><td>v1 と v2 を混ぜて結論生成</td><td>—</td><td>矛盾した成果物</td></tr>
+</tbody>
+</table>
+
+これは分散システムでいう「破れた読み取り（torn read）」です。読み取りの一貫性が保証されないと、エージェントは自分の推論の前提が途中で崩れたことに気づけません。
+
+ポイントは、これを完全な同時実行制御で解こうとしないことです。ストアへの書き込みを止めてエージェントを走らせるのは非現実的で、収益の入り口である本番アプリを止めることになります。必要なのは、書き込みは自由に続けさせたまま、読み手であるエージェントには「実行を始めた瞬間の世界」を見せ続ける仕組みです。
+
+## メタデータに版管理を持たせる
+
+File Search はチャンクにメタデータを付与でき、検索時にフィルタをかけられます。この機構を版管理に転用します。
+
+各チャンクに、有効期間を表す2つのフィールドを持たせます。
+
+- `active_from`: そのチャンクが有効になった論理時刻（単調増加する整数エポック）
+- `retired_at`: 無効化された論理時刻。現役なら大きな番兵値（例: 9999999999）
+
+更新は「上書き」ではなく「旧版を retire して新版を追加する」操作に置き換えます。削除も物理削除ではなく `retired_at` を現在エポックに設定するソフトデリートです。こうすると、過去のどの時点の状態も、フィルタ式だけで復元できます。
+
+エポックは実時刻ではなく、書き込みごとに増える論理カウンタを使います。実時刻はクロックのずれで逆転しうるからです。単一のカウンタ（例えば Firestore のトランザクショナルなインクリメント、または KV の原子的加算）を「版発行器」として1本用意します。
+
+```python
+# 版発行器: 書き込みのたびに単調増加するエポックを払い出す
+# KV の原子的インクリメントを想定（Firestore / Redis / Durable Object いずれでも可）
+
+def next_epoch(kv) -> int:
+    # 原子的加算。並行書き込みでも重複しない単調増加値を返す
+    return kv.incr("filesearch:epoch")
+
+def now_epoch(kv) -> int:
+    v = kv.get("filesearch:epoch")
+    return int(v) if v is not None else 0
+```
+
+## 実装：実行エポックを固定して検索をスナップショット化する
+
+エージェントの実行を開始する瞬間に、その時点のエポックを1回だけ読み、実行全体で使い回します。これが「スナップショットの固定」です。
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+class GroundingSnapshot:
+    """エージェント1回の実行で使う、固定された根拠ビュー。"""
+
+    SENTINEL = 9_999_999_999  # retired_at の番兵値
+
+    def __init__(self, kv, store_name: str):
+        # 実行開始時に一度だけエポックを確定する
+        self.epoch = now_epoch(kv)
+        self.store_name = store_name
+
+    def _snapshot_filter(self) -> str:
+        # active_from <= 実行エポック < retired_at のチャンクだけを見る
+        e = self.epoch
+        return (
+            f"active_from <= {e} AND retired_at > {e}"
+        )
+
+    def search(self, query: str, top_k: int = 8):
+        tool = types.Tool(
+            file_search=types.FileSearch(
+                file_search_store_names=[self.store_name],
+                metadata_filter=self._snapshot_filter(),
+            )
+        )
+        resp = client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=query,
+            config=types.GenerateContentConfig(tools=[tool]),
+        )
+        return resp
+```
+
+肝は `metadata_filter` が実行エポックという定数に束ねられている点です。実行の後半で `search()` を何度呼んでも、フィルタは常に同じ `self.epoch` を参照します。途中でストアに v2 が追加されても、その `active_from` は実行エポックより大きいため、このスナップショットからは見えません。retire された v1 は `retired_at` が実行エポックより大きい限り見え続けます。
+
+結果として、エージェントは「実行を始めた瞬間の世界」を最後まで一貫して観測します。書き込み側は一切止める必要がありません。
+
+## 書き込み側：ソフトデリートで過去を残す
+
+読み手の一貫性は、書き手が過去を壊さないことで初めて成立します。更新と削除を、版を積み増す操作に統一します。
+
+```python
+def upsert_document(client, store_name, kv, doc_id, new_chunks):
+    """旧版を retire し、新版を追加する。物理削除はしない。"""
+    e = next_epoch(kv)
+
+    # 1) 旧版チャンクの retired_at を現在エポックに更新
+    for chunk in list_active_chunks(client, store_name, doc_id):
+        client.file_search_stores.update_chunk_metadata(
+            store=store_name,
+            chunk_name=chunk.name,
+            metadata={"retired_at": e},
+        )
+
+    # 2) 新版チャンクを active_from = e で追加
+    for c in new_chunks:
+        client.file_search_stores.upload_chunk(
+            store=store_name,
+            content=c["text"],
+            metadata={
+                "doc_id": doc_id,
+                "rev": c["rev"],
+                "active_from": e,
+                "retired_at": GroundingSnapshot.SENTINEL,
+            },
+        )
+```
+
+削除は新版の追加を省いた retire 単独の操作になります。これで、いつの実行エポックから読んでも、その時点で現役だったチャンクの集合が一意に定まります。
+
+なお、`update_chunk_metadata` や `upload_chunk` のシグネチャは提供時期によって差異があります。ここでは設計の骨格を示すためのアダプタとして書いています。実際のプロジェクトでは、この2関数を薄いラッパにまとめ、API の変更を1箇所に閉じ込めておくと運用が楽になります。
+
+## 実行中のドリフト検知とフェイルセーフ
+
+スナップショットで一貫性は保てますが、「エージェントが古すぎる世界を見て走り続ける」リスクは別に残ります。実行が長引くほど、固定したエポックと最新エポックの差は開きます。
+
+そこで、実行の節目でドリフト量を測り、閾値を超えたら方針を切り替えます。
+
+```python
+def drift_guard(kv, snapshot, max_lag: int = 200):
+    """固定エポックと最新エポックの差を測り、逸脱時に判断を返す。"""
+    current = now_epoch(kv)
+    lag = current - snapshot.epoch
+    if lag <= max_lag:
+        return {"action": "continue", "lag": lag}
+    # 差が開きすぎた場合、途中生成物を破棄して新エポックで再実行する方が安全
+    return {
+        "action": "restart",
+        "lag": lag,
+        "reason": "grounding snapshot too stale",
+    }
+```
+
+`max_lag` はドメインで決めます。カタログのように更新が穏やかな領域なら大きく、価格や在庫のように鮮度が命の領域なら小さく取ります。ここで大切なのは、鮮度と一貫性はトレードオフだという前提を、設計に明示的に埋め込んでおくことです。片方を暗黙に犠牲にしないための番人が `drift_guard` です。
+
+さらに、成果物にはその実行が固定したエポックを必ず刻んでおきます。後からトレースを追うとき、「このエージェントはどの版の世界を見ていたか」が即座に分かります。冒頭のような不整合の原因調査が、推測ではなく事実の照合になります。
+
+## コストと剪定：ソフトデリートは無限には積めない
+
+ソフトデリートは過去を残すぶん、ストレージと検索対象を増やします。retire したチャンクを放置すれば、検索のたびにフィルタで弾く無駄が積み上がります。
+
+現役チャンク10万件・平均800トークンのストアで、1日あたり更新率5%を想定した概算を示します。
+
+<table>
+<thead>
+<tr><th>剪定なしの経過</th><th>累積チャンク数</th><th>retired の割合</th><th>検索フィルタ負荷</th></tr>
+</thead>
+<tbody>
+<tr><td>初日</td><td>100,000</td><td>0%</td><td>基準</td></tr>
+<tr><td>30日後</td><td>約 250,000</td><td>約 60%</td><td>約 2.5 倍</td></tr>
+<tr><td>90日後</td><td>約 550,000</td><td>約 82%</td><td>約 5.5 倍</td></tr>
+</tbody>
+</table>
+
+剪定の原則はシンプルです。「現在走りうる最も古い実行のエポックより前に retire されたチャンクは、二度と読まれない」。したがって、稼働中の全実行の最小エポックを `low_watermark` として把握し、それより古い retired チャンクだけを安全に物理削除します。
+
+```python
+def prune_below_watermark(client, store_name, active_runs):
+    """全稼働実行の最小エポック未満で retire 済みのチャンクを物理削除する。"""
+    if not active_runs:
+        return 0
+    low_watermark = min(r.epoch for r in active_runs)
+    deleted = 0
+    for chunk in list_retired_chunks(client, store_name):
+        if chunk.metadata["retired_at"] < low_watermark:
+            client.file_search_stores.delete_chunk(
+                store=store_name, chunk_name=chunk.name
+            )
+            deleted += 1
+    return deleted
+```
+
+この剪定を1日1回、更新の谷間に走らせるだけで、retired の割合は数パーセントに収まります。低ウォーターマークを基準にする限り、走行中のエージェントが参照するチャンクを誤って消すことはありません。安全に消せるものだけを、確実に消す。ここが運用の勘所です。
+
+## 導入チェックリスト
+
+段階的に入れることをおすすめします。既存のストアにいきなり全面適用するより、影響範囲を絞って確かめながら広げるほうが確実です。
+
+1. 版発行器（単調増加エポック）を1本用意し、原子性を確認する
+2. 新規チャンクに `active_from` / `retired_at` を必ず付与する運用へ切り替える
+3. 更新・削除を retire + 追加のソフトデリートに置き換える
+4. エージェント実行の入口で `GroundingSnapshot` を1回だけ生成し、全検索で共有する
+5. 成果物とトレースに固定エポックを刻む
+6. `drift_guard` の閾値をドメインごとに設定する
+7. 低ウォーターマーク基準の剪定ジョブを日次で回す
+
+Managed Agents に実行環境を預けられるようになったぶん、私たちが引き受けるべきは「エージェントに何を見せるか」の設計です。実行環境の面倒は預けられても、根拠の一貫性は自分たちの責務として残ります。
+
+一貫性は、あとから足すと高くつきます。スナップショットの固定は、版管理のフィールドを2つ足すだけで始められます。小さく入れて、トレースが素直に読めるようになる感触を確かめていただければ嬉しいです。お読みいただきありがとうございました。
