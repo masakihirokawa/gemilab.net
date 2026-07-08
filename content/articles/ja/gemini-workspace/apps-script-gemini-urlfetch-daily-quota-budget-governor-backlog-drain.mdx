@@ -1,0 +1,258 @@
+---
+title: "Apps Script の Gemini 自動化が月末に必ず止まる — UrlFetch 日次上限を溶かさない予算ガバナー設計"
+slug: "apps-script-gemini-urlfetch-daily-quota-budget-governor-backlog-drain"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-07-08T15:58"
+author: "Gemini Lab"
+description: "Apps Script から Gemini を呼ぶ自動化は、6分上限やトリガー本数とは別に UrlFetch の日次呼び出し上限で静かに止まります。件数が増えた日だけ落ちる問題を、日次予算ガバナーとバックログ繰り越しで捌き切る設計と動くコードにまとめます。"
+tags: ["Apps Script", "Gemini API", "UrlFetchApp", "Google Workspace", "自動化"]
+highlights:
+  - "6分実行上限・トリガー本数とは別の第3の天井である UrlFetch 日次呼び出し上限（consumer 20,000 回/日）が、件数が増えた日だけ自動化を落とす仕組みを再現コードで理解できます"
+  - "Script Properties に日次予算台帳を持たせ、タイムゾーン境界でリセットする token-bucket 型ガバナーの完全な Apps Script コードを、そのまま貼って使えます"
+  - "急増した日のバックログを翌日以降へ繰り越して捌き切る設計を、決定論シミュレーションの実数値（スパイク後3日で解消）つきで検証できます"
+---
+
+月末になると、決まって同じ自動化が止まっていました。
+
+私は個人開発でいくつかのアプリを運営していて、そのうちのいくつかはユーザーレビューへの返信文の下書きや、壁紙の新規追加分へのタグ付けを Apps Script から Gemini に投げて回しています。ふだんは何事もなく流れているのに、月のうち数日だけ、実行ログに見慣れないエラーが残る。しかも決まって、レビューがどっと増えた翌日でした。
+
+最初はレート制限（429）を疑いました。けれど 429 なら指数バックオフで捌けるはずです。ログをたどると、止まっていたのは Gemini 側ではなく Apps Script 側でした。`Service invoked too many times for one day: urlfetch` ——UrlFetch の日次呼び出し上限に当たっていたのです。
+
+この記事は、6分の実行上限でもトリガー本数の上限でもない、`UrlFetchApp` の**日次呼び出し上限**という第3の天井に焦点を当てます。件数が平常運転のうちは見えず、増えた日だけ牙をむくこの制約を、日次予算ガバナーとバックログの繰り越しで静かに捌き切る設計を、動くコードと実測シミュレーションでまとめます。
+
+## 3つ目の天井は「1日に何回 UrlFetch を呼べるか」
+
+Apps Script で Gemini 自動化を組むと、規模が大きくなるにつれて別々の上限に順番にぶつかります。よく知られているのは実行時間とトリガーですが、UrlFetch の日次上限はその陰に隠れがちです。
+
+<table>
+<thead>
+<tr><th>ぶつかる制約</th><th>何が上限か</th><th>consumer (gmail.com)</th><th>Google Workspace</th></tr>
+</thead>
+<tbody>
+<tr><td>実行時間上限</td><td>1回の実行の最長時間</td><td>6 分 / 実行</td><td>30 分 / 実行</td></tr>
+<tr><td>トリガー合計実行時間</td><td>1日のトリガー総実行時間</td><td>90 分 / 日</td><td>6 時間 / 日</td></tr>
+<tr><td><strong>UrlFetch 日次呼び出し</strong></td><td>1日に UrlFetch を呼べる回数</td><td><strong>20,000 回 / 日</strong></td><td><strong>100,000 回 / 日</strong></td></tr>
+</tbody>
+</table>
+
+実行時間の壁は、処理を分割して次のトリガーへ引き継げば越えられます。トリガー本数の壁は、単一ディスパッチャに束ねれば越えられます。けれど UrlFetch の日次上限だけは性質が違います。**分割しても束ねても、1日に発行できる呼び出しの総数は変わらない**からです。Gemini を1件ごとに1回呼ぶ設計なら、その日に処理する件数がそのまま上限に効きます。
+
+実行時間やトリガー本数の詰まりについては、以前に別の記事で扱いました。この記事は、それらをすべて解決してもなお残る「1日に呼べる回数」の問題を扱います。関連する設計として[Apps Script の6分実行上限を越える分割と冪等性の設計](/articles/gemini-workspace/apps-script-gemini-sheets-batch-6min-limit-idempotent)と[時間主導型トリガーを一本のディスパッチャに束ねる設計](/articles/gemini-workspace/apps-script-gemini-time-driven-trigger-exhaustion-dispatcher)も併せてご覧いただければ、3つの天井が別物であることがはっきりします。
+
+## 素朴な実装は、増えた日に上限を溶かす
+
+まず、私が最初に書いていた素朴な処理を示します。トリガーが起きるたびに、未処理の行をすべて拾って Gemini に投げる——ふだんはこれで足ります。
+
+```javascript
+// Before: 未処理を毎回まとめて処理する（増えた日に落ちる）
+function enrichPendingRows() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('reviews');
+  const rows = sheet.getDataRange().getValues();
+
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][STATUS_COL]) continue;      // 済みは飛ばす
+    const draft = callGemini(rows[i][TEXT_COL]);   // ← 1件ごとに UrlFetch 1回
+    sheet.getRange(i + 1, STATUS_COL + 1).setValue('done');
+    sheet.getRange(i + 1, DRAFT_COL + 1).setValue(draft);
+  }
+}
+
+function callGemini(text) {
+  const res = UrlFetchApp.fetch(GEMINI_ENDPOINT, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': 'YOUR_API_KEY' },
+    payload: JSON.stringify({ contents: [{ parts: [{ text: text }] }] }),
+    muteHttpExceptions: true,
+  });
+  return JSON.parse(res.getContentText()).candidates[0].content.parts[0].text;
+}
+```
+
+このコードには、増えた日に必ず露呈する弱点があります。未処理件数に**上限がない**のです。ふだん1日3,000件なら 3,000 回強の UrlFetch で済みますが、機能リリース直後にレビューが 40,000 件増えた翌日は、43,000 件を一度に処理しようとして 46,000 回を超える UrlFetch を発行します。20,000 回の壁の手前で `urlfetch` の日次上限に達し、実行は途中で例外を投げて止まります。
+
+さらに厄介なのは、止まる位置が毎回違うことです。何件目で落ちるかは、その日に他のスクリプトが何回 UrlFetch を使ったかにも左右されます。手前で止まった分は翌日に持ち越されますが、素朴な実装は「どこまで進んだか」を予算の観点で持っていないので、翌日もまた全件を一気に投げて同じ壁に当たる——月末の数日、これを繰り返していたわけです。
+
+## 予算ガバナー：1日に使ってよい呼び出し数を先に決める
+
+考え方はシンプルです。**1日に発行してよい UrlFetch 回数を先に決め、それを超えそうになったら今日はそこで止めて、残りを明日へ回す**。ドルのコスト上限を二段で止める設計に近い発想ですが、ここで数えるのは金額ではなく「呼び出し回数」です。金額ベースの上限設計は[Project Spend Caps とアプリ側ソフト上限の二段構え](/articles/gemini-api/gemini-api-spend-cap-soft-governor-unattended-pipeline)にまとめてありますので、費用側も固めたい場合はそちらが対になります。
+
+予算は上限そのものではなく、安全マージンと予約を引いた実効値にします。
+
+<table>
+<thead>
+<tr><th>項目</th><th>値</th><th>意味</th></tr>
+</thead>
+<tbody>
+<tr><td>日次上限（consumer）</td><td>20,000 回</td><td>Apps Script が保証する天井</td></tr>
+<tr><td>安全マージン</td><td>15%</td><td>他スクリプトや突発呼び出しの余白</td></tr>
+<tr><td>予約枠</td><td>500 回</td><td>ハートビート・ロギング用に確保</td></tr>
+<tr><td><strong>実効予算</strong></td><td><strong>16,500 回 / 日</strong></td><td>この自動化が使ってよい上限</td></tr>
+</tbody>
+</table>
+
+台帳は Script Properties に持たせます。ポイントは、**タイムゾーン境界で予算をリセットする**ことです。UTC でなく、スクリプトのタイムゾーン（日本なら Asia/Tokyo）の日付が変わった瞬間に使用量を 0 に戻します。ここを UTC のままにすると、日本時間の午前9時に「昨日の残り」が復活してしまい、日次上限の実体とズレます。
+
+```javascript
+// After: 日次予算ガバナー（token-bucket / TZ境界リセット）
+const DAILY_QUOTA    = 20000;  // consumer。Workspace は 100000
+const MARGIN         = 0.15;   // 安全マージン
+const RESERVE        = 500;    // 予約枠
+const CALLS_PER_ITEM = 1.08;   // リトライ増幅の見込み（実測に合わせる）
+const TZ = 'Asia/Tokyo';
+
+function usableBudget() {
+  return Math.floor(DAILY_QUOTA * (1 - MARGIN)) - RESERVE;  // 16500
+}
+
+// 今日の日付キー（TZ境界でロールオーバー）
+function todayKey() {
+  return Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+}
+
+// 残り予算を返す。日付が変わっていれば使用量を0にリセット
+function remainingBudget() {
+  const props = PropertiesService.getScriptProperties();
+  const ledger = JSON.parse(props.getProperty('urlfetch_ledger') || '{}');
+  if (ledger.date !== todayKey()) {
+    ledger.date = todayKey();
+    ledger.used = 0;
+    props.setProperty('urlfetch_ledger', JSON.stringify(ledger));
+  }
+  return usableBudget() - (ledger.used || 0);
+}
+
+// 実際に使った回数を記録（LockServiceで競合を畳む）
+function chargeBudget(calls) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const ledger = JSON.parse(props.getProperty('urlfetch_ledger') || '{}');
+    if (ledger.date !== todayKey()) { ledger.date = todayKey(); ledger.used = 0; }
+    ledger.used = (ledger.used || 0) + calls;
+    props.setProperty('urlfetch_ledger', JSON.stringify(ledger));
+  } finally {
+    lock.releaseLock();
+  }
+}
+```
+
+Script Properties への read-modify-write は複数トリガーから同時に走ると取りこぼします。ここで `LockService` を挟んでいるのはそのためです。Properties の競合と容量制限そのものについては[Apps Script の Properties 競合を畳む保管設計](/articles/gemini-workspace/apps-script-gemini-properties-lock-contention-durable-result-store)で詳しく扱っていますので、台帳を大きくしたくなったらそちらの保管層に逃がすのが安全です。
+
+## バックログを翌日へ繰り越すディスパッチャ
+
+予算が数えられるようになったら、処理側は「残り予算の範囲でだけ進み、余りは残す」形に変えます。ステータス列で未処理を管理していれば、繰り越しは自動的に成立します——今日処理しなかった行は未処理のまま残るだけだからです。
+
+```javascript
+// After: 残り予算の範囲でだけ処理し、残りは翌日へ
+function enrichWithinBudget() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('reviews');
+  const rows = sheet.getDataRange().getValues();
+
+  let remaining = remainingBudget();
+  if (remaining <= 0) {
+    console.log('今日の UrlFetch 予算を使い切りました。翌日へ繰り越します。');
+    return;
+  }
+  // 残り予算を「件数」に換算（リトライ増幅を織り込む）
+  let itemsAllowed = Math.floor(remaining / CALLS_PER_ITEM);
+
+  for (let i = 1; i < rows.length && itemsAllowed > 0; i++) {
+    if (rows[i][STATUS_COL]) continue;
+    const { draft, calls } = callGeminiWithRetry(rows[i][TEXT_COL]);
+    sheet.getRange(i + 1, STATUS_COL + 1).setValue('done');
+    sheet.getRange(i + 1, DRAFT_COL + 1).setValue(draft);
+    chargeBudget(calls);          // 実際に使った回数を台帳へ
+    itemsAllowed -= 1;
+  }
+}
+
+// リトライした回数も返すことで、台帳を実測に寄せる
+function callGeminiWithRetry(text) {
+  let calls = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    calls += 1;
+    const res = UrlFetchApp.fetch(GEMINI_ENDPOINT, {
+      method: 'post', contentType: 'application/json',
+      headers: { 'x-goog-api-key': 'YOUR_API_KEY' },
+      payload: JSON.stringify({ contents: [{ parts: [{ text: text }] }] }),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() === 200) {
+      const draft = JSON.parse(res.getContentText()).candidates[0].content.parts[0].text;
+      return { draft, calls };
+    }
+    Utilities.sleep(Math.pow(2, attempt) * 1000);  // 指数バックオフ
+  }
+  return { draft: '', calls };  // 失敗行は空のまま次回へ
+}
+```
+
+大切なのは、リトライで実際に増えた呼び出し回数を `calls` として台帳に記録している点です。見込み係数（`CALLS_PER_ITEM`）はあくまで件数への換算に使い、消費の記録は実測に寄せます。こうすると、リトライが想定より多い日でも予算が正しく減り、上限の手前で自然に止まります。
+
+## どれくらいで捌き切れるか — シミュレーションで確かめる
+
+「翌日へ繰り越す」と言うと、バックログが雪だるま式に膨らむのではないかと不安になります。そこで、繰り越しが本当に収束するのかを決定論シミュレーションで確かめました。前提は、平常時 3,000 件/日、5日目に機能リリース後のレビュー急増とバックフィルで 40,000 件が上乗せされる、というものです。
+
+```python
+import math
+DAILY_QUOTA, MARGIN, RESERVE, CALLS_PER_ITEM = 20000, 0.15, 500, 1.08
+UB = int(DAILY_QUOTA * (1 - MARGIN)) - RESERVE          # 16500
+CAP = math.floor(UB / CALLS_PER_ITEM)                   # 15277 件/日
+
+arrivals = [3000]*14
+arrivals[4] += 40000                                    # 5日目にスパイク
+
+backlog = 0
+for d in range(14):
+    pend = backlog + arrivals[d]
+    proc = min(pend, CAP)               # 予算内でだけ処理
+    backlog = pend - proc               # 残りは翌日へ
+    naive = math.ceil(arrivals[d] * CALLS_PER_ITEM)     # 素朴実装の呼び出し数
+    status = "OK" if naive <= DAILY_QUOTA else "THROW"
+    print(d+1, arrivals[d], proc, backlog, naive, status)
+```
+
+実行すると、実効予算は 16,500 回/日、1日の処理能力は 15,277 件になりました。結果は次の通りです。
+
+<table>
+<thead>
+<tr><th>日</th><th>到着</th><th>処理(ガバナー)</th><th>残バックログ</th><th>素朴実装の呼び出し</th><th>素朴実装</th></tr>
+</thead>
+<tbody>
+<tr><td>4</td><td>3,000</td><td>3,000</td><td>0</td><td>3,240</td><td>OK</td></tr>
+<tr><td><strong>5</strong></td><td><strong>43,000</strong></td><td>15,277</td><td>27,723</td><td><strong>46,440</strong></td><td><strong>THROW</strong></td></tr>
+<tr><td>6</td><td>3,000</td><td>15,277</td><td>15,446</td><td>3,240</td><td>OK</td></tr>
+<tr><td>7</td><td>3,000</td><td>15,277</td><td>3,169</td><td>3,240</td><td>OK</td></tr>
+<tr><td>8</td><td>3,000</td><td>6,169</td><td>0</td><td>3,240</td><td>OK</td></tr>
+</tbody>
+</table>
+
+読み取れることは2つあります。ひとつは、素朴実装はスパイクの5日目に 46,440 回の UrlFetch を試みて 20,000 回の壁を越え、その日の処理を途中で失う（THROW）こと。もうひとつは、ガバナーは同じ日に上限内の 15,277 件だけを確実に処理し、残り 27,723 件を翌日以降に回して、**スパイクからわずか3日（8日目）でバックログが 0 に戻る**ことです。到着レート（3,000/日）が処理能力（15,277/日）を下回っている限り、繰り越しは必ず収束します。膨らむのではなく、山を平らにならしているだけなのです。
+
+## 運用：止まったことに気づく仕掛けと、環境差の数字
+
+ガバナーを入れると自動化は「静かに止まらなく」なりますが、代わりに「今日は予算を使い切ったのでここまで」という**意図した停止**が起きます。これを障害と区別できるよう、1日の終わりに残バックログと使用量をログか通知に出しておくと安心です。バックログが数日連続で増え続けるなら、それは到着レートが処理能力を超えたサインで、Workspace アカウント（日次 100,000 回）への移行や、複数件を1回の呼び出しにまとめるバッチ化を検討する合図になります。
+
+<table>
+<thead>
+<tr><th>環境</th><th>UrlFetch 日次上限</th><th>実効予算(15%減-500)</th><th>処理能力(1.08/件)</th></tr>
+</thead>
+<tbody>
+<tr><td>consumer (gmail.com)</td><td>20,000 回</td><td>16,500 回</td><td>約 15,277 件/日</td></tr>
+<tr><td>Google Workspace</td><td>100,000 回</td><td>84,500 回</td><td>約 78,240 件/日</td></tr>
+</tbody>
+</table>
+
+同じスクリプトでも、実行するアカウントの種別で天井は5倍変わります。移行を前提にするなら `DAILY_QUOTA` を定数で持ち、環境ごとに切り替えられるようにしておくと、後から慌てずに済みます。Apps Script の各上限の最新値は[Apps Script の割り当てと制限のドキュメント](https://developers.google.com/apps-script/guides/services/quotas)で確認できますので、運用に入れる前に一度ご自身の環境の数字を突き合わせておくことをおすすめします。
+
+## まとめ
+
+Apps Script の Gemini 自動化が「増えた日だけ落ちる」とき、原因は Gemini でもレート制限でもなく、UrlFetch の日次呼び出し上限であることが少なくありません。実行時間やトリガー本数を先に解決していると、なおさら見落としがちな第3の天井です。
+
+対処は、上限そのものと戦うのではなく、**1日に使ってよい回数を先に決め、超えそうなら残りを翌日へ回す**こと。Script Properties の予算台帳をタイムゾーン境界でリセットし、リトライ込みの実測で消費を記録すれば、スパイクの日も山をならして数日で捌き切れます。まず手を動かすなら、いま動いている自動化に `remainingBudget()` のログ出力だけを足して、平常時に1日何回 UrlFetch を使っているかを測ってみてください。マージンをどこに引くべきかは、その実測から見えてきます。
+
+私自身、この予算台帳を入れてから月末のエラー通知がぱたりと止みました。同じように無人の自動化を回している方の、静かな運用の助けになれば嬉しいです。お読みいただきありがとうございました。

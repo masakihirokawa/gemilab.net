@@ -1,0 +1,258 @@
+---
+title: "Your Apps Script Gemini Automation Fails Every Month-End — Budgeting Against the UrlFetch Daily Quota"
+slug: "apps-script-gemini-urlfetch-daily-quota-budget-governor-backlog-drain"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-07-08T15:59"
+author: "Gemini Lab"
+description: "Apps Script automations that call Gemini stall on the UrlFetch daily call quota — a separate ceiling from the 6-minute limit and trigger counts. Here is a daily budget governor with backlog carry-over that keeps the job running on busy days, with working code and a verified simulation."
+tags: ["Apps Script", "Gemini API", "UrlFetchApp", "Google Workspace", "automation"]
+highlights:
+  - "Understand, from reproducible code, how the UrlFetch daily call quota (20,000 calls/day on consumer accounts) is a third ceiling — distinct from the 6-minute runtime and trigger-count limits — that only bites on high-volume days"
+  - "Copy a complete Apps Script token-bucket governor that keeps a daily budget ledger in Script Properties and resets it on the timezone boundary, not UTC"
+  - "Verify with a deterministic simulation (backlog clears three days after a spike) that carrying work over to the next day converges instead of snowballing"
+---
+
+Every month-end, the same automation quietly died.
+
+As an indie developer I run a handful of apps on my own, and a few of them lean on Apps Script to call Gemini — drafting replies to user reviews, tagging newly added wallpapers. On ordinary days everything flows without a hitch. But on a few days each month, an unfamiliar error showed up in the execution log, always the day after reviews had surged.
+
+My first guess was rate limiting (429). But a 429 should be absorbed by exponential backoff. Following the log, I found the failure was not on Gemini's side at all — it was on Apps Script's. `Service invoked too many times for one day: urlfetch`. I had hit the UrlFetch daily call quota.
+
+This article focuses on that third ceiling: the **daily call quota** of `UrlFetchApp`, which is neither the 6-minute runtime limit nor the trigger-count limit. It stays invisible while volume is steady and only shows its teeth on busy days. I will lay out a design that absorbs it quietly — a daily budget governor plus backlog carry-over — with working code and a verified simulation.
+
+## The third ceiling is "how many times can you call UrlFetch in a day"
+
+As an Apps Script Gemini automation grows, it hits separate limits in sequence. Runtime and triggers are the well-known ones; the UrlFetch daily quota tends to hide behind them.
+
+<table>
+<thead>
+<tr><th>Limit you hit</th><th>What is capped</th><th>consumer (gmail.com)</th><th>Google Workspace</th></tr>
+</thead>
+<tbody>
+<tr><td>Execution time</td><td>Longest single execution</td><td>6 min / execution</td><td>30 min / execution</td></tr>
+<tr><td>Total trigger runtime</td><td>Trigger runtime per day</td><td>90 min / day</td><td>6 hr / day</td></tr>
+<tr><td><strong>UrlFetch daily calls</strong></td><td>UrlFetch calls per day</td><td><strong>20,000 / day</strong></td><td><strong>100,000 / day</strong></td></tr>
+</tbody>
+</table>
+
+The runtime wall can be crossed by splitting work and continuing in the next trigger. The trigger-count wall can be crossed by consolidating into a single dispatcher. But the UrlFetch daily quota is different in kind: **splitting or consolidating does not change the total number of calls you can issue in one day.** If your design calls Gemini once per item, the number of items you process that day maps directly onto the quota.
+
+I covered the runtime and trigger bottlenecks in earlier articles. This one is about the problem that remains even after you have solved both — how many calls you can make in a day. For the related designs, see [crossing the 6-minute limit with chunking and idempotency](/articles/gemini-workspace/apps-script-gemini-sheets-batch-6min-limit-idempotent) and [consolidating time-driven triggers into one dispatcher](/articles/gemini-workspace/apps-script-gemini-time-driven-trigger-exhaustion-dispatcher); together they make clear that the three ceilings are genuinely separate.
+
+## The naive version melts the quota on a busy day
+
+Here is the naive version I wrote first. On each trigger, pick up every unprocessed row and send it to Gemini — on ordinary days, that is enough.
+
+```javascript
+// Before: process all pending each run (fails on busy days)
+function enrichPendingRows() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('reviews');
+  const rows = sheet.getDataRange().getValues();
+
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][STATUS_COL]) continue;      // skip done rows
+    const draft = callGemini(rows[i][TEXT_COL]);   // one UrlFetch per item
+    sheet.getRange(i + 1, STATUS_COL + 1).setValue('done');
+    sheet.getRange(i + 1, DRAFT_COL + 1).setValue(draft);
+  }
+}
+
+function callGemini(text) {
+  const res = UrlFetchApp.fetch(GEMINI_ENDPOINT, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': 'YOUR_API_KEY' },
+    payload: JSON.stringify({ contents: [{ parts: [{ text: text }] }] }),
+    muteHttpExceptions: true,
+  });
+  return JSON.parse(res.getContentText()).candidates[0].content.parts[0].text;
+}
+```
+
+This code has a weakness that always surfaces on a busy day: there is **no cap on the number of pending items**. At a usual 3,000 items/day it takes just over 3,000 UrlFetch calls. But the day after a feature launch adds 40,000 reviews, it tries to process 43,000 at once and issues over 46,000 UrlFetch calls. Well past the 20,000 wall, it hits the `urlfetch` daily limit and throws mid-run.
+
+Worse, the failure point moves around. Which item it dies on depends on how many UrlFetch calls other scripts made that day. Whatever stopped short carries over to the next day — but the naive version has no notion of "how far did I get" in budget terms, so the next day it fires all pending items at once again and hits the same wall. That was the loop I ran, a few days every month-end.
+
+## The budget governor: decide how many calls you may spend per day, up front
+
+The idea is simple. **Decide up front how many UrlFetch calls you may issue in a day; when you are about to exceed it, stop for today and push the rest to tomorrow.** It is close in spirit to a two-stage dollar cap, but what you count here is call count, not money. For the dollar-based design, see [pairing Project Spend Caps with an app-side soft limit](/articles/gemini-api/gemini-api-spend-cap-soft-governor-unattended-pipeline); if you also want to lock down cost, that is the counterpart.
+
+Make the budget the effective value — the ceiling minus a safety margin and a reservation — not the ceiling itself.
+
+<table>
+<thead>
+<tr><th>Item</th><th>Value</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td>Daily quota (consumer)</td><td>20,000</td><td>The ceiling Apps Script guarantees</td></tr>
+<tr><td>Safety margin</td><td>15%</td><td>Headroom for other scripts and bursts</td></tr>
+<tr><td>Reservation</td><td>500</td><td>Held for heartbeat and logging</td></tr>
+<tr><td><strong>Effective budget</strong></td><td><strong>16,500 / day</strong></td><td>What this automation may spend</td></tr>
+</tbody>
+</table>
+
+Keep the ledger in Script Properties. The key point is to **reset the budget on the timezone boundary**, not UTC. Zero out usage the moment the date rolls over in the script's timezone (Asia/Tokyo for me). Leave it on UTC and yesterday's remainder revives at 9 a.m. local time, drifting away from what the daily quota actually measures.
+
+```javascript
+// After: daily budget governor (token-bucket / TZ-boundary reset)
+const DAILY_QUOTA    = 20000;  // consumer. Workspace is 100000
+const MARGIN         = 0.15;   // safety margin
+const RESERVE        = 500;    // reservation
+const CALLS_PER_ITEM = 1.08;   // expected retry amplification (tune to measured)
+const TZ = 'Asia/Tokyo';
+
+function usableBudget() {
+  return Math.floor(DAILY_QUOTA * (1 - MARGIN)) - RESERVE;  // 16500
+}
+
+// today's date key (rolls over on the TZ boundary)
+function todayKey() {
+  return Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+}
+
+// return remaining budget; reset usage to 0 if the date changed
+function remainingBudget() {
+  const props = PropertiesService.getScriptProperties();
+  const ledger = JSON.parse(props.getProperty('urlfetch_ledger') || '{}');
+  if (ledger.date !== todayKey()) {
+    ledger.date = todayKey();
+    ledger.used = 0;
+    props.setProperty('urlfetch_ledger', JSON.stringify(ledger));
+  }
+  return usableBudget() - (ledger.used || 0);
+}
+
+// record calls actually spent (fold concurrency with LockService)
+function chargeBudget(calls) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const ledger = JSON.parse(props.getProperty('urlfetch_ledger') || '{}');
+    if (ledger.date !== todayKey()) { ledger.date = todayKey(); ledger.used = 0; }
+    ledger.used = (ledger.used || 0) + calls;
+    props.setProperty('urlfetch_ledger', JSON.stringify(ledger));
+  } finally {
+    lock.releaseLock();
+  }
+}
+```
+
+Read-modify-write on Script Properties loses updates when several triggers run at once, which is why `LockService` wraps it here. For the Properties contention and size limits themselves, see [folding Properties contention into a durable store](/articles/gemini-workspace/apps-script-gemini-properties-lock-contention-durable-result-store); if the ledger grows, moving it into that storage layer is the safe path.
+
+## A dispatcher that carries the backlog to the next day
+
+Once you can count the budget, change the worker to "advance only within the remaining budget and leave the rest." If you already track pending work with a status column, the carry-over happens for free — rows you did not process today simply stay unprocessed.
+
+```javascript
+// After: process only within remaining budget, defer the rest to tomorrow
+function enrichWithinBudget() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('reviews');
+  const rows = sheet.getDataRange().getValues();
+
+  let remaining = remainingBudget();
+  if (remaining <= 0) {
+    console.log('Daily UrlFetch budget spent. Carrying over to tomorrow.');
+    return;
+  }
+  // convert remaining budget into an item count (fold in retry amplification)
+  let itemsAllowed = Math.floor(remaining / CALLS_PER_ITEM);
+
+  for (let i = 1; i < rows.length && itemsAllowed > 0; i++) {
+    if (rows[i][STATUS_COL]) continue;
+    const { draft, calls } = callGeminiWithRetry(rows[i][TEXT_COL]);
+    sheet.getRange(i + 1, STATUS_COL + 1).setValue('done');
+    sheet.getRange(i + 1, DRAFT_COL + 1).setValue(draft);
+    chargeBudget(calls);          // record calls actually spent
+    itemsAllowed -= 1;
+  }
+}
+
+// return the retry count too, so the ledger tracks reality
+function callGeminiWithRetry(text) {
+  let calls = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    calls += 1;
+    const res = UrlFetchApp.fetch(GEMINI_ENDPOINT, {
+      method: 'post', contentType: 'application/json',
+      headers: { 'x-goog-api-key': 'YOUR_API_KEY' },
+      payload: JSON.stringify({ contents: [{ parts: [{ text: text }] }] }),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() === 200) {
+      const draft = JSON.parse(res.getContentText()).candidates[0].content.parts[0].text;
+      return { draft, calls };
+    }
+    Utilities.sleep(Math.pow(2, attempt) * 1000);  // exponential backoff
+  }
+  return { draft: '', calls };  // leave failed rows empty for next time
+}
+```
+
+The point is that the calls actually added by retries are recorded in the ledger as `calls`. The estimate factor (`CALLS_PER_ITEM`) is only used to convert budget into an item count; the record of consumption is measured. That way, even on a day with more retries than expected, the budget draws down correctly and the job stops naturally before the ceiling.
+
+## How long does the backlog take to clear — check with a simulation
+
+"Carry over to tomorrow" raises a fear that the backlog will snowball. So I checked whether the carry-over actually converges, with a deterministic simulation. The premise: 3,000 items/day at steady state, plus 40,000 added on day 5 from a post-launch review surge and backfill.
+
+```python
+import math
+DAILY_QUOTA, MARGIN, RESERVE, CALLS_PER_ITEM = 20000, 0.15, 500, 1.08
+UB = int(DAILY_QUOTA * (1 - MARGIN)) - RESERVE          # 16500
+CAP = math.floor(UB / CALLS_PER_ITEM)                   # 15277 items/day
+
+arrivals = [3000]*14
+arrivals[4] += 40000                                    # spike on day 5
+
+backlog = 0
+for d in range(14):
+    pend = backlog + arrivals[d]
+    proc = min(pend, CAP)               # process only within budget
+    backlog = pend - proc               # defer the rest to tomorrow
+    naive = math.ceil(arrivals[d] * CALLS_PER_ITEM)     # naive call count
+    status = "OK" if naive <= DAILY_QUOTA else "THROW"
+    print(d+1, arrivals[d], proc, backlog, naive, status)
+```
+
+Running it, the effective budget is 16,500 calls/day and daily capacity is 15,277 items. Here are the results.
+
+<table>
+<thead>
+<tr><th>Day</th><th>Arrivals</th><th>Processed (governor)</th><th>Backlog end</th><th>Naive calls</th><th>Naive</th></tr>
+</thead>
+<tbody>
+<tr><td>4</td><td>3,000</td><td>3,000</td><td>0</td><td>3,240</td><td>OK</td></tr>
+<tr><td><strong>5</strong></td><td><strong>43,000</strong></td><td>15,277</td><td>27,723</td><td><strong>46,440</strong></td><td><strong>THROW</strong></td></tr>
+<tr><td>6</td><td>3,000</td><td>15,277</td><td>15,446</td><td>3,240</td><td>OK</td></tr>
+<tr><td>7</td><td>3,000</td><td>15,277</td><td>3,169</td><td>3,240</td><td>OK</td></tr>
+<tr><td>8</td><td>3,000</td><td>6,169</td><td>0</td><td>3,240</td><td>OK</td></tr>
+</tbody>
+</table>
+
+Two things stand out. First, the naive version attempts 46,440 UrlFetch calls on the day-5 spike, crosses the 20,000 wall, and loses that day's work mid-run (THROW). Second, the governor processes exactly 15,277 items within the ceiling that same day, defers the remaining 27,723 to later days, and clears the backlog to zero just **three days after the spike (day 8)**. As long as the arrival rate (3,000/day) stays below capacity (15,277/day), the carry-over always converges. It does not snowball — it just flattens the peak.
+
+## Operations: noticing that it stopped, and the numbers per environment
+
+With the governor in place, the automation stops "dying quietly," but in exchange you get an **intentional stop** — "spent today's budget, that's it for now." To tell this apart from a failure, log or notify the end-of-day backlog and usage. If the backlog grows for several days in a row, that is a sign the arrival rate has outpaced capacity, and a cue to consider a Workspace account (100,000 calls/day) or batching several items into one call.
+
+<table>
+<thead>
+<tr><th>Environment</th><th>UrlFetch daily quota</th><th>Effective budget (−15%, −500)</th><th>Capacity (1.08/item)</th></tr>
+</thead>
+<tbody>
+<tr><td>consumer (gmail.com)</td><td>20,000</td><td>16,500</td><td>~15,277 items/day</td></tr>
+<tr><td>Google Workspace</td><td>100,000</td><td>84,500</td><td>~78,240 items/day</td></tr>
+</tbody>
+</table>
+
+The same script has a ceiling that differs fivefold depending on the account type it runs under. If a migration is on the horizon, keep `DAILY_QUOTA` as a constant you can switch per environment, and you will not scramble later. For the current values of each Apps Script limit, see the [Apps Script quotas and limitations documentation](https://developers.google.com/apps-script/guides/services/quotas); reconciling your own environment's numbers before you go live is time well spent.
+
+## Wrapping up
+
+When an Apps Script Gemini automation "only fails on busy days," the cause is often neither Gemini nor rate limiting but the UrlFetch daily call quota. It is easy to miss precisely because you have already solved runtime and trigger counts — a third ceiling behind the first two.
+
+The fix is not to fight the limit but to **decide how many calls you may spend per day and defer the rest to tomorrow**. Reset the Script Properties budget ledger on the timezone boundary and record consumption from measured calls including retries, and even a spike day flattens out and clears in a few days. To start, add just a `remainingBudget()` log line to the automation you already run, and measure how many UrlFetch calls a steady day actually uses. Where to draw the margin becomes clear from that measurement.
+
+For me, the month-end error alerts stopped the moment I added this budget ledger. If you run unattended automations the same way, I hope it helps toward a quieter operation. Thank you for reading.
