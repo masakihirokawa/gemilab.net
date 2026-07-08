@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SPARK — GoogleのエージェントアシスタントGemini SparkがmacOSのGeminiアプリに登場し、タスクを自律的に代行します",
-    "BRIEF — Personal Intelligenceを活用したDaily BriefがGmailやカレンダーから優先事項をまとめ、次の一手を提案します",
-    "MODEL — Gemini 3.5 FlashがGA（正式版）となり、100万トークンのコンテキストで低コスト・高速な処理に対応します",
-    "GROWTH — Geminiアプリの月間アクティブユーザーが9億人を突破し、1年前の4億人から大きく成長しました",
-    "APPS — SparkはGoogle TasksやGoogle Keepと連携し、話題をリアルタイムに追いかけられるようになりました",
-    "ENTERPRISE — Gemini 3.5 FlashがGlobal・US・EUのGemini Enterpriseで一般提供されています",
+    "FLASH — Gemini 3.5 FlashがGAとなり、gemini-flash-latestの実体として利用できます",
+    "AGENTS — Gemini APIのManaged Agentsがパブリックプレビューとなり、Googleホストの隔離Linuxサンドボックスで自律実行できます",
+    "STUDIO — Google AI Studioにプロジェクト単位の支出上限（spend caps）が追加され、ネイティブAndroid vibe codingにも対応しました",
+    "LIVE — 音声対音声でリアルタイム対話するGemini 3.1 Flash Live Previewが公開されました",
+    "IMAGE — 最速・低コストの画像モデルNano Banana 2 Liteが提供され、Gemini Omni FlashもAPIでプレビュー公開されています",
+    "LYRIA — 音楽生成モデルLyria 3（clip-preview / pro-preview）が新たに利用できます",
   ],
   en: [
-    "SPARK — Gemini Spark, Google's agentic assistant, arrives in the Gemini app for macOS and works on tasks on your behalf",
-    "BRIEF — Daily Brief, powered by Personal Intelligence, distills priorities from Gmail and Calendar with suggested next steps",
-    "MODEL — Gemini 3.5 Flash reaches GA, offering faster, lower-cost AI with a 1M-token context window",
-    "GROWTH — The Gemini app has passed 900 million monthly active users, up from 400 million a year earlier",
-    "APPS — Spark now connects to Google Tasks and Google Keep and stays up to date on topics in real time",
-    "ENTERPRISE — Gemini 3.5 Flash is generally available across the Global, US, and EU regions on Gemini Enterprise",
+    "FLASH — Gemini 3.5 Flash is now generally available and powers gemini-flash-latest",
+    "AGENTS — Managed Agents in the Gemini API enter public preview, running autonomously in Google-hosted isolated Linux sandboxes",
+    "STUDIO — Google AI Studio adds project-level spend caps and native Android vibe coding",
+    "LIVE — Gemini 3.1 Flash Live Preview, an audio-to-audio model for real-time dialogue, is now available",
+    "IMAGE — Nano Banana 2 Lite arrives as the fastest, most cost-efficient image model, and Gemini Omni Flash is in API preview",
+    "LYRIA — Lyria 3 music generation models (clip-preview and pro-preview) are now available",
   ],
 };
 
