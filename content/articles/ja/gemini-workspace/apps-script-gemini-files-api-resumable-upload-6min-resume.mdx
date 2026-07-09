@@ -1,0 +1,304 @@
+---
+title: "Apps Script の6分制限を跨いで Gemini Files API に大容量ファイルを再開アップロードする"
+slug: "apps-script-gemini-files-api-resumable-upload-6min-resume"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-07-10T05:10"
+author: "Gemini Lab"
+description: "Drive に置いた数百MBの動画や音声を Apps Script から Gemini Files API へ送る際、6分の実行時間上限とペイロード上限をどう跨ぐか。resumable upload の start / upload / query / finalize を分解し、中断しても壊れない転送を組み立てます。"
+tags: ["gemini", "apps-script", "files-api", "google-workspace", "resumable-upload"]
+highlights:
+  - "Apps Script の6分制限で落ち続けていた大容量アップロードを、途中から再開できる転送に置き換えられる"
+  - "resumable upload の query コマンドでサーバ側の真のオフセットを取り直し、二重送信とオフセットずれを根絶できる"
+  - "Files API の48時間保管を冪等キーとして使い、同じ Drive ファイルの再アップロードを避けて転送コストを削れる"
+---
+
+Drive に置いた 380 MB の紹介動画を Gemini に読ませようとして、Apps Script の実行が「Exceeded maximum execution time」で止まりました。個人開発で運用しているアプリの動画素材を、月に一度まとめて解析させたいだけだったのですが、`UrlFetchApp` に blob を渡す素朴な書き方では最初の一歩で詰みます。
+
+Files API の仕様と Apps Script の実行モデルは、そもそも噛み合っていません。片方は「大きなファイルを一度に預かる」前提で、もう片方は「6分で必ず殺される短命な関数」です。この二つを橋渡しするには、転送そのものを中断可能な状態機械として設計し直す必要がありました。
+
+## まず Files API 側の制約を数字で押さえる
+
+実装の前に、どこが硬い壁なのかを確定させます。Gemini の公式ドキュメントが明示している数値は次の通りです。
+
+<table>
+  <thead>
+    <tr><th>項目</th><th>値</th><th>実装への影響</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Files API を使うべき閾値</td><td>リクエスト総サイズ 100 MB 超</td><td>これ未満なら inline data で済む</td></tr>
+    <tr><td>PDF の inline 上限</td><td>50 MB</td><td>PDF だけ閾値が低い</td></tr>
+    <tr><td>1ファイルの最大サイズ</td><td>2 GB</td><td>これを超えるなら事前分割が必要</td></tr>
+    <tr><td>プロジェクトあたりの保管容量</td><td>20 GB</td><td>放置すると容量を食い潰す</td></tr>
+    <tr><td>保管期間</td><td>48 時間</td><td>期限後は自動削除・ダウンロード不可</td></tr>
+  </tbody>
+</table>
+
+利用料は無償で、Gemini API が使える全リージョンで提供されています。ここで効いてくるのは <strong>48 時間</strong> という保管期間です。後述しますが、この短さは制約であると同時に、冪等性を設計する足場にもなります。
+
+## resumable upload は三つのコマンドでできている
+
+Files API のアップロードは、内部的には Google 共通の resumable upload プロトコルです。SDK を使うと隠れてしまいますが、REST で叩くと三段構えなのが見えます。
+
+第一段は <strong>start</strong>。ファイル本体は送らず、メタデータだけを投げてアップロード先の URL を受け取ります。
+
+```bash
+curl "https://generativelanguage.googleapis.com/upload/v1beta/files" \
+  -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+  -D headers.tmp \
+  -H "X-Goog-Upload-Protocol: resumable" \
+  -H "X-Goog-Upload-Command: start" \
+  -H "X-Goog-Upload-Header-Content-Length: 398458880" \
+  -H "X-Goog-Upload-Header-Content-Type: video/mp4" \
+  -H "Content-Type: application/json" \
+  -d '{"file": {"display_name": "promo-2026-07"}}'
+
+# レスポンスヘッダに転送先が返る
+grep -i "x-goog-upload-url" headers.tmp
+```
+
+第二段は <strong>upload</strong>。受け取った URL に対して、`X-Goog-Upload-Offset` で「このバイト位置から書く」と宣言しながらバイト列を送ります。最後のチャンクだけ `upload, finalize` を指定すると、そこでファイルが確定します。
+
+第三段が <strong>query</strong> です。これは公式のコード例にはあまり登場しませんが、中断からの復帰では主役になります。サーバに「今どこまで受け取ったか」を訊ねるコマンドで、これを持っているかどうかで設計の堅さが変わります。
+
+start から finalize までを一気に流すなら SDK で十分です。私自身、100 MB 程度までは `client.files.upload()` の一行で済ませています。分解が必要になるのは、転送の途中でプロセスが死ぬ環境に置かれたときだけです。
+
+## Apps Script 側の壁は「時間」と「メモリ」の二枚
+
+Apps Script でこれをやろうとすると、二つの制約が同時に効いてきます。
+
+一つは実行時間です。スクリプトは一回の呼び出しで 6 分を超えられません。380 MB を単一の実行で送り切るのは、回線が理想的でも賭けになります。
+
+もう一つはメモリと転送サイズです。`DriveApp.getFileById(id).getBlob()` は原則としてファイル全体をメモリに載せます。数百 MB の blob を作った時点で、転送に入る前に実行が不安定になります。`UrlFetchApp` のペイロードにも上限があり、巨大な blob をそのまま `payload` に渡す発想は成立しません。
+
+つまり <strong>ファイル全体を一度も手元に持たずに転送する</strong>必要があります。Drive から必要な範囲だけを切り出し、その範囲だけを Gemini に流し、位置を記録して関数を終える。次の起動が続きを引き受ける。この形にしか着地しません。
+
+同じ「6分の壁」を Sheets のバッチ処理で越える話は [Apps Script × Gemini の6分制限を冪等な分割実行で越える](/articles/gemini-workspace/apps-script-gemini-sheets-batch-6min-limit-idempotent) で扱っています。今回はその設計をバイナリ転送に持ち込む形になります。
+
+## Drive から Range で必要な範囲だけ切り出す
+
+鍵は Drive API v3 の `alt=media` に `Range` ヘッダを添えることです。`DriveApp` の blob を経由せず、欲しいバイト範囲だけを取得します。
+
+```javascript
+/**
+ * Drive ファイルの [start, end] バイトだけを取得する。
+ * end は inclusive（HTTP Range の仕様）。
+ * 返り値はバイト配列で、Blob 化してもファイル全体は載らない。
+ */
+function fetchDriveRange_(fileId, start, end) {
+  const url = 'https://www.googleapis.com/drive/v3/files/'
+    + encodeURIComponent(fileId) + '?alt=media&supportsAllDrives=true';
+
+  const res = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: {
+      Authorization: 'Bearer ' + ScriptApp.getOAuthToken(),
+      Range: 'bytes=' + start + '-' + end,
+    },
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  // 206 Partial Content が正常。200 が返ったら Range が無視されている
+  if (code !== 206) {
+    throw new Error('Range fetch failed: HTTP ' + code + ' (expected 206)');
+  }
+  return res.getContent(); // byte[]
+}
+```
+
+`206` を明示的に検証しているのは、`Range` が無視されて `200` で全体が返ってくると、その瞬間にメモリが飛ぶからです。ここを `muteHttpExceptions` に頼って握り潰すと、原因の分からない実行失敗が残ります。エラーは早く、具体的に投げます。
+
+チャンクサイズは 8 MB を初期値にしています。resumable upload の仕様上、finalize 以外のチャンクは 256 KiB の倍数である必要があるため、`8 * 1024 * 1024` のようなキリのよい値を選ぶと考えなくて済みます。
+
+## 転送と、位置の永続化
+
+チャンクを送る側は素直です。オフセットを宣言し、最後だけ `finalize` を足します。
+
+```javascript
+const CHUNK = 8 * 1024 * 1024; // 256 KiB の倍数であること
+
+/**
+ * 1チャンクを送る。isLast のときだけ finalize してファイルを確定させる。
+ * finalize 時のレスポンス JSON に file.uri / file.name が入る。
+ */
+function putChunk_(uploadUrl, bytes, offset, isLast) {
+  const command = isLast ? 'upload, finalize' : 'upload';
+
+  const res = UrlFetchApp.fetch(uploadUrl, {
+    method: 'post',
+    contentType: 'application/octet-stream',
+    payload: Utilities.newBlob(bytes),
+    headers: {
+      'X-Goog-Upload-Command': command,
+      'X-Goog-Upload-Offset': String(offset),
+    },
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    throw new Error('chunk upload failed at offset ' + offset + ': HTTP ' + code);
+  }
+  return isLast ? JSON.parse(res.getContentText()) : null;
+}
+```
+
+状態は `PropertiesService` に置きます。保存すべきは、アップロード URL、次に送るオフセット、総バイト数、そして元の Drive ファイル ID です。関数はチャンクを何本か送ったら、残り時間を見て自分から降ります。
+
+```javascript
+const SAFE_MS = 60 * 1000; // 6分のうち最後の1分は撤退に使う
+
+function resumeUpload() {
+  const props = PropertiesService.getScriptProperties();
+  const state = JSON.parse(props.getProperty('UPLOAD_STATE'));
+  const started = Date.now();
+
+  while (state.offset < state.total) {
+    // 実行時間を使い切る前に、状態を残して撤退する
+    if (Date.now() - started > 6 * 60 * 1000 - SAFE_MS) {
+      props.setProperty('UPLOAD_STATE', JSON.stringify(state));
+      return; // 次のトリガーが続きを引き受ける
+    }
+
+    const end = Math.min(state.offset + CHUNK, state.total) - 1;
+    const bytes = fetchDriveRange_(state.fileId, state.offset, end);
+    const isLast = end === state.total - 1;
+    const done = putChunk_(state.uploadUrl, bytes, state.offset, isLast);
+
+    state.offset = end + 1;
+    props.setProperty('UPLOAD_STATE', JSON.stringify(state));
+
+    if (done) {
+      props.setProperty('FILE_URI', done.file.uri);
+      props.setProperty('FILE_NAME', done.file.name);
+      props.deleteProperty('UPLOAD_STATE');
+      return;
+    }
+  }
+}
+```
+
+`setProperty` をチャンクごとに呼んでいるのは、途中で強制終了されても最後に成功した位置が残るようにするためです。ここで「まとめて最後に保存」を選ぶと、6分で殺された瞬間に進捗が丸ごと消えます。
+
+## 中断からの復帰では、自分の記録を信用しない
+
+素朴に書くと、次回起動時は保存しておいた `state.offset` から再開したくなります。しかし、この値は嘘をつくことがあります。
+
+チャンクを送信し、サーバは受理し、レスポンスが返る途中で実行が打ち切られる。この窓に入ると、ローカルの `offset` は古いままです。そこから再送すると、同じバイト範囲を二度書くことになります。
+
+そこで再開の一手目は必ず <strong>query</strong> にします。サーバ自身に、どこまで受け取ったかを申告させます。
+
+```javascript
+/**
+ * サーバ側が受理済みのバイト数を取得する。
+ * ローカルに保存した offset より、常にこちらを信用する。
+ */
+function queryServerOffset_(uploadUrl) {
+  const res = UrlFetchApp.fetch(uploadUrl, {
+    method: 'post',
+    headers: { 'X-Goog-Upload-Command': 'query' },
+    muteHttpExceptions: true,
+  });
+
+  const status = res.getHeaders()['x-goog-upload-status']; // active / final / cancelled
+  if (status === 'final') return -1; // 既に確定済み。再送は不要
+
+  const received = res.getHeaders()['x-goog-upload-size-received'];
+  return Number(received || 0);
+}
+```
+
+`x-goog-upload-status` が `final` を返したなら、前回の実行は finalize まで到達していたことになります。この場合は再送してはいけません。無駄な転送どころか、二重にファイルが作られる状況を招きます。`-1` を返して「もう終わっている」と呼び出し側に伝え、重複を回避します。
+
+私はこの一手を最初は省いていました。省いた結果、Drive の同じ動画が Files API 上に二つ並び、20 GB の保管枠を静かに削っていました。ローカルの進捗記録は「ヒント」であり、真実はサーバにしかありません。
+
+## ACTIVE を待たずに generateContent へ渡さない
+
+finalize が成功しても、ファイルはすぐ使えるとは限りません。動画や音声は前処理が走り、`state` が `PROCESSING` の間は参照できません。
+
+```javascript
+/**
+ * ファイルが ACTIVE になるまで待つ。
+ * Apps Script の残り時間を食い潰さないよう、上限回数で必ず抜ける。
+ */
+function waitUntilActive_(fileName, maxAttempts) {
+  const url = 'https://generativelanguage.googleapis.com/v1beta/' + fileName;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    const res = UrlFetchApp.fetch(url, {
+      headers: { 'x-goog-api-key': getApiKey_() },
+      muteHttpExceptions: true,
+    });
+    const file = JSON.parse(res.getContentText());
+
+    if (file.state === 'ACTIVE') return file;
+    if (file.state === 'FAILED') throw new Error('file processing failed: ' + fileName);
+
+    Utilities.sleep(Math.min(2000 * Math.pow(2, i), 30000)); // 指数バックオフ・上限30秒
+  }
+  return null; // 未完了。次のトリガーで再確認する
+}
+```
+
+`maxAttempts` を切って `null` を返す形にしているのは、待ち続けて 6 分を溶かすくらいなら、状態を残して次の起動に委ねた方が安全だからです。待つ側もまた、中断可能でなければなりません。
+
+`PropertiesService` を跨いだ状態管理で並行実行がぶつかる問題は [Apps Script の PropertiesService とロック競合を捌く](/articles/gemini-workspace/apps-script-gemini-properties-lock-contention-durable-result-store) に整理があります。トリガーを複数本に増やすなら、先にそちらの排他を入れてください。
+
+## 48時間の保管期間を、冪等キーとして使う
+
+Files API のファイルは 48 時間で消えます。この性質は、再アップロードを避ける仕組みにそのまま流用できます。
+
+`display_name` に「Drive ファイル ID とチェックサムから作った決定的な文字列」を入れておきます。転送を始める前に `files.list` を舐め、同じ `display_name` が `ACTIVE` で存在すればそれを再利用します。
+
+```javascript
+/**
+ * display_name を決定的に作る。同じ内容なら同じ名前になる。
+ * Drive の md5Checksum を混ぜることで、差し替えを検知できる。
+ */
+function uploadKey_(fileId, md5) {
+  return 'drive-' + fileId.slice(0, 12) + '-' + md5.slice(0, 8);
+}
+
+function findReusable_(key) {
+  const res = UrlFetchApp.fetch(
+    'https://generativelanguage.googleapis.com/v1beta/files?pageSize=100',
+    { headers: { 'x-goog-api-key': getApiKey_() }, muteHttpExceptions: true }
+  );
+  const files = JSON.parse(res.getContentText()).files || [];
+  return files.find(f => f.displayName === key && f.state === 'ACTIVE') || null;
+}
+```
+
+Drive 側でファイルが差し替えられれば `md5Checksum` が変わり、キーも変わります。内容が同じなら、48 時間以内の二回目の解析は転送ゼロで始まります。380 MB を毎回送り直さずに済むというのは、実行時間の面でもチャンク往復の回数の面でも効きます。
+
+同時に、20 GB の枠を守る責任も生まれます。解析が終わったファイルは `files.delete` で明示的に消すのが行儀です。48 時間放置しても消えますが、その間に別の大きなファイルを送ろうとして容量に弾かれるのは、原因が見えにくい失敗になります。
+
+Drive 側のスコープをどこまで絞れるかは [Apps Script の OAuth スコープを最小権限で設計する](/articles/gemini-workspace/apps-script-gemini-least-privilege-oauth-scope-design) の整理が使えます。`alt=media` を叩く以上、読み取りスコープは避けられませんが、`drive.readonly` で足りるケースは多いはずです。
+
+## 実行時間の予算を、チャンク数で考える
+
+設計を数字で検算しておきます。
+
+1チャンクの往復には、Drive からの Range 取得と Gemini への転送、二回の HTTP が含まれます。仮に往復を最悪 5 秒と見積もると、撤退用に 1 分を残した 5 分の枠では 60 チャンクが上限です。8 MB × 60 で、一回の実行あたり約 480 MB。
+
+380 MB のファイルなら、理屈の上では一回の起動で終わります。しかし回線が遅い日や Drive 側のレイテンシが伸びた日には、48 チャンク目で時間切れになる。そのときに進捗が残っているかどうかが、この設計の全てです。
+
+チャンクを 16 MB に倍増させれば往復回数は 50% 減りますが、一回の失敗で捨てる量も 2 倍になり、`Utilities.newBlob` に載せるメモリも増えます。8 MB は、そのどちらにも寄りすぎない位置として選んでいます。回線が安定している本番運用では 16 MB まで上げる余地はありますが、私は失敗時の損失が読める 8 MB を推奨します。
+
+## 落とし穴と、その回避
+
+`Range` ヘッダの `end` は inclusive です。`bytes=0-8388607` が 8 MB ちょうどで、`bytes=0-8388608` は 1 バイト多く取ります。この 1 バイトのずれは finalize の直前まで表面化せず、`Content-Length` の不一致という遠い場所でエラーになります。
+
+アップロード URL には寿命があります。数日にわたって再開し続ける設計にはできません。ファイルが 48 時間で消えることと合わせ、転送は「その日のうちに終わらせる」前提で組みます。
+
+`X-Goog-Upload-Header-Content-Length` に渡す総バイト数は、Drive API の `files.get` で取得した `size` を使います。`DriveApp` の `getSize()` でも取れますが、Google ドキュメント形式のファイルではバイト数の意味が変わるため、エクスポートが必要な種類を早い段階で弾いておくのが安全です。
+
+そして最後に、失敗したチャンクの再試行はオフセットを固定したまま行うこと。`upload` コマンドは冪等で、同じオフセットに同じバイトを書き直しても壊れません。壊れるのは、勝手にオフセットを進めたときだけです。エラーの対処としては、そのチャンクだけを同じ位置で投げ直すのが最短です。
+
+## 次に触るなら
+
+手元の Drive にある 100 MB を超えるファイルを一つ選び、`start` コマンドだけを叩いて `x-goog-upload-url` を受け取るところまでを、まず単体で動かしてみてください。そこから先のチャンク転送は、この URL に対する反復でしかないことが体感できるはずです。
+
+大容量の転送を「一度で成功させる処理」ではなく「いつ止められても再開できる処理」として捉え直すと、6 分という上限は壁ではなく、単なるチェックポイントの間隔になります。私自身、この見方に切り替えてから Apps Script でできることの範囲がかなり広がりました。実装の参考になれば幸いです。

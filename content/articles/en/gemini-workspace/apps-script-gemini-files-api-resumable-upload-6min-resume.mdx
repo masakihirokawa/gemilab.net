@@ -1,0 +1,302 @@
+---
+title: "Resuming Large Gemini Files API Uploads Across the Apps Script 6-Minute Limit"
+slug: "apps-script-gemini-files-api-resumable-upload-6min-resume"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-07-10T05:10"
+author: "Gemini Lab"
+description: "Sending a few hundred megabytes from Drive to the Gemini Files API through Apps Script means fighting a 6-minute execution cap and payload limits. Here is how to decompose resumable upload into start, upload, query and finalize so a killed run never loses progress."
+tags: ["gemini", "apps-script", "files-api", "google-workspace", "resumable-upload"]
+highlights:
+  - "You can replace an upload that keeps dying at the 6-minute mark with a transfer that picks up exactly where it stopped"
+  - "You will be able to use the resumable query command to read the server's true offset, eliminating duplicate chunks and offset drift"
+  - "You can turn the 48-hour Files API retention window into an idempotency key, skipping re-uploads of unchanged Drive files entirely"
+---
+
+A 380 MB promo video sitting in Drive killed my Apps Script run with "Exceeded maximum execution time." All I wanted was a monthly pass where Gemini watched the footage for one of the apps I maintain as an indie developer. Handing a blob straight to `UrlFetchApp` does not survive the first step.
+
+The Files API and the Apps Script execution model were never designed for each other. One assumes you can hand over a large file in a single motion. The other guarantees your function dies at six minutes, no negotiation. Bridging them means rebuilding the transfer as a state machine that expects to be interrupted.
+
+## Pin down the hard numbers first
+
+Before writing anything, it helps to know exactly which walls are load-bearing. These are the limits Google documents.
+
+<table>
+  <thead>
+    <tr><th>Item</th><th>Value</th><th>What it forces</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>When Files API is required</td><td>Total request over 100 MB</td><td>Below that, inline data is fine</td></tr>
+    <tr><td>Inline limit for PDFs</td><td>50 MB</td><td>PDFs cross the line sooner</td></tr>
+    <tr><td>Maximum size per file</td><td>2 GB</td><td>Anything larger must be split first</td></tr>
+    <tr><td>Storage per project</td><td>20 GB</td><td>Abandoned files quietly eat the quota</td></tr>
+    <tr><td>Retention</td><td>48 hours</td><td>Auto-deleted, and never downloadable</td></tr>
+  </tbody>
+</table>
+
+The API itself costs nothing and is available in every region where Gemini is. The number that shapes the design is <strong>48 hours</strong>. It is a constraint, but it also happens to be the foundation for idempotency, which I will come back to.
+
+## Resumable upload is three commands, not one
+
+Underneath the SDK, Files API uploads speak Google's standard resumable protocol. Drop to REST and the three phases become visible.
+
+Phase one is <strong>start</strong>. No file bytes travel. You send metadata and receive an upload URL.
+
+```bash
+curl "https://generativelanguage.googleapis.com/upload/v1beta/files" \
+  -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+  -D headers.tmp \
+  -H "X-Goog-Upload-Protocol: resumable" \
+  -H "X-Goog-Upload-Command: start" \
+  -H "X-Goog-Upload-Header-Content-Length: 398458880" \
+  -H "X-Goog-Upload-Header-Content-Type: video/mp4" \
+  -H "Content-Type: application/json" \
+  -d '{"file": {"display_name": "promo-2026-07"}}'
+
+# The destination comes back in a response header
+grep -i "x-goog-upload-url" headers.tmp
+```
+
+Phase two is <strong>upload</strong>. You push bytes at the URL, declaring their position with `X-Goog-Upload-Offset`. Only the final chunk carries `upload, finalize`, which seals the file.
+
+Phase three is <strong>query</strong>. It rarely shows up in sample code, yet it is the one command that makes recovery correct. It asks the server how many bytes it has actually accepted.
+
+If nothing can interrupt you, none of this matters. For anything under 100 MB I still reach for a single `client.files.upload()` call. Decomposition only earns its keep when the process running the transfer is expected to die.
+
+## Two Apps Script walls, not one
+
+Apps Script pushes back in two directions at once.
+
+The first is time. A single invocation cannot exceed six minutes. Streaming 380 MB inside one run is a bet even on a good connection.
+
+The second is memory. `DriveApp.getFileById(id).getBlob()` materializes the whole file. Build a several-hundred-megabyte blob and the runtime is already unstable before a single byte leaves. `UrlFetchApp` has its own payload ceiling, so passing that blob as `payload` was never an option.
+
+The conclusion is uncomfortable but clear: <strong>the script must never hold the whole file</strong>. Slice a range out of Drive, push exactly that range, record the position, exit. Let the next trigger continue.
+
+The same six-minute problem, framed for Sheets batches, is covered in [crossing the Apps Script 6-minute limit with idempotent chunked runs](/articles/gemini-workspace/apps-script-gemini-sheets-batch-6min-limit-idempotent). What follows applies that shape to binary transfer.
+
+## Slice Drive with a Range header
+
+The trick is `alt=media` on Drive API v3, combined with an HTTP `Range` header. No blob, no full copy.
+
+```javascript
+/**
+ * Fetch only bytes [start, end] of a Drive file. `end` is inclusive per HTTP Range.
+ * Returns a byte array, so the full file never lands in memory.
+ */
+function fetchDriveRange_(fileId, start, end) {
+  const url = 'https://www.googleapis.com/drive/v3/files/'
+    + encodeURIComponent(fileId) + '?alt=media&supportsAllDrives=true';
+
+  const res = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: {
+      Authorization: 'Bearer ' + ScriptApp.getOAuthToken(),
+      Range: 'bytes=' + start + '-' + end,
+    },
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  // 206 Partial Content is success. A 200 means Range was ignored.
+  if (code !== 206) {
+    throw new Error('Range fetch failed: HTTP ' + code + ' (expected 206)');
+  }
+  return res.getContent(); // byte[]
+}
+```
+
+Asserting on `206` is not paranoia. If `Range` gets ignored and the server answers `200`, the entire file arrives and memory goes with it. Swallowing that with `muteHttpExceptions` leaves you with an execution failure and no explanation. Fail early, fail specifically.
+
+I start at 8 MB per chunk. The protocol requires every non-final chunk to be a multiple of 256 KiB, so a clean `8 * 1024 * 1024` removes one thing to think about.
+
+## Push the chunk, persist the position
+
+The sending half is straightforward. Declare the offset, and add `finalize` only on the last one.
+
+```javascript
+const CHUNK = 8 * 1024 * 1024; // must be a multiple of 256 KiB
+
+/**
+ * Send one chunk. Only the last call finalizes and seals the file.
+ * The finalize response body carries file.uri and file.name.
+ */
+function putChunk_(uploadUrl, bytes, offset, isLast) {
+  const command = isLast ? 'upload, finalize' : 'upload';
+
+  const res = UrlFetchApp.fetch(uploadUrl, {
+    method: 'post',
+    contentType: 'application/octet-stream',
+    payload: Utilities.newBlob(bytes),
+    headers: {
+      'X-Goog-Upload-Command': command,
+      'X-Goog-Upload-Offset': String(offset),
+    },
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    throw new Error('chunk upload failed at offset ' + offset + ': HTTP ' + code);
+  }
+  return isLast ? JSON.parse(res.getContentText()) : null;
+}
+```
+
+State lives in `PropertiesService`: the upload URL, the next offset, the total size, and the source Drive file ID. The function ships a few chunks, watches the clock, and retreats on its own terms.
+
+```javascript
+const SAFE_MS = 60 * 1000; // reserve the final minute for a clean exit
+
+function resumeUpload() {
+  const props = PropertiesService.getScriptProperties();
+  const state = JSON.parse(props.getProperty('UPLOAD_STATE'));
+  const started = Date.now();
+
+  while (state.offset < state.total) {
+    // Leave before the runtime takes the decision away from us
+    if (Date.now() - started > 6 * 60 * 1000 - SAFE_MS) {
+      props.setProperty('UPLOAD_STATE', JSON.stringify(state));
+      return; // the next trigger takes over
+    }
+
+    const end = Math.min(state.offset + CHUNK, state.total) - 1;
+    const bytes = fetchDriveRange_(state.fileId, state.offset, end);
+    const isLast = end === state.total - 1;
+    const done = putChunk_(state.uploadUrl, bytes, state.offset, isLast);
+
+    state.offset = end + 1;
+    props.setProperty('UPLOAD_STATE', JSON.stringify(state));
+
+    if (done) {
+      props.setProperty('FILE_URI', done.file.uri);
+      props.setProperty('FILE_NAME', done.file.name);
+      props.deleteProperty('UPLOAD_STATE');
+      return;
+    }
+  }
+}
+```
+
+Writing the property after every chunk looks wasteful until the run gets killed. Batch the writes to the end and a six-minute timeout erases all progress at once.
+
+## On resume, do not trust your own bookkeeping
+
+The obvious move is to restart from the saved `state.offset`. That number lies.
+
+Send a chunk, the server accepts it, and the runtime kills you while the response is still in flight. Your local offset is now stale. Resume from it and you rewrite bytes the server already has.
+
+So the first action after a restart is always <strong>query</strong>. Ask the server to state its own position.
+
+```javascript
+/**
+ * Read how many bytes the server has actually accepted.
+ * Always trust this over the locally persisted offset.
+ */
+function queryServerOffset_(uploadUrl) {
+  const res = UrlFetchApp.fetch(uploadUrl, {
+    method: 'post',
+    headers: { 'X-Goog-Upload-Command': 'query' },
+    muteHttpExceptions: true,
+  });
+
+  const status = res.getHeaders()['x-goog-upload-status']; // active / final / cancelled
+  if (status === 'final') return -1; // already sealed, nothing to resend
+
+  const received = res.getHeaders()['x-goog-upload-size-received'];
+  return Number(received || 0);
+}
+```
+
+When `x-goog-upload-status` comes back `final`, the previous run reached finalize before dying. Resending then wastes bandwidth and, worse, can leave you with two copies of the same asset.
+
+I skipped this call in my first version. The result was the same video sitting twice in the Files API, quietly consuming the 20 GB project quota. Local progress is a hint. The server holds the truth.
+
+## Never hand a file to the model before it is ACTIVE
+
+Finalize succeeding does not mean the file is usable. Video and audio go through preprocessing, and while `state` reads `PROCESSING` the URI is not consumable.
+
+```javascript
+/**
+ * Wait for ACTIVE, but never burn the whole execution budget doing it.
+ */
+function waitUntilActive_(fileName, maxAttempts) {
+  const url = 'https://generativelanguage.googleapis.com/v1beta/' + fileName;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    const res = UrlFetchApp.fetch(url, {
+      headers: { 'x-goog-api-key': getApiKey_() },
+      muteHttpExceptions: true,
+    });
+    const file = JSON.parse(res.getContentText());
+
+    if (file.state === 'ACTIVE') return file;
+    if (file.state === 'FAILED') throw new Error('file processing failed: ' + fileName);
+
+    Utilities.sleep(Math.min(2000 * Math.pow(2, i), 30000)); // exponential backoff, 30s cap
+  }
+  return null; // still pending, let the next trigger check again
+}
+```
+
+Capping the attempts and returning `null` is deliberate. Spending six minutes in a polling loop is strictly worse than persisting state and letting the next invocation look again. The waiting must be interruptible too.
+
+Once several triggers can run concurrently, the shared state needs a lock. [Handling PropertiesService lock contention in Apps Script](/articles/gemini-workspace/apps-script-gemini-properties-lock-contention-durable-result-store) covers that before it bites.
+
+## Turn the 48-hour window into an idempotency key
+
+Files vanish after 48 hours. That same property can prevent a redundant re-upload.
+
+Put a deterministic string in `display_name`, derived from the Drive file ID and its checksum. Before starting a transfer, list the files and reuse any `ACTIVE` match.
+
+```javascript
+/**
+ * Deterministic display name. Same content, same key.
+ * Mixing in Drive's md5Checksum makes a replaced file produce a new key.
+ */
+function uploadKey_(fileId, md5) {
+  return 'drive-' + fileId.slice(0, 12) + '-' + md5.slice(0, 8);
+}
+
+function findReusable_(key) {
+  const res = UrlFetchApp.fetch(
+    'https://generativelanguage.googleapis.com/v1beta/files?pageSize=100',
+    { headers: { 'x-goog-api-key': getApiKey_() }, muteHttpExceptions: true }
+  );
+  const files = JSON.parse(res.getContentText()).files || [];
+  return files.find(f => f.displayName === key && f.state === 'ACTIVE') || null;
+}
+```
+
+Swap the file in Drive and `md5Checksum` changes, so the key changes with it. Leave it alone and a second analysis within 48 hours starts with zero bytes transferred. For a 380 MB asset that is a meaningful saving in both wall-clock time and chunk round trips.
+
+The flip side is stewardship of the 20 GB quota. Call `files.delete` once the analysis is done. The 48-hour sweep will get there eventually, but running into a quota rejection while uploading something unrelated is a genuinely confusing failure to debug.
+
+How tightly the Drive scope can be drawn is worked through in [designing least-privilege OAuth scopes for Apps Script](/articles/gemini-workspace/apps-script-gemini-least-privilege-oauth-scope-design). Hitting `alt=media` requires a read scope, but `drive.readonly` is usually enough.
+
+## Budget the run in chunks, not megabytes
+
+Some arithmetic to sanity-check the design.
+
+Each chunk costs two HTTP round trips: one to Drive, one to Gemini. Assume a pessimistic 5 seconds per chunk. Reserve a minute for the retreat and you have five minutes, or 60 chunks. At 8 MB each, that is roughly 480 MB per invocation.
+
+So a 380 MB file should finish in a single run. On a slow day, with Drive latency stretched, it dies on chunk 48 instead. Whether progress survives that moment is the entire point of the design.
+
+Larger chunks mean fewer round trips, but more bytes thrown away per failure and more memory inside `Utilities.newBlob`. 8 MB sits between those pressures. On a stable connection there is room to push it to 16 MB.
+
+## The traps worth naming up front
+
+HTTP `Range` is inclusive on both ends. `bytes=0-8388607` is exactly 8 MB; `bytes=0-8388608` grabs one byte too many. That off-by-one hides until finalize, then surfaces as a content-length mismatch far from its cause.
+
+Upload URLs expire. A design that resumes across several days will not hold. Combined with the 48-hour retention, treat every transfer as something that must finish the same day.
+
+The total size passed to `X-Goog-Upload-Header-Content-Length` should come from Drive's `files.get` `size` field. `getSize()` works too, but for native Google Docs formats the byte count means something else entirely, so reject export-required types early.
+
+Finally, retry failed chunks at the same offset. The `upload` command is idempotent, and rewriting identical bytes at an identical position breaks nothing. What breaks it is advancing the offset on your own initiative.
+
+## Where to start
+
+Pick one file over 100 MB in your Drive and issue only the `start` command until you have an `x-goog-upload-url` in hand. Everything after that is repetition against a single URL, and seeing it isolated makes that obvious.
+
+Once a large transfer stops being "an operation that must succeed once" and becomes "an operation that can be stopped at any moment," six minutes stops being a wall and turns into a checkpoint interval. That shift widened what I was willing to build on Apps Script considerably.
