@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH — Gemini 3.5 FlashがGAとなり、gemini-flash-latestの実体として利用できます",
-    "AGENTS — Gemini APIのManaged Agentsがパブリックプレビューとなり、Googleホストの隔離Linuxサンドボックスで自律実行できます",
-    "STUDIO — Google AI Studioにプロジェクト単位の支出上限（spend caps）が追加され、ネイティブAndroid vibe codingにも対応しました",
-    "LIVE — 音声対音声でリアルタイム対話するGemini 3.1 Flash Live Previewが公開されました",
-    "IMAGE — 最速・低コストの画像モデルNano Banana 2 Liteが提供され、Gemini Omni FlashもAPIでプレビュー公開されています",
-    "LYRIA — 音楽生成モデルLyria 3（clip-preview / pro-preview）が新たに利用できます",
+    "API — Interactions APIが一般提供となり、Geminiモデルとエージェントを扱う主要APIとしてスキーマが安定しました",
+    "AGENTS — Interactions APIのGAでManaged Agentsとバックグラウンド実行が正式対応となり、Gemini Omniも追って対応予定です",
+    "LIVE — Live APIとAI Studioに多言語リアルタイム音声翻訳が加わり、70以上の言語を自動検出して話者の抑揚を保ちます",
+    "OMNI — ネイティブマルチモーダルのGemini Omni FlashがAPIでパブリックプレビューとなり、動画ワークフローを自作できます",
+    "SPARK — 個人向けエージェントGemini SparkがmacOSに対応し、ローカルファイルやWorkspaceをまたいだ処理を自律実行します",
+    "PRO — Gemini 3.5 Proは7月17日に延期と報じられ、200万トークンとDeep Think Reasoning Layerが焦点とされています",
   ],
   en: [
-    "FLASH — Gemini 3.5 Flash is now generally available and powers gemini-flash-latest",
-    "AGENTS — Managed Agents in the Gemini API enter public preview, running autonomously in Google-hosted isolated Linux sandboxes",
-    "STUDIO — Google AI Studio adds project-level spend caps and native Android vibe coding",
-    "LIVE — Gemini 3.1 Flash Live Preview, an audio-to-audio model for real-time dialogue, is now available",
-    "IMAGE — Nano Banana 2 Lite arrives as the fastest, most cost-efficient image model, and Gemini Omni Flash is in API preview",
-    "LYRIA — Lyria 3 music generation models (clip-preview and pro-preview) are now available",
+    "API — The Interactions API reaches general availability as the primary API for Gemini models and agents, with a stable schema",
+    "AGENTS — With GA, the Interactions API formally supports Managed Agents and background execution, with Gemini Omni coming soon",
+    "LIVE — The Live API and AI Studio add real-time speech-to-speech translation, auto-detecting 70+ languages while preserving intonation",
+    "OMNI — Gemini Omni Flash, a natively multimodal model, enters API public preview for building custom video workflows",
+    "SPARK — Gemini Spark, Google's personal agent, arrives on macOS to work across local files and Google Workspace on your behalf",
+    "PRO — Gemini 3.5 Pro is reported to be delayed to July 17, centered on a 2M-token context and a Deep Think Reasoning Layer",
   ],
 };
 
