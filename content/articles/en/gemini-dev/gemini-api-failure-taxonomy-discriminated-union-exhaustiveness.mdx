@@ -1,0 +1,236 @@
+---
+title: "Closing the Failures That Never Throw: Normalizing Gemini API Responses into a Discriminated Union"
+slug: "gemini-api-failure-taxonomy-discriminated-union-exhaustiveness"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-07-09T15:45"
+author: "Gemini Lab"
+description: "An HTTP 200 with an empty body will never reach your catch block. Here is how I normalize finishReason and blockReason into a discriminated union, and let a never check turn missed cases into compile errors."
+tags: ["Gemini API", "TypeScript", "Error Handling", "Type Safety", "Production"]
+highlights:
+  - "How to enumerate the five failures that arrive as HTTP 200 (empty candidates, SAFETY, MAX_TOKENS, RECITATION, OTHER)"
+  - "A discriminated union plus a never check that turns a newly added finishReason into a compile error"
+  - "A retry-eligibility table per failure kind, plus 30 days of measured failure distribution from a live batch"
+---
+
+At 2 a.m. my wallpaper app's description-generation batch reported "1,842 succeeded" and exited cleanly. The next morning, about twenty documents in Firestore held nothing but an empty string.
+
+Nothing threw. Every HTTP status was 200. The SDK never complained. `response.text` was simply the empty string.
+
+The code I had written looked like this.
+
+```ts
+try {
+  const res = await ai.models.generateContent({ model, contents });
+  await save(res.text ?? "");   // quietly persists ""
+} catch (e) {
+  logger.error(e);
+}
+```
+
+A `catch` block only sees failures that were thrown. Most Gemini API failures are never thrown — they arrive wearing the shape of a successful response. This is the record of how I closed that gap with the type system.
+
+## Gemini failures live in three layers
+
+Once I sorted them by where they originate, the picture became clear.
+
+<table>
+  <thead>
+    <tr><th>Layer</th><th>Examples</th><th>How you catch it</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Transport</td><td>Timeouts, DNS failures, dropped connections</td><td>Thrown</td></tr>
+    <tr><td>HTTP</td><td>400 INVALID_ARGUMENT, 429, 500, 503</td><td>Thrown</td></tr>
+    <tr><td>Semantic</td><td>Empty candidates, finishReason SAFETY / MAX_TOKENS / RECITATION</td><td><strong>Never thrown. You must look</strong></td></tr>
+  </tbody>
+</table>
+
+The first two layers are well covered — I wrote about telling retryable 429s apart from spend-cap exhaustion in [a separate piece on 429 handling](/articles/gemini-api/gemini-api-429-retryable-vs-spend-cap-exhaustion-retry-design). The third layer is where the silence lives.
+
+To the SDK, a semantic failure *is* a success. The response gets assembled, the reason gets written into `promptFeedback` or `candidates[0].finishReason`, and it comes back. If the caller never reads those fields, the failure effectively never happened.
+
+That is exactly how I ended up persisting empty strings.
+
+## Enumerate every possible outcome first
+
+Before writing any types, I listed the shapes a response can actually take. For my workloads, everything fit into five branches.
+
+1. `promptFeedback.blockReason` is set — the input was stopped, and `candidates` does not exist.
+2. `candidates` is an empty array — the model returned nothing.
+3. `finishReason: "STOP"` with non-empty text — the only real success.
+4. `finishReason` is `"MAX_TOKENS"`, `"SAFETY"`, `"RECITATION"`, or `"OTHER"` — generation stopped on the output side.
+5. `finishReason: "STOP"` but the text is empty — I hit this with structured output when the model could not satisfy the schema.
+
+The fifth case is the nasty one. If you judge success by `finishReason` alone, an empty string sails straight through. That is precisely the path that produced my twenty broken documents.
+
+So the predicate is not "is finishReason STOP." It is "is finishReason STOP **and** is the text non-empty." Obvious in hindsight; nowhere in my code at the time.
+
+## Model the outcomes as a discriminated union
+
+With the branches enumerated, the type writes itself. A `kind` field acts as the discriminant.
+
+```ts
+// gemini/outcome.ts
+export type GeminiOutcome =
+  | { kind: "ok"; text: string; usage: TokenUsage }
+  | { kind: "prompt_blocked"; blockReason: string }
+  | { kind: "no_candidates" }
+  | { kind: "truncated"; partial: string; usage: TokenUsage }
+  | { kind: "output_blocked"; reason: "SAFETY" | "RECITATION" }
+  | { kind: "empty_text"; finishReason: string }
+  | { kind: "unknown_finish"; finishReason: string };
+
+export type TokenUsage = {
+  promptTokens: number;
+  candidatesTokens: number;
+};
+```
+
+The critical detail: only `ok` carries `text: string`. No other branch has a `text` field at all. To reach `outcome.text`, a caller is forced through `kind === "ok"`.
+
+The type now makes "persist an empty string" ungrammatical. I like being protected this way. I forget the warnings in the documentation; the compiler does not.
+
+## Normalize the raw response at one boundary
+
+Next, a function that maps the SDK response onto the union. I confine this conversion to a single place, and everything downstream touches only `GeminiOutcome`.
+
+```ts
+// gemini/normalize.ts
+import type { GenerateContentResponse } from "@google/genai";
+import type { GeminiOutcome } from "./outcome";
+
+export function normalize(res: GenerateContentResponse): GeminiOutcome {
+  const usage = {
+    promptTokens: res.usageMetadata?.promptTokenCount ?? 0,
+    candidatesTokens: res.usageMetadata?.candidatesTokenCount ?? 0,
+  };
+
+  const blockReason = res.promptFeedback?.blockReason;
+  if (blockReason) return { kind: "prompt_blocked", blockReason };
+
+  const candidate = res.candidates?.[0];
+  if (!candidate) return { kind: "no_candidates" };
+
+  const text = candidate.content?.parts
+    ?.map((p) => p.text ?? "")
+    .join("") ?? "";
+
+  switch (candidate.finishReason) {
+    case "STOP":
+      return text.length > 0
+        ? { kind: "ok", text, usage }
+        : { kind: "empty_text", finishReason: "STOP" };
+    case "MAX_TOKENS":
+      return { kind: "truncated", partial: text, usage };
+    case "SAFETY":
+    case "RECITATION":
+      return { kind: "output_blocked", reason: candidate.finishReason };
+    default:
+      return {
+        kind: "unknown_finish",
+        finishReason: candidate.finishReason ?? "UNSPECIFIED",
+      };
+  }
+}
+```
+
+Routing `default` into `unknown_finish` is the point. Gemini adds new `finishReason` values over time. When something like `MALFORMED_FUNCTION_CALL` appears, this function does not crash — it carries the unrecognized reason downstream intact. Carry it, do not drop it.
+
+Why assemble `text` from `parts` by hand rather than using the SDK's `.text` getter? Because getter behavior around multi-part content and `undefined` shifts between SDK versions. At a boundary function, I prefer building from the raw structure. It reads more honestly six months later.
+
+## Let never prove the exhaustiveness
+
+Once outcomes are normalized, force every consumer to handle every branch.
+
+```ts
+// gemini/handle.ts
+import type { GeminiOutcome } from "./outcome";
+
+function assertNever(x: never): never {
+  throw new Error(`Unhandled outcome: ${JSON.stringify(x)}`);
+}
+
+export function toPersistable(o: GeminiOutcome): string | null {
+  switch (o.kind) {
+    case "ok":
+      return o.text;
+    case "truncated":
+      // continuation is the caller's decision; never persist a partial here
+      return null;
+    case "prompt_blocked":
+    case "output_blocked":
+    case "no_candidates":
+    case "empty_text":
+    case "unknown_finish":
+      return null;
+    default:
+      return assertNever(o);
+  }
+}
+```
+
+The moment you add a branch to `GeminiOutcome`, the argument to `assertNever(o)` no longer narrows to `never`, and the build fails. "Added a new failure kind, forgot to handle it" becomes a compile-time event.
+
+This paid off immediately. When I introduced `empty_text` after the fact, four call sites broke: `toPersistable`, the metrics emitter, the retry decision, and an admin dashboard renderer. Had I been grepping by hand, I would have missed at least two of them.
+
+`assertNever` looks alarming because it throws at runtime. Its real job is the compile-time proof. Reaching it at runtime just means the type was lying, and it says so loudly.
+
+## Decide retry policy per failure kind
+
+Types in place, the policy follows. Pushing every failure through the same `retry(3)` wastes both money and quality.
+
+<table>
+  <thead>
+    <tr><th>kind</th><th>Retry?</th><th>Action</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>prompt_blocked</td><td>No</td><td>Fix the input, or exclude it permanently</td></tr>
+    <tr><td>no_candidates</td><td>Once</td><td>Retry the same prompt; on repeat, record and move on</td></tr>
+    <tr><td>truncated</td><td>No (continue)</td><td>Keep the partial and hand it to a continuation call</td></tr>
+    <tr><td>output_blocked</td><td>No</td><td>Log it as a safetySettings review candidate</td></tr>
+    <tr><td>empty_text</td><td>Up to twice</td><td>Retry with higher temperature; flag the schema for simplification</td></tr>
+    <tr><td>unknown_finish</td><td>No</td><td>Alert. Suspect an SDK or API change</td></tr>
+  </tbody>
+</table>
+
+`truncated` is marked no-retry because the same input truncates at the same place. It belongs on a continuation path instead, which I described in [recovering from MAX_TOKENS truncation](/articles/gemini-api/gemini-api-max-tokens-truncation-continuation-recovery).
+
+`output_blocked` follows the same logic. Safety filtering is largely deterministic — three attempts earn three identical verdicts and triple the token spend. Adjustments belong on the [layered safety settings](/articles/gemini-api/gemini-api-safety-settings-production-layered-design) side of the house.
+
+## Thirty days of measurements
+
+The best side effect of typing the outcomes was that failures became countable. Before this, all I could say was "sometimes it comes back empty."
+
+I used `kind` directly as a metrics label and watched the wallpaper description batch for 30 days — roughly 600 requests per day, 18,140 in total.
+
+<table>
+  <thead>
+    <tr><th>kind</th><th>Count</th><th>Share</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ok</td><td>17,656</td><td>97.33%</td></tr>
+    <tr><td>truncated</td><td>281</td><td>1.55%</td></tr>
+    <tr><td>empty_text</td><td>121</td><td>0.67%</td></tr>
+    <tr><td>no_candidates</td><td>49</td><td>0.27%</td></tr>
+    <tr><td>output_blocked</td><td>29</td><td>0.16%</td></tr>
+    <tr><td>prompt_blocked</td><td>4</td><td>0.02%</td></tr>
+    <tr><td>unknown_finish</td><td>0</td><td>0.00%</td></tr>
+  </tbody>
+</table>
+
+Semantic failures totaled 484, or 2.67% of all calls. Under the old code, the 170 `empty_text` and `no_candidates` results were stored as empty strings, and the 281 `truncated` ones were stored mid-sentence. That is 451 documents — 2.49% — quietly corrupted.
+
+One more finding. Over 90% of the 121 `empty_text` results came from generations whose `responseSchema` contained an `enum`. After relaxing the schema and validating downstream instead, the next 30 days produced 14 instead of 121. Types do not eliminate failures. They give failures names, and a named failure can finally be traced.
+
+I also measured the normalizer's cost: 0.31 seconds across all 18,140 calls, about 17 microseconds each. Against API latency measured in hundreds of milliseconds, it is not worth a second thought.
+
+## Where to start
+
+If you want to try this, you do not need to write `GeminiOutcome` in full on day one. Mine began as two branches, `ok` and `not_ok`, and split further each time a new failure introduced itself.
+
+The one thing to enforce from the start is that `generateContent` is called from exactly one place in your codebase. That call site becomes your normalization boundary. If calls are scattered, no amount of good typing helps — there will always be a back door around the types. On an existing project, the first honest step is probably shrinking `grep -rn "generateContent" src/` down to a single line.
+
+Types are not magic. But they are a colleague smart enough to tell you, before breakfast, about the data that quietly broke overnight. I fell into this same hole several times before drawing the boundary. If it spares even one other person that morning, writing it down was worth it.
+
+**Your next step:** find the line in your running code that persists `res.text`, and add a `text.length > 0` check immediately before it. That alone stops the empty documents from accumulating, starting today.

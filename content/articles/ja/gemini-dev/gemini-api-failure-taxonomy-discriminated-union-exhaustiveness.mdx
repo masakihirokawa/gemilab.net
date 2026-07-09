@@ -1,0 +1,240 @@
+---
+title: "例外にならない失敗を型で閉じる — Gemini API のレスポンスを判別可能ユニオンに正規化する"
+slug: "gemini-api-failure-taxonomy-discriminated-union-exhaustiveness"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-07-09T15:45"
+author: "Gemini Lab"
+description: "HTTP 200 なのに本文が空、という失敗は try/catch では捕まりません。finishReason と blockReason を判別可能ユニオンに正規化し、never による網羅性チェックで処理漏れをコンパイル時に潰す設計をまとめました。"
+tags: ["Gemini API", "TypeScript", "エラーハンドリング", "型安全", "本番運用"]
+highlights:
+  - "HTTP 200 で返る5種類の失敗（空 candidates / SAFETY / MAX_TOKENS / RECITATION / OTHER）を漏れなく列挙する方法"
+  - "判別可能ユニオンと never チェックで、新しい finishReason の追加をコンパイルエラーとして検出する実装"
+  - "失敗種別ごとのリトライ可否表と、30日間の実運用ログから得た失敗内訳の実測値"
+---
+
+深夜、壁紙アプリの説明文生成バッチが「成功 1,842 件」と表示したまま終わりました。翌朝、Firestore を覗くと空文字のドキュメントが 20 件ほど混ざっていました。
+
+例外は一つも投げられていません。HTTP ステータスは全て 200。SDK も何も文句を言いませんでした。ただ `response.text` が空文字だっただけです。
+
+このとき私が書いていたコードは、こういう形でした。
+
+```ts
+try {
+  const res = await ai.models.generateContent({ model, contents });
+  await save(res.text ?? "");   // ← ここが空文字を静かに通す
+} catch (e) {
+  logger.error(e);
+}
+```
+
+個人開発では、こういう失敗の見つかり方が一番こたえます。誰も監視していない時間帯に、静かにデータだけが痩せていきます。
+
+`try/catch` は「投げられた失敗」しか捕まえません。Gemini API の失敗の多くは、投げられずに、正常なレスポンスの形をして返ってきます。この記事は、その取りこぼしを型システムで塞ぐまでの実装記録です。
+
+## Gemini API の失敗は三層に分かれています
+
+整理してみると、失敗は発生場所によって三層に分かれていました。
+
+<table>
+  <thead>
+    <tr><th>層</th><th>例</th><th>捕まえ方</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>トランスポート層</td><td>タイムアウト、DNS 解決失敗、接続断</td><td>例外が投げられる</td></tr>
+    <tr><td>HTTP 層</td><td>400 INVALID_ARGUMENT、429、500、503</td><td>例外が投げられる</td></tr>
+    <tr><td>意味論層</td><td>candidates 空、finishReason: SAFETY / MAX_TOKENS / RECITATION</td><td><strong>投げられない。自分で見る</strong></td></tr>
+  </tbody>
+</table>
+
+上二層は既に多くの記事で語られていますし、私も[429 の見分け方についての記事](/articles/gemini-api/gemini-api-429-retryable-vs-spend-cap-exhaustion-retry-design)で扱いました。問題は三層目です。
+
+意味論層の失敗は、SDK にとっては成功です。レスポンスは組み立てられ、`promptFeedback` や `candidates[0].finishReason` に事情が書き込まれ、そのまま返されます。呼び出し側が読まなければ、それは無かったことになります。
+
+私が空文字を保存してしまったのは、まさにこの層でした。
+
+## 起こりうる結果を、まず全部書き出す
+
+型を書く前に、実際のレスポンスがどんな形を取りうるかを列挙しました。SDK のレスポンスから読める分岐は、私の用途では次の5つに収まりました。
+
+1. `promptFeedback.blockReason` が立っている（入力が止められた。`candidates` は存在しない）
+2. `candidates` が空配列（モデルが何も返さなかった）
+3. `finishReason: "STOP"` で本文あり（唯一の成功）
+4. `finishReason` が `"MAX_TOKENS"` / `"SAFETY"` / `"RECITATION"` / `"OTHER"`（出力側で止まった）
+5. `finishReason: "STOP"` なのに本文が空文字（構造化出力でスキーマに合わず、空を返してくる場合に遭遇しました）
+
+5番目は特に厄介でした。`finishReason` だけを見て成功と判定すると、静かに空文字が通ります。前掲のバッチが 20 件の空ドキュメントを作ったのは、この経路です。
+
+つまり判定は「finishReason が STOP か」ではなく、「STOP であり、かつ本文が非空か」でなければなりません。当たり前のようでいて、コードにはこの `かつ` が書かれていませんでした。
+
+## 判別可能ユニオンとして表現する
+
+列挙できたので、そのまま型にします。`kind` フィールドをタグとして持つ判別可能ユニオン（discriminated union）です。
+
+```ts
+// gemini/outcome.ts
+export type GeminiOutcome =
+  | { kind: "ok"; text: string; usage: TokenUsage }
+  | { kind: "prompt_blocked"; blockReason: string }
+  | { kind: "no_candidates" }
+  | { kind: "truncated"; partial: string; usage: TokenUsage }
+  | { kind: "output_blocked"; reason: "SAFETY" | "RECITATION" }
+  | { kind: "empty_text"; finishReason: string }
+  | { kind: "unknown_finish"; finishReason: string };
+
+export type TokenUsage = {
+  promptTokens: number;
+  candidatesTokens: number;
+};
+```
+
+ここで大事なのは、`ok` にだけ `text: string` を置き、他のどの枝にも `text` を生やさないことです。呼び出し側が `outcome.text` に触れるには、必ず `kind === "ok"` を通過しなければならなくなります。
+
+型が「空文字を保存する」という書き方を、構文レベルで禁止してくれる状態です。私はこの、型に守ってもらう感覚が好きです。ドキュメントに書かれた注意事項は忘れますが、コンパイラは忘れません。
+
+## 生レスポンスを正規化する
+
+SDK のレスポンスをこのユニオンへ写す関数を書きます。境界はここ一箇所だけに閉じ込め、以降のコードは `GeminiOutcome` しか触らないようにしました。
+
+```ts
+// gemini/normalize.ts
+import type { GenerateContentResponse } from "@google/genai";
+import type { GeminiOutcome } from "./outcome";
+
+export function normalize(res: GenerateContentResponse): GeminiOutcome {
+  const usage = {
+    promptTokens: res.usageMetadata?.promptTokenCount ?? 0,
+    candidatesTokens: res.usageMetadata?.candidatesTokenCount ?? 0,
+  };
+
+  const blockReason = res.promptFeedback?.blockReason;
+  if (blockReason) return { kind: "prompt_blocked", blockReason };
+
+  const candidate = res.candidates?.[0];
+  if (!candidate) return { kind: "no_candidates" };
+
+  const text = candidate.content?.parts
+    ?.map((p) => p.text ?? "")
+    .join("") ?? "";
+
+  switch (candidate.finishReason) {
+    case "STOP":
+      return text.length > 0
+        ? { kind: "ok", text, usage }
+        : { kind: "empty_text", finishReason: "STOP" };
+    case "MAX_TOKENS":
+      return { kind: "truncated", partial: text, usage };
+    case "SAFETY":
+    case "RECITATION":
+      return { kind: "output_blocked", reason: candidate.finishReason };
+    default:
+      return {
+        kind: "unknown_finish",
+        finishReason: candidate.finishReason ?? "UNSPECIFIED",
+      };
+  }
+}
+```
+
+`default` 節を `unknown_finish` に落としているのが要点です。Gemini は新しい `finishReason` を追加することがあります。将来 `MALFORMED_FUNCTION_CALL` のような値が増えても、この関数はクラッシュせず、既知でない終了理由として下流に渡します。落とさずに運ぶ、という姿勢です。
+
+なぜ `text` を `parts` から自前で連結しているか。SDK の `.text` ゲッターは実装によっては複数パートの結合や `undefined` の扱いが変わります。境界の関数では、SDK の便利機能に寄りかからず、生の構造から自分で組み立てるほうが後で読みやすい、というのが私の判断です。
+
+## never による網羅性チェック
+
+正規化できたら、消費側で全ての枝を扱わせます。ここで `never` を使います。
+
+```ts
+// gemini/handle.ts
+import type { GeminiOutcome } from "./outcome";
+
+function assertNever(x: never): never {
+  throw new Error(`Unhandled outcome: ${JSON.stringify(x)}`);
+}
+
+export function toPersistable(o: GeminiOutcome): string | null {
+  switch (o.kind) {
+    case "ok":
+      return o.text;
+    case "truncated":
+      // 続きを継ぎ直す判断は呼び出し側。ここでは保存しない
+      return null;
+    case "prompt_blocked":
+    case "output_blocked":
+    case "no_candidates":
+    case "empty_text":
+    case "unknown_finish":
+      return null;
+    default:
+      return assertNever(o);
+  }
+}
+```
+
+`GeminiOutcome` に新しい枝を足した瞬間、`assertNever(o)` の引数が `never` に収まらなくなり、コンパイルが落ちます。「新しい失敗種別を追加したが、扱いを書き忘れた」という事故が、ビルド時に止まります。
+
+これは実際に効きました。`empty_text` を後から追加したとき、`toPersistable` だけでなく、メトリクス送信・リトライ判定・管理画面の表示ロジックの計 4 箇所がコンパイルエラーになりました。手で grep していたら、そのうち 2 箇所は確実に見落としていたと思います。
+
+`assertNever` を「ランタイムで例外を投げる関数」だと思うと少し怖く見えますが、本質はコンパイル時の網羅性証明です。実行時に到達したときは、型に嘘があったことを大声で教えてくれる保険として働きます。
+
+## 失敗種別ごとに、リトライするかを決める
+
+型が揃ったので、次は方針です。全ての失敗を同じ `retry(3)` に流すのは、費用の面でも品質の面でも良くありません。
+
+<table>
+  <thead>
+    <tr><th>kind</th><th>リトライ</th><th>取るべき行動</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>prompt_blocked</td><td>不可</td><td>入力を修正するか、その入力を恒久的に除外</td></tr>
+    <tr><td>no_candidates</td><td>1回のみ</td><td>同一プロンプトで再試行。再発したら記録して次へ</td></tr>
+    <tr><td>truncated</td><td>不可（継続）</td><td>partial を保持し、続きの生成へ引き継ぐ</td></tr>
+    <tr><td>output_blocked</td><td>不可</td><td>safetySettings の見直し対象として記録</td></tr>
+    <tr><td>empty_text</td><td>2回まで</td><td>temperature を上げて再試行。スキーマ簡素化の候補に</td></tr>
+    <tr><td>unknown_finish</td><td>不可</td><td>アラートを上げる。SDK / API の変更を疑う</td></tr>
+  </tbody>
+</table>
+
+`truncated` を「リトライ不可」に分類しているのは、同じ入力をもう一度投げても同じ位置で切れるからです。ここは継続生成に接続する経路であり、その実装は[MAX_TOKENS の続きを継ぎ直す記事](/articles/gemini-api/gemini-api-max-tokens-truncation-continuation-recovery)にまとめてあります。
+
+`output_blocked` を無闇にリトライしないのも同じ理由です。安全性フィルタは概ね決定的に働きます。3 回投げて 3 回同じ判定を受け、トークンだけ 3 倍消費する、という無駄をよく見かけます。安全性側の調整は[Safety Settings のレイヤード設計](/articles/gemini-api/gemini-api-safety-settings-production-layered-design)の話になります。
+
+## 30日間の実測 — 何がどれだけ起きていたか
+
+型を入れた最大の副産物は、失敗が数えられるようになったことでした。それまでは「たまに空になる」としか言えませんでした。
+
+`kind` をそのままメトリクスのラベルに使い、30 日間、壁紙アプリの説明文生成（1 日あたり約 600 リクエスト、合計 18,140 リクエスト）を観測しました。
+
+<table>
+  <thead>
+    <tr><th>kind</th><th>件数</th><th>比率</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ok</td><td>17,656</td><td>97.33%</td></tr>
+    <tr><td>truncated</td><td>281</td><td>1.55%</td></tr>
+    <tr><td>empty_text</td><td>121</td><td>0.67%</td></tr>
+    <tr><td>no_candidates</td><td>49</td><td>0.27%</td></tr>
+    <tr><td>output_blocked</td><td>29</td><td>0.16%</td></tr>
+    <tr><td>prompt_blocked</td><td>4</td><td>0.02%</td></tr>
+    <tr><td>unknown_finish</td><td>0</td><td>0.00%</td></tr>
+  </tbody>
+</table>
+
+意味論層の失敗は合計 484 件、全体の 2.67% でした。以前の実装では、このうち `empty_text` と `no_candidates` の 170 件が空文字として保存され、`truncated` の 281 件は途中で切れた本文がそのまま保存されていました。合わせて 451 件、2.49% のドキュメントが静かに壊れていた計算になります。
+
+もう一つ分かったことがあります。`empty_text` の 121 件は、`responseSchema` に `enum` を含む生成に 9 割以上が集中していました。スキーマを緩めて後段でバリデーションする形に変えたところ、翌 30 日は 121 件から 14 件へ落ちました。型は失敗を消しませんが、失敗に名前を与えます。名前が付くと、初めて原因を追えるようになります。
+
+正規化関数のオーバーヘッドも測りました。18,140 回の呼び出しで正規化に費やした時間は合計 0.31 秒、1 回あたり約 17 マイクロ秒です。API 呼び出しが 1 回あたり数百ミリ秒かかることを思えば、計測に値しないほどの小ささでした。
+
+## 導入するなら、境界を一つに絞ることから
+
+もし同じ設計を試すなら、`GeminiOutcome` を全部書き切ることから始めなくて構いません。私も最初は `ok` と `not_ok` の 2 枝で始め、失敗に出会うたびに枝を割っていきました。
+
+一つだけ最初から守るべきは、`generateContent` を直接呼ぶ場所をコードベースで 1 箇所に絞ることです。そこが正規化の境界になります。呼び出しが散らばっていると、どれだけ良い型を用意しても、型を通らない裏口が残ります。既存プロジェクトなら `grep -rn "generateContent" src/` の結果が 1 行になるまで寄せる、という作業がおそらく最初の一歩です。
+
+型は魔法ではありません。ただ、深夜に静かに壊れたデータを、朝までに教えてくれる程度には賢い同僚です。私自身、この境界を引くまでに何度か同じ穴に落ちました。同じ夜を過ごす方が一人でも減れば嬉しく思います。
+
+より広い型設計の話は[TypeScript による型安全な Gemini アプリ設計](/articles/gemini-api/gemini-api-typescript-typesafe-ai-application-architecture)に、HTTP 層のエラー設計は[429・500・503 に耐える運用ノート](/articles/gemini-dev/gemini-api-error-handling-rate-limit-production-patterns)に、それぞれ分けて書いてあります。
+
+**次の一歩:** 今動いているコードで `res.text` を保存している行を探し、その直前に `text.length > 0` の判定を足してください。それだけで、静かに増えていく空ドキュメントは今日から止まります。
