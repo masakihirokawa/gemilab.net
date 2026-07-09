@@ -1,0 +1,350 @@
+---
+title: "My ADK Assistant Quietly Forgot a Deadline — Catching Compaction Memory Loss With a Recall Probe"
+slug: "adk-session-compaction-memory-loss-recall-probe-harness"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-10T08:30"
+author: "Gemini Lab"
+description: "Compacting conversation history in Google ADK with Gemini lowers cost, but it also erodes what your assistant remembers — silently. Here is how I built a recall probe to measure that loss, compared three compaction strategies against the same ledger, and stopped trading memory for tokens."
+tags: ["Google ADK", "SessionService", "Conversation Compaction", "Gemini", "Long-Term Memory", "Python", "Eval Harness"]
+highlights:
+  - "A working recall probe in Python that mechanically decides which facts a compacted session has lost"
+  - "A side-by-side run of summary compaction, sliding window, and hybrid against one fact ledger — reading the recall-vs-token tradeoff honestly"
+  - "The refactor that moves extracted facts outside the summarizer, so raising compression stops costing you names, deadlines, and decisions"
+---
+
+## The assistant answered a deadline question with a blank
+
+One evening I was scrolling back through the logs of a small task assistant I run for myself. Nothing exotic — Gemini behind Google's Agent Development Kit, plain multi-turn conversation.
+
+Three days earlier I had written: "I want the App Store screenshots ready by Friday 18:00."
+
+Three days later I asked when that deadline was. The reply came back courteous and useless: "I'm afraid I don't have any information about a deadline. Could you tell me more?"
+
+Nothing had crashed. No error, no alert. Latency held steady around 900ms. The month's API bill was down roughly 40% from the previous month. Every dashboard I owned was green.
+
+The falling bill was the culprit. To keep long conversations from ballooning, I had added compaction: once a session passed ten turns, older turns were folded into a summary. That summary had thrown the deadline away.
+
+I had instrumented cost. I had never instrumented memory.
+
+## Compaction is lossy compression that never reports its losses
+
+JPEG artifacts you can see. Audio compression you can hear. Conversation compaction offers no equivalent sense.
+
+The compacted assistant does not know what it forgot, because the fact of forgetting was itself discarded. That is where the polite, correct, worthless "I don't have that information" comes from.
+
+<table>
+<thead>
+<tr><th>Strategy</th><th>What it discards</th><th>What tends to vanish quietly</th></tr>
+</thead>
+<tbody>
+<tr><td>Sliding window (keep last N turns)</td><td>Whole older turns</td><td>Premises stated up front, user attributes</td></tr>
+<tr><td>Summary compaction (fold history into one summary)</td><td>Detail the summarizer omitted</td><td>Numbers, proper nouns, dates, commitments</td></tr>
+<tr><td>Hybrid (summary + last N verbatim)</td><td>Detail from the middle of the conversation</td><td>Spec changes agreed mid-conversation</td></tr>
+</tbody>
+</table>
+
+Summary compaction does not drop what is semantically unimportant. It drops **whatever the summarizer's prompt did not explicitly tell it to preserve**. Across sixty turns, "Friday 18:00" is one line. The summarizer rounds it into "the user is preparing a store submission," and in that moment the hour is gone.
+
+I stopped guessing at this. I started measuring it.
+
+## The recall probe — letting a machine decide what was forgotten
+
+What I added is a small reproducible test I call a recall probe. The idea is unglamorous.
+
+Keep a ledger of facts that must remain retrievable later. After compaction runs, ask the session a question that targets each fact. Decide whether the answer contains it. If not, record that this strategy dropped that fact.
+
+Exact string matching is wrong here — restating "18:00" as "six in the evening" should count as remembering. But relying purely on an LLM judge folds the judge's own variance into your measurement. So I put **a regex allowlist first**, and only send the misses to Gemini for a second-stage verdict. Judging ends up around 5% of total probe cost.
+
+```python
+"""recall_probe.py — measure how much memory survives compaction"""
+import asyncio
+import re
+from dataclasses import dataclass, field
+
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # reads GOOGLE_API_KEY from the environment
+
+@dataclass
+class Fact:
+    """Something said in conversation that must remain retrievable afterward"""
+    key: str                       # ledger identifier
+    question: str                  # the question that should surface it
+    patterns: list[str]            # accepted phrasings, as regexes
+    critical: bool = False         # losing this fails the whole run
+
+@dataclass
+class ProbeResult:
+    strategy: str
+    recalled: set[str] = field(default_factory=set)
+    lost: set[str] = field(default_factory=set)
+    lost_critical: set[str] = field(default_factory=set)
+    prompt_tokens: int = 0
+
+    @property
+    def recall_rate(self) -> float:
+        total = len(self.recalled) + len(self.lost)
+        return len(self.recalled) / total if total else 0.0
+
+
+def _matched_by_pattern(answer: str, fact: Fact) -> bool:
+    """Stage one: absorb phrasing variance cheaply. A hit here skips the judge."""
+    return any(re.search(p, answer) for p in fact.patterns)
+
+
+async def _matched_by_judge(answer: str, fact: Fact) -> bool:
+    """Stage two: only paraphrases the regexes missed reach the model."""
+    verdict = await client.aio.models.generate_content(
+        model="gemini-flash-latest",
+        contents=(
+            f"Question: {fact.question}\n"
+            f"Answer: {answer}\n\n"
+            f"Does the answer contain a concrete fact responding to the question? "
+            f"Treat 'I don't know' or 'no information' as not containing it. "
+            f"Reply with exactly one word: YES or NO."
+        ),
+        config=types.GenerateContentConfig(
+            temperature=0.0,       # keep judge variance out of the measurement
+            max_output_tokens=4,
+        ),
+    )
+    return (verdict.text or "").strip().upper().startswith("YES")
+
+
+async def probe(ask, facts: list[Fact], strategy: str) -> ProbeResult:
+    """ask(question) -> (answer, prompt_tokens); records recall per fact"""
+    result = ProbeResult(strategy=strategy)
+    for fact in facts:
+        answer, tokens = await ask(fact.question)
+        result.prompt_tokens += tokens
+
+        ok = _matched_by_pattern(answer, fact)
+        if not ok:
+            ok = await _matched_by_judge(answer, fact)
+
+        if ok:
+            result.recalled.add(fact.key)
+        else:
+            result.lost.add(fact.key)
+            if fact.critical:
+                result.lost_critical.add(fact.key)
+    return result
+```
+
+The `temperature=0.0` and `max_output_tokens=4` on the judge are deliberate. A chatty judge starts prefacing its YES with commentary and your parser breaks. A sampling judge gives you 79% one run and 86% the next for identical inputs. **A measuring instrument must be quieter than the thing it measures.**
+
+The `critical` flag earns its keep in practice. Forgetting "the user is new to Python" and forgetting "Friday 18:00" are not the same injury. A 92% recall rate where the missing 8% is entirely critical facts is a failing configuration. Averages lie.
+
+## Writing the ledger — deciding what must not be forgotten
+
+A probe is only as good as its ledger. I walked back roughly 200 turns of my own logs and sorted the facts that were actually referenced later. They fell into five kinds.
+
+Proper nouns (people, projects, filenames). Dates and deadlines. Numeric constraints (budgets, counts, limits). User attributes (skill level, language, environment). And decisions — things we explicitly agreed on.
+
+The two most frequently recalled were dates and decisions. Those are also exactly what summary compaction drops first. The ordering is precisely inverted.
+
+```python
+FACTS = [
+    Fact(
+        key="deadline",
+        question="What deadline did I mention?",
+        patterns=[r"Friday", r"18:00", r"6\s*p\.?m\.?", r"six in the evening"],
+        critical=True,
+    ),
+    Fact(
+        key="decision_screenshot_tool",
+        question="How did we decide to produce the screenshots?",
+        patterns=[r"script", r"automat", r"CLI"],
+        critical=True,
+    ),
+    Fact(
+        key="user_level",
+        question="What is your understanding of my Python experience?",
+        patterns=[r"beginner", r"new to", r"just started", r"learning"],
+    ),
+    Fact(
+        key="budget",
+        question="What monthly API budget did I give you?",
+        patterns=[r"3,?000\s*(yen|JPY|円)", r"\$?20"],
+        critical=True,
+    ),
+    Fact(
+        key="project_name",
+        question="What is the name of the app I'm working on?",
+        patterns=[r"Wallpaper\s*Studio"],
+    ),
+]
+```
+
+Writing the ledger taught me something I did not expect. **If you cannot write the question, the assistant never needed to remember the fact.** Any entry where no plausible follow-up question came to mind got deleted. The ledger shrank from 31 entries to 14, and each surviving entry got sharper.
+
+## Three strategies, one ledger
+
+I compacted the same 60-turn conversation three ways and ran all fourteen probes against each. Prompt token figures are measured from `usage_metadata.prompt_token_count`, not estimated.
+
+<table>
+<thead>
+<tr><th>Strategy</th><th>Recall rate</th><th>Critical losses</th><th>Mean prompt tokens</th><th>vs. uncompacted</th></tr>
+</thead>
+<tbody>
+<tr><td>No compaction (full history)</td><td>100% (14/14)</td><td>0</td><td>18,400</td><td>—</td></tr>
+<tr><td>Sliding window (last 10 turns)</td><td>50% (7/14)</td><td>3</td><td>3,100</td><td>-83%</td></tr>
+<tr><td>Summary compaction (history → one summary)</td><td>64% (9/14)</td><td>2</td><td>2,700</td><td>-85%</td></tr>
+<tr><td>Hybrid (summary + last 6 verbatim)</td><td>79% (11/14)</td><td>1</td><td>4,500</td><td>-76%</td></tr>
+</tbody>
+</table>
+
+Read plainly, hybrid wins. Most write-ups would stop here and recommend it.
+
+I did not want a production configuration that still drops one critical fact. An assistant that loses a deadline has failed at being a deadline assistant. Seventy-nine percent is a fine average and a catastrophic individual outcome.
+
+More telling: all three strategies failed at the same place. The summarizer, told to "preserve important content," was re-deciding what counted as important on every single call.
+
+## Move the facts outside the summary
+
+The fix was not a better compaction algorithm. It was **separating what may be compressed from what may not**.
+
+Natural conversational prose can be summarized freely. Extracted facts should bypass the summarizer entirely, live in a structured store, and be injected verbatim on every turn. ADK's `Session.state` exists for exactly this. I had been treating it as a scratchpad.
+
+```python
+"""fact_extractor.py — pull structured facts out of turns, keep them outside compaction"""
+from google.genai import types
+
+FACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "facts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["deadline", "decision", "constraint",
+                                 "entity", "user_attribute"],
+                    },
+                    "value": {"type": "string"},
+                    "source_turn": {"type": "integer"},
+                },
+                "required": ["kind", "value", "source_turn"],
+            },
+        }
+    },
+    "required": ["facts"],
+}
+
+
+async def extract_facts(client, turn_text: str, turn_index: int) -> list[dict]:
+    """Extract from one turn. Tuned to over-extract rather than miss."""
+    resp = await client.aio.models.generate_content(
+        model="gemini-flash-latest",     # extraction is transcription, not judgment
+        contents=(
+            f"Extract only facts from the utterance below that later turns may "
+            f"need to reference. Include only deadlines, decisions, numeric "
+            f"constraints, proper nouns, or user attributes. "
+            f"Return an empty array if none apply.\n\n"
+            f"Utterance (turn {turn_index}):\n{turn_text}"
+        ),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=FACT_SCHEMA,   # never hand-parse free text here
+            temperature=0.0,
+        ),
+    )
+    return resp.parsed["facts"]
+
+
+def merge_into_state(state: dict, new_facts: list[dict]) -> dict:
+    """Same kind+value never duplicates; the newer source_turn wins."""
+    ledger: dict[tuple[str, str], dict] = {
+        (f["kind"], f["value"]): f for f in state.get("fact_ledger", [])
+    }
+    for f in new_facts:
+        k = (f["kind"], f["value"])
+        if k not in ledger or f["source_turn"] > ledger[k]["source_turn"]:
+            ledger[k] = f
+    state["fact_ledger"] = list(ledger.values())
+    return state
+
+
+def render_ledger(state: dict) -> str:
+    """Injected verbatim into system context each turn. Never through the summarizer."""
+    facts = state.get("fact_ledger", [])
+    if not facts:
+        return ""
+    lines = [f"- [{f['kind']}] {f['value']}" for f in facts]
+    return ("Established facts (prefer these over the conversation summary):\n"
+            + "\n".join(lines))
+```
+
+`response_schema` forces JSON because parsing free-form extraction output breaks. I used to maintain a preprocessing step that stripped markdown code fences off the model's reply. The day I passed a schema, forty lines of that vanished.
+
+`merge_into_state` keeps the newer `source_turn` rather than blindly overwriting because people change their minds. When "Friday 18:00" later becomes "Monday morning works now," a stale fact makes the assistant defend a deadline that no longer exists. **Not forgetting and not updating are different failures.**
+
+## Numbers after the refactor
+
+With the ledger living outside compaction, I pushed the summarizer back to its most aggressive setting — only the last four turns kept verbatim.
+
+<table>
+<thead>
+<tr><th>Configuration</th><th>Recall rate</th><th>Critical losses</th><th>Mean prompt tokens</th><th>vs. uncompacted</th></tr>
+</thead>
+<tbody>
+<tr><td>No compaction</td><td>100%</td><td>0</td><td>18,400</td><td>—</td></tr>
+<tr><td>Hybrid (best before refactor)</td><td>79%</td><td>1</td><td>4,500</td><td>-76%</td></tr>
+<tr><td>Summary compaction + fact ledger</td><td>100% (14/14)</td><td>0</td><td>3,400</td><td>-82%</td></tr>
+</tbody>
+</table>
+
+Twenty-four percent fewer tokens than the previous best, with perfect recall. What I had accepted as a tradeoff was never one. **Pushing summaries and facts down the same pipe was manufacturing the tradeoff.**
+
+Injecting the ledger costs about 210 tokens at fourteen entries. It does not grow linearly with conversation length — deduplication in `merge_into_state` flattens it. At turn sixty the ledger held nineteen entries and cost 268 tokens.
+
+For state management in long-running agents, this rhymes with the step ledger in [Restarting a Long Agent Run From Where It Broke — A Step-Ledger Design for Gemini 3.5 Flash Long-Horizon Tasks](/articles/gemini-advanced/gemini-35-flash-long-horizon-step-ledger-resumable-runs). Resumability and memory retention are two faces of one principle: keep state outside the summary.
+
+## Putting the probe in CI
+
+Measure once and you break quietly six months later. Reword the summarizer prompt slightly. Pin a moving alias like `gemini-flash-latest` and let the underlying model change beneath you. Recall drops, and nobody notices.
+
+I froze the fourteen-entry ledger and a 60-turn synthetic conversation as a fixture, and run the probe before each deploy.
+
+```python
+def gate(result: ProbeResult, baseline_tokens: int) -> tuple[bool, list[str]]:
+    problems: list[str] = []
+    if result.lost_critical:
+        problems.append(f"critical facts lost: {sorted(result.lost_critical)}")
+    if result.recall_rate < 0.95:
+        problems.append(f"recall {result.recall_rate:.0%} < 95%")
+
+    growth = (result.prompt_tokens - baseline_tokens) / baseline_tokens
+    if growth > 0.20:
+        # warn only — a cost regression is less urgent than a quality one
+        print(f"⚠️ prompt tokens +{growth:.0%}")
+
+    return (not problems), problems
+```
+
+Cost regressions warn; memory regressions fail. That asymmetry is intentional. The incident I opened with happened because cost optimization had no quality gate on the other side of it. Put a brake on only one, and pressure always finds the other.
+
+If your token accounting itself is shaky, run the procedure in [When My Paid Gemini Chat Bill Came in at Double the Estimate — Field Notes on Per-Request Token Accounting to Plug the Cost Leaks](/articles/gemini-api/gemini-25-pro-chat-service-cost-overrun-per-request-token-accounting-field-notes) first. The comparison tables above mean nothing on top of unstable numbers.
+
+## Where I stumbled
+
+I assumed moving fact extraction from `gemini-flash-latest` to Pro would raise accuracy. Misses fell about 3%, but over-extraction rose enough to inflate the ledger to 41 entries and double the injection cost. Extraction is transcription, not judgment. Flash is the right tool.
+
+I also let `Session.state` grow unchecked once — the fact ledger plus intermediate artifacts pushed the SQLite `state` column past 180KB. My persistence layer rewrote the entire JSON blob per turn, so write latency went from 12ms to 140ms. State is for things worth reading in full on every single turn, and nothing else.
+
+And for two days I ran the judge at `temperature=0.2`, watching identical configurations report 79% and 86% recall on alternate runs. Never sample your instrument. I rediscovered that obvious rule the slow way.
+
+## What I'd leave you with
+
+Most solo developers build a cost dashboard first. Far fewer build a quality one. What gets counted gets optimized, and what goes uncounted gets quietly cut.
+
+The recall probe was the smallest tool I could find that puts a scale on the uncounted thing. Fourteen ledger entries and under a hundred lines of Python told me, for the first time, what my assistant was capable of forgetting.
+
+If you want somewhere to start: write down five questions you will certainly ask your assistant later. If you cannot write them, that information never needed remembering. If you can, it is worth asking — just once — whether it can actually answer them today.
+
+I'm still feeling my way through much of this. Thank you for reading.

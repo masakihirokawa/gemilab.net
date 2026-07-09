@@ -1,0 +1,350 @@
+---
+title: "ADK アシスタントが三日前の約束を静かに忘れていた — 会話圧縮の記憶欠落を再現テストで炙り出す"
+slug: "adk-session-compaction-memory-loss-recall-probe-harness"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-10T08:30"
+author: "Gemini Lab"
+description: "Google ADK と Gemini で会話履歴を圧縮すると、コストは下がる代わりにアシスタントの記憶が静かに欠けていきます。リコールプローブという再現テストで欠落を数値化し、圧縮戦略を根拠を持って選ぶまでの実装手順をまとめました。"
+tags: ["Google ADK", "SessionService", "会話圧縮", "Gemini", "長期記憶", "Python", "評価ハーネス"]
+highlights:
+  - "圧縮後のセッションから「何を忘れたか」を機械判定するリコールプローブの実装（動くPythonコード）"
+  - "要約圧縮・スライディングウィンドウ・ハイブリッドの3方式を同じ台帳で比較し、リコール率とトークン削減率のトレードオフを読む手順"
+  - "「事実だけ別テーブルに逃がす」設計で、圧縮率を上げても人物名・締切・約束が落ちなくなるまでの改修記録"
+---
+
+## 「先週お話しした締切の件ですが」に、アシスタントが白紙で答えた
+
+個人開発で回しているタスク支援アシスタントの会話ログを、ある夜なんとなく読み返していました。ADK（Agent Development Kit）に Gemini を載せた、ごく普通のマルチターン構成です。
+
+三日前、私はこう書いていました。「金曜の 18:00 までにストア審査用のスクリーンショットを揃えたい」。
+
+そして三日後、「例の締切、あと何日ですか」と聞いた私に、アシスタントはこう返していました。「恐れ入りますが、締切についての情報が見当たりません。詳しく教えていただけますか」。
+
+胸の奥が少し冷たくなりました。壊れてはいないのです。エラーも出ていない。レスポンスは丁寧で、レイテンシは 900ms 台で安定していて、月末の API 請求も前月比で 40% ほど下がっている。すべてのメトリクスが健全でした。
+
+下がった請求こそが犯人でした。会話が長くなるたびにトークンが膨らむのを嫌って、私は「10 ターンを超えたら過去分を要約に畳む」圧縮処理を入れていました。その要約が、締切を捨てていたのです。
+
+コストの計測は入れていました。記憶の計測は入れていませんでした。
+
+## 会話圧縮は「劣化を報告しない圧縮」である
+
+画像の JPEG 圧縮なら、劣化は目で見えます。音声なら耳で聞こえます。会話履歴の圧縮に、それに相当する知覚がありません。
+
+圧縮後のアシスタントは、忘れたことを知りません。忘れたという事実自体が履歴から消えているからです。だから「情報が見当たりません」という、丁寧で、正しく、そして無価値な返答が生まれます。
+
+<table>
+<thead>
+<tr><th>圧縮方式</th><th>削るもの</th><th>静かに落ちやすい情報</th></tr>
+</thead>
+<tbody>
+<tr><td>スライディングウィンドウ（直近 N ターンのみ保持）</td><td>古いターン全体</td><td>会話冒頭で宣言された前提・人物属性</td></tr>
+<tr><td>要約圧縮（過去を LLM で1本の要約に）</td><td>要約に載らなかった細部</td><td>数値・固有名詞・日時・約束</td></tr>
+<tr><td>ハイブリッド（要約＋直近 N ターン原文）</td><td>中間層の細部</td><td>中盤で決まった仕様変更</td></tr>
+</tbody>
+</table>
+
+要約圧縮が落とすのは、意味的に「重要でない」ものではありません。**要約器のプロンプトが明示的に守れと言わなかったもの**です。「金曜 18:00」は会話全体から見れば一行に過ぎず、要約 LLM はそれを「ユーザーはストア申請の準備をしている」という一文に丸めてしまう。丸めた瞬間、時刻は失われます。
+
+ここを直感で埋めるのはやめました。測ることにしたのです。
+
+## リコールプローブ — 「何を忘れたか」を機械が判定する
+
+私が入れたのは、リコールプローブと呼んでいる小さな再現テストです。考え方は身も蓋もありません。
+
+会話の中で「後から必ず思い出せてほしい事実」を、あらかじめ台帳として持っておく。圧縮を通した後のセッションに対して、その事実を問う質問を投げる。返答に事実が含まれているかを判定する。含まれていなければ、その圧縮方式はその事実を落としたと記録する。
+
+事実の判定に完全一致は使いません。「18:00」を「午後6時」と言い換えるのは正解であってほしいからです。かといって LLM 判定だけに頼ると、判定器自体のブレが測定に混ざる。私は**正規表現による許容表記の列挙**を第一段に置き、そこで落ちたものだけを Gemini に判定させる二段構えにしました。判定コストは全体の 5% 程度に収まります。
+
+```python
+"""recall_probe.py — 圧縮後セッションの記憶保持率を測る"""
+import asyncio
+import re
+from dataclasses import dataclass, field
+
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # 環境変数 GOOGLE_API_KEY を参照
+
+@dataclass
+class Fact:
+    """会話中に登場し、後から必ず想起されてほしい事実"""
+    key: str                       # 台帳上の識別子
+    question: str                  # 想起を促す質問
+    patterns: list[str]            # 許容表記（正規表現）
+    critical: bool = False         # 落ちたら即失格とみなすか
+
+@dataclass
+class ProbeResult:
+    strategy: str
+    recalled: set[str] = field(default_factory=set)
+    lost: set[str] = field(default_factory=set)
+    lost_critical: set[str] = field(default_factory=set)
+    prompt_tokens: int = 0
+
+    @property
+    def recall_rate(self) -> float:
+        total = len(self.recalled) + len(self.lost)
+        return len(self.recalled) / total if total else 0.0
+
+
+def _matched_by_pattern(answer: str, fact: Fact) -> bool:
+    """第一段: 表記ゆれを正規表現で吸収する。ここで通れば LLM 判定を呼ばない"""
+    return any(re.search(p, answer) for p in fact.patterns)
+
+
+async def _matched_by_judge(answer: str, fact: Fact) -> bool:
+    """第二段: 正規表現で拾えなかった言い換えだけを Gemini に判定させる"""
+    verdict = await client.aio.models.generate_content(
+        model="gemini-flash-latest",
+        contents=(
+            f"質問: {fact.question}\n"
+            f"回答: {answer}\n\n"
+            f"この回答は質問に対する具体的な事実を含んでいますか。"
+            f"「わからない」「情報がない」等は含んでいないと判定します。"
+            f"YES または NO の一語のみで答えてください。"
+        ),
+        config=types.GenerateContentConfig(
+            temperature=0.0,       # 判定器のブレを測定に混ぜない
+            max_output_tokens=4,
+        ),
+    )
+    return (verdict.text or "").strip().upper().startswith("YES")
+
+
+async def probe(ask, facts: list[Fact], strategy: str) -> ProbeResult:
+    """ask(question) -> (answer, prompt_tokens) を受け取り、事実ごとに想起可否を記録する"""
+    result = ProbeResult(strategy=strategy)
+    for fact in facts:
+        answer, tokens = await ask(fact.question)
+        result.prompt_tokens += tokens
+
+        ok = _matched_by_pattern(answer, fact)
+        if not ok:
+            ok = await _matched_by_judge(answer, fact)
+
+        if ok:
+            result.recalled.add(fact.key)
+        else:
+            result.lost.add(fact.key)
+            if fact.critical:
+                result.lost_critical.add(fact.key)
+    return result
+```
+
+`temperature=0.0` と `max_output_tokens=4` を判定器に指定しているのには理由があります。判定器が饒舌になると、YES/NO の前に前置きを書き始めて後段のパースが崩れます。そして判定器のサンプリングが揺れると、同じ圧縮方式を二度測って違う数字が出る。測定器は測定対象より静かでなければなりません。
+
+`critical` フラグも実務上は効きます。「ユーザーが Python 初学者である」を忘れるのと「金曜 18:00 の締切」を忘れるのは、被害の大きさが違う。リコール率 92% でも、落ちた 8% が全部 critical なら、その圧縮方式は不合格です。平均値は嘘をつきます。
+
+## 台帳を書く — 何を「忘れてはいけない」と定義するか
+
+プローブの質は、台帳の質を超えません。私は自分のアシスタントの会話ログを 200 ターンほど遡って、実際に後から参照された事実を分類しました。おおむね五種類に落ち着きます。
+
+固有名詞（人名・プロジェクト名・ファイル名）、日時と期限、数値制約（予算・件数・上限）、ユーザー属性（習熟度・使用言語・環境）、そして決定事項（「A 案でいく」と合意した内容）です。
+
+このうち後から呼び戻される頻度が高かったのは日時と決定事項でした。そして要約圧縮が最も落としやすいのも、この二つです。順位が完全に逆です。
+
+```python
+FACTS = [
+    Fact(
+        key="deadline",
+        question="私が話した締切はいつでしたか",
+        patterns=[r"金曜", r"18:00", r"18時", r"午後6時", r"午後六時"],
+        critical=True,
+    ),
+    Fact(
+        key="decision_screenshot_tool",
+        question="スクリーンショットの生成にはどの方法で進めることにしましたか",
+        patterns=[r"スクリプト", r"自動化", r"CLI"],
+        critical=True,
+    ),
+    Fact(
+        key="user_level",
+        question="私の Python の習熟度をどう理解していますか",
+        patterns=[r"初学者", r"学び始め", r"入門", r"beginner"],
+    ),
+    Fact(
+        key="budget",
+        question="月あたりの API 予算はいくらと伝えましたか",
+        patterns=[r"3,?000\s*円", r"三千円"],
+        critical=True,
+    ),
+    Fact(
+        key="project_name",
+        question="私が進めているアプリの名前は何でしたか",
+        patterns=[r"Wallpaper\s*Studio", r"ウォールペーパー"],
+    ),
+]
+```
+
+台帳を書いていて気づいたことがあります。**質問を書けない事実は、そもそもアシスタントに覚えさせる必要がなかった**のです。「後からこう聞かれるはず」という質問文が思い浮かばない項目は、削除しました。台帳は 31 項目から 14 項目に減り、そのぶん一項目あたりの記述が具体的になりました。
+
+## 三方式を同じ台帳で測る
+
+同一の 60 ターン会話を三方式で圧縮し、同じ 14 項目の台帳でプローブを回しました。プロンプトトークンは `usage_metadata.prompt_token_count` の実測値です。
+
+<table>
+<thead>
+<tr><th>圧縮方式</th><th>リコール率</th><th>critical 欠落</th><th>平均プロンプトトークン</th><th>無圧縮比</th></tr>
+</thead>
+<tbody>
+<tr><td>無圧縮（全履歴）</td><td>100%（14/14）</td><td>0 件</td><td>18,400</td><td>—</td></tr>
+<tr><td>スライディングウィンドウ（直近10ターン）</td><td>50%（7/14）</td><td>3 件</td><td>3,100</td><td>-83%</td></tr>
+<tr><td>要約圧縮（過去を1本の要約に）</td><td>64%（9/14）</td><td>2 件</td><td>2,700</td><td>-85%</td></tr>
+<tr><td>ハイブリッド（要約＋直近6ターン）</td><td>79%（11/14）</td><td>1 件</td><td>4,500</td><td>-76%</td></tr>
+</tbody>
+</table>
+
+素直に読めば、ハイブリッドが最良に見えます。実際、多くの記事はここで「ハイブリッドを採用しましょう」と結んで終わります。
+
+私はここで止まりませんでした。critical 欠落が 1 件でも残る構成を本番に置きたくなかったからです。締切をひとつ落とすアシスタントは、締切を管理するアシスタントとして失格です。リコール率 79% は、平均としては優秀で、個別の被害としては致命的でした。
+
+そして三方式のどれもが、同じ場所で失敗していました。要約器が「重要な内容を保持して要約せよ」という曖昧な指示のもとで、何を重要と判断するかを毎回引き直していたのです。
+
+## 事実を要約の外に逃がす
+
+解決は、圧縮アルゴリズムの改良ではありませんでした。**圧縮してよいものと、してはいけないものを分離する**ことでした。
+
+会話の自然文は要約してよい。抽出された事実は、要約を通さず構造化ストアに格納し、毎ターン原文のまま注入する。ADK の `Session.state` はまさにこのために存在しています。私は今まで、そこを単なるスクラッチパッドとしてしか使っていませんでした。
+
+```python
+"""fact_extractor.py — 会話ターンから構造化事実を抜き、圧縮の外側に置く"""
+from google.genai import types
+
+FACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "facts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["deadline", "decision", "constraint",
+                                 "entity", "user_attribute"],
+                    },
+                    "value": {"type": "string"},
+                    "source_turn": {"type": "integer"},
+                },
+                "required": ["kind", "value", "source_turn"],
+            },
+        }
+    },
+    "required": ["facts"],
+}
+
+
+async def extract_facts(client, turn_text: str, turn_index: int) -> list[dict]:
+    """1ターン分のテキストから事実を抽出する。抽出漏れより過剰抽出を許容する設計"""
+    resp = await client.aio.models.generate_content(
+        model="gemini-flash-latest",     # 抽出は軽量モデルで十分。Pro を使う場所ではない
+        contents=(
+            f"以下の発言から、後の会話で参照される可能性のある事実だけを抽出してください。\n"
+            f"日時・決定事項・数値制約・固有名詞・ユーザー属性のいずれかに該当するものに限ります。\n"
+            f"該当がなければ空配列を返してください。\n\n"
+            f"発言（ターン {turn_index}）:\n{turn_text}"
+        ),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=FACT_SCHEMA,   # 自由文パースを挟まないことが安定性の要
+            temperature=0.0,
+        ),
+    )
+    return resp.parsed["facts"]
+
+
+def merge_into_state(state: dict, new_facts: list[dict]) -> dict:
+    """同一 kind + value は上書きせず、より新しい source_turn を採用する"""
+    ledger: dict[tuple[str, str], dict] = {
+        (f["kind"], f["value"]): f for f in state.get("fact_ledger", [])
+    }
+    for f in new_facts:
+        k = (f["kind"], f["value"])
+        if k not in ledger or f["source_turn"] > ledger[k]["source_turn"]:
+            ledger[k] = f
+    state["fact_ledger"] = list(ledger.values())
+    return state
+
+
+def render_ledger(state: dict) -> str:
+    """毎ターンの system 側に原文のまま差し込む。要約を通さないことが唯一の要件"""
+    facts = state.get("fact_ledger", [])
+    if not facts:
+        return ""
+    lines = [f"- [{f['kind']}] {f['value']}" for f in facts]
+    return "確定済みの事実（会話の要約より優先して参照すること）:\n" + "\n".join(lines)
+```
+
+`response_schema` を指定して JSON を強制しているのは、抽出結果を自由文でパースすると壊れるからです。以前はマークダウンのコードフェンスを剥がす前処理を書いていました。スキーマを渡した日に、その前処理は 40 行まるごと消えました。
+
+`merge_into_state` で上書きせず `source_turn` の新しい方を採るのは、ユーザーが途中で心変わりするからです。「金曜 18:00」が後半で「月曜の朝でよくなりました」に変わったとき、古い事実が残り続けると、アシスタントは存在しない締切を守ろうとします。**忘れないことと、更新しないことは違います。**
+
+## 改修後の数字
+
+事実台帳を圧縮の外に出したうえで、要約圧縮を最も攻めた設定（直近 4 ターンのみ原文保持）に戻しました。
+
+<table>
+<thead>
+<tr><th>構成</th><th>リコール率</th><th>critical 欠落</th><th>平均プロンプトトークン</th><th>無圧縮比</th></tr>
+</thead>
+<tbody>
+<tr><td>無圧縮</td><td>100%</td><td>0 件</td><td>18,400</td><td>—</td></tr>
+<tr><td>ハイブリッド（改修前の最良）</td><td>79%</td><td>1 件</td><td>4,500</td><td>-76%</td></tr>
+<tr><td>要約圧縮 ＋ 事実台帳</td><td>100%（14/14）</td><td>0 件</td><td>3,400</td><td>-82%</td></tr>
+</tbody>
+</table>
+
+改修前の最良構成よりトークンが 24% 少なく、リコール率は満点になりました。トレードオフだと思っていたものは、トレードオフではなかったのです。**要約と事実を同じパイプに流していたことが、トレードオフを作り出していただけ**でした。
+
+事実台帳の注入コストは、14 項目で 210 トークン前後に収まります。会話が伸びても台帳は線形に増えず、`merge_into_state` の重複排除が効いて 300 トークン付近で頭打ちになりました。60 ターン時点で台帳は 19 項目、注入は 268 トークンでした。
+
+長時間走るエージェントの状態管理という点では、[長時間エージェント実行を途中から立て直す — Gemini 3.5 Flash の long-horizon タスクをステップ台帳で運用する設計](/articles/gemini-advanced/gemini-35-flash-long-horizon-step-ledger-resumable-runs) で扱ったステップ台帳と発想が重なります。実行の再開可能性と記憶の保持は、同じ「状態を要約の外に置く」という原則の別の顔です。
+
+## 運用に乗せる — プローブを CI に常駐させる
+
+一度測って満足すると、半年後に静かに壊れます。要約器のプロンプトを少し書き換えたとき、モデルを `gemini-flash-latest` のように可変エイリアスで指定していて実体が入れ替わったとき、リコール率は誰にも気づかれずに落ちます。
+
+私は 14 項目の台帳と 60 ターンの合成会話を固定フィクスチャとして置き、デプロイ前にプローブを回すようにしました。判定はこうです。
+
+critical 欠落が 1 件でもあれば失敗。全体リコール率が 95% を下回れば失敗。プロンプトトークンの平均が前回計測比で 20% を超えて増えていれば警告。
+
+```python
+def gate(result: ProbeResult, baseline_tokens: int) -> tuple[bool, list[str]]:
+    problems: list[str] = []
+    if result.lost_critical:
+        problems.append(f"critical欠落: {sorted(result.lost_critical)}")
+    if result.recall_rate < 0.95:
+        problems.append(f"リコール率 {result.recall_rate:.0%} < 95%")
+
+    growth = (result.prompt_tokens - baseline_tokens) / baseline_tokens
+    if growth > 0.20:
+        # 警告どまり。コスト増は品質劣化より緊急度が低い
+        print(f"⚠️ プロンプトトークン +{growth:.0%}")
+
+    return (not problems), problems
+```
+
+コスト増を警告どまりにして、記憶欠落だけを失敗にしたのは意図的です。冒頭の事故は、コスト最適化が品質ゲートを持たなかったから起きました。片方だけに歯止めがあると、必ずもう片方に流れ込みます。
+
+トークン会計そのものの精度が疑わしいときは、[有料チャットの Gemini 請求が見積りの倍になっていたとき — リクエスト単位でトークンを計上して原価の漏れを塞ぐ運用メモ](/articles/gemini-api/gemini-25-pro-chat-service-cost-overrun-per-request-token-accounting-field-notes) の計上手順を先に通してください。土台の数字が揺れていると、この記事の比較表は意味を持ちません。
+
+## つまずいた箇所
+
+事実抽出を `gemini-flash-latest` から Pro に上げれば精度が上がると考えて試しました。抽出漏れは 3% ほど減りましたが、そのぶん過剰抽出が増えて台帳が 41 項目まで膨らみ、注入トークンが倍になりました。抽出は判断ではなく写経に近い仕事です。Flash で足ります。
+
+`Session.state` を巨大化させたことも一度あります。事実台帳に加えて中間生成物まで押し込み、SQLite の `state` カラムが 180KB を超えました。永続化のたびに JSON をまるごと書き戻す実装だったので、書き込みレイテンシが 12ms から 140ms に伸びました。state は「毎ターン全部読む価値のあるものだけ」を置く場所です。
+
+判定器を `temperature=0.2` で回していた時期は、同じ圧縮方式のリコール率が 79% と 86% の間で揺れました。測定器の温度は 0 以外にしない。当たり前のことを、二日かけて再発見しました。
+
+## この先に置いておきたいこと
+
+コストのダッシュボードは、たいていの個人開発者が最初に作ります。品質のダッシュボードを作る人は、ずっと少ない。数えられるものだけが最適化され、数えられないものは静かに削られていきます。
+
+リコールプローブは、その「数えられないもの」に目盛りを与える最小の道具でした。14 項目の台帳と 100 行足らずのコードで、私は自分のアシスタントが何を忘れうるのかを初めて知りました。
+
+次に手を入れるなら、あなたのアシスタントに「後から必ず聞かれる質問」を五つ書き出すところから始めてみてください。書けなければ、それは覚えさせる必要のない情報です。書けたなら、いま本当にそれを答えられるか、一度だけ聞いてみる価値があります。
+
+私自身まだ手探りのところが多くあります。読んでくださってありがとうございました。
