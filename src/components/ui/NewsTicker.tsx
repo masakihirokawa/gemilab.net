@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "API — Interactions APIが一般提供となり、Geminiモデルとエージェントを扱う主要APIとしてスキーマが安定しました",
-    "AGENTS — Interactions APIのGAでManaged Agentsとバックグラウンド実行が正式対応となり、Gemini Omniも追って対応予定です",
-    "LIVE — Live APIとAI Studioに多言語リアルタイム音声翻訳が加わり、70以上の言語を自動検出して話者の抑揚を保ちます",
-    "OMNI — ネイティブマルチモーダルのGemini Omni FlashがAPIでパブリックプレビューとなり、動画ワークフローを自作できます",
-    "SPARK — 個人向けエージェントGemini SparkがmacOSに対応し、ローカルファイルやWorkspaceをまたいだ処理を自律実行します",
-    "PRO — Gemini 3.5 Proは7月17日に延期と報じられ、200万トークンとDeep Think Reasoning Layerが焦点とされています",
+    "OMNI — ネイティブマルチモーダルのGemini Omni FlashがAPIでパブリックプレビューとなり、独自の動画ワークフローを組み立てられるようになりました",
+    "NANO — Nano Banana 2 Liteが登場し、これまでで最速かつ最も低コストなGemini画像モデルとして提供されています",
+    "FLASH — Gemini 3.5 Flashが一般提供となり、エージェント処理やコーディングで持続的な高性能を発揮します",
+    "AGENTS — Managed AgentsがGemini APIでパブリックプレビューとなり、Googleが隔離管理するLinuxサンドボックスで自律・状態保持型エージェントを動かせます",
+    "MEMORY — Memory BankのIngestEvents APIが一般提供となり、イベント取り込みとメモリ生成を分離して継続的にストリーミングできます",
+    "THROUGHPUT — プロビジョンドスループットで、同一モデル・同一リージョンに最大7件までの発注をまとめて申請できるようになりました",
   ],
   en: [
-    "API — The Interactions API reaches general availability as the primary API for Gemini models and agents, with a stable schema",
-    "AGENTS — With GA, the Interactions API formally supports Managed Agents and background execution, with Gemini Omni coming soon",
-    "LIVE — The Live API and AI Studio add real-time speech-to-speech translation, auto-detecting 70+ languages while preserving intonation",
     "OMNI — Gemini Omni Flash, a natively multimodal model, enters API public preview for building custom video workflows",
-    "SPARK — Gemini Spark, Google's personal agent, arrives on macOS to work across local files and Google Workspace on your behalf",
-    "PRO — Gemini 3.5 Pro is reported to be delayed to July 17, centered on a 2M-token context and a Deep Think Reasoning Layer",
+    "NANO — Nano Banana 2 Lite arrives as the fastest and most cost-efficient Gemini image model yet",
+    "FLASH — Gemini 3.5 Flash reaches general availability with sustained frontier performance on agentic and coding tasks",
+    "AGENTS — Managed Agents enter public preview in the Gemini API, running autonomous, stateful agents in isolated Google-hosted Linux sandboxes",
+    "MEMORY — The Memory Bank IngestEvents API is GA, decoupling event ingestion from memory generation for continuous streaming",
+    "THROUGHPUT — Provisioned throughput now accepts up to seven pending model orders for the same model and region",
   ],
 };
 
