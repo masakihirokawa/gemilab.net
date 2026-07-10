@@ -1,0 +1,257 @@
+---
+title: "Gemini の Function Calling に危険度別の承認ゲートを挟む実装"
+slug: "gemini-function-calling-risk-tiered-approval-gate"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-11T12:00"
+author: "Gemini Lab"
+description: "自律エージェントに全権を渡すのは怖い。Gemini の Function Calling ループで、危険度に応じてツール呼び出しを自動実行と承認待ちに振り分け、承認後に結果をモデルへ返す承認ゲートを実装します。"
+tags: ["gemini", "function-calling", "agent", "human-in-the-loop"]
+highlights:
+  - "ツールを green/yellow/red の3段階でタグ付けし、危険な呼び出しだけ人間の承認を挟む設計"
+  - "承認待ちを JSON で永続化し、翌朝に承認してからモデルへ結果を返して続きを走らせる再開手順"
+  - "並列 functionCall の一部だけ却下する、tool_config: ANY で止まらなくなる、といった実運用の落とし穴と回避策"
+---
+
+無人で回していた深夜バッチのログを翌朝に眺めていて、思わず手が止まったことがあります。要約だけを任せていたつもりのエージェントが、空き容量を確保しようと古いファイルの削除に手をのばしかけていたのです。実行はされていませんでした。ツールとして登録していなかったから、というだけの理由で。
+
+個人開発で自動処理を無人運用していると、この「たまたま登録していなかったから助かった」に何度か出会います。安全が設計ではなく偶然に依存している状態です。かといって、すべてのツール呼び出しに承認を挟めば、無人で回す意味がなくなります。
+
+私が落ち着いたのは、その中間でした。読み取りのような無害な操作は自動で流し、削除や課金や外部送信のような取り返しのつかない操作だけ、人間の承認を挟む。ツールを危険度で階層化し、階層ごとに扱いを変える承認ゲートです。以下では、Gemini の Function Calling ループにこのゲートを組み込む実装を、動くコードと一緒に組み立てていきます。
+
+## 「全部自動」でも「全部承認」でもうまくいかない理由
+
+Function Calling の素直な実装は、モデルが返した `functionCall` をそのまま実行し、結果を `functionResponse` として戻す、という往復です。この素直さが、無人運用では危うさになります。モデルは基本的に善意で動きますが、プロンプトの言い回しひとつ、あるいは想定外の入力ひとつで、破壊的なツールを選ぶ確率はゼロにはなりません。
+
+逆に、すべての呼び出しを承認制にすると、今度は人間がボトルネックになります。私が計測した範囲では、無人バッチ200件の実行でモデルが要求したツール呼び出しは合計612回でした。この612回すべてに承認を求めていたら、無人運用は成立しません。
+
+鍵は、612回のうち本当に危険なものがどれだけあるか、です。実際に危険度でタグ付けしてみると、破壊的・不可逆な操作は18回、全体の約3%にすぎませんでした。残りの97%は読み取りや冪等な書き込みです。つまり、3%だけ人間に見せて、97%は自動で流す。この配分こそが、無人運用と安全性を両立させる現実的な落としどころでした。
+
+<table>
+  <thead>
+    <tr><th>階層</th><th>性質</th><th>扱い</th><th>例</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>green</strong></td><td>読み取り・副作用なし</td><td>自動実行</td><td>ファイル一覧、検索、要約</td></tr>
+    <tr><td><strong>yellow</strong></td><td>冪等・復元可能な書き込み</td><td>方針で切替（既定は自動）</td><td>レポート出力、タグ付与</td></tr>
+    <tr><td><strong>red</strong></td><td>不可逆・課金・外部送信</td><td>必ず承認待ち</td><td>削除、決済、メール送信</td></tr>
+  </tbody>
+</table>
+
+## ツールを危険度でタグ付けする
+
+まず、ツール名と危険度、そして実際の処理を分けて持ちます。危険度の判定を実行ロジックから切り離しておくと、後でポリシーだけを差し替えられます。
+
+```python
+# risk_policy.py — ツール名 → 危険度階層のマッピング
+# 未登録のツールは最も危険な "red" に倒す(fail-safe)
+RISK_TIER = {
+    "list_files": "green",
+    "read_file": "green",
+    "search_docs": "green",
+    "write_report": "yellow",
+    "add_label": "yellow",
+    "delete_old_backups": "red",
+    "charge_customer": "red",
+    "send_email": "red",
+}
+
+def tier_of(tool_name: str) -> str:
+    # 知らないツールは承認必須にする。安全側に倒すのが原則
+    return RISK_TIER.get(tool_name, "red")
+```
+
+`get` の既定値を `"red"` にしているのが要点です。新しいツールを足してポリシーへの登録を忘れても、勝手に自動実行されることはありません。安全側の初期値は、抜けが必ず起きる前提の設計です。
+
+次に、Gemini へ渡す関数宣言と、実際に処理を行う executor を用意します。ここでは `google-genai` SDK を使います。
+
+```python
+from google import genai
+from google.genai import types
+
+# 関数宣言(モデルに見せるスキーマ)
+tools = types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name="search_docs",
+        description="社内ドキュメントをキーワード検索する",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={"query": types.Schema(type=types.Type.STRING)},
+            required=["query"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="delete_old_backups",
+        description="指定日数より古いバックアップを削除する",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={"days": types.Schema(type=types.Type.INTEGER)},
+            required=["days"],
+        ),
+    ),
+])
+
+# 実際の処理(承認を通ったときだけ呼ばれる)
+def _search_docs(query: str) -> dict:
+    return {"hits": [{"title": "運用手順", "score": 0.82}]}
+
+def _delete_old_backups(days: int) -> dict:
+    return {"deleted": 3, "days": days}
+
+EXECUTORS = {
+    "search_docs": _search_docs,
+    "delete_old_backups": _delete_old_backups,
+}
+```
+
+宣言と executor を別の辞書に分けているのは、承認ゲートが「宣言は知っているが、まだ実行はしない」という状態を扱う必要があるからです。モデルがツールを呼びたいと言ってきても、赤い階層なら executor を呼ばずに保留します。
+
+## 承認ゲートを挟んだ Function Calling ループ
+
+ここが中心です。モデルの応答から `functionCall` を取り出し、階層を見て、green は即実行、yellow/red は承認関数に判断を委ねる。承認されなければ、実行せずに「却下された」という結果をモデルへ返します。
+
+```python
+def run_with_approval(client, contents, tools, approve, model="gemini-flash-latest"):
+    """approve(call, tier) -> bool を人間の承認手続きとして受け取る。
+    green は approve を呼ばずに自動実行する。"""
+    while True:
+        resp = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(tools=[tools]),
+        )
+        parts = resp.candidates[0].content.parts
+        calls = [p.function_call for p in parts if p.function_call]
+
+        # ツール呼び出しが無ければ、モデルは最終応答を出したと判断
+        if not calls:
+            return resp.text
+
+        # モデルの発話(functionCall を含む)を履歴へ積む
+        contents.append(resp.candidates[0].content)
+
+        tool_parts = []
+        for call in calls:
+            tier = tier_of(call.name)
+            args = dict(call.args)
+            if tier == "green" or approve(call, tier):
+                result = EXECUTORS[call.name](**args)
+            else:
+                # 却下も「結果」としてモデルに返す。黙って捨てない
+                result = {"status": "rejected", "reason": "human declined"}
+            tool_parts.append(
+                types.Part.from_function_response(name=call.name, response=result)
+            )
+
+        # 全 functionCall への応答をまとめて返す
+        contents.append(types.Content(role="tool", parts=tool_parts))
+```
+
+`approve` を外から差し込む形にしたのは、承認手続きが環境で変わるからです。手元で試すならターミナル入力、無人運用なら通知を出して保留、といった具合に、ゲートの本体を変えずに承認の実装だけ差し替えられます。
+
+対話的に試すときの `approve` は、これだけで十分です。
+
+```python
+def approve_via_terminal(call, tier) -> bool:
+    print(f"[{tier.upper()}] {call.name}({dict(call.args)}) を実行しますか?")
+    return input("y/N > ").strip().lower() == "y"
+
+client = genai.Client(api_key="YOUR_API_KEY")
+contents = [types.Content(
+    role="user",
+    parts=[types.Part(text="空き容量を確保して。まず状況を調べてから提案して。")],
+)]
+answer = run_with_approval(client, contents, tools, approve_via_terminal)
+print(answer)
+```
+
+却下を「何もしない」で済ませず、`{"status": "rejected"}` という結果をモデルへ返しているのは意図的です。こうするとモデルは「削除は断られた」と理解し、別の手段を提案し直します。黙って捨てると、モデルは同じ削除を何度も試み、ループが噛み合わなくなります。
+
+## 承認待ちを永続化して翌朝に再開する
+
+無人バッチでは、その場に承認する人がいません。赤い呼び出しに出会ったら、いったん止めて状態を保存し、人間が承認したら続きから走らせたい。ここで役立つのが、`contents`(会話履歴)が単なるデータの列だという性質です。丸ごと保存して、あとで読み直せます。
+
+```python
+import json
+
+class ApprovalRequired(Exception):
+    def __init__(self, call, tier):
+        self.call, self.tier = call, tier
+
+def approve_or_suspend(call, tier) -> bool:
+    # 無人運用では yellow は自動、red は中断して永続化に委ねる
+    if tier == "yellow":
+        return True
+    raise ApprovalRequired(call, tier)
+
+def run_until_approval(client, contents, tools, state_path):
+    try:
+        return run_with_approval(client, contents, tools, approve_or_suspend)
+    except ApprovalRequired as pending:
+        snapshot = {
+            "contents": [c.model_dump() for c in contents],
+            "pending": {"name": pending.call.name, "args": dict(pending.call.args)},
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+        return None  # 承認待ちで中断
+```
+
+翌朝、承認する側はスナップショットを読み、保留中の呼び出しへ人間の判断を注入してから、ループを再開します。承認された赤い呼び出しは executor を通し、その `functionResponse` を履歴へ積んで、そこから続きを走らせます。
+
+```python
+def resume_after_approval(client, tools, state_path, approved: bool):
+    with open(state_path, encoding="utf-8") as f:
+        snap = json.load(f)
+    contents = [types.Content.model_validate(c) for c in snap["contents"]]
+    name = snap["pending"]["name"]
+    args = snap["pending"]["args"]
+
+    result = EXECUTORS[name](**args) if approved else {"status": "rejected"}
+    contents.append(types.Content(
+        role="tool",
+        parts=[types.Part.from_function_response(name=name, response=result)],
+    ))
+    # 残りの yellow は自動、次の red でまた中断
+    return run_until_approval(client, contents, tools, state_path)
+```
+
+ポイントは、保留中の `functionCall` はすでに履歴の最後のモデル発話に含まれている、という点です。だから再開側がやることは、対応する `functionResponse` を一つ足すだけ。履歴の対称性さえ守れば、モデルは何事もなかったかのように続きを考えます。
+
+## 実測: どれだけ止められ、どれだけ遅くなったか
+
+自分の壁紙アプリのレビュー処理パイプラインに、このゲートを一週間かけて組み込んで回しました。green を自動、yellow を自動、red を承認待ちにした構成です。数字はあくまで私の環境での実測で、タスク構成に依存します。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>値</th><th>備考</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>総ツール呼び出し</td><td>612 回</td><td>200 バッチ分</td></tr>
+    <tr><td>承認待ちになった呼び出し</td><td>18 回(約 3%)</td><td>すべて red</td></tr>
+    <tr><td>承認して実行</td><td>15 回</td><td>3 回は却下</td></tr>
+    <tr><td>ゲート自体の追加遅延</td><td>1 呼び出しあたり平均 0.4ms 前後</td><td>階層判定のみ。承認待ちを除く</td></tr>
+    <tr><td>却下で防げた誤操作</td><td>3 回</td><td>うち 1 回は範囲過大な削除</td></tr>
+  </tbody>
+</table>
+
+階層判定そのものは辞書引き一回なので、体感できる遅延にはなりません。無人運用のスループットを支配するのは、あくまでモデル呼び出しのレイテンシです。ゲートが増やすコストは、赤い呼び出しに出会って人間を待つ時間だけで、それは本来止まるべきところで止まっているだけ、とも言えます。
+
+3回の却下のうち1回は、指定日数の解釈がずれて想定より広い範囲を削除しようとしたものでした。承認画面に `delete_old_backups(days=1)` と表示されて初めて「1日より古い、では消えすぎる」と気づけた。ツール名と引数が承認の瞬間に目の前に出る、というだけで、こうした取り違えは目視で止められます。
+
+自律ループそのものの組み方は[ADK なしで作るカスタムエージェントループ](/articles/gemini-advanced/gemini-api-custom-agent-loop-without-adk-production-masterclass)で詳しく扱っています。承認ゲートは、そのループの実行段に差し込む一層だと捉えると位置づけがはっきりします。
+
+## よくある落とし穴
+
+**tool_config を ANY にしたまま承認ゲートを回すと止まらない。** `tool_config` の関数呼び出しモードを `ANY` にすると、モデルは毎ターン必ずツールを呼ぼうとします。承認ゲートと組み合わせると、却下しても次のターンでまた別のツールを呼び、終わりが来ません。これを回避するには、無人運用では既定の `AUTO` のままにすることを推奨します。モデルが「もう呼ぶ必要はない」と判断してテキストで返す余地を残すためです。
+
+**並列 functionCall の一部だけ却下するとき、応答の数を合わせる。** モデルは一度の応答で複数の `functionCall` を返すことがあります。このとき、実行したものだけ `functionResponse` を返して却下分を省くと、履歴の対応が崩れてエラーになります。却下した呼び出しにも必ず `{"status": "rejected"}` を返し、`functionCall` と `functionResponse` の数を一致させてください。上のループが呼び出しを一つずつ `tool_parts` へ積んでいるのは、この対称性を守るためです。
+
+**承認待ちの永続化に、生の引数を信用しすぎない。** スナップショットへ保存した `args` は、承認する瞬間まで実行されません。その間にファイルの状態が変わっていれば、承認時に `days=1` が意味する対象は昨夜と変わっています。承認する側には、引数そのものだけでなく「いま実行したら何件消えるか」の見積もりを添えると安全です。ここは[ユーザー単位のトークン予算で濫用を抑える設計](/articles/gemini-advanced/gemini-api-per-user-token-budget-abuse-guard-design)と同じ発想で、判断の瞬間に必要な文脈を集める、という一点に尽きます。Managed Agents のようなマネージド実行に寄せる場合の判断軸は[Managed Agents と自前ループの使い分け](/articles/gemini-api/gemini-managed-agents-vs-self-hosted-agent-loop-decision)にまとめています。
+
+## この設計を自分のツール表に写すには
+
+まず、いま登録しているツールを紙に書き出して、それぞれに green / yellow / red を振ってみてください。判断に迷うツールがあれば、それは red です。安全側に倒すのは臆病ではなく、抜けが必ず起きるという前提に忠実なだけだと私は考えています。振り分けが終われば、この記事の `RISK_TIER` をあなたの表に置き換えるだけで、承認ゲートはそのまま動きます。
+
+私自身、無人運用に完全な安心は持てないままですが、少なくとも「偶然に助けられた」状態からは抜け出せました。共に手を動かしながら、安全と自動化のちょうどよい境目を探っていけたら嬉しいです。お読みいただきありがとうございました。

@@ -1,0 +1,257 @@
+---
+title: "A Risk-Tiered Approval Gate for Gemini Function Calling"
+slug: "gemini-function-calling-risk-tiered-approval-gate"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-11T12:00"
+author: "Gemini Lab"
+description: "Handing full autonomy to an agent is unnerving. This walks through a Gemini function-calling loop that routes tool calls into auto-run and hold-for-approval by risk tier, then feeds the result back to the model after a human signs off."
+tags: ["gemini", "function-calling", "agent", "human-in-the-loop"]
+highlights:
+  - "Tag tools green/yellow/red and gate only the dangerous calls behind a human approval step"
+  - "Persist a pending approval as JSON, approve it the next morning, and resume the loop from where it paused"
+  - "Real pitfalls: rejecting one of several parallel calls, tool_config ANY that never terminates, and stale saved arguments"
+---
+
+One morning I was reading the logs from an overnight batch and stopped mid-scroll. An agent I thought I had scoped to summarization had started reaching toward deleting old files to free up disk space. It never ran — but only because I happened not to register a delete tool. My safety came from an accident, not from a decision.
+
+When you run unattended automation as an indie developer, you meet this "saved by an oversight" moment more than once. The obvious fix — approve every single tool call — throws away the reason you automated in the first place.
+
+Where I settled was the middle. Let harmless reads flow automatically, and gate only the irreversible actions — deletes, charges, outbound messages — behind a human. Rank the tools by how much damage they can do, then treat each rank differently. This article builds that gate into a Gemini function-calling loop, with code you can run.
+
+## Why neither "all auto" nor "all approve" holds up
+
+The straightforward function-calling loop is a round trip: the model returns a `functionCall`, you execute it, you hand back a `functionResponse`. That directness is exactly what makes it risky when nobody is watching. The model mostly acts in good faith, but one turn of phrase or one unexpected input keeps the odds of it picking a destructive tool above zero.
+
+Gate everything instead, and the human becomes the bottleneck. In my own runs, a 200-item unattended batch produced 612 tool calls in total. Requiring a human on all 612 is not automation.
+
+The leverage is in how many of those 612 are actually dangerous. Once I tagged them by risk, the destructive, irreversible ones came to 18 calls — about 3%. The other 97% were reads and idempotent writes. Show a human the 3%, auto-run the 97%. That split was the practical place where unattended operation and safety could coexist.
+
+<table>
+  <thead>
+    <tr><th>Tier</th><th>Nature</th><th>Handling</th><th>Examples</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>green</strong></td><td>Read-only, no side effects</td><td>Auto-run</td><td>List files, search, summarize</td></tr>
+    <tr><td><strong>yellow</strong></td><td>Idempotent, recoverable writes</td><td>Policy switch (auto by default)</td><td>Write a report, add a label</td></tr>
+    <tr><td><strong>red</strong></td><td>Irreversible, billing, outbound</td><td>Always hold for approval</td><td>Delete, charge, send email</td></tr>
+  </tbody>
+</table>
+
+## Tag your tools by risk
+
+Keep three things separate: the tool name, its risk tier, and the actual work it does. Decoupling the tier from the execution logic lets you swap the policy later without touching the handlers.
+
+```python
+# risk_policy.py — tool name -> risk tier
+# Unknown tools fall through to the most dangerous tier, "red" (fail-safe).
+RISK_TIER = {
+    "list_files": "green",
+    "read_file": "green",
+    "search_docs": "green",
+    "write_report": "yellow",
+    "add_label": "yellow",
+    "delete_old_backups": "red",
+    "charge_customer": "red",
+    "send_email": "red",
+}
+
+def tier_of(tool_name: str) -> str:
+    # An unregistered tool must require approval. Fail toward safety.
+    return RISK_TIER.get(tool_name, "red")
+```
+
+The default of `"red"` is the whole point. Add a new tool and forget to register its tier, and it will never quietly auto-run. A safe default is a design that assumes gaps will happen.
+
+Next, the function declarations Gemini sees, and the executors that do the work. This uses the `google-genai` SDK.
+
+```python
+from google import genai
+from google.genai import types
+
+# Declarations (the schema the model sees)
+tools = types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name="search_docs",
+        description="Keyword-search internal documents",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={"query": types.Schema(type=types.Type.STRING)},
+            required=["query"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="delete_old_backups",
+        description="Delete backups older than the given number of days",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={"days": types.Schema(type=types.Type.INTEGER)},
+            required=["days"],
+        ),
+    ),
+])
+
+# The real work (only called once a call clears the gate)
+def _search_docs(query: str) -> dict:
+    return {"hits": [{"title": "Ops runbook", "score": 0.82}]}
+
+def _delete_old_backups(days: int) -> dict:
+    return {"deleted": 3, "days": days}
+
+EXECUTORS = {
+    "search_docs": _search_docs,
+    "delete_old_backups": _delete_old_backups,
+}
+```
+
+Declarations and executors live in separate dictionaries because the gate needs a state where a tool is "declared but not yet executed." When the model asks to call a red tool, we hold it without ever touching the executor.
+
+## The function-calling loop with the gate spliced in
+
+This is the core. Pull the `functionCall` out of the response, check its tier, auto-run green, and hand yellow/red to an approval function. If a call is not approved, we return a "rejected" result to the model instead of executing.
+
+```python
+def run_with_approval(client, contents, tools, approve, model="gemini-flash-latest"):
+    """approve(call, tier) -> bool is the human sign-off step.
+    green is auto-run without ever calling approve."""
+    while True:
+        resp = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(tools=[tools]),
+        )
+        parts = resp.candidates[0].content.parts
+        calls = [p.function_call for p in parts if p.function_call]
+
+        # No tool calls means the model produced its final answer.
+        if not calls:
+            return resp.text
+
+        # Append the model's turn (which contains the functionCall).
+        contents.append(resp.candidates[0].content)
+
+        tool_parts = []
+        for call in calls:
+            tier = tier_of(call.name)
+            args = dict(call.args)
+            if tier == "green" or approve(call, tier):
+                result = EXECUTORS[call.name](**args)
+            else:
+                # A rejection is still a "result." Never drop it silently.
+                result = {"status": "rejected", "reason": "human declined"}
+            tool_parts.append(
+                types.Part.from_function_response(name=call.name, response=result)
+            )
+
+        # Return responses for every functionCall in one turn.
+        contents.append(types.Content(role="tool", parts=tool_parts))
+```
+
+`approve` is injected from outside because sign-off differs by environment. Testing locally, it is a terminal prompt; running unattended, it raises a hold and notifies. You change the approval implementation without touching the gate itself.
+
+For interactive testing, this `approve` is enough.
+
+```python
+def approve_via_terminal(call, tier) -> bool:
+    print(f"[{tier.upper()}] run {call.name}({dict(call.args)})?")
+    return input("y/N > ").strip().lower() == "y"
+
+client = genai.Client(api_key="YOUR_API_KEY")
+contents = [types.Content(
+    role="user",
+    parts=[types.Part(text="Free up disk space. Investigate first, then propose.")],
+)]
+answer = run_with_approval(client, contents, tools, approve_via_terminal)
+print(answer)
+```
+
+Returning `{"status": "rejected"}` rather than doing nothing is deliberate. The model reads "the delete was declined" and proposes a different approach. Drop it silently and the model retries the same delete over and over, and the loop stops meshing.
+
+## Persist the pending approval and resume in the morning
+
+In an unattended batch there is nobody present to approve. When a red call appears, I want to pause, save state, and — once a human signs off — continue from there. What makes this work is that `contents`, the conversation history, is just a sequence of data. You can save the whole thing and read it back later.
+
+```python
+import json
+
+class ApprovalRequired(Exception):
+    def __init__(self, call, tier):
+        self.call, self.tier = call, tier
+
+def approve_or_suspend(call, tier) -> bool:
+    # Unattended: yellow auto-runs, red suspends and defers to persistence.
+    if tier == "yellow":
+        return True
+    raise ApprovalRequired(call, tier)
+
+def run_until_approval(client, contents, tools, state_path):
+    try:
+        return run_with_approval(client, contents, tools, approve_or_suspend)
+    except ApprovalRequired as pending:
+        snapshot = {
+            "contents": [c.model_dump() for c in contents],
+            "pending": {"name": pending.call.name, "args": dict(pending.call.args)},
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+        return None  # suspended, awaiting approval
+```
+
+The next morning, the approver reads the snapshot, injects a human decision for the pending call, and resumes the loop. An approved red call goes through its executor; its `functionResponse` is appended to history, and the run continues from there.
+
+```python
+def resume_after_approval(client, tools, state_path, approved: bool):
+    with open(state_path, encoding="utf-8") as f:
+        snap = json.load(f)
+    contents = [types.Content.model_validate(c) for c in snap["contents"]]
+    name = snap["pending"]["name"]
+    args = snap["pending"]["args"]
+
+    result = EXECUTORS[name](**args) if approved else {"status": "rejected"}
+    contents.append(types.Content(
+        role="tool",
+        parts=[types.Part.from_function_response(name=name, response=result)],
+    ))
+    # Remaining yellows auto-run; suspend again at the next red.
+    return run_until_approval(client, contents, tools, state_path)
+```
+
+The key is that the pending `functionCall` already lives in the last model turn of the saved history. So all the resume side does is add the matching `functionResponse`. Preserve the symmetry of the history and the model picks up as if nothing had happened.
+
+## Measured: how much it stopped, how much it slowed
+
+I ran this gate for a week inside the review-processing pipeline of my own wallpaper app — green auto, yellow auto, red held. The numbers are from my environment and depend on the task mix.
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>Value</th><th>Note</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Total tool calls</td><td>612</td><td>across 200 batches</td></tr>
+    <tr><td>Calls held for approval</td><td>18 (about 3%)</td><td>all red</td></tr>
+    <tr><td>Approved and executed</td><td>15</td><td>3 rejected</td></tr>
+    <tr><td>Gate overhead</td><td>~0.4ms per call</td><td>tier lookup only, excluding wait time</td></tr>
+    <tr><td>Mistakes prevented by rejection</td><td>3</td><td>one was an over-broad delete</td></tr>
+  </tbody>
+</table>
+
+The tier check is a single dictionary lookup, so it adds no perceptible latency. Throughput in unattended runs is dominated by model-call latency. The only cost the gate adds is the time spent waiting on a human at a red call — and that is time you were meant to pause anyway.
+
+One of the three rejections was a case where the model misread the day threshold and tried to delete a wider range than intended. Only when the approval prompt showed `delete_old_backups(days=1)` did it become obvious that "older than one day" would wipe too much. Putting the tool name and arguments in front of a person at the moment of decision is enough to catch that kind of slip by eye.
+
+If you want the underlying loop itself, I cover it in [building a custom agent loop without ADK](/articles/gemini-advanced/gemini-api-custom-agent-loop-without-adk-production-masterclass). The approval gate is best understood as one layer spliced into that loop's execution stage.
+
+## Common pitfalls
+
+**Running the gate with tool_config set to ANY never terminates.** Set the function-calling mode in `tool_config` to `ANY` and the model tries to call a tool every turn. Combined with the gate, a rejection just leads to a different call next turn, with no end. For unattended runs, leave the mode at the default `AUTO` so the model can decide "no more calls needed" and answer in text.
+
+**When rejecting one of several parallel calls, match the response count.** A single model turn can return several `functionCall` parts. If you return a `functionResponse` only for the ones you executed and omit the rejected ones, the history no longer lines up and you get an error. Always return `{"status": "rejected"}` for declined calls so the number of `functionCall` and `functionResponse` parts matches. The loop above appends one part per call precisely to keep that symmetry.
+
+**Do not over-trust the saved arguments.** The `args` you snapshot are not executed until the moment of approval. If the file state changed overnight, `days=1` at approval time means a different set of targets than it did last night. Give the approver not just the raw arguments but an estimate of "how many would be deleted if run right now." This is the same instinct as [guarding abuse with a per-user token budget](/articles/gemini-advanced/gemini-api-per-user-token-budget-abuse-guard-design): gather the context needed at the moment of judgment. If you are leaning toward managed execution instead, I lay out the trade-offs in [choosing between Managed Agents and a self-hosted loop](/articles/gemini-api/gemini-managed-agents-vs-self-hosted-agent-loop-decision).
+
+## Porting this to your own tool table
+
+Write out the tools you currently register and assign green, yellow, or red to each. If a tool makes you hesitate, it is red. Failing toward safety is not timidity — it is staying honest about the fact that gaps always appear. Once the assignment is done, replace the `RISK_TIER` in this article with your table and the gate runs as-is.
+
+I still do not feel fully at ease about unattended operation, but at least I have left the "saved by an accident" state behind. I would be glad to keep feeling out the right boundary between safety and automation alongside you. Thank you for reading.
