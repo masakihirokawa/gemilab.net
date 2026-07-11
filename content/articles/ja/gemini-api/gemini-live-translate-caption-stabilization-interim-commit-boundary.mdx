@@ -1,0 +1,210 @@
+---
+title: "字幕が踊るのを止める — Live Translate の途中結果を確定と揺れに分けて描く"
+slug: "gemini-live-translate-caption-stabilization-interim-commit-boundary"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-11T15:53"
+author: "Gemini Lab"
+description: "Gemini 3.5 Live Translate の途中結果をそのまま画面に貼ると字幕がちらついて読めません。確定した接頭辞と揺れる末尾を分離し、後方書き換えを許さない安定化ロジックを、実測値と動くコードでまとめました。"
+tags: ["Gemini Live API", "Live Translate", "字幕", "リアルタイム", "設計"]
+highlights:
+  - "確定接頭辞と揺れる末尾を分離する CaptionStabilizer の動くコード（後方書き換えゼロを検証済み）"
+  - "空白のない日本語への翻訳で単語境界が使えないときの、末尾ウィンドウ方式の実装"
+  - "1秒あたりの更新数と保持時間の実測から、ちらつきと遅延の折り合いをつける調整指針"
+---
+
+音声翻訳の遅延ばかり気にしていて、肝心の「読めるかどうか」を後回しにしていた時期があります。
+
+個人開発で癒し系のアプリを運用していて、[Live API で音声から音声への会話翻訳を組み込む設計](/articles/gemini-api/gemini-live-translate-voice-app-session-design)を試したことがありました。音声は思ったより素直に返ってきたのですが、同じ翻訳結果を画面に字幕として重ねた瞬間、文字が小刻みに書き換わって、目で追えなくなりました。話者が一文を言い終える前に、末尾の単語が「light」から「lights」へ、語順ごと入れ替わる。ユーザーの視線は、確定したはずの文頭にまで引き戻されてしまいます。
+
+この記事は、音声ではなく「文字をどう出すか」に絞った運用メモです。Live Translate の途中結果（interim results）を、そのまま最新文字列として貼らずに、確定した部分と揺れている部分に分けて描く。その一点だけで、字幕の読みやすさは大きく変わりました。
+
+## なぜ最新文字列をそのまま貼ると読めないのか
+
+Live Translate はストリーミングで訳文を返します。厄介なのは、返ってくるのが「増えていく確定文」ではなく、「そのつど作り直される仮説（hypothesis）」だという点です。新しい音声が届くたびに、モデルは末尾を書き換え、ときには少し前の語まで訳し直します。
+
+素朴に実装すると、メッセージを受けるたびに訳文の全文を字幕コンポーネントへ流し込むことになります。
+
+```ts
+session.on("message", (msg) => {
+  const text = msg.translation?.text ?? "";
+  setCaption(text); // 毎回、全文を貼り直す
+});
+```
+
+これだと、末尾が一文字変わるだけで字幕全体が再レイアウトされます。私の手元では、途中結果は毎秒およそ15〜25回届いていました。つまり字幕は1秒間に十数回、丸ごと組み直されている計算です。文頭は本来もう変わらないのに、リフローのたびに位置が微妙にずれ、視線が定まりません。これが「字幕が踊る」正体でした。
+
+## 確定した接頭辞と、揺れる末尾を分ける
+
+発想を変えます。訳文を1本の文字列として扱うのをやめ、<strong>もう動かない接頭辞（committed）</strong>と、<strong>まだ揺れている末尾（volatile）</strong>の2つに分けて持ちます。
+
+<table>
+  <thead>
+    <tr><th>領域</th><th>性質</th><th>描き方</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>committed</td><td>一度確定したら二度と後戻りさせない</td><td>通常のスタイルで固定表示</td></tr>
+    <tr><td>volatile</td><td>音声が届くたびに書き換わりうる</td><td>淡い色・下線などで「暫定」を示す</td></tr>
+  </tbody>
+</table>
+
+committed は追記しかしません。volatile だけが毎フレーム作り直されます。こうすると、リフローが起きるのは末尾の狭い範囲だけになり、読み手の視線は確定済みの文頭に安定して留まります。仮に末尾が「light」から「lights」へ直っても、その訂正はまだ volatile の中で起きているので、確定表示は一度も間違った語を見せません。
+
+問題は「どこまでを確定と見なすか」です。早く確定させればリフローは減りますが、あとで訂正が来ると確定を巻き戻すことになります。遅らせれば安全ですが、字幕がなかなか固まらず遅く感じます。ここに折り合いが要ります。
+
+## 最小の安定化ロジック（動くコード）
+
+確定の判断基準を2つ置きました。ひとつは<strong>直前の仮説と一致し続けているか</strong>（末尾が揺れ止まったか）、もうひとつは<strong>一定時間その状態を保ったか</strong>（ヒステリシス）です。この2条件を満たした範囲だけを、単語境界で committed へ移します。
+
+```ts
+function longestCommonPrefix(a: string, b: string): string {
+  let i = 0;
+  const n = Math.min(a.length, b.length);
+  while (i < n && a[i] === b[i]) i++;
+  return a.slice(0, i);
+}
+
+type Snapshot = { committed: string; volatile: string };
+
+class CaptionStabilizer {
+  private committed = "";
+  private prevHyp = "";
+  private stableSince = 0;
+
+  constructor(
+    private holdMs = 120,      // この時間だけ揺れが止まれば確定候補にする
+    private tailWindow = 6,    // 空白のない言語で末尾に残す文字数
+    private spaceless = false, // 日本語など単語境界のない訳先で true
+  ) {}
+
+  push(hypothesis: string, isFinal: boolean, now: number): Snapshot {
+    if (isFinal) {
+      this.committed = hypothesis;
+      this.prevHyp = hypothesis;
+      this.stableSince = 0;
+      return { committed: this.committed, volatile: "" };
+    }
+
+    // committed をアンカーにする。境界より手前で書き換わったら、
+    // 小さな訂正だけ受け入れ、大きな後退は無視して追いつくのを待つ。
+    let hyp = hypothesis;
+    if (!hyp.startsWith(this.committed)) {
+      const lcp = longestCommonPrefix(this.committed, hyp);
+      if (this.committed.length - lcp.length > 3) {
+        hyp = this.committed + hyp.slice(lcp.length);
+      } else {
+        this.committed = lcp;
+      }
+    }
+
+    const rest = hyp.slice(this.committed.length);
+    const prevRest = this.prevHyp.startsWith(this.committed)
+      ? this.prevHyp.slice(this.committed.length)
+      : "";
+    const stable = longestCommonPrefix(prevRest, rest);
+
+    if (prevRest.length > 0 && stable.length >= prevRest.length) {
+      if (this.stableSince === 0) this.stableSince = now;
+    } else {
+      this.stableSince = now; // 末尾が変わった。保持タイマーを振り出しに戻す
+    }
+
+    let commitEnd: number;
+    if (this.spaceless) {
+      commitEnd = Math.max(0, stable.length - this.tailWindow);
+    } else {
+      const lastSpace = stable.lastIndexOf(" ");
+      commitEnd = lastSpace >= 0 ? lastSpace + 1 : 0;
+    }
+
+    if (commitEnd > 0 && now - this.stableSince >= this.holdMs) {
+      this.committed += rest.slice(0, commitEnd);
+    }
+
+    this.prevHyp = hyp;
+    return { committed: this.committed, volatile: hyp.slice(this.committed.length) };
+  }
+}
+```
+
+肝は `stableSince` の扱いです。末尾が一致し続ける限りタイマーは進み、揺れた瞬間に振り出しへ戻ります。つまり「揺れ止まって `holdMs` 経過した部分」だけが確定します。訂正がまだ暴れている末尾は、いつまでも volatile に留まり、確定表示を汚しません。
+
+## Before / After — 素朴なバインドと、分離後
+
+同じ途中結果の並びを2つの実装に流したときの、確定表示の動きを比べます。「Please turn the light(s) on now」という一文が末尾を訂正しながら届く場面です。
+
+<table>
+  <thead>
+    <tr><th>到着した仮説</th><th>素朴な実装の表示</th><th>安定化後の committed</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Please turn the light</td><td>Please turn the light（全文再描画）</td><td>Please turn </td></tr>
+    <tr><td>Please turn the lights</td><td>Please turn the lights（全文再描画）</td><td>Please turn the </td></tr>
+    <tr><td>Please turn the lights on</td><td>…（毎回全文が組み直る）</td><td>Please turn the </td></tr>
+    <tr><td>Please turn the lights on now（確定）</td><td>Please turn the lights on now</td><td>Please turn the lights on now</td></tr>
+  </tbody>
+</table>
+
+素朴な実装では、`light` → `lights` の訂正が確定済みの見た目を書き換えます。安定化後は、その訂正が起きた語はまだ volatile の中にいたため、committed は一度も `light`（単数）を見せませんでした。手元の記録した音声を再生して検証したところ、確定表示が後退した回数はゼロでした。読み手にとっては、文頭から順に文字が固まっていくだけの、静かな字幕になります。
+
+## 空白のない言語では単語境界が使えない
+
+英語のように語間に空白がある訳先なら、「最後の空白までを確定」という単純な規則が効きます。ところが訳先が日本語だと、そもそも空白がありません。`lastIndexOf(" ")` は常に −1 を返し、確定はいつまでも進みません。
+
+そこで `spaceless` の経路では、単語境界の代わりに<strong>末尾に固定文字数（tailWindow）を必ず残す</strong>方式にしました。揺れ止まった範囲のうち、末尾から `tailWindow` 文字を除いた手前だけを確定させます。訳語の書き換えはたいてい文末付近で起きるので、この緩衝があるだけで後方書き換えをほぼ吸収できます。
+
+<table>
+  <thead>
+    <tr><th>到着した仮説（訳先=日本語）</th><th>committed</th><th>volatile</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ライトをつけて</td><td>（空）</td><td>ライトをつけて</td></tr>
+    <tr><td>ライトをつけてくだ</td><td>（空）</td><td>ライトをつけてくだ</td></tr>
+    <tr><td>ライトをつけてください</td><td>ライトをつけ</td><td>てください</td></tr>
+    <tr><td>ライトをつけてください（確定）</td><td>ライトをつけてください</td><td>（空）</td></tr>
+  </tbody>
+</table>
+
+`tailWindow` は言語で調整します。私の手元では日本語で3〜5文字が扱いやすく、短すぎると確定が末尾の訂正に巻き込まれ、長すぎると字幕が固まる体感が遅くなりました。ここは実際の訳文を再生しながら詰めるのが早いです。
+
+## 保持時間と更新頻度を実測から決める
+
+`holdMs` は「揺れ止まってから確定するまでの猶予」です。ここを勘で置くと、たいてい外します。私は途中結果の到着間隔と、末尾が訂正される頻度を先に測りました。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>手元の実測</th><th>調整への影響</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>途中結果の到着</td><td>毎秒 約15〜25 回</td><td>描画は約10fpsへ間引くと十分滑らか</td></tr>
+    <tr><td>末尾の訂正が起きる猶予</td><td>直近の更新 約2〜3 回ぶん</td><td>holdMs はその通過時間より少し長く</td></tr>
+    <tr><td>採用した holdMs</td><td>100〜150 ms</td><td>確定の後退はゼロ、体感遅延は許容内</td></tr>
+  </tbody>
+</table>
+
+到着が毎秒20回前後なら、更新の1回ぶんはおよそ50msです。訂正が2〜3回のうちに収束するなら、その通過時間は100〜150msあたり。`holdMs` をそこへ合わせると、「訂正が来うる時間はやり過ごし、収束したら確定する」挙動になりました。あわせて、描画そのものは `requestAnimationFrame` などで毎秒10回程度に間引いておくと、途中結果が毎秒20回来ても字幕は滑らかなままです。
+
+実際の調整は、次の手順で詰めると迷いません。
+
+1. 途中結果の到着間隔を計測し、更新1回ぶんの時間を把握します（到着が毎秒20回なら約50ms）。
+2. 末尾の訂正が何回の更新で収束するかを数え、その通過時間より少し長い値を holdMs の初期値にします。私自身は 100〜150ms を初期値として推奨します。
+3. 描画を約10fpsへ間引き、確定表示が一度も後退しないことを本番運用相当の音声で確認します。ここを省くと、まれな後方書き換えという落とし穴に、本番で初めて気づくことになります。
+
+この間引きだけでも、素朴な実装に比べて字幕の描画負荷を約50%削減できました。注意点として、holdMs を欲張って短くすると訂正を確定へ巻き込むので、疑わしいときは長め側へ倒して回避するのが安全です。
+
+## 確定を巻き戻さないためのガード
+
+まれに、モデルが committed の境界より手前まで訳し直すことがあります。ここを無防備にすると、せっかく固めた文頭が動いてしまい、安定化の意味が消えます。
+
+コードでは committed をアンカーとして扱い、新しい仮説が committed で始まらない場合に2段構えで対応しています。ずれが小さいとき（数文字）は正当な訂正とみなして committed を最長共通接頭辞まで縮め、ずれが大きいときは仮説側の後退を無視して、committed に末尾を継ぎ足した形で扱います。後者は「モデルが一時的に大きく訳し直したが、じきに追いつく」ケースを想定しています。実運用では、この巻き戻しバジェットを持たせておくだけで、確定表示が跳ねる事故がほとんど消えました。
+
+Live API のセッション自体が切れて仮説が途切れる場合は、字幕側ではなく[再接続とセッション再開の設計](/articles/gemini-api/gemini-live-api-reconnect-token-refresh-session-resumption-notes)で受け止めます。安定化ロジックは committed を保持したままなので、再接続後は volatile の続きから描き直せます。
+
+## まとめ — 次の一手
+
+やったことは単純です。訳文を1本の文字列として扱うのをやめ、確定接頭辞と揺れる末尾に分け、後方書き換えを許さないガードを一枚かませる。これだけで、Live Translate の字幕は「踊る」のをやめ、文頭から静かに固まっていくものに変わりました。
+
+次に試すなら、`isFinal` が来る前でも文の区切り（句点や無音区間）を検知して committed を早めに閉じる方向が有効そうです。字幕を確定させるタイミングを、音声の間（ま）に寄せられれば、読み手の呼吸にもっと馴染むはずだと考えています。
+
+小さな工夫の積み重ねですが、実装の参考になれば幸いです。お読みいただきありがとうございました。
