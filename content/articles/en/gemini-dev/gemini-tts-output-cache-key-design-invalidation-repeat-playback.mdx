@@ -1,0 +1,265 @@
+---
+title: "Never Generate the Same Narration Twice: Cache-Key Design and Invalidation for Gemini TTS Output"
+slug: "gemini-tts-output-cache-key-design-invalidation-repeat-playback"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-07-11T15:12"
+author: "Gemini Lab"
+description: "For apps that replay the same audio over and over—meditation, language learning, storytelling—caching the Gemini TTS output itself drives the variable cost to near zero. This is a working design: how to build a cache key that text alone can't cover, a two-tier server-plus-device cache, and an invalidation policy that survives model shutdowns like the August 17 image-model deprecation."
+tags: ["gemini-api", "tts", "cache", "cost-optimization", "mobile-app"]
+highlights:
+  - "Build a SHA-256 cache key that includes text, voice, model ID, format, and speaking rate, so changing the voice never returns stale audio"
+  - "Use a two-tier server-plus-device cache to keep daily regeneration near zero even at 8,000 DAU"
+  - "Adopt a freeze-or-regenerate invalidation policy so a model shutdown like the August 17 deprecation never leaves your users in silence"
+---
+
+I run a small meditation-narration app as an indie developer. One morning I was scanning my Gemini TTS bill, and I froze.
+
+The same audio was being generated again and again.
+
+Every time a user played "Three Minutes Before Sleep," the app sent the exact same script to TTS and produced the exact same audio from scratch. The script was fixed. The voice was fixed. Yet every playback added to the bill. In hindsight it was an obvious mistake, but because it worked, I was slow to notice.
+
+That was when something clicked. Unlike a dynamic conversational agent, most audio in healing or learning apps is "the same script, listened to repeatedly." So save the generated audio itself, and stop rebuilding it from the second play onward. That single change drops the bill dramatically.
+
+The hard part was designing the key that makes saving safe, and handling invalidation when the model or the voice changes. Get this wrong and you either serve old audio after you meant to change the voice, or the cache misses entirely and the bill comes back.
+
+## Grasp the order of magnitude first
+
+Before any fix, it helps to grasp the cost of doing nothing. Without that, you can't judge how much effort is worth spending.
+
+TTS is usually billed by the character count of input text. As an illustrative rate for explanation, I'll use ¥0.02 per character (your actual rate depends on your model and contract, so always substitute your own bill).
+
+Here are my app's numbers.
+
+<table>
+<thead>
+<tr><th>Item</th><th>Value</th></tr>
+</thead>
+<tbody>
+<tr><td>Number of narrations</td><td>30</td></tr>
+<tr><td>Script per narration</td><td>~1,500 characters</td></tr>
+<tr><td>Active users</td><td>8,000 DAU</td></tr>
+<tr><td>Plays per user</td><td>6 per day</td></tr>
+</tbody>
+</table>
+
+Generating on every play means 8,000 × 6 × 1,500 = 72 million characters per day. At ¥0.02, that is ¥1,440,000 per day. Not a number anyone can pay.
+
+Generating the whole library once is 30 × 1,500 = 45,000 characters, or ¥900. Unless you rewrite a script, that ¥900 never recurs.
+
+The same audio, delivered for ¥1,440,000/day versus ¥900 once. That gap is the entire reason to invest in caching.
+
+## Text alone is not enough for a cache key
+
+My first near-mistake was to key on the raw script text. That fails in production every time.
+
+The same text becomes different audio if you change the voice. Swapping the model, changing the speaking rate, or switching the output format from mp3 to wav all change the bytes. A text-only key confuses them. The bug "I switched the voice from female to male, but the old female voice keeps coming back" was caused by exactly this.
+
+The cache key must include every element that determines the identity of the audio.
+
+1. Normalized script text (trim whitespace, unify line endings)
+2. Voice name
+3. Model ID (e.g., gemini-3.1-flash-tts)
+4. Output format (mp3 / wav / opus)
+5. Generation parameters such as speaking rate
+
+Order these canonically, then hash.
+
+```typescript
+import { createHash } from "node:crypto";
+
+interface TtsRequest {
+  text: string;
+  voice: string;
+  model: string;
+  format: "mp3" | "wav" | "opus";
+  speakingRate: number;
+}
+
+// Key only on the elements that determine audio identity, in a fixed order.
+export function buildCacheKey(req: TtsRequest): string {
+  const normalizedText = req.text
+    .replace(/\r\n/g, "\n")
+    .replace(/\s+$/gm, "")
+    .trim();
+
+  const canonical = JSON.stringify({
+    t: normalizedText,
+    v: req.voice,
+    m: req.model,
+    f: req.format,
+    r: req.speakingRate,
+  });
+
+  return createHash("sha256").update(canonical).digest("hex");
+}
+```
+
+The critical point is including the model ID. Omit it and the model-swap invalidation described below stops working entirely. When I'm unsure what belongs in the key, I default to "include everything that could change the audio bytes."
+
+## Guard with two tiers: server generation cache and device cache
+
+One tier is not enough. I split it into two, because their jobs are entirely different.
+
+<table>
+<thead>
+<tr><th>Tier</th><th>Location</th><th>Waste it prevents</th></tr>
+</thead>
+<tbody>
+<tr><td>Generation cache</td><td>Object storage</td><td>TTS regeneration (billing)</td></tr>
+<tr><td>Device cache</td><td>On-device local storage</td><td>Re-downloading audio (bandwidth)</td></tr>
+</tbody>
+</table>
+
+### Tier 1: server-side generation cache
+
+On the server, look up storage by key first; return it if present, generate and store it if not. Since the whole user base generates each track only once, billing converges to the number of tracks.
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+async function getOrGenerateAudio(
+  req: TtsRequest,
+  storage: ObjectStorage,
+): Promise<string> {
+  const key = buildCacheKey(req);
+  const objectPath = `tts/${key}.${req.format}`;
+
+  // 1. If already generated, return the delivery URL as-is.
+  const existing = await storage.exists(objectPath);
+  if (existing) {
+    return storage.publicUrl(objectPath);
+  }
+
+  // 2. Call TTS only when missing (this is the sole billing point).
+  const res = await ai.models.generateContent({
+    model: req.model,
+    contents: req.text,
+    config: {
+      responseModalities: ["AUDIO"],
+      speechConfig: {
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: req.voice } },
+      },
+    },
+  });
+
+  const audio = res.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  if (!audio) {
+    // On failure, do NOT cache an empty object. Let the next call retry.
+    throw new Error("TTS returned no audio");
+  }
+
+  await storage.put(objectPath, Buffer.from(audio, "base64"), {
+    contentType: `audio/${req.format}`,
+    // Keep the model ID in metadata for later invalidation decisions.
+    metadata: { model: req.model, voice: req.voice },
+  });
+
+  return storage.publicUrl(objectPath);
+}
+```
+
+Here is a pitfall I hit in production. If you cache an "empty object" when generation fails, you serve silence forever after. On failure, don't write to the cache—always let the next call retry. That one decision headed off silent-audio complaints before they happened.
+
+### Tier 2: device-side cache
+
+Even with the same delivery URL, downloading every time costs bandwidth and breaks offline playback. On the device, store audio locally under a filename derived from the same key.
+
+```swift
+import Foundation
+
+// On-device cache. The key is used directly as the filename.
+final class AudioCache {
+    static let shared = AudioCache()
+    private let dir: URL
+
+    private init() {
+        let base = FileManager.default.urls(for: .cachesDirectory,
+                                            in: .userDomainMask)[0]
+        dir = base.appendingPathComponent("tts", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir,
+                                                 withIntermediateDirectories: true)
+    }
+
+    func localURL(forKey key: String, format: String) -> URL {
+        dir.appendingPathComponent("\(key).\(format)")
+    }
+
+    func cached(key: String, format: String) -> URL? {
+        let url = localURL(forKey: key, format: format)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    func store(key: String, format: String, data: Data) throws {
+        try data.write(to: localURL(forKey: key, format: format))
+    }
+}
+```
+
+Putting the device cache in the caches directory is deliberate. The OS sweeps it automatically under storage pressure, so you never have to police its size yourself. If it is cleared, the app just refetches from the server generation cache, and no regeneration billing occurs.
+
+## How to invalidate when the model or voice changes
+
+This is the operational point I most want to convey. A cache is harder to "discard correctly" than to "make it hit."
+
+Gemini has announced that its image-generation models are scheduled to shut down on 2026-08-17. TTS included, any model you depend on will eventually be retired or replaced. When that happens, how do you treat the saved audio? Deciding the axis in advance keeps you calm at the deadline.
+
+I split it three ways.
+
+1. Freeze — keep using existing audio as-is even after the model retires. Best for existing tracks where you want voice consistency.
+2. Regenerate lazily — because the model ID is in the key, switching models changes the key, and the audio is rebuilt on the next play with the new model. Migration happens naturally.
+3. Regenerate in bulk — only when you want a uniform voice across all tracks, rebuild everything ahead of time.
+
+In most cases I combine "freeze" with "regenerate lazily." Existing audio plays as long as it remains in storage, so a model shutdown does not instantly produce silence. Only new tracks, or tracks whose voice you changed, get new keys and new-model audio.
+
+Here is a checklist for running invalidation safely.
+
+<table>
+<thead>
+<tr><th>Check</th><th>Why it matters</th></tr>
+</thead>
+<tbody>
+<tr><td>Is the model ID in the key?</td><td>Without it, a model swap won't trigger invalidation</td></tr>
+<tr><td>Are old-model files kept, not deleted immediately?</td><td>Freeze them to keep playback alive during migration</td></tr>
+<tr><td>Is the model name in the object metadata?</td><td>So you can audit which audio came from which model</td></tr>
+<tr><td>Do failures avoid caching an empty object?</td><td>Prevents serving silence</td></tr>
+</tbody>
+</table>
+
+Delete old audio only after new audio plays correctly across all tracks. Delete first, and you get silence during migration. I run the cleanup at the very end of a migration, targeting only objects whose metadata carries the old model.
+
+## What I found in the field
+
+Three weeks after rollout, here are the real numbers.
+
+<table>
+<thead>
+<tr><th>Metric</th><th>Before</th><th>After</th></tr>
+</thead>
+<tbody>
+<tr><td>TTS characters generated per day</td><td>~72 million</td><td>~4,500 (new/changed only)</td></tr>
+<tr><td>Device cache hit rate</td><td>—</td><td>97-99%</td></tr>
+<tr><td>Time to first playback (second play onward)</td><td>1.5-3 s</td><td>Under 0.1 s</td></tr>
+</tbody>
+</table>
+
+The generated-character count dropping by five orders of magnitude is, well, expected: unless you change a script, new generation barely happens. What mattered more than the numbers was the feel. Second and later plays start with zero wait, and the app feels noticeably lighter. A measure aimed at TTS cost reduction turned directly into a better experience—a happy surprise.
+
+As a side effect, the balance with ad revenue improved too. The free tier runs on AdMob, and with the TTS variable cost effectively at zero, I stopped worrying about per-play economics and let play counts grow. On both the App Store and Google Play, plays per session are up.
+
+## What to cache, and what not to
+
+Finally, situation-by-situation judgment. Caching everything is not the answer.
+
+Fixed scripts played repeatedly should be cached without hesitation. Meditation guidance, language example sentences, picture-book readings—their scripts are fixed and the same audio is delivered at scale, so caching pays off the most.
+
+Content whose text varies per user won't benefit from caching. Name-personalized readouts, or on-the-fly summaries, change the key almost every time and never hit. For such dynamic audio, I invest instead in streaming delivery to shorten the first-play wait. I split these two purely on whether the script is fixed.
+
+When in doubt, estimate "how often the same input will recur." The more repetition, the greater the return on caching. Conversely, building a cache mechanism for one-off audio only adds complexity for no gain.
+
+I myself first tried to cache every TTS call, watched keys scatter across dynamic audio, and made the design more complex than it needed to be. Narrowing to fixed scripts made both the code and the operations far more straightforward.
+
+If you suspect you're regenerating the same audio, start by wrapping just your single most-played track in a generation cache. The shift in your bill should be visible right away. I hope this gives you a foothold for your own implementation, and thank you for reading.
