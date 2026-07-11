@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "OMNI — ネイティブマルチモーダルのGemini Omni FlashがAPIでパブリックプレビューとなり、独自の動画ワークフローを組み立てられるようになりました",
-    "NANO — Nano Banana 2 Liteが登場し、これまでで最速かつ最も低コストなGemini画像モデルとして提供されています",
-    "FLASH — Gemini 3.5 Flashが一般提供となり、エージェント処理やコーディングで持続的な高性能を発揮します",
-    "AGENTS — Managed AgentsがGemini APIでパブリックプレビューとなり、Googleが隔離管理するLinuxサンドボックスで自律・状態保持型エージェントを動かせます",
-    "MEMORY — Memory BankのIngestEvents APIが一般提供となり、イベント取り込みとメモリ生成を分離して継続的にストリーミングできます",
-    "THROUGHPUT — プロビジョンドスループットで、同一モデル・同一リージョンに最大7件までの発注をまとめて申請できるようになりました",
+    "SHEETS — Fill with Geminiが28言語に拡大しました。中国語・トルコ語ほか各言語のまま自然文で表を組めます",
+    "ALPHAEVOLVE — Gemini Enterpriseに、コードをAIが自律的に最適化するAlphaEvolveが一般提供されました",
+    "SPARK — macOS向けの個人AIエージェントGemini Sparkが、フォルダ整理やWorkspace横断の作業を代行します",
+    "OMNI — Gemini Omniがテキスト・写真・動画を掛け合わせた高品質な動画作成と、自分に似たAIアバターに対応します",
+    "GEMINI35 — Gemini 3.5 Proがアーキテクチャ刷新のため7月17日へ延期。200万トークンとDeep Thinkを導入予定です",
+    "DEEPTHINK — 3.5 Proは数学的推論・SVGシーン生成・画像品質の改善を狙って再設計されています",
   ],
   en: [
-    "OMNI — Gemini Omni Flash, a natively multimodal model, enters API public preview for building custom video workflows",
-    "NANO — Nano Banana 2 Lite arrives as the fastest and most cost-efficient Gemini image model yet",
-    "FLASH — Gemini 3.5 Flash reaches general availability with sustained frontier performance on agentic and coding tasks",
-    "AGENTS — Managed Agents enter public preview in the Gemini API, running autonomous, stateful agents in isolated Google-hosted Linux sandboxes",
-    "MEMORY — The Memory Bank IngestEvents API is GA, decoupling event ingestion from memory generation for continuous streaming",
-    "THROUGHPUT — Provisioned throughput now accepts up to seven pending model orders for the same model and region",
+    "SHEETS — Fill with Gemini expands to 28 more languages, so you can build spreadsheets in your own language with natural prompts",
+    "ALPHAEVOLVE — Gemini Enterprise makes AlphaEvolve generally available, autonomously discovering optimized code solutions",
+    "SPARK — Gemini Spark, a personal AI agent for macOS, organizes folders and runs workflows across Workspace",
+    "OMNI — Gemini Omni blends text, photos, and video for high-quality creation, plus custom AI avatars of you",
+    "GEMINI35 — Gemini 3.5 Pro slips to July 17 for a full rebuild, introducing a 2M-token context and Deep Think",
+    "DEEPTHINK — The 3.5 Pro rebuild targets better math reasoning, SVG scene generation, and image quality",
   ],
 };
 
