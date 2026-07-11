@@ -1,0 +1,162 @@
+---
+title: "When Gemini's Context Cache Quietly Expires Mid-Run: A TTL Guard for Pipelines That Pause"
+slug: "gemini-context-cache-ttl-expiry-paused-pipeline-rearm-guard"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-07-11T09:20"
+author: "Gemini Lab"
+description: "When a nightly batch or a retry backoff pauses your pipeline, Gemini's explicit context cache can expire on the wall clock while nothing errors out, sending later calls back to full-token billing. Here is a small lease guard that decides whether to re-arm or run uncached based on cost."
+tags: ["Gemini API", "Context Caching", "Cost Optimization", "Batch Processing", "Indie Development"]
+---
+
+As an indie developer, I was looking over the billing for a nightly batch that classifies app reviews — sitting next to my AdMob revenue reports — when something made me pause. It was processing the same volume as always, yet on one particular day the input-token charges had ballooned to several times the usual amount.
+
+The cause was a 20-minute wait that had slipped into the middle of the run. While the pipeline sat idle during a rate-limit backoff, the TTL on the shared explicit context cache quietly passed its deadline. No error surfaced. Every call after that was re-sending the long system instruction and reference document in full, and those tokens were being billed as ordinary input.
+
+Context caching exists to register a large preamble once and keep costs down. But pair it with a pipeline that can pause partway through, and that TTL becomes a silent trap. This article walks through making expiry observable, then deciding whether to re-arm the cache or run uncached based on cost.
+
+## Why It Expires Silently in Pipelines That Pause
+
+An explicit context cache (`cachedContent`) has a TTL set at creation time. The default is one hour, and once `expireTime` passes, the server discards it automatically. The key detail is that the cache's lifespan advances on the wall clock, not on how long you were actually processing.
+
+Unattended pipelines stall more often than we expect. A rate-limit (429) backoff, a temporary spend-cap ceiling, upstream latency, a split run that crosses a nightly window. The work itself may be light, but once waits accumulate, the wall clock marches on regardless.
+
+The awkward part is that an expired cache does not necessarily make the call fail. Even if you pass the cache name, a missing target is treated as an ordinary, uncached request, and the whole preamble is re-sent. A response still comes back, so it is easy to miss — the billing statement is where you find out, which is the worst possible order.
+
+For a different symptom, where the hit rate itself never improves, see "[When Context Caching Didn't Lower Your Gemini Bill: Measuring Hit Rate to Recover](/articles/gemini-api/gemini-context-cache-savings-shortfall-hit-rate-instrumentation-field-notes)." This article sits one step before that: whether the cache is even alive.
+
+## Making Expiry Observable
+
+The first step is to stop treating the cache as something you create and forget, and instead keep its remaining lifetime in hand. Hold on to the `expire_time` returned at creation, and just before each call, check whether it is safe to use from here.
+
+```python
+from datetime import datetime, timezone
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+MODEL = "gemini-flash-latest"
+
+def create_cache(system_instruction: str, reference_doc: str, ttl_seconds: int = 3600):
+    cache = client.caches.create(
+        model=MODEL,
+        config=types.CreateCachedContentConfig(
+            system_instruction=system_instruction,
+            contents=[reference_doc],
+            ttl=f"{ttl_seconds}s",
+        ),
+    )
+    # We use cache.name and cache.expire_time (a UTC datetime) later
+    return cache
+
+def remaining_seconds(cache) -> float:
+    now = datetime.now(timezone.utc)
+    return (cache.expire_time - now).total_seconds()
+```
+
+The value from `remaining_seconds()` becomes the raw material for the decision. If the remaining time is shorter than the wait you expect before the next call, you know to act before using it. The important move is to base the decision on whether you have crossed a safety margin, not on whether it has already expired. Try to squeeze out every last second, and you will cross the boundary mid-call.
+
+## Re-arm or Run Uncached — Decide on Cost
+
+Once you dip below the safety margin, there are broadly two choices: re-arm the cache (extend or recreate it), or skip the cache entirely and run an ordinary request. Which is cheaper depends on how much work remains.
+
+Extending simply lengthens the TTL of a cache that is still alive, so it incurs no additional creation cost. Recreating writes the preamble again, so you pay the cache-creation tokens a second time. Running uncached, by contrast, sends the full preamble just once for that call, but frees you from the cache storage charge. Here is a rough guide.
+
+<table>
+  <thead>
+    <tr>
+      <th>Situation</th>
+      <th>Items remaining</th>
+      <th>What to do</th>
+      <th>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Before expiry, within safety margin</td>
+      <td>Any</td>
+      <td>Use it as is</td>
+      <td>On a hit, input billing is minimal</td>
+    </tr>
+    <tr>
+      <td>About to cross the margin, cache still alive</td>
+      <td>Many (dozens or more)</td>
+      <td>Extend the TTL</td>
+      <td>Lengthens lifespan with no creation cost</td>
+    </tr>
+    <tr>
+      <td>Already expired, work continues</td>
+      <td>Many</td>
+      <td>Recreate and re-arm</td>
+      <td>Recreation cost is recovered over remaining items</td>
+    </tr>
+    <tr>
+      <td>Already expired, few left</td>
+      <td>Few (a handful)</td>
+      <td>Run uncached</td>
+      <td>Creation cost cannot be recouped</td>
+    </tr>
+  </tbody>
+</table>
+
+The break-even can be estimated roughly as "preamble tokens paid to recreate ÷ preamble tokens saved per item." The heavier the preamble and the more items remain, the more re-arming wins; conversely, with only a few left, running uncached is the honest choice. Rather than exact optimization, what pays off in unattended runs is being able to pick between these two mechanically.
+
+On the theme of stopping cost leaks, "[Stopping Cost Accidents in Unattended Pipelines with Project Spend Caps and an App-Side Soft Ceiling](/articles/gemini-api/gemini-api-spend-cap-soft-governor-unattended-pipeline)" is worth reading alongside this.
+
+## A Wrapper That Checks the Lease Before Each Call
+
+Now to put the decision into code. Before each call, check the cache's "lease," and if it has dipped below the safety margin, take the action from the table before proceeding to the real work. Extension is `caches.update`; recreation is another call to `create_cache()`.
+
+```python
+SAFETY_MARGIN_S = 300        # act once we drop below this many seconds
+EXTEND_TTL_S = 3600          # TTL to reset on extend / recreate
+BREAK_EVEN_ITEMS = 30        # tune to your preamble weight
+
+class CacheLease:
+    def __init__(self, system_instruction, reference_doc):
+        self.system = system_instruction
+        self.doc = reference_doc
+        self.cache = create_cache(system_instruction, reference_doc, EXTEND_TTL_S)
+
+    def _extend(self):
+        self.cache = client.caches.update(
+            name=self.cache.name,
+            config=types.UpdateCachedContentConfig(ttl=f"{EXTEND_TTL_S}s"),
+        )
+
+    def _recreate(self):
+        self.cache = create_cache(self.system, self.doc, EXTEND_TTL_S)
+
+    def ensure(self, remaining_items: int) -> str | None:
+        left = remaining_seconds(self.cache)
+        if left > SAFETY_MARGIN_S:
+            return self.cache.name                 # use as is
+        if left > 0:
+            self._extend()                          # still alive, extend
+            return self.cache.name
+        if remaining_items > BREAK_EVEN_ITEMS:      # expired, many items
+            self._recreate()                        # re-arm
+            return self.cache.name
+        return None                                 # expired, few left -> uncached
+
+def classify(lease: CacheLease, user_input: str, remaining_items: int) -> str:
+    cache_name = lease.ensure(remaining_items)
+    cfg = types.GenerateContentConfig(cached_content=cache_name) if cache_name else None
+    resp = client.models.generate_content(model=MODEL, contents=user_input, config=cfg)
+    return resp.text
+```
+
+Routing every call through `ensure()` first is the crux of this design. Even right after a long wait from a backoff or a nightly window, the lease state is refreshed before the real work begins, which prevents the accident of holding an expired cache name and slipping back into full-token billing. `BREAK_EVEN_ITEMS` is a constant you set to match the weight of your preamble; I start from a rough figure of preamble tokens divided by the savings per item.
+
+You can confirm after the fact whether the cache actually took effect by checking `cached_content_token_count` in `resp.usage_metadata`. A run of zeros is a sign the lease decision is missing somewhere.
+
+## What I Learned Putting It Into Production
+
+After slotting in this small guard, the input charges on the nightly batch visibly settled down. What helped was not any sophisticated optimization but one thing: always re-examining state after a wait.
+
+The biggest lesson was to think about the cache's lifespan separately from how far the processing has progressed. To us it feels like "we've only handled a few items," yet on the wall clock an hour has passed. Grabbing hold of that time-axis gap through the concrete value of `expire_time` let me pick between the two options without relying on intuition.
+
+As a next step, I would suggest logging which of extend, recreate, or uncached `ensure()` chose, one line each. After a few days accumulate, you can see whether your initial TTL and safety margin actually fit your pipeline. When you want to revisit the overall cache design, "[Gemini API Context Caching: How to Cut Large-Document Processing Costs by 90%](/articles/gemini-api/gemini-api-context-caching-cost-optimization)" makes a solid foundation.
+
+I am still in the middle of tuning this myself, but I hope it gives a starting point to anyone who has been surprised by the cost of an unattended run. Thank you for reading.

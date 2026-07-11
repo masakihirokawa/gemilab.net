@@ -1,0 +1,161 @@
+---
+title: "Gemini のコンテキストキャッシュが途中で失効する — 一時停止するパイプラインで TTL 切れを検知して張り直す"
+slug: "gemini-context-cache-ttl-expiry-paused-pipeline-rearm-guard"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-07-11T09:20"
+author: "Gemini Lab"
+description: "夜間バッチや再試行で処理が一時停止すると、Gemini の明示的コンテキストキャッシュは静かに TTL 切れを起こし、以降の呼び出しが全トークン課金へ戻ります。残り有効期限を握って張り直すか素通しするかを費用で決める、小さなリース設計をまとめました。"
+tags: ["Gemini API", "コンテキストキャッシュ", "コスト最適化", "バッチ処理", "個人開発"]
+---
+
+先日、AdMob の収益レポートと並べてアプリのレビューを分類する夜間バッチの請求額を眺めていて、手が止まりました。同じ量を処理しているはずなのに、ある日だけ入力トークンの課金が数倍に膨らんでいたのです。
+
+原因は、処理の途中で挟まった 20 分ほどの待機でした。レート制限のバックオフでいったん止まっている間に、共有していた明示的コンテキストキャッシュの有効期限（TTL）が過ぎていた。エラーは出ません。以降の呼び出しは、キャッシュされていたはずの長いシステム指示と参照ドキュメントを毎回まるごと送り直していて、それがそのまま入力トークンとして課金されていました。
+
+コンテキストキャッシュは、大きな前置きを一度だけ登録してコストを抑える仕組みです。ところが「途中で止まる可能性のあるパイプライン」と組み合わせると、この TTL が静かな落とし穴になります。個人開発でアプリを無人運用していると、この種の失効はいつか必ず踏みます。以下では、失効を検知できる形にして、張り直すか素通しするかを費用で判断する小さなガードをまとめます。
+
+## なぜ一時停止するパイプラインで静かに失効するのか
+
+明示的コンテキストキャッシュ（`cachedContent`）には、作成時に決めた TTL があります。既定は 1 時間で、`expireTime` を過ぎるとサーバー側から自動的に破棄されます。ここで大切なのは、キャッシュの寿命が「実際に処理していた時間」ではなく「壁時計の経過時間」で進むという点です。
+
+無人で回すパイプラインは、しばしば意図せず止まります。レート制限（429）のバックオフ、Spend Caps の一時的な上限到達、上流 API の遅延、夜間ウィンドウを跨ぐ分割実行。処理そのものが軽くても、待機が積み重なれば壁時計は容赦なく進みます。
+
+厄介なのは、失効しても呼び出しが失敗しない場合があることです。キャッシュ名を指定していても、対象が消えていれば「キャッシュなし」の通常リクエストとして扱われ、前置き全体が再送されます。結果は返ってくるので気づきにくく、請求書で初めて分かる、というのが最悪の順番でした。
+
+命中率そのものが伸びない別の症状については「[Context Caching を入れたのに Gemini の請求が減らなかったとき — 命中率を計測して立て直す運用メモ](/articles/gemini-api/gemini-context-cache-savings-shortfall-hit-rate-instrumentation-field-notes)」で扱っています。本記事はその手前、「そもそもキャッシュが生きているか」を扱います。
+
+## 失効を検知できる形にする
+
+対策の第一歩は、キャッシュを「作って忘れる」対象ではなく、残り有効期限を握れる状態にすることです。作成時に返る `expire_time` を保持し、各呼び出しの直前に「今から使って安全に間に合うか」を確かめます。
+
+```python
+from datetime import datetime, timezone, timedelta
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+MODEL = "gemini-flash-latest"
+
+def create_cache(system_instruction: str, reference_doc: str, ttl_seconds: int = 3600):
+    cache = client.caches.create(
+        model=MODEL,
+        config=types.CreateCachedContentConfig(
+            system_instruction=system_instruction,
+            contents=[reference_doc],
+            ttl=f"{ttl_seconds}s",
+        ),
+    )
+    # cache.name と cache.expire_time（UTC の datetime）を後で使います
+    return cache
+
+def remaining_seconds(cache) -> float:
+    now = datetime.now(timezone.utc)
+    return (cache.expire_time - now).total_seconds()
+```
+
+`remaining_seconds()` が返す値を、そのまま分岐の材料にします。次の呼び出しまでに想定される待機時間より残りが短ければ、使う前に手を打つべきだと分かります。ポイントは、判断の基準を「失効したかどうか」ではなく「安全域を割り込んだかどうか」に置くことです。ギリギリまで使い切ろうとすると、呼び出しの最中に境界を跨いでしまいます。
+
+## 張り直すか、素通しするか — 費用で決める
+
+安全域を割り込んだとき、選択肢は大きく二つです。キャッシュを張り直す（延長または再作成）か、いっそキャッシュを使わず通常リクエストで素通しするか。どちらが安いかは、残りの処理量で変わります。
+
+延長は、まだ生きているキャッシュの TTL を伸ばすだけなので追加の作成コストがかかりません。再作成は前置きをもう一度書き込むため、キャッシュ作成分のトークンを再び支払います。一方で素通しは、その 1 回だけ前置きを丸ごと送る代わりに、キャッシュ保持料からは解放されます。判断の目安を表にまとめます。
+
+<table>
+  <thead>
+    <tr>
+      <th>状況</th>
+      <th>残り処理件数</th>
+      <th>取るべき手</th>
+      <th>理由</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>まだ失効前・安全域内</td>
+      <td>問わない</td>
+      <td>そのまま使う</td>
+      <td>命中していれば入力課金は最小</td>
+    </tr>
+    <tr>
+      <td>安全域を割り込む見込み・キャッシュは生存</td>
+      <td>多い（あと数十件以上）</td>
+      <td>TTL を延長</td>
+      <td>作成コストなしで寿命だけ伸ばせる</td>
+    </tr>
+    <tr>
+      <td>既に失効・処理はまだ続く</td>
+      <td>多い</td>
+      <td>再作成して張り直す</td>
+      <td>再作成分を残り件数で回収できる</td>
+    </tr>
+    <tr>
+      <td>既に失効・残りわずか</td>
+      <td>少ない（数件）</td>
+      <td>キャッシュなしで素通し</td>
+      <td>作成コストを回収しきれない</td>
+    </tr>
+  </tbody>
+</table>
+
+損益分岐はおおまかに「再作成で払う前置きトークン ÷ 1 件あたりで節約できる前置きトークン」で見積もれます。前置きが重く残り件数が多いほど張り直しが有利になり、逆に残り数件なら素通しの方が素直です。厳密な最適化よりも、この二択を機械的に選べる状態にしておくことが、無人運用では効きます。
+
+費用の取りこぼしを止める観点では「[Project Spend Caps とアプリ側ソフト上限で、無人パイプラインの費用事故を二重に止める](/articles/gemini-api/gemini-api-spend-cap-soft-governor-unattended-pipeline)」も併せてご覧いただければと思います。
+
+## 呼び出し前にリースを確認するラッパー
+
+判断をコードに落とし込みます。各呼び出しの前にキャッシュの「リース」を確認し、安全域を割り込んでいれば表の方針に沿って手当てしてから本処理に進みます。延長は `caches.update`、再作成は `create_cache()` の呼び直しで表現します。
+
+```python
+SAFETY_MARGIN_S = 300        # この秒数を切ったら手当てする
+EXTEND_TTL_S = 3600          # 延長・再作成時に設定し直す TTL
+
+class CacheLease:
+    def __init__(self, system_instruction, reference_doc):
+        self.system = system_instruction
+        self.doc = reference_doc
+        self.cache = create_cache(system_instruction, reference_doc, EXTEND_TTL_S)
+
+    def _extend(self):
+        self.cache = client.caches.update(
+            name=self.cache.name,
+            config=types.UpdateCachedContentConfig(ttl=f"{EXTEND_TTL_S}s"),
+        )
+
+    def _recreate(self):
+        self.cache = create_cache(self.system, self.doc, EXTEND_TTL_S)
+
+    def ensure(self, remaining_items: int) -> str | None:
+        left = remaining_seconds(self.cache)
+        if left > SAFETY_MARGIN_S:
+            return self.cache.name                 # そのまま使う
+        if left > 0:
+            self._extend()                          # 生存中なら延長
+            return self.cache.name
+        if remaining_items > BREAK_EVEN_ITEMS:      # 失効・件数が多い
+            self._recreate()                        # 張り直す
+            return self.cache.name
+        return None                                 # 失効・残りわずか → 素通し
+
+def classify(lease: CacheLease, user_input: str, remaining_items: int) -> str:
+    cache_name = lease.ensure(remaining_items)
+    cfg = types.GenerateContentConfig(cached_content=cache_name) if cache_name else None
+    resp = client.models.generate_content(model=MODEL, contents=user_input, config=cfg)
+    return resp.text
+```
+
+`ensure()` を呼び出しの直前に必ず通すのがこの設計の要点です。バックオフや夜間ウィンドウで長く待った直後でも、本処理に入る前にリースの状態が更新されるため、失効したキャッシュ名を握ったまま全トークン課金へ戻る事故を防げます。`BREAK_EVEN_ITEMS` は前置きの重さに合わせて決める定数で、私は前置きトークンを 1 件あたりの節約量で割った概算値を出発点にしています。
+
+なお `resp.usage_metadata` の `cached_content_token_count` を見れば、その呼び出しで実際にキャッシュが効いたかを事後確認できます。ゼロが続いていれば、リースの判断がどこかで空振りしている合図です。
+
+## 運用に入れて分かったこと
+
+この小さなガードを挟んでから、夜間バッチの入力課金は目に見えて落ち着きました。効いたのは高度な最適化ではなく、「待機のあとに必ず状態を見直す」という一点です。
+
+いちばんの学びは、キャッシュの寿命を処理の進み具合と切り離して考えることでした。私たちの感覚では「まだ数件しか処理していない」でも、壁時計では 1 時間が過ぎている。この時間軸のずれを `expire_time` という具体的な値で握り直したことで、勘に頼らず二択を選べるようになりました。
+
+次の一歩としては、`ensure()` が延長・再作成・素通しのどれを選んだかを 1 行ずつ記録しておくことをおすすめします。数日分たまると、TTL の初期値や安全域が自分のパイプラインに合っているかが見えてきます。キャッシュ全体の設計を見直したいときは「[Gemini API コンテキストキャッシュ — 大量ドキュメント処理のコストを90%削減する方法](/articles/gemini-api/gemini-api-context-caching-cost-optimization)」も土台として役立つはずです。
+
+私自身まだ調整の途中ですが、同じように無人運用の費用で驚いた方の手がかりになれば嬉しいです。お読みいただきありがとうございました。
