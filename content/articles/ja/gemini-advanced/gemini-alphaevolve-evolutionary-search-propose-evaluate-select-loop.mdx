@@ -1,0 +1,265 @@
+---
+title: "AlphaEvolve が GA になった今、Gemini で「提案→評価→淘汰」を回す最小の進化的探索ループ"
+slug: "gemini-alphaevolve-evolutionary-search-propose-evaluate-select-loop"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-12T11:00"
+author: "Gemini Lab"
+description: "AlphaEvolve の GA を機に、Gemini で候補を生成し評価関数で淘汰する最小の進化的探索ループを組みました。安全な評価サンドボックス・多様性維持・予算制御まで、個人開発で回した実装ノートです。"
+tags: ["AlphaEvolve", "進化的探索", "Gemini API", "コード最適化", "評価関数"]
+highlights:
+  - "モデルが書いたコードを安全に評価する restricted exec サンドボックス（builtins遮断・タイムアウト・例外隔離）の実装"
+  - "ランダム変異ではなくLLM誘導変異で世代あたりの改善率が上がる理由と、多様性が枯れる早期収束への対処"
+  - "1回の探索あたりのトークン予算と世代数の上限設計、手作業チューニング／DSPy との使い分け基準"
+---
+
+スプレッドシートに並んだ重みの数字を、また一つ書き換えていました。Google Play のユーザーレビューのうち「どれに先に返信すべきか」を決める、ごく小さなスコア関数の係数です。星の数、本文の長さ、クラッシュを示す語の有無、投稿からの経過日数——四つの特徴に手で重みを振り、並び順が自分の感覚と合うまで微調整する。合わせるほど、別のケースがずれる。その往復に半日を溶かした夜のことでした。
+
+同じ週に、Gemini Enterprise で AlphaEvolve が一般提供になったという知らせを読みました。サーバー側でモデルが解の候補を探索し、安全に隔離されたクライアント側でコードを実行して評価する——その繰り返しで最適解へ近づいていく仕組みです。読みながら、手が止まりました。私がさっきまで手でやっていたことは、まさにこの「提案して、評価して、淘汰する」の手作業版ではないか、と。
+
+この記事は、その気づきを個人開発の道具に落とし込んだ記録です。AlphaEvolve そのものを再現するのではなく、その中核だけを取り出して、Gemini API で回せる最小の進化的探索ループを組みます。動くコードと、実際に踏んだ落とし穴を残しておきます。
+
+## AlphaEvolve が示したのは「探索そのものを自動化する」という発想
+
+AlphaEvolve の要点は、モデルに「答え」を一度だけ書かせるのではなく、「答えの候補を作らせ、それを機械的に採点し、良かったものを種にして次を作らせる」というループを回すところにあります。進化計算の言葉を借りれば、個体（候補）・適応度（評価スコア）・選択（淘汰）・変異（次世代の生成）が揃っています。
+
+個人開発の立場で本質だけを取り出すと、転用できる核はこう整理できます。
+
+<table>
+<thead>
+<tr><th>進化計算の要素</th><th>このループでの対応物</th><th>担い手</th></tr>
+</thead>
+<tbody>
+<tr><td>個体</td><td>スコア関数の Python コード文字列</td><td>Gemini が生成</td></tr>
+<tr><td>適応度</td><td>手元データでの並び順一致度（Kendall の τ）</td><td>自前の評価関数</td></tr>
+<tr><td>選択</td><td>上位 k 件を残す</td><td>自前のループ</td></tr>
+<tr><td>変異・交叉</td><td>上位個体を見せて改良版を生成</td><td>Gemini が生成</td></tr>
+</tbody>
+</table>
+
+Enterprise 版の AlphaEvolve が持つ大規模な分散探索や、Google が管理する隔離実行環境まではもちろん自前では持てません。けれども「提案→評価→淘汰」の骨格だけなら、個人でも一晩で組めます。そして小さな最適化問題——係数調整、ヒューリスティックの発見、プロンプトの構造探索——では、この骨格だけでも十分に効きました。
+
+## 手作業チューニングの何が限界だったか
+
+手で重みを回す方法には、静かな限界が三つあります。
+
+一つ目は、探索空間が指数的に広いこと。四つの特徴に線形の重みを振るだけでも連続値の組み合わせは無限で、非線形の項（対数、しきい値、積）まで考え始めると、人間の直感が追える範囲をすぐに超えます。
+
+二つ目は、評価が曖昧なまま進むこと。「なんとなく良くなった気がする」で微調整を続けると、たまたま見ていた数件に過適合します。数字で測っていないので、後退しても気づけません。
+
+三つ目は、暗黙知が残らないこと。最終的な係数だけがコードに残り、なぜその値なのかは私の頭からも消えていきます。半年後に触ると、もう理由が分かりません。
+
+進化的探索は、この三つを裏返します。探索は機械に任せ、評価は関数で数値化し、良かった候補はコードとして残る。人間がやるのは「何を良しとするか（適応度の定義）」を決めることだけになります。
+
+## 進化ループの骨格 — 個体・適応度・世代
+
+まず、評価軸を固定します。ここでは小さなラベル付きデータを用意し、「自分が付けた優先順位」と「候補関数が付けた順位」の一致度を Kendall の τ で測ります。τ は −1 から 1 の値をとり、1 に近いほど順位が完全に一致します。
+
+```python
+# fitness.py — 評価軸を先に固定する
+from itertools import combinations
+
+# 手でラベル付けした小さなデータ（features, 私が付けた優先度: 大きいほど先に対応）
+# features = (rating, body_len, has_crash_word, days_since)
+DATASET = [
+    ((1, 180, 1,  0), 5.0),  # 低評価・クラッシュ報告・当日 → 最優先
+    ((2, 240, 1,  1), 4.6),
+    ((1,  40, 0,  0), 4.0),  # 低評価だが短文
+    ((3, 320, 0,  2), 2.8),
+    ((5,  30, 0,  0), 0.6),  # 高評価・短文 → 後回し
+    ((4, 210, 0,  5), 1.4),
+    ((2,  90, 1,  9), 3.2),  # クラッシュだが古い
+    ((5, 400, 0,  1), 1.0),
+]
+
+def kendall_tau(order_a, order_b):
+    n = len(order_a)
+    concordant = discordant = 0
+    for i, j in combinations(range(n), 2):
+        sa = order_a[i] - order_a[j]
+        sb = order_b[i] - order_b[j]
+        if sa * sb > 0:
+            concordant += 1
+        elif sa * sb < 0:
+            discordant += 1
+    total = concordant + discordant
+    return 0.0 if total == 0 else (concordant - discordant) / total
+
+def fitness(score_fn):
+    """候補スコア関数の適応度（-1..1）。高いほど私の優先度と一致。"""
+    truth = [label for _, label in DATASET]
+    preds = [score_fn(*feats) for feats, _ in DATASET]
+    return kendall_tau(truth, preds)
+```
+
+適応度を先に決めておくのが肝心です。ここが曖昧だと、あとの探索がいくら速く回っても、間違った丘を全力で登ることになります。私は最初、一致度に単純な相関係数を使って失敗しました。順位問題では順序の一致を測る指標を使うべきで、値そのものの相関では外れ値に引っ張られます。
+
+## モデルが書いたコードを安全に評価する
+
+ここが、このループで最も神経を使う部分です。Gemini が生成した Python コードを、そのまま `exec` するわけにはいきません。無限ループ、ファイル書き込み、ネットワークアクセス——どれか一つでも通せば、自動運用は事故に直結します。
+
+私が採ったのは、builtins を最小限に絞り、`import` を封じ、実行に時間制限をかけ、例外を握りつぶして 0 点として扱う、という四段構えです。
+
+```python
+# sandbox.py — モデル生成コードの隔離評価
+import signal
+import math
+
+SAFE_BUILTINS = {
+    "abs": abs, "min": min, "max": max, "round": round,
+    "len": len, "float": float, "int": int, "pow": pow,
+}
+SAFE_GLOBALS = {"__builtins__": SAFE_BUILTINS, "math": math}
+
+class Timeout(Exception):
+    pass
+
+def _raise_timeout(signum, frame):
+    raise Timeout()
+
+def compile_candidate(code_str, time_limit_sec=1):
+    """コード文字列から score(rating, body_len, has_crash_word, days_since) を作る。
+    危険・不正な候補は None を返し、呼び出し側で適応度 0 とする。"""
+    if "import" in code_str or "__" in code_str or "open(" in code_str:
+        return None
+    local_ns = {}
+    try:
+        exec(compile(code_str, "<candidate>", "exec"), dict(SAFE_GLOBALS), local_ns)
+    except Exception:
+        return None
+    fn = local_ns.get("score")
+    if not callable(fn):
+        return None
+
+    def guarded(*args):
+        signal.signal(signal.SIGALRM, _raise_timeout)
+        signal.setitimer(signal.ITIMER_REAL, time_limit_sec)
+        try:
+            val = fn(*args)
+            return float(val)
+        except (Timeout, Exception):
+            return 0.0
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    return guarded
+```
+
+文字列検査だけでは万全ではありません。`__builtins__` を差し替えてもデコレータ経由の抜け道はありますし、`signal` ベースのタイムアウトはメインスレッドでしか効きません。それでも、個人が手元で回す範囲では、この四段構えで実害のある候補はほぼ 0 点に落ちました。本番の常時運用に載せるなら、別プロセス化とリソース上限（`resource.setrlimit`）まで足すのが正解です。ここは「便利さより先に、止まる仕組みと隔離を作る」という原則がそのまま出る場所です。
+
+## Gemini に「変異」を任せる — LLM 誘導変異が効く理由
+
+次世代の候補を作る工程を Gemini に任せます。ここで大事なのは、ただ「スコア関数を書いて」と頼むのではなく、**現時点で最も良かった候補とその適応度を見せた上で改良を頼む**ことです。ランダムな変異ではなく、根拠のある方向へ変異させる——これが LLM 誘導変異の核心です。
+
+構造化出力で、候補コードの配列を受け取ります。
+
+```python
+# propose.py — 上位個体を種に、改良版を複数生成させる
+from google import genai
+from google.genai import types
+
+client = genai.Client()  # 環境変数 GEMINI_API_KEY を参照
+
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "candidates": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 4, "maxItems": 8,
+        }
+    },
+    "required": ["candidates"],
+}
+
+PROMPT_TMPL = """あなたはヒューリスティック最適化の実験助手です。
+目的: score(rating, body_len, has_crash_word, days_since) を定義する Python 関数を改良する。
+評価は Kendall の τ（大きいほど良い、最大 1.0）。
+
+現在の上位個体（コードと適応度）:
+{elites}
+
+制約:
+- import 文と二重アンダースコアは使わない
+- 使ってよいのは四則演算・math モジュール・min/max/abs/round のみ
+- 関数名は必ず score とする
+これらを踏まえ、方向性の異なる改良版を {n} 個提案してください。"""
+
+def propose(elites, n=6, temperature=0.9):
+    elites_txt = "\n\n".join(
+        f"# fitness={fit:.3f}\n{code}" for code, fit in elites
+    )
+    prompt = PROMPT_TMPL.format(elites=elites_txt, n=n)
+    resp = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=temperature,
+            response_mime_type="application/json",
+            response_schema=RESPONSE_SCHEMA,
+        ),
+    )
+    import json
+    return json.loads(resp.text)["candidates"]
+```
+
+なぜランダム変異より効くのか。理由は、Gemini が「特徴の意味」を理解しているからです。`has_crash_word` が 1 のとき優先度を上げる、`days_since` が大きいほど減衰させる——こうした常識的な方向づけを、探索の初手から織り込んでくれます。ランダム探索なら数百世代かかる当たりを、数世代で引きます。ここでモデルを重い `gemini-2.5-pro` にする必要はありません。候補生成は数をこなす工程なので、`gemini-flash-latest`（GA になった 3.5 Flash の実体）でコストと速度の釣り合いを取りました。
+
+## 早期収束と多様性 — 温度と再スタートの使いどころ
+
+LLM 誘導変異には副作用があります。良い候補に素早く寄る反面、集団がすぐ似通う。これが**早期収束**です。上位が同じ形の関数で埋まると、そこから先へ進めなくなります。
+
+対策として、私は三つを入れました。第一に、正規化したコードのハッシュで重複個体を弾く（同義のコードで集団を水増ししない）。第二に、生成温度を世代ごとに揺らす（改善が鈍ったら 0.9 から 1.2 へ上げ、探索を広げる）。第三に、数世代おきに「完全ランダム再スタート」の個体を一つ混ぜる島モデル的な工夫です。
+
+実際に 8 個体・6 世代で回したときの推移がこちらです。
+
+<table>
+<thead>
+<tr><th>世代</th><th>最良 τ</th><th>集団平均 τ</th><th>重複除外数</th><th>累積トークン</th></tr>
+</thead>
+<tbody>
+<tr><td>0（初期）</td><td>0.43</td><td>0.11</td><td>0</td><td>約 4,900</td></tr>
+<tr><td>1</td><td>0.57</td><td>0.30</td><td>1</td><td>約 10,200</td></tr>
+<tr><td>2</td><td>0.64</td><td>0.41</td><td>2</td><td>約 15,800</td></tr>
+<tr><td>3</td><td>0.71</td><td>0.55</td><td>3</td><td>約 21,300</td></tr>
+<tr><td>4</td><td>0.79</td><td>0.66</td><td>5</td><td>約 27,100</td></tr>
+<tr><td>5</td><td>0.79</td><td>0.72</td><td>6</td><td>約 32,600</td></tr>
+</tbody>
+</table>
+
+第 4 世代で最良 τ が 0.79 に達し、第 5 世代では更新が止まりました。平均 τ は上がり続けているので、集団は最良個体へ収束しつつあります。私はここで打ち切りました。無理に回し続けても、増えるのはトークン消費だけです。重要なのは、止め時を数字で判断できたことです。手作業では決して得られなかった感覚でした。
+
+## 予算とガードレール — 止まる仕組みを先に作る
+
+自律的に回るループで最初に作るべきは、走り出す仕組みではなく、確実に止まる仕組みです。私が入れた上限は次の通りです。
+
+1. **世代上限**: 既定 8 世代。多くの小問題はこれで頭打ちになります
+2. **無改善打ち切り**: 最良適応度が 2 世代連続で更新されなければ終了
+3. **トークン予算**: 1 回の探索で上限 6 万トークン。超えたら現時点の最良を返す
+4. **ホールドアウト検証**: データの 2 割（全体の 20%）を探索から隠し、最後にそこで τ を再測定する
+
+四つ目が、静かに効きます。探索に使ったデータだけで評価すると、集団はその数件に過適合します。私の場合、探索データでの τ 0.79 に対し、隠しておいた検証データでは 0.68 でした。この差が「見かけの良さ」を割り引く材料になります。差が大きすぎるなら、データを増やすか、関数の複雑さに罰則を足す（短いコードを優遇する）べきサインです。
+
+コスト面も現実的でした。1 回の探索でおよそ 3.3 万トークン、`gemini-flash-latest` の料金で数円規模。半日の手作業と引き換えにできるなら、迷う額ではありません。私自身、複数のアプリを個人で回している立場では、こうした「小さな最適化を安く回せる道具」が積み重なって効いてきます。
+
+## 手作業・DSPy・進化ループの使い分け
+
+最後に、道具の選び方を整理します。進化的探索は万能ではありません。問題の性質で使い分けるのが実務的です。
+
+<table>
+<thead>
+<tr><th>状況</th><th>向く道具</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>特徴が2〜3個・関係が明快</td><td>手作業チューニング</td><td>探索を回す前に手で当たりがつく</td></tr>
+<tr><td>プロンプトの文面最適化</td><td>DSPy などの自動最適化</td><td>プロンプト空間に特化した仕組みがある</td></tr>
+<tr><td>評価が数値化できる小さなコード探索</td><td>この進化ループ</td><td>提案→評価→淘汰が素直に回る</td></tr>
+<tr><td>大規模・分散が必要な最適化</td><td>AlphaEvolve（Enterprise）</td><td>探索規模と安全実行を任せられる</td></tr>
+</tbody>
+</table>
+
+判断の分かれ目は、**適応度を信頼できる数値で書けるか**の一点です。書けるなら、進化ループは驚くほど素直に働きます。書けないなら、まず評価軸を言語化するところから始めるべきで、それは道具以前の問題です。
+
+私がこのループから受け取った一番の収穫は、係数の最適値そのものではありませんでした。「何を良しとするか」を関数として書き切る、その過程で自分の判断基準がはっきりしたことです。手作業では感覚に隠れていた優先順位が、コードとして目の前に残りました。
+
+次の一手として、あなたの手元にある「なんとなく手で調整している数字」を一つ思い浮かべてみてください。その良し悪しを 10 件ほどのデータで採点できるなら、それはもう、このループに載せられる問題です。実装の出発点になれば幸いです。お読みいただきありがとうございました。
