@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SHEETS — Fill with Geminiが28言語に拡大しました。中国語・トルコ語ほか各言語のまま自然文で表を組めます",
-    "ALPHAEVOLVE — Gemini Enterpriseに、コードをAIが自律的に最適化するAlphaEvolveが一般提供されました",
-    "SPARK — macOS向けの個人AIエージェントGemini Sparkが、フォルダ整理やWorkspace横断の作業を代行します",
-    "OMNI — Gemini Omniがテキスト・写真・動画を掛け合わせた高品質な動画作成と、自分に似たAIアバターに対応します",
-    "GEMINI35 — Gemini 3.5 Proがアーキテクチャ刷新のため7月17日へ延期。200万トークンとDeep Thinkを導入予定です",
-    "DEEPTHINK — 3.5 Proは数学的推論・SVGシーン生成・画像品質の改善を狙って再設計されています",
+    "NANOLITE — 最速・最もコスト効率の高いGemini ImageモデルNano Banana 2 Liteが利用可能になりました",
+    "OMNIFLASH — Gemini Omni FlashがAPIにパブリックプレビューで登場。動的な動画ワークフローをカスタムで組めます",
+    "AGENTS — Managed AgentsがGemini APIに。GoogleがホストするLinuxサンドボックスで自律エージェントを構築できます",
+    "FILESEARCH — File Searchがマルチモーダル検索に対応。gemini-embedding-2で画像を埋め込み・検索でき、視覚引用のmedia_idも加わりました",
+    "WEBHOOKS — Webhooksに対応し、Batch APIと長時間オペレーションのポーリングをイベント駆動で置き換えられます",
+    "DEPRECATE — 旧画像生成モデルは8/17に停止予定です。移行の準備を進めておきましょう",
   ],
   en: [
-    "SHEETS — Fill with Gemini expands to 28 more languages, so you can build spreadsheets in your own language with natural prompts",
-    "ALPHAEVOLVE — Gemini Enterprise makes AlphaEvolve generally available, autonomously discovering optimized code solutions",
-    "SPARK — Gemini Spark, a personal AI agent for macOS, organizes folders and runs workflows across Workspace",
-    "OMNI — Gemini Omni blends text, photos, and video for high-quality creation, plus custom AI avatars of you",
-    "GEMINI35 — Gemini 3.5 Pro slips to July 17 for a full rebuild, introducing a 2M-token context and Deep Think",
-    "DEEPTHINK — The 3.5 Pro rebuild targets better math reasoning, SVG scene generation, and image quality",
+    "NANOLITE — Nano Banana 2 Lite is now available as the fastest, most cost-efficient Gemini Image model",
+    "OMNIFLASH — Gemini Omni Flash comes to the API in public preview for building custom, dynamic video workflows",
+    "AGENTS — Managed Agents arrives in the Gemini API, running autonomous agents in secure Google-hosted Linux sandboxes",
+    "FILESEARCH — File Search now supports multimodal search via gemini-embedding-2, with media_id for visual citations",
+    "WEBHOOKS — Event-driven Webhooks replace polling for the Batch API and long-running operations",
+    "DEPRECATE — Older image generation models are deprecated and shut down on Aug 17, so plan your migration",
   ],
 };
 
