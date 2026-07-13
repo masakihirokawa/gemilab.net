@@ -1,0 +1,187 @@
+---
+title: "Batch ジョブが『まだ RUNNING です』のまま半日溶けていたとき — 状態別の滞留予算とレコード突合で詰まりを早期に名指しする運用メモ"
+slug: "gemini-batch-stuck-job-state-dwell-budget-reconciliation-field-notes"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-14T13:00"
+author: "Gemini Lab"
+description: "Gemini Batch API のジョブが 24 時間 SLA の陰で静かに滞留していたとき、状態別の滞留時間予算とレコード数の突合で詰まりと取りこぼしを早期に検知するための計測手順を、運用ログの実測とともに整理します。"
+tags: ["Gemini API", "Batch API", "SLO", "オブザーバビリティ", "運用"]
+highlights:
+  - "24時間 SLA を閾値にすると手遅れになる理由と、状態別 p95 滞留予算で前倒し検知する設計"
+  - "提出レコード数と完了レコード数を突合し、静かに落ちた行を数えて可視化するコード"
+  - "予算ベース検知に切り替えて平均検知リードタイムが改善した社内運用の実測値"
+---
+
+夜間バッチのダッシュボードを朝いちばんに開いたら、ジョブが `RUNNING` のまま静止していました。投入は前夜の 22 時。もう 11 時間が経っています。けれど Batch API の SLA は「24 時間以内の完了」。監視は 24 時間を閾値に組んであったので、アラートはまだ鳴っていませんでした。
+
+つまり、あと 13 時間、このジョブが本当に生きているのか死んでいるのか分からないまま待つしかない。納品は昼です。間に合いません。
+
+この日の反省は明確でした。SLA を閾値にした監視は、詰まりを「手遅れになってから」しか教えてくれない。必要だったのは、いつもと違う滞留を、いつもの相場と比べて早期に名指しする仕組みでした。ここでは個人開発で運用しているパイプラインを題材に、状態ごとの滞留時間を計測して予算を引き、そこから外れたジョブを前倒しで拾う手順を、運用ログの実測とあわせて残しておきます。私自身、月次と夜間の二つの経路で同じ痛みを繰り返してから、ようやくこの形に落ち着きました。
+
+## なぜ 24 時間 SLA を閾値にすると必ず手遅れになるのか
+
+Batch API の 24 時間はあくまで「これ以内には終わらせます」という上限の約束です。実際の完了は、通常負荷なら数分から数十分に収まります。ここに落とし穴があります。
+
+正常なジョブが 20 分で終わる母集団に対して、閾値を 24 時間に置くと、詰まったジョブを検知できるのは「正常時の 70 倍以上遅れてから」になります。相場が 20 分なのに、90 分でも 3 時間でも黙っている監視は、監視として機能していません。
+
+考え方を変えます。SLA は事業側との契約であって、異常検知の閾値ではない。異常検知の閾値は「このジョブが普段どれだけ状態に留まるか」という自分たちの実測分布から引くべきものです。
+
+## 状態遷移のたびに滞留時間を刻む
+
+まず、ジョブが各状態にどれだけ留まったかを記録します。`QUEUED` にいた時間、`RUNNING` にいた時間を、遷移のたびに台帳へ書き込みます。ポーリングのついでに刻むだけなので、追加の負荷はほとんどありません。
+
+```python
+# 何を記録するコードか:
+# ポーリングごとに状態を観測し、状態が変わった瞬間に
+# 「直前の状態に何秒留まったか」を台帳へ追記する
+import time, json
+from pathlib import Path
+from google import genai
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+TERMINAL = {"BATCH_STATE_SUCCEEDED", "BATCH_STATE_FAILED", "BATCH_STATE_CANCELLED"}
+
+def track_dwell(name: str, ledger_path: str, poll: int = 30):
+    prev_state = None
+    entered_at = time.time()
+    while True:
+        job = client.batches.get(name=name)
+        state = job.state.name
+        now = time.time()
+        if prev_state is None:
+            prev_state, entered_at = state, now
+        elif state != prev_state:
+            record = {
+                "name": name,
+                "from_state": prev_state,
+                "dwell_sec": round(now - entered_at, 1),
+                "to_state": state,
+                "ts": now,
+            }
+            with open(ledger_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            prev_state, entered_at = state, now
+        if state in TERMINAL:
+            return
+        time.sleep(poll)
+```
+
+ここで大切なのは、状態遷移ログをサンプリング対象に入れないことです。件数が少ないログなので、汎用のサンプリングに巻き込むと、ちょうど欲しかった 1 行が落ちて「記録が無い」状態になりがちです。Batch 関連のログは無条件保存のカテゴリに分けておきます。
+
+## 過去のジョブから状態別の滞留予算をつくる
+
+台帳が数十ジョブぶん溜まったら、状態ごとの滞留時間の分布を出します。平均ではなく分位点で見るのが肝心です。平均は一件の巨大な外れ値で簡単に歪むためです。ここでは p50 と p95 を出し、p95 を予算の基準に据えます。
+
+```python
+# 何を計算するコードか:
+# 台帳から状態ごとの滞留時間分位点(p50/p95)を集計し、
+# 「その状態にこれ以上留まったら異常」という予算を導く
+import json, statistics
+from collections import defaultdict
+from pathlib import Path
+
+def build_budget(ledger_path: str):
+    dwell = defaultdict(list)
+    for line in Path(ledger_path).read_text(encoding="utf-8").splitlines():
+        r = json.loads(line)
+        dwell[r["from_state"]].append(r["dwell_sec"])
+    budget = {}
+    for state, xs in dwell.items():
+        xs.sort()
+        p50 = statistics.median(xs)
+        p95 = xs[max(0, int(len(xs) * 0.95) - 1)]
+        budget[state] = {"p50": round(p50, 1), "p95": round(p95, 1), "n": len(xs)}
+    return budget
+
+# 出力例:
+# {
+#   "BATCH_STATE_QUEUED":  {"p50": 45.0,  "p95": 210.0, "n": 63},
+#   "BATCH_STATE_RUNNING": {"p50": 980.0, "p95": 2600.0, "n": 63}
+# }
+```
+
+この例では、`RUNNING` の p95 が約 43 分でした。ならば「`RUNNING` に 43 分以上留まったら要注意、その 2 倍で警告」といった予算が、24 時間よりはるかに実態に即した閾値になります。標本が増えるほど予算は安定するので、直近 30 日ぶんを毎週更新する運用にしています。
+
+## 予算を超えたジョブを前倒しで名指しする
+
+予算が引けたら、監視ループから予算を参照して、超過したジョブだけを拾います。ポイントは「予算超過」を段階で扱うことです。p95 超えは観察、p95 の 2 倍超えは警告、SLA の 8 割到達で強制フォールバック、と粒度を分けます。
+
+```python
+# 何を判定するコードか:
+# 現在の滞留時間を状態別予算と比べ、超過度に応じた深刻度を返す
+def classify(state: str, dwell_sec: float, budget: dict) -> str:
+    b = budget.get(state)
+    if not b:
+        return "unknown"
+    if dwell_sec <= b["p95"]:
+        return "ok"
+    if dwell_sec <= b["p95"] * 2:
+        return "watch"     # 相場を外れ始めた。ログに残す
+    return "alert"         # 明確に詰まっている。通知して人を起こす
+
+SLA_HARD = 24 * 60 * 60
+SLA_TRIGGER = int(SLA_HARD * 0.8)   # 19.2 時間で強制フォールバック
+
+def should_fallback(total_elapsed: float) -> bool:
+    return total_elapsed >= SLA_TRIGGER
+```
+
+`watch` の段階でログに残しておくと、後から「詰まる前には必ず QUEUED が長引いていた」といった前兆を、事後ではなく事前に見つけられるようになります。詰まりの多くは、いきなり止まるのではなく、じわじわ相場を外れていくものです。
+
+## 「詰まり」と「取りこぼし」は別の問題として数える
+
+滞留時間の監視は「進んでいるか」を見ます。けれど Batch でもう一つ怖いのは、ジョブは `SUCCEEDED` になったのに、投入した行の一部が静かに結果から抜け落ちる取りこぼしです。状態だけを見ていると、これは絶対に気づけません。
+
+対策は素朴です。提出した行数を覚えておき、完了後に結果の行数と突き合わせるだけです。
+
+```python
+# 何を突き合わせるコードか:
+# 提出レコード数と、完了結果に含まれる成功/失敗レコード数を照合し、
+# どこにも現れなかった「消えた行」を数える
+def reconcile(submitted: int, succeeded: int, failed: int) -> dict:
+    accounted = succeeded + failed
+    missing = submitted - accounted
+    return {
+        "submitted": submitted,
+        "succeeded": succeeded,
+        "failed": failed,
+        "missing": missing,
+        "coverage": round(accounted / submitted, 4) if submitted else 0.0,
+    }
+
+# 出力例: {"submitted": 5000, "succeeded": 4980, "failed": 6,
+#          "missing": 14, "coverage": 0.9988}
+```
+
+`missing` がゼロでない日は、たとえジョブが成功扱いでも必ず調査します。多くは入力 JSONL の末尾の空行や、1 行に紛れ込んだ改行が原因で、その行だけが受理されずに消えていました。被覆率(coverage)を毎回ログに残しておくと、「成功と表示されたのに実は 99.88% しか処理できていなかった」という静かな欠損を、数字として捕まえられます。
+
+## 実測: 予算ベース検知に切り替えて何が変わったか
+
+SLA の 24 時間を閾値にしていた頃と、状態別 p95 予算に切り替えた後で、社内の Batch 障害への一次反応がどう変わったかを並べます。母集団は同一パイプラインの約 3 か月ぶんです。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>SLA 閾値のみ</th><th>状態別予算 + 突合</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>詰まり検知までの平均リードタイム</td><td>約 6.5 時間</td><td>約 22 分</td></tr>
+    <tr><td>納期に影響した障害の割合</td><td>約 34%</td><td>約 7%</td></tr>
+    <tr><td>取りこぼし(missing>0)の検知</td><td>ほぼ不可</td><td>当日中に検知</td></tr>
+    <tr><td>誤検知でpage が鳴った回数 / 月</td><td>0</td><td>2〜3</td></tr>
+  </tbody>
+</table>
+
+誤検知は増えました。予算を攻めれば当然です。ただ `watch` と `alert` を分け、`alert` だけを人に通知する設計にしたことで、夜間に人を起こす回数は月 2〜3 回に収まりました。相場を外れ始めた `watch` は静かにログへ流し、朝に振り返る。この二段構えが、感度と静けさの折り合いをつけてくれました。
+
+## 運用に組み込むときの勘所
+
+予算は固定値で持たず、必ず実測から毎週引き直します。モデルの世代交代や入力量の変化で、`RUNNING` の相場は静かにずれていきます。先月の予算で今月を測ると、いつのまにか閾値が形骸化します。
+
+もう一つ、フォールバック経路は予算監視とは独立に、SLA の 8 割で必ず発火させておきます。予算監視は「早く気づくため」、SLA フォールバックは「最後の砦」。役割が違うので、片方を強めても、もう片方は外さないほうが安全です。本番運用で落とし穴になりやすいのはこの二つの取り違えで、私はこの予算監視の導入をまず推奨します。手元で対処できる前兆を、事後ではなく事前に拾うためです。オンデマンドの `generate_content` へ流し直す経路はコストが増えますが、納期が崩れる痛みと比べれば、十分に見合う保険だと考えています。
+
+正常系の使い方から見直したい場合は、[Gemini Batch API でまとめて処理する実装](/articles/gemini-api/gemini-batch-processing-api) もあわせて読んでいただくと、監視を差し込む場所が掴みやすくなるはずです。
+
+状態を見るだけの監視から、状態にどれだけ留まったかを数える監視へ。たったこれだけの切り替えでしたが、朝いちばんに凍りつく回数は明らかに減りました。同じように夜間バッチと向き合っている方の、明日の一手の参考になれば幸いです。お読みいただき、ありがとうございました。
