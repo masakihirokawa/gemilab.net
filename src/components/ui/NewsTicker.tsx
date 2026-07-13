@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "NANOLITE — 最速・最もコスト効率の高いGemini ImageモデルNano Banana 2 Liteが利用可能になりました",
-    "OMNIFLASH — Gemini Omni FlashがAPIにパブリックプレビューで登場。動的な動画ワークフローをカスタムで組めます",
-    "AGENTS — Managed AgentsがGemini APIに。GoogleがホストするLinuxサンドボックスで自律エージェントを構築できます",
-    "FILESEARCH — File Searchがマルチモーダル検索に対応。gemini-embedding-2で画像を埋め込み・検索でき、視覚引用のmedia_idも加わりました",
-    "WEBHOOKS — Webhooksに対応し、Batch APIと長時間オペレーションのポーリングをイベント駆動で置き換えられます",
-    "DEPRECATE — 旧画像生成モデルは8/17に停止予定です。移行の準備を進めておきましょう",
+    "FLASH35 — Gemini 3.5 Flashが一般提供となり、gemini-flash-latestが指す実体になりました。日常的な生成を速く安価にこなせます",
+    "AGENTS — Gemini APIのManaged Agentsがpublic previewに。Google管理の隔離Linuxサンドボックスで自律的なエージェントを構築できます",
+    "MEDIA — Nano Banana 2 Lite（画像）とGemini Omni Flash（動画・会話的編集）がAI Studio・API・Enterprise Agent Platformで利用可能に",
+    "TTS — gemini-3.1-flash-tts-previewの音声生成がstreamGenerateContent経由でストリーミング対応になりました",
+    "TRANSLATE — 新しい音声モデルが70以上の言語を自動判別し、話者の自然な抑揚を保ったままライブ音声翻訳を行います",
+    "SPENDCAP — AI Studioにプロジェクト単位の費用上限が導入され、支出を安全側に抑えられるようになりました",
   ],
   en: [
-    "NANOLITE — Nano Banana 2 Lite is now available as the fastest, most cost-efficient Gemini Image model",
-    "OMNIFLASH — Gemini Omni Flash comes to the API in public preview for building custom, dynamic video workflows",
-    "AGENTS — Managed Agents arrives in the Gemini API, running autonomous agents in secure Google-hosted Linux sandboxes",
-    "FILESEARCH — File Search now supports multimodal search via gemini-embedding-2, with media_id for visual citations",
-    "WEBHOOKS — Event-driven Webhooks replace polling for the Batch API and long-running operations",
-    "DEPRECATE — Older image generation models are deprecated and shut down on Aug 17, so plan your migration",
+    "FLASH35 — Gemini 3.5 Flash is now GA and powers gemini-flash-latest, making everyday generation faster and more affordable",
+    "AGENTS — Managed Agents launch in public preview in the Gemini API, running in secure, isolated Google-hosted Linux sandboxes",
+    "MEDIA — Nano Banana 2 Lite and Gemini Omni Flash bring faster image and high-quality video generation across AI Studio and the API",
+    "TTS — Streaming speech generation is now supported for gemini-3.1-flash-tts-preview via streamGenerateContent",
+    "TRANSLATE — A new audio model detects 70+ languages for live speech-to-speech translation while preserving natural intonation",
+    "SPENDCAP — Project-level spend caps for billing have been added in Google AI Studio to keep costs under control",
   ],
 };
 
