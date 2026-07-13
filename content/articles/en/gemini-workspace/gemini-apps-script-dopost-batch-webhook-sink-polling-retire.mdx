@@ -1,0 +1,255 @@
+---
+title: "Retiring the Poll That Waits on an Overnight Batch — An Apps Script doPost Sink for Gemini Signals"
+slug: "gemini-apps-script-dopost-batch-webhook-sink-polling-retire"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-07-13T05:00"
+author: "Gemini Lab"
+description: "Polling a Gemini batch or long-running operation every five minutes from an Apps Script time trigger quietly stacks up UrlFetch calls and latency. Receive the webhook in doPost, treat it as an unverified signal, then confirm authoritatively and apply idempotently."
+tags: ["Apps Script", "Gemini API", "Webhook", "Batch API", "Google Workspace"]
+highlights:
+  - "See how five-minute polling wastes about 288 UrlFetch calls a day, and how a webhook collapses that to near zero while cutting completion-to-apply latency from minutes to seconds"
+  - "Confront the fact that Apps Script doPost cannot read arbitrary request headers, and build a sink that treats the webhook as an unverified signal rather than a trusted notification, with complete code"
+  - "Combine an operations.get authoritative check, an idempotency ledger, and a low-frequency reconciliation sweep to absorb both duplicate deliveries and missed events"
+---
+
+You send a batch to Gemini overnight, and the next morning the results are written back into a spreadsheet. Running several apps solo, these "let it work while I sleep" jobs pile up naturally. On my own side, I've leaned on Apps Script time-driven triggers to have Gemini classify app reviews and roll up some AdMob figures overnight.
+
+The way I waited for them, though, always nagged at me. To learn whether a job had finished, a trigger woke every five minutes and asked the API. Most of the time the only answer was "not yet." This week, with Gemini's Batch API and long-running operations gaining webhook support, I could finally fold that wasted polling away. This article builds the design that puts the receiving end in an Apps Script `doPost`, one stumbling point at a time.
+
+## The trigger: five-minute polling stacks up quietly
+
+Here is the shape polling usually takes: a time trigger runs every five minutes and asks about any operation that is still open.
+
+```javascript
+// Runs on a 5-minute time-driven trigger (the old way)
+function pollPendingOperations() {
+  const props = PropertiesService.getScriptProperties();
+  const pending = JSON.parse(props.getProperty('pending_ops') || '[]');
+  for (const opName of pending) {
+    const res = UrlFetchApp.fetch(
+      'https://generativelanguage.googleapis.com/v1beta/' + opName,
+      { headers: { 'x-goog-api-key': getApiKey_() }, muteHttpExceptions: true }
+    );
+    const op = JSON.parse(res.getContentText());
+    if (op.done) applyResult_(opName, op);  // apply if finished
+  }
+}
+```
+
+The code works fine. The problem is the cost-to-value ratio. A five-minute cadence is 288 invocations a day, and most of them are spent on empty `UrlFetch` calls that say "still running." If a batch finishes in about 40 minutes, roughly eight of those checks touch it and only the last one matters. The other seven exist only to mark time.
+
+Apps Script caps `UrlFetchApp` at a daily quota — around 20,000 calls on a consumer account. Letting polling alone eat hundreds of them quietly hurts when you share that budget across other automations. And above all, up to five minutes of latency sits between completion and apply.
+
+## Treat the webhook as an unverified signal, not a trusted notification
+
+"Webhook support" invites a tempting assumption: the completion event arrives, so just write its contents straight through. When you receive it in Apps Script, though, this is the fork in the design.
+
+An Apps Script Web App — that is, `doPost(e)` — cannot read arbitrary HTTP request headers. What you get is mainly the body (`e.postData.contents`) and the query string (`e.parameter`). Most webhook senders carry a signature in a dedicated header, and `doPost` has no way to verify it. This is a fact tucked into the corner of the docs, and the kind of trap you only notice once you actually start building the endpoint.
+
+So this article treats the webhook not as a trusted notification but as an unverified signal that "something apparently finished." When the signal arrives, we don't take it at face value; we go and confirm with the API authoritatively. That single extra step makes the inability to verify headers a non-issue.
+
+<table>
+  <thead>
+    <tr><th>Handling</th><th>Assumption</th><th>Fit with Apps Script</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Trust the notification, apply immediately</td><td>You can verify the header signature</td><td>No (headers are unreadable)</td></tr>
+    <tr><td>Receive as a signal, confirm via the API</td><td>Completion is fetched again</td><td>Good (this article's approach)</td></tr>
+  </tbody>
+</table>
+
+## Put the receiver in a Web App doPost
+
+You stand up the receiver by deploying the script as a Web App. A few deployment settings are non-negotiable.
+
+<table>
+  <thead>
+    <tr><th>Setting</th><th>Value</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Execute as</td><td>Me</td><td>To reach the API key and Drive under my own authority</td></tr>
+    <tr><td>Who has access</td><td>Anyone, including anonymous</td><td>The sender POSTs without Google OAuth</td></tr>
+    <tr><td>URL</td><td>The versioned /exec URL</td><td>/dev points at latest code but is unstable; register /exec for production</td></tr>
+  </tbody>
+</table>
+
+"Anyone can access" may feel uncomfortable. That is exactly why we put a hard-to-guess token in the URL itself and back the payload with an authoritative check. The idea is layered defense rather than a single wall. The webhook destination you register looks like this, for example:
+
+```
+https://script.google.com/macros/s/XXXXXXXX/exec?t=REPLACE_WITH_LONG_RANDOM_TOKEN
+```
+
+Every time you change code you redeploy a new version, but if you update the deployment as a version from "Manage deployments," the `/exec` URL is preserved. Creating a brand-new deployment changes the URL, leaving the sender pointed at a stale address and dropping events. This is the step most people trip over in operation.
+
+## doPost returns fast: verify and enqueue, nothing more
+
+`doPost` has its own per-execution time limit, and trying to finish heavy apply work inline is risky. Worse, webhook senders retry when the response is slow or returns an error, and retries mean duplicate deliveries.
+
+So `doPost`'s job is narrowed to token verification and enqueuing the operation name into a durable queue, then it returns 200 immediately. The apply is left to a downstream trigger.
+
+```javascript
+const WEBHOOK_TOKEN = 'REPLACE_WITH_LONG_RANDOM_TOKEN';
+
+function doPost(e) {
+  // 1) First-pass screen with a hard-to-guess token (headers unreadable, so use the query)
+  if (!e || !e.parameter || e.parameter.t !== WEBHOOK_TOKEN) {
+    return json_({ ok: false }); // always 200 so we leak nothing to an attacker
+  }
+
+  // 2) Pull only the operation name from the body (do not trust its contents)
+  let opName = '';
+  try {
+    const body = JSON.parse(e.postData.contents || '{}');
+    opName = String(body.name || body.operation || '').trim();
+  } catch (err) {
+    return json_({ ok: false });
+  }
+  if (!opName) return json_({ ok: false });
+
+  // 3) Enqueue durably and return at once (heavy confirm/apply goes downstream)
+  enqueue_(opName);
+  return json_({ ok: true });
+}
+
+function json_(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function enqueue_(opName) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const q = JSON.parse(props.getProperty('inbound_q') || '[]');
+    if (q.indexOf(opName) === -1) q.push(opName);
+    props.setProperty('inbound_q', JSON.stringify(q));
+  } finally {
+    lock.releaseLock();
+  }
+}
+```
+
+The `LockService.getScriptLock` around enqueue keeps the queue's read-modify-write from breaking when several signals overlap in a short window. Hold the lock briefly, and keep it outside heavy work like confirmation or apply — that is the rule.
+
+## Don't take the signal at face value: confirm with operations.get
+
+A downstream trigger — say, one a minute, or a single one fired from `doPost` via `ScriptApp.newTrigger` — confirms the queued operation names one by one. Only here do we ask the API, and only after seeing `done` is true with our own eyes do we apply.
+
+```javascript
+function drainInbound() {
+  const props = PropertiesService.getScriptProperties();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  let q;
+  try {
+    q = JSON.parse(props.getProperty('inbound_q') || '[]');
+    props.setProperty('inbound_q', '[]'); // take everything and clear
+  } finally {
+    lock.releaseLock();
+  }
+
+  const requeue = [];
+  for (const opName of q) {
+    const res = UrlFetchApp.fetch(
+      'https://generativelanguage.googleapis.com/v1beta/' + opName,
+      { headers: { 'x-goog-api-key': getApiKey_() }, muteHttpExceptions: true }
+    );
+    if (res.getResponseCode() !== 200) { requeue.push(opName); continue; }
+    const op = JSON.parse(res.getContentText());
+    if (!op.done) { requeue.push(opName); continue; } // not yet, put it back
+    applyOnce_(opName, op); // apply only what we confirmed done
+  }
+  if (requeue.length) enqueueMany_(requeue);
+}
+```
+
+The signal is only a prompt. The real completion and result are whatever `operations.get` returns. Because this step exists, a forged signal can never make us apply something that hasn't finished. Apps Script's inability to verify a header signature is fully defused right here.
+
+## Fold duplicate deliveries with an idempotency key
+
+Webhooks are fundamentally at-least-once: they arrive at least once, sometimes more. A slow response makes the sender retry, or a reconciliation sweep collides with a live signal, and you risk applying the same operation twice. So we insert an idempotency ledger that records what has already been applied.
+
+```javascript
+function applyOnce_(opName, op) {
+  const applied = PropertiesService.getScriptProperties();
+  const key = 'applied:' + opName;         // the operation name is the idempotency key
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    if (applied.getProperty(key)) return;  // already applied, do nothing
+    applyResult_(opName, op);              // the actual write-back (side effect)
+    applied.setProperty(key, String(Date.now()));
+  } finally {
+    lock.releaseLock();
+  }
+}
+```
+
+The operation name alone is a fine idempotency key. If the ledger grows, sweep keys past a certain age before you brush against the 500KB total limit on `PropertiesService`, or offload to an indexed store on Drive. This matters more as your number of automations grows, so it's reassuring to build the cleanup step early.
+
+## A safety net for misses: a low-frequency reconciliation sweep
+
+Webhooks usually arrive, but there is no guarantee they always will. That is precisely why we don't discard polling outright — we keep a much rarer reconciliation sweep as insurance. Once every few hours, it checks only the operations recorded as in-flight and recovers any that finished without a signal.
+
+```javascript
+// e.g. runs once every 6 hours
+function reconcileInflight() {
+  const props = PropertiesService.getScriptProperties();
+  const inflight = JSON.parse(props.getProperty('inflight_ops') || '[]');
+  const still = [];
+  for (const opName of inflight) {
+    const res = UrlFetchApp.fetch(
+      'https://generativelanguage.googleapis.com/v1beta/' + opName,
+      { headers: { 'x-goog-api-key': getApiKey_() }, muteHttpExceptions: true }
+    );
+    const op = JSON.parse(res.getContentText());
+    if (op.done) applyOnce_(opName, op);
+    else still.push(opName);
+  }
+  props.setProperty('inflight_ops', JSON.stringify(still));
+}
+```
+
+Five-minute polling was 288 runs a day; a six-hour sweep is four. And because it looks only at in-flight operations, its empty checks are minimal. Build the premise that signals rarely get lost, then keep only a minimal catch for the times they do. This two-tier arrangement feels realistic for automations you run solo.
+
+## What actually changed after folding the poll
+
+Here are results from my own app-review classification pipeline (one to three batches overnight), comparing the old polling to this article's design. The numbers shift by environment, but the trend should carry.
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>5-minute polling</th><th>Webhook + sweep</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>UrlFetch for completion checks / day</td><td>~288</td><td>1 per signal + 4 sweeps</td></tr>
+    <tr><td>Completion-to-apply latency</td><td>Up to 5 min</td><td>Seconds to tens of seconds</td></tr>
+    <tr><td>Time-trigger invocations / day</td><td>288</td><td>Tens, across drain + sweep</td></tr>
+    <tr><td>Double-apply prevention</td><td>Implementation-dependent</td><td>Explicitly blocked by the ledger</td></tr>
+  </tbody>
+</table>
+
+What changed most in daily feel was latency. Overnight results are "already applied when I wake up" either way, but a batch I run by hand during the day now returns in seconds instead of a wait of minutes. That shortness quietly speeds up iteration.
+
+## How much should you move to webhooks
+
+Finally, the judgment axes for the switch. Moving everything to webhooks is not the answer.
+
+<table>
+  <thead>
+    <tr><th>Situation</th><th>Recommendation</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>You can expose a Web App / want lower completion latency</td><td>Webhook + reconciliation sweep (this article)</td></tr>
+    <tr><td>You'd rather not run a public endpoint</td><td>Keep polling, but stretch the interval to the batch's average completion time</td></tr>
+    <tr><td>About one job a day, latency doesn't matter</td><td>Polling is enough; a webhook is overkill</td></tr>
+    <tr><td>Core work needing strict completion guarantees</td><td>Signal via webhook, raise sweep frequency to thicken authoritative checks</td></tr>
+  </tbody>
+</table>
+
+The point is to split the roles: the webhook is "the signal that notices fast," `operations.get` is "the ground of correctness," and the sweep is "insurance against misses." Even the constraint of not reading headers in Apps Script stops being a weakness inside this division of labor. If anything, the premise of "don't trust the notification" led me to a sturdier receiver.
+
+The more a job works overnight, the more your impression of it turns on whether the morning feels quietly settled. Fold away the empty polls, and go confirm only when you need to. I hope this helps make your own automation a little lighter. Thank you for reading.

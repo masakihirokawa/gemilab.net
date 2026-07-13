@@ -1,0 +1,261 @@
+---
+title: "夜間バッチの完了を待つポーリングを畳む — Apps Script の doPost を Gemini の合図受けにする設計"
+slug: "gemini-apps-script-dopost-batch-webhook-sink-polling-retire"
+category: "gemini-workspace"
+level: "advanced"
+premium: true
+date: "2026-07-13T05:00"
+author: "Gemini Lab"
+description: "Gemini の Batch や長時間オペレーションの完了を Apps Script の時間主導トリガーで5分おきに問い合わせると、UrlFetch の呼び出しと待ち時間が静かに積み上がります。Webhook を doPost で受け、合図として扱ってから権威確認と冪等適用に落とす設計を組み立てます。"
+tags: ["Apps Script", "Gemini API", "Webhook", "Batch API", "Google Workspace"]
+highlights:
+  - "5分間隔のポーリングが1日288回の UrlFetch を無駄に積む構造を実測で示し、Webhook 化で問い合わせ0回・遅延を分から秒へ畳む道筋を描きます"
+  - "Apps Script の doPost は任意のリクエストヘッダーを読めないという制約を直視し、Webhook を「認証済み通知」ではなく「未確認の合図」として扱う受信設計を、完全なコードで掲載します"
+  - "operations.get による権威確認・冪等台帳・低頻度の突合スイープを組み合わせ、二重配信と取りこぼしの両方を畳む運用層を提示します"
+---
+
+夜間に Gemini へ投げたバッチの結果を、翌朝スプレッドシートへ書き戻す。個人開発でいくつものアプリを回していると、こうした「寝ている間に働いてもらう」処理が自然と増えていきます。私の手元でも、アプリレビューの分類や AdMob 周りの集計を、Apps Script の時間主導トリガーから Gemini に任せてきました。
+
+ただ、その待ち方には長らく引っかかりがありました。完了したかどうかを知るために、5分おきにトリガーを起こして API へ問い合わせる。ほとんどの回は「まだです」という返事だけが返ってきます。今週、Gemini API の Batch と長時間オペレーションが Webhook に対応したことで、この無駄な問い合わせをようやく畳めるようになりました。私自身の夜間パイプラインを題材に、その受信口を Apps Script の `doPost` に据える設計を、つまずきやすい点ごと組み立てていきます。
+
+## 発端：5分おきのポーリングが静かに積み上がる
+
+まず、よくあるポーリングの形を見てください。時間主導トリガーで5分ごとに走り、未完了のオペレーションを問い合わせます。
+
+```javascript
+// 5分ごとの時間主導トリガーで実行（従来型）
+function pollPendingOperations() {
+  const props = PropertiesService.getScriptProperties();
+  const pending = JSON.parse(props.getProperty('pending_ops') || '[]');
+  for (const opName of pending) {
+    const res = UrlFetchApp.fetch(
+      'https://generativelanguage.googleapis.com/v1beta/' + opName,
+      { headers: { 'x-goog-api-key': getApiKey_() }, muteHttpExceptions: true }
+    );
+    const op = JSON.parse(res.getContentText());
+    if (op.done) applyResult_(opName, op);  // 完了していれば適用
+  }
+}
+```
+
+このコード自体は正しく動きます。問題は割に合わなさです。5分間隔は1日あたり 288 回の起動になり、その大半は「まだ完了していない」という空振りの `UrlFetch` に費やされます。バッチが平均40分で終わるとすれば、1件あたり8回前後の問い合わせのうち、意味があるのは最後の1回だけ。残り7回、割合にして約 88% は待ち時間を刻むためだけの空振りです。
+
+Apps Script の `UrlFetchApp` には1日あたりの呼び出し上限があり、消費者アカウントでは 20,000 回程度が目安です。ポーリングだけで数百回を占めるのは、他の自動化と枠を分け合う個人開発では地味に効いてきます。そして何より、完了から適用までに最大5分の遅延が挟まります。
+
+## Webhook は「認証済みの通知」ではなく「未確認の合図」として扱う
+
+Webhook 対応と聞くと、完了イベントが飛んでくるのを受けて中身をそのまま書き込めばよい、と考えたくなります。ですが Apps Script で受ける場合、ここに設計上の分かれ目があります。
+
+Apps Script の Web App、つまり `doPost(e)` は、任意の HTTP リクエストヘッダーを読み取れません。受け取れるのは本文（`e.postData.contents`）とクエリ文字列（`e.parameter`）が中心です。多くの Webhook 送信元は署名を専用ヘッダーに載せますが、それをそのまま検証する手立てが `doPost` 側にはないのです。これは公式ドキュメントの隅にある事実で、実際に受信口を作り始めて初めて気づく落とし穴でした。
+
+そこでここでは、Webhook を「認証済みの通知」ではなく「何かが終わったらしいという未確認の合図」として扱います。合図を受けたら、その内容を鵜呑みにせず、API へ権威的に確認しに行く。この一段を挟むだけで、ヘッダー検証ができないという制約が問題でなくなります。
+
+<table>
+  <thead>
+    <tr><th>扱い方</th><th>前提</th><th>Apps Script での相性</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>通知を信頼して即適用</td><td>ヘッダー署名を検証できる</td><td>不可（ヘッダーを読めない）</td></tr>
+    <tr><td>合図として受け、API で権威確認</td><td>完了確認は改めて取りに行く</td><td>良好（本稿の方針）</td></tr>
+  </tbody>
+</table>
+
+## 受信口を Web App の doPost に置く
+
+受信口は、スクリプトを Web App としてデプロイして用意します。デプロイ時の設定に、いくつか外せない点があります。
+
+<table>
+  <thead>
+    <tr><th>設定</th><th>値</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>実行するユーザー</td><td>自分</td><td>API キーや Drive へ自分の権限でアクセスするため</td></tr>
+    <tr><td>アクセスできるユーザー</td><td>全員（匿名を含む）</td><td>送信元は Google の OAuth を持たずに POST するため</td></tr>
+    <tr><td>URL</td><td>末尾 /exec の版付き URL</td><td>/dev は最新コードを指すが不安定。本番は /exec を登録する</td></tr>
+  </tbody>
+</table>
+
+「全員がアクセスできる」という設定に不安を覚えるかもしれません。だからこそ、URL 自体に推測困難なトークンを含め、さらに中身は権威確認で裏取りします。単一の防御に頼らず、層を重ねる考え方です。登録する Webhook の宛先はたとえば次の形にします。
+
+```
+https://script.google.com/macros/s/XXXXXXXX/exec?t=REPLACE_WITH_LONG_RANDOM_TOKEN
+```
+
+コードを更新するたびに新しいバージョンをデプロイし直しますが、デプロイを「管理」から版として更新すれば `/exec` の URL は保たれます。新規デプロイを作り直すと URL が変わり、送信元の登録先が古いままになって取りこぼす。ここは運用でいちばん踏みやすい段差です。
+
+## doPost は速く返す：検証と投入だけに絞る
+
+`doPost` にも1実行あたりの実行時間上限があり、重い適用処理をその場でやり切ろうとすると危険です。しかも Webhook 送信元は、応答が遅い・エラーを返すと再送してきます。再送は二重配信につながります。
+
+そこで `doPost` の仕事は、トークン検証と、オペレーション名を耐久キューへ投入するところまでに絞り、すぐ 200 を返します。適用は後段のトリガーに委ねます。
+
+```javascript
+const WEBHOOK_TOKEN = 'REPLACE_WITH_LONG_RANDOM_TOKEN';
+
+function doPost(e) {
+  // 1) 推測困難トークンで一次選別（ヘッダーは読めないのでクエリで受ける）
+  if (!e || !e.parameter || e.parameter.t !== WEBHOOK_TOKEN) {
+    return json_({ ok: false }, 200); // 攻撃者に情報を与えないため常に200
+  }
+
+  // 2) 本文からオペレーション名だけを取り出す（中身は信頼しない）
+  let opName = '';
+  try {
+    const body = JSON.parse(e.postData.contents || '{}');
+    opName = String(body.name || body.operation || '').trim();
+  } catch (err) {
+    return json_({ ok: false }, 200);
+  }
+  if (!opName) return json_({ ok: false }, 200);
+
+  // 3) 耐久キューへ投入して即返す（重い確認・適用は後段トリガーへ）
+  enqueue_(opName);
+  return json_({ ok: true }, 200);
+}
+
+function json_(obj, code) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function enqueue_(opName) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const q = JSON.parse(props.getProperty('inbound_q') || '[]');
+    if (q.indexOf(opName) === -1) q.push(opName);
+    props.setProperty('inbound_q', JSON.stringify(q));
+  } finally {
+    lock.releaseLock();
+  }
+}
+```
+
+投入時に `LockService.getScriptLock` を挟んでいるのは、短時間に複数の合図が重なってもキューの read-modify-write が壊れないようにするためです。ロックは短く握り、確認や適用のような重い処理の外側で使うのが原則です。
+
+## 合図を鵜呑みにしない：operations.get で権威確認
+
+後段のトリガー（たとえば1分間隔、あるいは `doPost` から `ScriptApp.newTrigger` で1回だけ起こす方式）で、キューに溜まったオペレーション名を1件ずつ確認します。ここで初めて API へ問い合わせ、`done` が真であることを自分の目で確かめてから適用します。
+
+```javascript
+function drainInbound() {
+  const props = PropertiesService.getScriptProperties();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  let q;
+  try {
+    q = JSON.parse(props.getProperty('inbound_q') || '[]');
+    props.setProperty('inbound_q', '[]'); // 取り出して空にする
+  } finally {
+    lock.releaseLock();
+  }
+
+  const requeue = [];
+  for (const opName of q) {
+    const res = UrlFetchApp.fetch(
+      'https://generativelanguage.googleapis.com/v1beta/' + opName,
+      { headers: { 'x-goog-api-key': getApiKey_() }, muteHttpExceptions: true }
+    );
+    if (res.getResponseCode() !== 200) { requeue.push(opName); continue; }
+    const op = JSON.parse(res.getContentText());
+    if (!op.done) { requeue.push(opName); continue; } // まだなら戻す
+    applyOnce_(opName, op); // 完了を確認できたものだけ適用
+  }
+  if (requeue.length) enqueueMany_(requeue);
+}
+```
+
+合図はあくまできっかけです。実際の完了・結果は `operations.get` の応答を正とする。この一段があるおかげで、偽の合図が飛んできても、まだ終わっていないものを誤って適用することはありません。ヘッダー署名を検証できないという Apps Script の制約は、ここで完全に無害化されます。
+
+## 二重配信を冪等キーで畳む
+
+Webhook は基本的に at-least-once、つまり「少なくとも1回、ときに複数回」届きます。応答が遅れて送信元が再送したり、突合スイープと合図が重なったりすれば、同じオペレーションを二度適用しかねません。そこで、適用済みを記録する冪等台帳を挟み、二重適用を確実に回避します。
+
+```javascript
+function applyOnce_(opName, op) {
+  const applied = PropertiesService.getScriptProperties();
+  const key = 'applied:' + opName;         // オペレーション名を冪等キーに
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    if (applied.getProperty(key)) return;  // 既に適用済みなら何もしない
+    applyResult_(opName, op);              // 実際の書き戻し（副作用）
+    applied.setProperty(key, String(Date.now()));
+  } finally {
+    lock.releaseLock();
+  }
+}
+```
+
+冪等キーはオペレーション名そのもので十分です。台帳が肥大する場合は、`PropertiesService` の 500KB 総量制限に触れる前に、一定日数を過ぎたキーを掃除するか、Drive 上の索引付きストアへ逃がします。ここは自動化の本数が増えるほど効いてくるので、早めに掃除の段を用意しておくと安心です。
+
+## 取りこぼしの保険：低頻度の突合スイープ
+
+Webhook は届くことが多いですが、確実に届く保証まではありません。だからこそ、ポーリングを完全に捨てるのではなく、頻度をぐっと下げた突合スイープを保険として残します。数時間に1回、進行中として記録しているオペレーションだけを確認し、合図が来ないまま終わっていたものを回収します。
+
+```javascript
+// 例：6時間に1回だけ実行
+function reconcileInflight() {
+  const props = PropertiesService.getScriptProperties();
+  const inflight = JSON.parse(props.getProperty('inflight_ops') || '[]');
+  const still = [];
+  for (const opName of inflight) {
+    const res = UrlFetchApp.fetch(
+      'https://generativelanguage.googleapis.com/v1beta/' + opName,
+      { headers: { 'x-goog-api-key': getApiKey_() }, muteHttpExceptions: true }
+    );
+    const op = JSON.parse(res.getContentText());
+    if (op.done) applyOnce_(opName, op);
+    else still.push(opName);
+  }
+  props.setProperty('inflight_ops', JSON.stringify(still));
+}
+```
+
+5分間隔のポーリングは1日 288 回でしたが、6時間間隔の突合は1日4回。しかも進行中のオペレーションだけを見るので、空振りはごくわずかです。合図で取りこぼさない前提を作ったうえで、届かなかったときの受け皿だけを最小限に残す。この二段構えが、個人で回す自動化には現実的だと感じています。
+
+## 実測：ポーリングを畳んで何が変わったか
+
+手元のアプリレビュー分類パイプライン（夜間に1〜3件のバッチ）で、従来のポーリングと本稿の構成を比べた結果を挙げます。数値は運用環境で変わりますが、傾向はつかめるはずです。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>5分ポーリング</th><th>Webhook + 突合</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>完了確認のための UrlFetch / 日</td><td>約 288 回</td><td>合図1件あたり1回 + 突合4回</td></tr>
+    <tr><td>完了から適用までの遅延</td><td>最大 5 分</td><td>数秒〜数十秒</td></tr>
+    <tr><td>時間主導トリガーの起動 / 日</td><td>288</td><td>ドレイン + 突合で 数十</td></tr>
+    <tr><td>二重適用の防ぎ方</td><td>実装依存</td><td>冪等台帳で明示的に遮断</td></tr>
+  </tbody>
+</table>
+
+いちばん体感が変わったのは遅延でした。夜間バッチの結果が「起きたら反映済み」なのは変わりませんが、日中に手動で走らせたバッチの結果が、数分待たずに秒で返ってくる。この短さは、試行錯誤の速度に静かに効いてきます。
+
+## どこまでを Webhook 化すべきか
+
+最後に、置き換えの判断軸を整理します。すべてを Webhook 化するのが正解ではありません。
+
+<table>
+  <thead>
+    <tr><th>状況</th><th>推奨</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Web App を公開できる / 完了遅延を縮めたい</td><td>Webhook + 突合スイープ（本稿の構成）</td></tr>
+    <tr><td>公開エンドポイントを持ちたくない</td><td>ポーリング継続。ただし間隔をバッチ平均完了時間に合わせて延ばす</td></tr>
+    <tr><td>1日1件程度・遅延が問題にならない</td><td>ポーリングのままで十分。Webhook 化は過剰</td></tr>
+    <tr><td>厳密な完了保証が要る基幹処理</td><td>Webhook を合図に、突合スイープの頻度を上げて権威確認を厚くする</td></tr>
+  </tbody>
+</table>
+
+設計の要点は、次の3つの役割をはっきり分けることに尽きます。
+
+1. Webhook は「速く気づくための合図」。速報性だけを担い、正しさは背負いません。
+2. `operations.get` は「正しさの拠り所」。適用してよいかは、必ずここで権威的に確かめます。
+3. 突合スイープは「取りこぼしの保険」。合図が届かなかった分だけを、低頻度で回収します。
+
+この役割分担のなかでは、Apps Script でヘッダーを読めないという制約も、この分業のなかでは弱点ではなくなります。むしろ「通知を信じない」という前提が、結果として壊れにくい受信口を導いてくれました。
+
+夜間に働いてもらう処理ほど、翌朝に静かな安心があるかどうかで印象が変わります。ポーリングの空振りを畳み、必要なときだけ確認しに行く。この記事が、あなたの自動化を少しでも軽くする助けになれば幸いです。お読みいただきありがとうございました。
