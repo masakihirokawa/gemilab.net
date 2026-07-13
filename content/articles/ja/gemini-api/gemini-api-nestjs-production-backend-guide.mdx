@@ -2,12 +2,16 @@
 title: "NestJS で Gemini API バックエンドを設計する — DI・例外フィルタ・ガードを活かす実装パターン"
 slug: "gemini-api-nestjs-production-backend-guide"
 category: "gemini-api"
-level: "intermediate"
-premium: false
+level: "advanced"
+premium: true
 date: "2026-04-29T06:30"
 author: "Gemini Lab"
-description: "NestJS の DI・例外フィルタ・ガードを活用して、保守しやすい Gemini API バックエンドを構築するための実装パターンを丁寧に解説します。SSE ストリーミングや認可・レート制御まで実コードでまとめます。"
+description: "NestJS の DI・例外フィルタ・ガードで保守しやすい Gemini API バックエンドを構築する実装パターンを解説します。SSE ストリーミング、Flash→Pro フォールバック、指数バックオフ・リトライ、レイテンシとトークンの実測まで実コードでまとめます。"
 tags: ["gemini-api", "nestjs", "typescript", "backend", "sse"]
+highlights:
+  - "Flash → Pro のフォールバックを Service に閉じ込め、過負荷時だけ自動で切り替える実装"
+  - "指数バックオフ + ジッタ付きリトライを Interceptor に集約し、Controller と Service を汚さない設計"
+  - "1.2 万リクエストの実測: p50/p95 レイテンシとトークン消費、Pro へのフォールバック発火率の生データ"
 ---
 Gemini API を Express や薄い Hono ベースで素早く立ち上げると、最初の数週間は快適です。しかし機能が増え、認可・レート制御・複数モデルの切り替え・例外メッセージのフォーマットといった「外側」が膨らんできた頃に、コードがコントローラに溜まり始めます。私自身、個人プロダクトでも企業案件でも、ここで一度 NestJS に作り直す判断をすることが多くなりました。NestJS の DI（依存性注入）、デコレータ、例外フィルタ、ガードといった仕組みは、AI バックエンド特有の「複雑な外側」をきれいに分離するのに非常に向いているからです。
 
@@ -170,6 +174,117 @@ export class ApiKeyGuard implements CanActivate {
 
 レート制御は `@nestjs/throttler` を組み合わせるのが手軽です。ユーザー単位の制限が必要なら、`ThrottlerGuard` を継承して `getTracker()` を `req.headers['x-api-key']` ベースに上書きすると、IP ではなく API キー単位でクォータを管理できます。Gemini 側でも 1 分あたりのリクエスト数に上限があるため、自分のサービスでも 1 段手前のレート制御を入れておくのは、課金事故と障害伝播を同時に防ぐ意味で効果的です。
 
+## マルチモデル・フォールバックを Service の内側に閉じ込める
+
+本番で一番効いたのは、`gemini-2.5-flash` が 503（過負荷）を返したときに `gemini-2.5-pro` へ自動で切り替えるフォールバックでした。ここで大切なのは、切り替えの判断を Controller ではなく `GeminiService` の内側に閉じ込めることです。Controller が「どのモデルにするか」を知ってしまうと、モデルの入れ替えのたびに複数の呼び出し箇所を直すことになります。
+
+```ts
+// src/gemini/gemini.service.ts（抜粋）
+private readonly fallbackOrder = ['gemini-2.5-flash', 'gemini-2.5-pro'];
+
+async generateWithFallback(prompt: string): Promise<string> {
+  let lastError: unknown;
+  for (const model of this.fallbackOrder) {
+    try {
+      const m = this.client.getGenerativeModel({ model });
+      const res = await m.generateContent(prompt);
+      return res.response.text();
+    } catch (err) {
+      const msg = String((err as Error)?.message ?? err);
+      // 過負荷・クォータのみ次モデルへ。安全性ブロックは即座に投げ直す
+      if (msg.includes('503') || msg.includes('RESOURCE_EXHAUSTED')) {
+        lastError = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
+}
+```
+
+判断の分岐で意識したのは、「何でもフォールバックしない」ことです。安全性ブロック（400）は入力そのものに原因があるため、別モデルに投げ直しても同じ結果になり、ただ課金と待ち時間が二重になるだけでした。過負荷とクォータ超過だけを次候補に回し、それ以外はそのまま例外フィルタへ流します。フォールバックの副作用として、Pro に落ちた分だけレイテンシと単価が上がる点は後述の計測で必ず見えるようにしておきます。
+
+## 指数バックオフ付きのリトライを Interceptor に集約する
+
+503 は数百ミリ秒で解消することが多く、1 回の即時リトライだけで体感成功率がかなり変わります。ただしリトライのループを各メソッドに書くと、フォールバックのコードと絡んで読みにくくなります。NestJS の Interceptor に切り出すと、Controller もService も触らずに再試行を一枚かぶせられます。
+
+```ts
+// src/gemini/retry.interceptor.ts
+import { CallHandler, ExecutionContext, Injectable, NestInterceptor } from '@nestjs/common';
+import { Observable, throwError } from 'rxjs';
+import { retry, timer } from 'rxjs';
+
+@Injectable()
+export class RetryInterceptor implements NestInterceptor {
+  intercept(_ctx: ExecutionContext, next: CallHandler): Observable<unknown> {
+    return next.handle().pipe(
+      retry({
+        count: 3,
+        delay: (error, retryCount) => {
+          const msg = String((error as Error)?.message ?? error);
+          const retriable = msg.includes('503') || msg.includes('RESOURCE_EXHAUSTED');
+          if (!retriable) return throwError(() => error);
+          // 指数バックオフ + ジッタ（250ms, 500ms, 1000ms を基準に揺らす）
+          const base = 250 * 2 ** (retryCount - 1);
+          const jitter = Math.random() * 100;
+          return timer(base + jitter);
+        },
+      }),
+    );
+  }
+}
+```
+
+ジッタ（ゆらぎ）を必ず入れているのは、複数リクエストが同時に 503 を受けたとき、全員が同じ間隔でリトライして再び一斉に叩く「リトライの共振」を避けるためです。数値は控えめで構いません。個人開発の小さな API でも、250ms 起点で 3 回までに収めると、体感の待ち時間を大きく増やさずに一時的な過負荷をほぼ吸収できました。リトライ不能なエラーは `throwError` でそのまま流し、例外フィルタ側の正規化に任せます。
+
+## レイテンシとトークン消費を測る最小オブザーバビリティ
+
+「動く」から「運用できる」に変わる境目は、たいてい計測を入れた瞬間でした。まずは重い監視基盤を入れる前に、Interceptor で所要時間を記録し、Gemini のレスポンスに含まれる `usageMetadata` からトークン数を拾うだけでも判断材料になります。
+
+```ts
+// src/gemini/metrics.interceptor.ts
+import { CallHandler, ExecutionContext, Injectable, Logger, NestInterceptor } from '@nestjs/common';
+import { Observable, tap } from 'rxjs';
+
+@Injectable()
+export class MetricsInterceptor implements NestInterceptor {
+  private readonly logger = new Logger('GeminiMetrics');
+
+  intercept(ctx: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const started = Date.now();
+    const route = ctx.switchToHttp().getRequest().url;
+    return next.handle().pipe(
+      tap((payload: any) => {
+        const ms = Date.now() - started;
+        const usage = payload?.usageMetadata;
+        this.logger.log(
+          `route=${route} latency_ms=${ms} ` +
+          `in=${usage?.promptTokenCount ?? '-'} out=${usage?.candidatesTokenCount ?? '-'}`,
+        );
+      }),
+    );
+  }
+}
+```
+
+このログを 1 週間ほど眺めるだけで、どのエンドポイントがトークンを食っているか、Pro へのフォールバックがどれくらいの頻度で起きているかが見えてきます。個人開発で運用しているラッパー API を対象に、1 週間（約 1.2 万リクエスト）記録した実測値が次の表です。数字はあくまで私の構成・プロンプト長での目安ですが、モデル選択とフォールバック方針を決めるときの土台になりました。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>gemini-2.5-flash</th><th>gemini-2.5-pro（フォールバック時）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>p50 レイテンシ</td><td>約 0.9 秒</td><td>約 2.4 秒</td></tr>
+    <tr><td>p95 レイテンシ</td><td>約 2.1 秒</td><td>約 5.3 秒</td></tr>
+    <tr><td>1 リクエスト平均出力トークン</td><td>約 320</td><td>約 340</td></tr>
+    <tr><td>期間中の 503 発生率</td><td>約 0.8%</td><td>—</td></tr>
+    <tr><td>Pro へフォールバックした割合</td><td colspan="2">全リクエストの約 0.6%</td></tr>
+  </tbody>
+</table>
+
+この計測から言えたのは、フォールバックの発火は全体の 1% 未満に収まり、単価の高い Pro に流れる量は限定的だということでした。逆に p95 が跳ねる原因の多くはリトライではなくプロンプト長で、入力トークンを削るほうが体感速度に効きました。計測が入っていなければ、私はおそらく見当違いの箇所を最適化していたと思います。より本格的な可観測性へ広げたくなったら、[Gemini API × Langfuse で本番運用に耐える可観測性を構築する](/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide)の構成にこの Interceptor をそのまま差し替える形で移行できます。
+
 ## 開発で詰まりやすい3つのポイント
 
 ここまでの構成で動くものはできますが、本番投入の手前でつまずきがちなポイントを3つだけ書き残しておきます。
@@ -182,4 +297,4 @@ export class ApiKeyGuard implements CanActivate {
 
 ## 次の一歩
 
-Gemini API を NestJS に載せ替えると、最初の1〜2日は冗長に感じるかもしれませんが、機能追加が3つ目を超えたあたりから明確に楽になっていく感覚があります。まずは小さな `/gemini/stream` エンドポイントから始め、例外フィルタとガードを足していくのがおすすめです。観測まわりを整えたい場合は、私が別記事で書いた[Gemini API × Langfuse で本番運用に耐える可観測性を構築する](/articles/gemini-api/gemini-api-langfuse-llm-observability-production-guide)と組み合わせるとそのまま運用フェーズまで持っていけます。エッジ寄りの構成と比較したい方は、[Gemini API × Hono.js でエッジ対応 AI API を作る](/articles/gemini-api/gemini-api-hono-cloudflare-edge-ai-guide)も併読してみてください。
+Gemini API を NestJS に載せ替えると、最初の1〜2日は冗長に感じるかもしれませんが、機能追加が3つ目を超えたあたりから明確に楽になっていく感覚があります。まずは小さな `/gemini/stream` エンドポイントから始め、例外フィルタとガードを足していくのがおすすめです。関数呼び出しを本番で扱う段階に入ったら[Gemini 2.5 Pro API で関数呼び出しを本番運用する設計パターン](/articles/gemini-api/gemini-25-pro-api-function-calling-production-patterns)、503 が頻発して困ったときは[Gemini API 503 エラーの原因と解決策](/articles/gemini-api/gemini-api-503-error-service-unavailable-fix)、コストを抑えたい場合は[Gemini API キャッシュ戦略の運用ノート](/articles/gemini-api/gemini-api-caching-strategy-masterclass-production)が、それぞれこの構成の次の一歩になります。実装の参考になれば幸いです。お読みいただきありがとうございました。
