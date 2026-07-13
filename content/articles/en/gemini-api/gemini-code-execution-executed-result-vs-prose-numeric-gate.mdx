@@ -1,0 +1,245 @@
+---
+title: "When Gemini's executed result and its prose disagree on a number — a gate that trusts only code_execution_result"
+slug: "gemini-code-execution-executed-result-vs-prose-numeric-gate"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-14T04:56"
+author: "Gemini Lab"
+description: "Gemini Code Execution returns the value it actually computed and the sentence describing it as separate parts. Trust the prose and you can inherit a hallucinated number. Here is a verification gate, in working code, that extracts the executed result as the single source of truth and rejects prose that disagrees."
+tags: ["gemini", "code-execution", "gemini-api", "python", "verification"]
+highlights:
+  - "If you have ever trusted a number in the model's prose and gotten an aggregate wrong, you can now pull out only what the sandbox actually executed and reconcile against it"
+  - "You get working code that separates the executable_code, code_execution_result, and text parts and rejects hallucinated numbers"
+  - "You will stop silently swallowing anything other than OUTCOME_OK, and classify failures and timeouts for retry in production"
+---
+
+Last month I had a quiet scare while letting Gemini aggregate the monthly AdMob report for one of the apps I run as an indie developer. The model wrote, "The weighted-average eCPM is 312.4 yen." I checked it by hand just in case, and the real figure was 287.9. Code Execution was enabled, so the model had actually run Python behind the scenes. Yet the number it computed and the number in the sentence it returned did not match.
+
+Code Execution is usually understood as "the feature that runs code," but that framing misses what matters in production. The real point is this: **the value that was actually executed and the natural-language summary of that value come back as separate parts, and they are not guaranteed to agree.** If you do not handle them separately, all that accurate sandbox math can still be undone at the last step, where the model transcribes a hallucinated number into its prose.
+
+This article separates those two, extracts the executed result as the single source of truth, and reconciles it against the prose so you can reject answers where they disagree. It is aimed at anyone whose numbers feed real decisions — billing math, report aggregation — while using Code Execution.
+
+## Why you cannot trust the model's prose
+
+When Code Execution is enabled, the model goes through a loop: write code, run it, look at the result, then answer in natural language. The API response therefore mixes at least three kinds of parts.
+
+<table>
+<thead>
+<tr><th>Part</th><th>Contents</th><th>Trust level</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>executable_code</strong></td><td>Python the model generated</td><td>Guaranteed to have run</td></tr>
+<tr><td><strong>code_execution_result</strong></td><td>The stdout and outcome the sandbox actually returned</td><td>Single source of truth</td></tr>
+<tr><td><strong>text</strong></td><td>Prose summarizing the result</td><td>Can hallucinate</td></tr>
+</tbody>
+</table>
+
+The problem is that last one. The model composes its sentence after seeing the result, but during that transcription it can drop a digit or confuse an intermediate value with the final one. The discrepancy I hit was exactly that: the execution result held the correct 287.9, but the prose reported a different intermediate value as if it were the final answer.
+
+In other words, **the executed value was right, and it broke on the way into a sentence.** To catch this you have to stop reading the prose and mechanically pull out only `code_execution_result`.
+
+## Separating the three response parts
+
+Here is the basic way to receive it. With the google-genai SDK you enable the feature simply by passing the `code_execution` tool, then sort the returned `parts` by type.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents=(
+        "Compute the weighted-average eCPM (yen) using impressions as weights. "
+        "day1: eCPM=280.0, impressions=12000 / "
+        "day2: eCPM=305.0, impressions=8000 / "
+        "day3: eCPM=290.0, impressions=15000"
+    ),
+    config=types.GenerateContentConfig(
+        tools=[types.Tool(code_execution=types.ToolCodeExecution())],
+    ),
+)
+
+executed_code = []      # code the model wrote
+execution_outputs = []  # what the sandbox actually printed (truth)
+prose = []              # natural-language summary
+
+for part in response.candidates[0].content.parts:
+    if part.executable_code is not None:
+        executed_code.append(part.executable_code.code)
+    elif part.code_execution_result is not None:
+        execution_outputs.append(part.code_execution_result)
+    elif part.text is not None:
+        prose.append(part.text)
+
+print("executed output:", [r.output for r in execution_outputs])
+# executed output: ['288.42105263157896\n']
+print("prose:", "".join(prose)[:60])
+# prose: The weighted-average eCPM is about 288.4 yen. ...
+```
+
+The key point is that `code_execution_result.output` is **the sandbox's stdout itself**, with none of the model's interpretation layered on. That value alone is what you flow downstream.
+
+Also note that the parts do not always arrive as "code, then result, then prose." When the model iterates, executable_code and code_execution_result appear in alternating pairs multiple times. The last execution result is not necessarily the final value, so instead of blindly taking "the last one," design the prompt to make the intended final result explicit, as shown next.
+
+## Extracting the executed result in a structured way
+
+`output` is stdout as a string, so you cannot treat it as a number as-is. Grabbing digits with a naive regex will catch some intermediate value instead. The robust move is to **have the model print the final value in a machine-readable form**, fixing the output format in the prompt.
+
+```python
+PROMPT_SUFFIX = (
+    "At the very end of your computation, print only the final result on a "
+    "single line in this exact format, and use this format nowhere else: "
+    "RESULT_JSON={\"weighted_ecpm\": <value>}"
+)
+
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents=user_prompt + "\n" + PROMPT_SUFFIX,
+    config=types.GenerateContentConfig(
+        tools=[types.Tool(code_execution=types.ToolCodeExecution())],
+    ),
+)
+
+import json, re
+
+def extract_executed_value(parts, key):
+    """Scan code_execution_result stdout for the RESULT_JSON line and
+    return the value for the given key, or None if not found."""
+    marker = re.compile(r'RESULT_JSON=(\{.*\})')
+    found = None
+    for part in parts:
+        if part.code_execution_result is None:
+            continue
+        for line in part.code_execution_result.output.splitlines():
+            m = marker.search(line)
+            if m:
+                try:
+                    found = json.loads(m.group(1)).get(key)
+                except json.JSONDecodeError:
+                    continue
+    return found  # keep the last RESULT_JSON if executed more than once
+
+executed = extract_executed_value(response.candidates[0].content.parts, "weighted_ecpm")
+print("executed final value:", executed)
+# executed final value: 288.42105263157896
+```
+
+The value `extract_executed_value` returns is the only number allowed into your business logic. The prose's "about 288.4 yen" is display copy; it never drives a decision. In my own reporting at Dolice, once I drew this line between the primary value and the display value, the mysteries of mismatched numbers simply stopped.
+
+## Classifying OUTCOME and reacting to it
+
+`code_execution_result` carries an `outcome` telling you whether the run succeeded. Read `output` without checking it and you hit a nasty bug: **an empty output from a failed run gets misread as "the result is zero."**
+
+<table>
+<thead>
+<tr><th>outcome</th><th>Meaning</th><th>What to do</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>OUTCOME_OK</strong></td><td>Ran cleanly</td><td>Take the output</td></tr>
+<tr><td><strong>OUTCOME_FAILED</strong></td><td>Runtime exception</td><td>Read the traceback in output, retry or fix the prompt</td></tr>
+<tr><td><strong>OUTCOME_DEADLINE_EXCEEDED</strong></td><td>Timed out</td><td>Split or lighten the input and re-run</td></tr>
+</tbody>
+</table>
+
+Fold this into a function that only takes values from a successful run.
+
+```python
+def resolve_execution(parts, key):
+    """Take the final value only from a successful run. Return failures
+    with a reason instead of silently swallowing them."""
+    marker = re.compile(r'RESULT_JSON=(\{.*\})')
+    ok_value = None
+    failures = []
+    for part in parts:
+        r = part.code_execution_result
+        if r is None:
+            continue
+        outcome = getattr(r.outcome, "name", str(r.outcome))
+        if outcome != "OUTCOME_OK":
+            failures.append((outcome, r.output[:200]))
+            continue
+        for line in r.output.splitlines():
+            m = marker.search(line)
+            if m:
+                try:
+                    ok_value = json.loads(m.group(1)).get(key)
+                except json.JSONDecodeError:
+                    pass
+    if ok_value is None:
+        return {"status": "no_value", "failures": failures}
+    return {"status": "ok", "value": ok_value, "failures": failures}
+
+result = resolve_execution(response.candidates[0].content.parts, "weighted_ecpm")
+print(result)
+# {'status': 'ok', 'value': 288.42105263157896, 'failures': []}
+```
+
+Returning `failures` rather than discarding them matters. In production, a run that succeeded but failed once along the way is a sign of an unstable prompt, so I log it and revisit it later. For triaging empty responses in general, the approach in [reverse-diagnosing empty Gemini responses from finish_reason](/en/articles/gemini-api/gemini-api-empty-output-finish-reason-diagnosis) transfers directly.
+
+## The gate: reconciling executed result against prose
+
+This is the heart of it. Holding the executed value as truth, you mechanically check whether **the model's prose contradicts that truth.** If it does, you do not surface that response — you reject it. Prose that disagrees is a signal the model did not correctly understand its own result, and you should not show it to a reader.
+
+```python
+def numbers_in_text(text):
+    """Return the set of numbers (commas and decimals) found in text."""
+    raw = re.findall(r'-?\d[\d,]*\.?\d*', text)
+    vals = set()
+    for r in raw:
+        try:
+            vals.add(float(r.replace(",", "")))
+        except ValueError:
+            pass
+    return vals
+
+def verify_prose(executed_value, prose_text, rel_tol=0.01):
+    """Check that the prose contains a number matching the executed
+    result within 1% relative error. If not, treat it as a contradiction."""
+    for v in numbers_in_text(prose_text):
+        if executed_value == 0:
+            if v == 0:
+                return True
+        elif abs(v - executed_value) / abs(executed_value) <= rel_tol:
+            return True
+    return False
+
+executed_value = result["value"]
+prose_text = "".join(prose)
+
+if verify_prose(executed_value, prose_text):
+    final_answer = prose_text        # prose is consistent with the result
+    trusted_number = executed_value  # the decision number is always the executed one
+else:
+    # prose is off -> replace what gets displayed
+    final_answer = f"The weighted-average eCPM is {executed_value:.1f} yen (auto-formatted)."
+    trusted_number = executed_value
+    print("WARNING prose mismatch:", prose_text[:80])
+
+print("display:", final_answer)
+print("decision value:", trusted_number)
+```
+
+The relative-error check exists so the prose can round to "288.4" without being rejected. It forgives a dropped decimal but **rejects a genuinely different number.** In my AdMob case the prose contained only 312.4, with no value within 1% of the executed 287.9, so the gate caught it cleanly.
+
+Treating the primary datum as the single source of truth and deriving everything else — display, explanation — from it pays off well beyond Code Execution. If you want the reasoning behind that design, the reliability chapter of [Designing Data-Intensive Applications (Martin Kleppmann)](https://www.amazon.co.jp/dp/B07P5RTFVL/?tag=pinocchio-22) is a useful lens on where to place your source of truth.
+
+## Traps you will hit in production
+
+Once you build this, a few quiet mistakes are easy to make.
+
+**Mixing up multiple execution-result parts.** When the model iterates, it may compute once, reconsider, and compute again. Grab the last output naively and it may not be the "computation for the final answer." That is exactly why you pin the final value with an explicit marker like `RESULT_JSON=` and break the dependence on ordering.
+
+**Expecting a value that was never printed to stdout.** The sandbox returns results through standard output. You cannot read the value of a variable you never printed. Writing with a REPL's "last expression is returned" instinct will come up empty, so always print the final value.
+
+**Over-sensitive matching from floating point.** When aggregation involves division, the rounding position differs between the executed result and the prose. Exact matching will reject everything, so relative error is the practical choice. Conversely, if rounding rules are fixed — as with currency — round on the execution side before writing it into RESULT_JSON so the display and the primary value line up more easily.
+
+**Overlooking cost.** Code Execution consumes tokens for the code it runs. If you execute on every request for verification, recording tokens per request pays off; I collected that in [recording production cost with Gemini's usageMetadata](/en/articles/gemini-api/gemini-api-usage-metadata-cost-tracking-production). If you want the basics of the feature itself first, [getting Gemini to write and run code with the Code Execution API](/en/articles/gemini-api/gemini-code-execution-api) is a good on-ramp.
+
+## Wrapping up
+
+If you use Code Execution for numeric aggregation, change one thing today: **take the number that drives decisions from `code_execution_result.output`, not from the model's prose.** The display sentence can stay as it is, but the value you pass to business logic flows through the executed result as primary data. Draw that single line and the class of accidents where a transcription hallucination trips you up nearly disappears.
+
+Automating reporting taught me that "it's handy, so delegate it" and "verify the result" are two different jobs. Slipping in one small gate that keeps the executed result and the prose apart changes how much you can trust the automation. I am still finding my way here, but I hope it helps anyone else handing numbers to an AI.
