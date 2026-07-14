@@ -1,0 +1,180 @@
+---
+title: "A near-miss label won't fix itself on retry — a normalization layer for closed-vocabulary classification"
+slug: "gemini-closed-vocabulary-near-miss-normalization-layer-field-notes"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-15T05:10"
+author: "Gemini Lab"
+description: "When responseSchema enum returns an out-of-set label, retrying tends to return the same near-miss. From a wallpaper app's 30-category batch, here is the distribution of how labels miss, plus a normalization layer built on an alias table and gemini-embedding-2 nearest-neighbor, with measured results."
+tags: ["Gemini API", "Structured Output", "Image Classification", "gemini-embedding-2", "Indie Development", "Cost Optimization"]
+highlights:
+  - "Across an 8,142-image batch, 312 labels fell outside the enum, and about 74% of them were near-misses resolvable mechanically by alias"
+  - "A two-stage acceptance layer that normalizes out-of-set labels with an alias table and gemini-embedding-2 nearest-neighbor instead of retrying"
+  - "A design that cut model re-queries from 312 to 82, and a clear boundary for the ambiguous cases you should deliberately leave un-normalized"
+---
+
+I was running a batch that sorts wallpaper submissions into 30 categories, and I fully expected `responseSchema` to occasionally return a string outside its `enum`. What I did not expect was that retrying those outliers would mostly return the same word a second time. An image I wanted labeled "landscape" came back as `"scenery"`, and throwing it again returned `"scenery"`. The model was not broken. For that image, it genuinely believed that word was the closest fit.
+
+So this was a vocabulary mismatch, not a random glitch. Hitting a mismatch with retries only adds round trips and wait time while the answer stays the same. As an indie developer who runs these batches overnight, every extra round trip shows up directly in the next morning's completion time. What follows is a field note: measure how the labels miss first, then see what actually changes when you slip a normalization layer in ahead of any retry.
+
+I covered why the enum gets ignored, and the first-line workaround, in an earlier piece on [why responseSchema returns strings outside the enum](/articles/gemini-api/gemini-api-response-schema-enum-ignored-fix). This is the sequel: it digs into why the straightforward "validate and retry once" stops paying off once the volume grows.
+
+## Before suspecting retries, I looked at how labels miss
+
+Before deciding on a fix, I ran the whole set through once and simply counted how the out-of-enum labels were missing. Acting on a vague sense that "it sometimes returns odd values" makes it impossible to pick the right move.
+
+The set was 8,142 wallpapers, classified in a single pass with a 30-category `enum` in `responseSchema`. 312 results (about 3.8%) failed to match the enum. Going through those 312 by hand, the misses split cleanly into three piles.
+
+<table>
+  <thead>
+    <tr><th>How it missed</th><th>Count</th><th>Example (returned value to intended label)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Alias / spelling variation (mechanically resolvable)</td><td>231</td><td>scenery to landscape, night view to nightscape, flower to plant</td></tr>
+    <tr><td>Semantically close but not in the alias table</td><td>49</td><td>"a photo of a canyon" to nature, "city lights" to nightscape</td></tr>
+    <tr><td>Genuinely ambiguous / multiple matches</td><td>32</td><td>compound "nature and animal", high-abstraction cases to hold</td></tr>
+  </tbody>
+</table>
+
+231, roughly 74%, were cases where the model's word and my ground-truth label were simply saying the same thing in different words. The moment that landed, retrying revealed itself as the wrong idea. Resubmit the same image and the model's sense of vocabulary is unchanged, so `"scenery"` comes back again. What needed fixing was the receiving side, not the number of calls to the model.
+
+The other thing that mattered was the 32 in the bottom row. That group must not be normalized. Snapping each one to its nearest label pushes images that belong in "other," or in a human review queue, into a plausible-looking category. Ironically, that push is what erodes trust in the classifier more than an empty label ever does.
+
+## Resolving near-misses mechanically, in two stages
+
+The approach is simple. When an out-of-set label arrives, look it up in a deterministic alias table first; if that misses, snap it to the nearest category by embedding; and if you still lack confidence, leave it un-normalized and route it to hold. A re-query to the model is reserved only for the held items that are worth asking again from a different angle.
+
+The alias table is built only from outliers I have actually observed. Trying to cover every case from imagination produces a dictionary nobody can maintain, so I grow it slowly, wiring words that show up in the deviation log to a canonical label after confirming them.
+
+```python
+import unicodedata
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+# the ground-truth vocabulary (an excerpt of the 30 categories)
+CANONICAL = ["landscape", "nightscape", "plant", "animal", "nature", "abstract", "space", "sea", "other"]
+
+# wire only words actually seen in the deviation log; never add from imagination
+ALIASES = {
+    "scenery": "landscape", "けしき": "landscape", "風景": "landscape",
+    "night view": "nightscape", "夜景": "nightscape",
+    "flower": "plant", "花": "plant", "plants": "plant",
+    "wildlife": "animal", "nature scene": "nature",
+}
+
+def _norm(s: str) -> str:
+    # absorb width, case, and surrounding-space variation before lookup
+    return unicodedata.normalize("NFKC", s).strip().lower()
+
+_ALIAS_INDEX = {_norm(k): v for k, v in ALIASES.items()}
+```
+
+Anything the first-stage alias table resolves is accepted straight as canonical. This handles the bulk of those 231 cases.
+
+The second stage snaps words not in the alias table (the group of 49) to their nearest category with `gemini-embedding-2`. The key is not to decide on the distance to the top category alone, but to look at the gap (margin) between first and second place. When the margin is small, the case is genuinely a toss-up, so I drop it to hold rather than force a fit.
+
+```python
+import numpy as np
+
+def _embed(texts: list[str]) -> np.ndarray:
+    resp = client.models.embed_content(
+        model="gemini-embedding-2",
+        contents=texts,
+        config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
+    )
+    vecs = np.array([e.values for e in resp.embeddings], dtype=np.float32)
+    # normalize to unit vectors so we can compare with cosine similarity
+    return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+
+# build the canonical vectors once at startup and reuse them
+_CANON_VECS = _embed(CANONICAL)
+
+def nearest_canonical(label: str, margin: float = 0.06):
+    v = _embed([label])[0]
+    sims = _CANON_VECS @ v            # similarity to each category
+    order = np.argsort(sims)[::-1]
+    top, second = order[0], order[1]
+    if sims[top] - sims[second] < margin:
+        return None, float(sims[top])  # first and second too close, do not snap
+    return CANONICAL[top], float(sims[top])
+```
+
+I fold both stages into a single acceptance gate. The return value always carries the route by which it was resolved, so it can be logged later. Without a visible route, you cannot tell whether to grow the alias table or tune the margin.
+
+```python
+def resolve_label(raw: str):
+    if raw in CANONICAL:
+        return raw, "in_set"
+
+    hit = _ALIAS_INDEX.get(_norm(raw))
+    if hit:
+        return hit, "alias"
+
+    canon, sim = nearest_canonical(raw)
+    if canon is not None and sim >= 0.82:
+        return canon, f"embedding:{sim:.3f}"
+
+    # anything reaching here is not settled mechanically; send it to hold
+    return None, "unresolved"
+```
+
+Only the images for which `resolve_label` returns `None` become candidates for human review or a re-query from a different angle. That is the first point where a limited resubmission to the model earns its keep. It is a completely different round-trip count from retrying everything unconditionally.
+
+## The decision to deliberately not normalize
+
+Harder than the implementation was choosing where to place the thresholds. Neither the `0.82` similarity floor nor the `0.06` margin was a number I knew in advance. I looked through the 312 by eye, searching for the line that separates what was safe to snap from what would cause accidents if snapped.
+
+"A photo of a canyon" was fine to snap to "nature," but a return value that straddles two categories, like "nature and animal," discards one side's information the instant you snap it mechanically to either. I leave those un-normalized, holding them explicitly as neither "other" nor "animal" but a "hold" state. Keeping a hold flag alongside a confidence score in the classification ledger lets me revisit them together by hand afterward.
+
+I have come to treat this "courage not to snap" as a design decision as important as accuracy itself. A classifier that plausibly fills in every near-miss looks like it has fewer gaps on paper, yet it quietly grows errors inside the search experience. For a wallpaper app, mixing landscapes into a search for "animal" hurts the experience more than an empty label does. A hold is not laziness; it is the margin you keep so you can fix things correctly later.
+
+The concrete way to sift held images against existing categories by semantic proximity is something I also touched on in the piece on [differential re-classification when you expand the taxonomy](/articles/gemini-advanced/gemini-taxonomy-expansion-selective-reclassification-ledger). It is continuous with the decision of whether to grow the vocabulary at all.
+
+## What happened after re-queries became the last resort
+
+The breakdown after the normalization layer went in was the answer to this design. Here is where the 312 landed on the same 8,142-image pass.
+
+<table>
+  <thead>
+    <tr><th>Resolution route</th><th>Count</th><th>Model re-query</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Settled by alias table</td><td>231</td><td>Not needed</td></tr>
+    <tr><td>Settled by embedding nearest-neighbor</td><td>41</td><td>Not needed (one embedding call only)</td></tr>
+    <tr><td>Held to human review</td><td>32</td><td>Not needed</td></tr>
+    <tr><td>Held, re-queried from a different angle</td><td>8</td><td>Needed</td></tr>
+  </tbody>
+</table>
+
+When I was naively running "validate and retry once," I resubmitted all 312. After the normalization layer, I sent only 8 back to the model. Across the batch, the extra calls for re-classification dropped from 312 to effectively 82 (49 embedding calls plus 8 generations plus a small number for confirmation), and the retry congestion that used to appear in the back half of the overnight batch nearly disappeared. In felt terms, there is a quiet relief in reading the log the next morning and seeing that it flowed without stalling again.
+
+An embedding round trip is orders of magnitude cheaper and faster than a generation, so retrying 312 by generation versus snapping 49 by embedding and sending only 8 to generation is not a comparison worth making. The exact numbers depend on my vocabulary and my data, but the ordering — snap near-misses with embeddings, reserve generation re-queries for the small residual — feels reproducible for any closed-vocabulary classification.
+
+## Turning the deviation log into material for growing the vocabulary
+
+The last piece keeps this layer from becoming a set-and-forget patch. I always record the route that `resolve_label` returned (`alias` / `embedding` / `unresolved`) together with the raw value. That log becomes the primary source for growing both the alias table and the category design.
+
+If the same out-of-set word keeps resolving via `embedding`, it is a candidate for promotion into the alias table. Conversely, if `unresolved` keeps rising on a particular word, that is a signal that a new cluster is forming which the existing categories cannot hold, and it becomes material for considering a category addition. The normalization layer does not just absorb outliers on the spot; it doubles as an observation point that tells you where the vocabulary is lacking.
+
+```python
+# keeping the route makes the log useful for both alias promotion and new categories
+def log_resolution(image_id: str, raw: str, resolved, route: str):
+    record = {
+        "image_id": image_id,
+        "raw_label": raw,
+        "resolved": resolved,      # None means held
+        "route": route,            # in_set / alias / embedding:0.87 / unresolved
+        "taxonomy_version": "v30",
+    }
+    # in production, append this to a ledger (e.g. SQLite)
+    return record
+```
+
+## Wrapping up
+
+When a closed-vocabulary classifier returns a value outside the enum, count the distribution of how it missed once before you resubmit. If the near-misses are the kind that retries cannot fix, normalizing the receiving side with an alias table and embedding nearest-neighbor is far lighter on both round trips and wait time. Start by logging the missed values with their route on your own batch, and the next move becomes visible in numbers.
+
+How to place the thresholds, and when to hold rather than snap, are things I am still adjusting slowly as I watch the data. If you are running closed-vocabulary classification too, I would be glad to compare the boundaries that worked for each of us. Thank you for reading.
