@@ -1,0 +1,162 @@
+---
+title: "Before One Runaway Experiment Drains the Shared Budget: Using AI Studio Spend Caps as Isolation Walls"
+slug: "gemini-ai-studio-project-spend-caps-parallel-experiment-isolation"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-14T15:53"
+author: "Gemini Lab"
+description: "When you run several Gemini experiments under one billing account, a single runaway loop takes everything else down with it. Here is how I use AI Studio's per-project spend caps as isolation walls, plus a client-side soft ceiling and monthly reconciliation, with working code."
+tags: ["gemini-api", "ai-studio", "spend-cap", "cost-management", "indie-dev"]
+highlights:
+  - "A concrete way to split each experiment into its own project and use AI Studio spend caps as walls that stop one runaway from taking down the rest"
+  - "A budget-ledger implementation that trips a soft ceiling and degrades quietly before the hard cap ever cuts a job off mid-run"
+  - "How to size the gap that absorbs the drift between your ledger estimate and the real invoice (about 3-5% per month in my setup)"
+---
+
+One morning, two of the three experiments I had running were silently dead. One was an image-classification batch for a wallpaper app; the other was a preprocessing step that turns articles into audio. Both were returning `429 RESOURCE_EXHAUSTED` on every call. The culprit was the third experiment. An embedding reindex I had kicked off the night before had a loop I forgot to bound, and it had burned through roughly 70% of the month's budget overnight.
+
+What stung was not the runaway itself. It was that **two unrelated jobs went down with it**. All three lived under the same billing account, in the same project, so the moment the ceiling was hit, the whole account stopped breathing at once.
+
+In July 2026, AI Studio gained per-project spend caps. I see this as more than a "don't overspend" switch. Treated deliberately, it becomes **an isolation boundary that keeps parallel experiments from taking each other down**. This article walks through where to draw that boundary, and how to cover what a hard cap alone cannot, with implementation included.
+
+## An account-wide limit cannot isolate experiments
+
+Until now, cost limits usually applied to the whole account. When you can only stop on a combined total, everything falls at the same instant the limit is reached, regardless of which experiment was actually eating the budget.
+
+For an indie developer, this structure bites often. In my setup, a stable production feature and an experiment whose behavior I still cannot predict share the same wallet. Experiments are the most likely thing to misbehave, so letting one runaway drag production down is exactly backwards. The things you most want to protect end up the most exposed.
+
+What you need is not "up to this much in total" but a separate wall that says **this experiment can cost at most this much**. Per-project spend caps give you precisely that granularity.
+
+## Make the project the unit of an experiment
+
+The first step toward isolation is changing how you carve up projects. I settled on a simple rule.
+
+Keep stable production features together in one project and protect it firmly. Split each unpredictable experiment into **its own project**, one per experiment, and give each an API key and a spend cap. Now, however wildly experiment A misbehaves, the cap it hits belongs only to experiment A's project. Production and experiment B keep running untouched.
+
+Splitting projects does add key-management overhead. But compared to the pain of an overnight accident stopping production, it has been a far lighter price to pay.
+
+## Build the defense in layers, not one wall
+
+Per-project spend caps are powerful, but leaning on them alone creates a different problem. A hard cap is a literal wall: the instant you touch it, work is cut off mid-flight. That invites half-finished failures, like a batch where the first half completes and the rest is lost.
+
+So I stack the limit as layers with different characters rather than a single wall.
+
+<table>
+  <thead>
+    <tr><th>Layer</th><th>Role</th><th>How it acts</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>AI Studio hard cap</td><td>Last line of defense</td><td>Sudden, forced stop (catches only unexpected runaways)</td></tr>
+    <tr><td>Client-side soft ceiling</td><td>The valve that trips first</td><td>Degrades or defers quietly, before the call</td></tr>
+    <tr><td>Degradation path</td><td>Slow down, don't stop</td><td>Fall back to cache, a lighter model, or a next-month queue</td></tr>
+    <tr><td>Monthly reconciliation</td><td>Correct the drift</td><td>Compare the ledger estimate against the real invoice</td></tr>
+  </tbody>
+</table>
+
+The hard cap sits as the final line that means "if we got here, something is wrong," while everyday slowdowns are handled by the soft ceiling. That division of labor is the key to avoiding half-finished failures.
+
+## Implementation: a per-project ledger and a soft gate
+
+The soft ceiling is a small ledger that accumulates an estimated cost per call. Before each call it decides whether this one request would cross the ceiling, and if so it raises an exception, handing the decision to degrade back to the caller.
+
+```python
+import threading
+from dataclasses import dataclass, field
+
+# Approximate Gemini 3.5 Flash pricing (USD / 1M tokens). Always confirm the real
+# numbers on your billing page.
+PRICE_PER_MTOK = {"input": 0.075, "output": 0.30}
+
+def estimate_cost_usd(input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens * PRICE_PER_MTOK["input"]
+            + output_tokens * PRICE_PER_MTOK["output"]) / 1_000_000
+
+class BudgetExhausted(Exception):
+    """Signals the soft ceiling was reached. Raised before the hard cap ever trips."""
+
+@dataclass
+class ProjectBudget:
+    project_id: str
+    hard_cap_usd: float          # keep this equal to the AI Studio hard cap
+    soft_ratio: float = 0.8      # soft ceiling at 80% of the hard cap
+    spent_usd: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def soft_cap_usd(self) -> float:
+        return self.hard_cap_usd * self.soft_ratio
+
+    def reserve(self, projected_usd: float) -> None:
+        with self._lock:
+            if self.spent_usd + projected_usd > self.soft_cap_usd:
+                raise BudgetExhausted(
+                    f"{self.project_id}: soft cap {self.soft_cap_usd:.2f} USD reached "
+                    f"(spent {self.spent_usd:.2f} + projected {projected_usd:.4f})")
+
+    def commit(self, actual_usd: float) -> None:
+        with self._lock:
+            self.spent_usd += actual_usd
+```
+
+Calls pass through the ledger before running. Input tokens are measured with `count_tokens`; output is reserved conservatively at its ceiling value.
+
+```python
+def guarded_generate(client, budget: ProjectBudget, *, model, contents, max_output_tokens):
+    # Reserve for the worst case (output using all its allowance), then call.
+    input_tokens = client.models.count_tokens(model=model, contents=contents).total_tokens
+    projected = estimate_cost_usd(input_tokens, max_output_tokens)
+    budget.reserve(projected)  # crossing the ceiling stops here with BudgetExhausted
+
+    resp = client.models.generate_content(
+        model=model, contents=contents,
+        config={"max_output_tokens": max_output_tokens})
+
+    usage = resp.usage_metadata
+    actual = estimate_cost_usd(usage.prompt_token_count, usage.candidates_token_count)
+    budget.commit(actual)  # update the ledger with real consumption
+    return resp
+```
+
+My earlier code just caught the `429` and retried with exponential backoff.
+
+```python
+# Before: assume "it will clear if I wait" and keep hammering
+for attempt in range(7):
+    try:
+        return client.models.generate_content(model=model, contents=contents)
+    except ResourceExhausted:
+        time.sleep(2 ** attempt)  # when the budget is drained, no wait ever clears it
+```
+
+This shape cannot tell a rate limit (clears if you wait) from budget exhaustion (does not clear until the month rolls over). Against a drained project it keeps firing up to seven wasted calls while only latency grows. For how to separate exhaustion from a transient limit, I covered the retry side in [Don't Retry Every Gemini 429](/articles/gemini-api/gemini-api-429-retryable-vs-spend-cap-exhaustion-retry-design); reading both makes the split between the retry layer and the soft ceiling much clearer.
+
+The caller catches `BudgetExhausted` and degrades.
+
+```python
+try:
+    resp = guarded_generate(client, budget, model="gemini-flash-latest",
+                            contents=chunk, max_output_tokens=1024)
+except BudgetExhausted:
+    queue_for_next_month(chunk)  # defer instead of stopping; production budget stays intact
+```
+
+Defer, don't halt. That is the heart of avoiding collateral damage. When an experiment hits its own ceiling, only that experiment's queue grows longer; nothing reaches the production feature next door.
+
+## Absorbing the drift between ledger and invoice
+
+The ledger is only an estimate. Input tokens come back nearly exact from `count_tokens`, but because output is reserved at its ceiling, the ledger accumulates a little more than actual consumption. That conservative drift errs in the safe direction: hitting the ceiling slightly early beats overspending.
+
+In my setup, the drift between the ledger estimate and the real invoice stayed around 3-5% per month. I put the soft ceiling at 80% of the hard cap specifically to absorb that difference, plus the small amount of slippage when several threads reserve at once. The remaining 20% is the buffer that keeps me from ever reaching the hard cap.
+
+Once a month, I pull the real invoice figure and correct the ledger's starting value. The `count_tokens` overhead measured a few tens of milliseconds per call in my tests, which is not negligible across a full batch. For workloads that fire many short calls, estimating input tokens yourself and skipping that step is a reasonable trade. For isolating the cause of a cost spike in the first place, I broke down the four main culprits in [Guardrails Against Gemini API Cost Spikes](/articles/gemini-api/gemini-api-cost-spike-defense-budget-guardrails), which works well as a map before you build a ledger.
+
+## Where to start
+
+Start by carving out just your single least-predictable experiment into a dedicated project. Split its API key and set a spend cap on that project in AI Studio. That alone raises one wall that says "this experiment can cost at most this much."
+
+The soft-ceiling implementation can come after that. The moment you split the project, you have already cut off the worst pattern: collateral damage from a runaway. The ledger and soft gate are an addition that reduces half-finished failures and slows things down instead of stopping them.
+
+For the production side, where free-user costs eat into your margin, I wrote up ceiling design separately in [Before Free Users Eat Your Margin](/articles/gemini-api/gemini-api-freemium-margin-tier-routing-cost-ceiling-notes). That protects a different target than isolating your own experiments, so if you run a production app, it is worth holding both in mind.
+
+For me, the day one accident stopped production still serves as a yardstick for design. I hope this helps with your own setup. Thank you for reading.
