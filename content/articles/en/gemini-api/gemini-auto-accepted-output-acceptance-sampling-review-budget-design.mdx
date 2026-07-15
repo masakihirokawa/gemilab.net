@@ -1,0 +1,308 @@
+---
+title: "Sample what you already accepted — an audit budget that catches silent quality drift"
+slug: "gemini-auto-accepted-output-acceptance-sampling-review-budget-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-15T11:00"
+author: "Gemini Lab"
+description: "A confidence gate only ever looks at output the model hesitated on. Silent drift sinks into the batch that sailed through. Working from a fixed 30-minutes-a-day review budget, this walks through deriving detection time from the binomial, reallocating the same budget across risk strata, and catching slow decay with a cumulative monitor."
+tags: ["gemini-api", "quality-monitoring", "acceptance-sampling", "production", "python", "review-design"]
+highlights:
+  - "How to carve out an audit population of 'confidently wrong' output that slipped past the confidence gate, without spending a minute more on review"
+  - "Code that inverts the binomial to answer 'which day do I notice?' for 1%, 2% and 5% defect rates, plus stratified allocation that speeds detection on the same budget"
+  - "A cumulative-sum monitor that catches gradual decay where daily thresholds stay silent, and the false-alarm line I settled on in production"
+---
+
+The day the entity behind `gemini-flash-latest` swapped over to 3.5 Flash, my nightly job finished without a complaint.
+
+Zero errors. The count of items pushed into the review queue looked much like the day before. The dashboard stayed quiet.
+
+I noticed something was off several days later. I happened to be reading through some store metadata and found that one locale's copy had gone oddly flat. Character limits respected. No banned terms. Schema valid. It was just that the product-specific turns of phrase that used to survive had been planed down into the same generic scaffold across every language.
+
+The model had not hesitated. Because it had not hesitated, the confidence gate had nothing to say.
+
+As an indie developer generating store copy for a number of apps, I cannot read every item by eye — which is exactly why I sieved on confidence in the first place. What I took from this is that routing only low-confidence output to human review is structurally blind to silent drift. Output that is confidently wrong never once appears in the queue.
+
+## The blind spot is on the side that passed
+
+The standard Human-in-the-Loop move is to sieve on confidence and hand the low side to a person. I had exactly the three-layer setup I described in [taking a Human-in-the-Loop workflow to production](/articles/gemini-api/gemini-api-human-in-the-loop-production-guide).
+
+That design works as long as the model's uncertainty correlates with the output being wrong. It breaks the moment that correlation snaps.
+
+An alias resolves to a new entity. Part of a prompt gets read differently. The distribution of reference data shifts. None of these lower the model's confidence. The new entity answers confidently, under its new assumptions.
+
+<table>
+  <thead>
+    <tr><th>Failure type</th><th>Model confidence</th><th>Confidence gate</th><th>How you find out</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Ambiguous or thin input</td><td>Low</td><td>Catches it</td><td>Review queue</td></tr>
+    <tr><td>Schema violation, empty output</td><td>—</td><td>Catches it</td><td>Validation</td></tr>
+    <tr><td>Behaviour shift from an entity swap</td><td>Stays high</td><td>Sails through</td><td>Sampling, or luck</td></tr>
+    <tr><td>Side effect of a prompt revision</td><td>Stays high</td><td>Sails through</td><td>Sampling, or luck</td></tr>
+  </tbody>
+</table>
+
+The whole point of this design is to replace "luck" in those bottom two rows with "sampling".
+
+A fair objection: wouldn't a promotion gate have caught it? It's a reasonable one, and mine is still running — I wrote it up in [a promotion gate for when gemini-flash-latest switches under you](/articles/gemini-api/gemini-flash-latest-promotion-gate-golden-set-rollback). But a promotion gate defends a known input set: the golden set. Your production input distribution drifts away from it, slowly. A golden set measures regression against yesterday's assumptions, not accuracy against today's real traffic.
+
+You want both. The first on every change. The second every day, in small doses.
+
+## Redefine the population as "output nobody looked at"
+
+Start by narrowing the definition. The audit population is not everything you generated. It is **only the output that passed validation, passed the confidence gate, and shipped without a human ever seeing it**.
+
+This narrowing pays. In my setup, of roughly 1,200 items generated per day, 40–60 already land in the review queue and a handful get rejected on schema. The remaining ~1,150 are the layer that ships unseen. If you define the population as everything, some of your sampled items land on records that were going to be reviewed anyway, and your scarce budget gets spent twice.
+
+Implementation starts by stamping the acceptance route onto the record.
+
+```python
+# accepted_pool.py
+from dataclasses import dataclass, asdict
+import sqlite3
+
+@dataclass
+class GenerationRecord:
+    record_id: str
+    model_id: str          # the resolved, pinned model ID -- not the alias
+    prompt_rev: str
+    locale: str
+    surface: str           # what the output is for: description / keywords / ...
+    route: str             # "auto" | "review_queue" | "rejected"
+    changed_input: bool    # did the input differ from last run?
+    created_at: str
+
+def init(db: sqlite3.Connection) -> None:
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS generations (
+            record_id TEXT PRIMARY KEY,
+            model_id TEXT NOT NULL,
+            prompt_rev TEXT NOT NULL,
+            locale TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            route TEXT NOT NULL,
+            changed_input INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_pool ON generations(route, created_at)")
+    db.commit()
+
+def record(db: sqlite3.Connection, r: GenerationRecord) -> None:
+    d = asdict(r)
+    d["changed_input"] = int(r.changed_input)
+    db.execute(
+        "INSERT OR REPLACE INTO generations VALUES "
+        "(:record_id,:model_id,:prompt_rev,:locale,:surface,:route,:changed_input,:created_at)",
+        d,
+    )
+    db.commit()
+
+def auto_accepted_pool(db: sqlite3.Connection, day: str) -> list[dict]:
+    cur = db.execute(
+        "SELECT * FROM generations WHERE route='auto' AND created_at LIKE ?",
+        (f"{day}%",),
+    )
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+```
+
+Storing the resolved entity in `model_id` rather than the alias is what later lets you reconstruct *when* the swap happened, straight from the population. Keep only the alias string and there is no trace in your records of the day the ground moved. I underrated this until an entity swap taught me otherwise.
+
+## Decide "which day do I notice?" before you decide how many
+
+The first question in sampling design is not how many items to look at. It is **how large a defect rate you are willing to tolerate, and for how many days**. Skip this and your sample size is just a guess.
+
+Draw n items at random each day. If the true defect rate is p, the chance of drawing none that day is (1-p)^n. Over d days, (1-p)^(n·d). So the probability of catching at least one within d days falls straight out:
+
+```python
+# detection_power.py
+from math import log, ceil
+
+def detect_prob(p: float, n: int, days: int) -> float:
+    """Probability of catching >=1 defect within `days`, sampling n/day at rate p."""
+    return 1.0 - (1.0 - p) ** (n * days)
+
+def days_to_detect(p: float, n: int, confidence: float = 0.95) -> int:
+    """Days needed to catch one with the given confidence."""
+    if p <= 0 or n <= 0:
+        return 10**9
+    return ceil(log(1 - confidence) / (n * log(1 - p)))
+
+def daily_n_for(p: float, days: int, confidence: float = 0.95) -> int:
+    """Daily sample size needed to catch one within `days`."""
+    return ceil(log(1 - confidence) / (days * log(1 - p)))
+
+if __name__ == "__main__":
+    for p in (0.01, 0.02, 0.05, 0.10):
+        row = [f"p={p:.0%}"]
+        for n in (10, 20, 30):
+            row.append(f"n={n}: {days_to_detect(p, n)}d")
+        print("  ".join(row))
+```
+
+Run it and you get this — days until you catch at least one, with 95% probability.
+
+<table>
+  <thead>
+    <tr><th>True defect rate</th><th>10/day</th><th>20/day</th><th>30/day</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1%</td><td>30 days</td><td>15 days</td><td>10 days</td></tr>
+    <tr><td>2%</td><td>15 days</td><td>8 days</td><td>5 days</td></tr>
+    <tr><td>5%</td><td>6 days</td><td>3 days</td><td>2 days</td></tr>
+    <tr><td>10%</td><td>3 days</td><td>2 days</td><td>1 day</td></tr>
+  </tbody>
+</table>
+
+My honest first reaction to this table was deflation. Even at 20 a day, a 1% degradation takes 15 days. Half a month.
+
+It also made something click. The reason the incident at the top of this piece took days to surface wasn't inattention — it was that I had no sampling design at all. Detection time is undefined when the sample size is zero.
+
+Then comes a judgement call. For store metadata, taking 15 days to find a 1% degradation was acceptable: the failure mode is copy going a bit flat, and repairing 15 days of output afterwards costs less than doubling my review time. Letting a 5% degradation sit for a week, though, I did not want. Twenty a day lands between those two lines.
+
+Change the surface and the lines move. If your output triggers charges or sends messages, the same table should lead you somewhere else entirely. What matters is the order of operations: **name the degradation you can live with and the days you can live with it, then derive the count** — rather than picking a count and reading the table afterwards.
+
+## Speed up detection without spending more — allocate by stratum
+
+You can shorten detection time while holding the budget at 20. Stop sampling uniformly and **oversample the risky strata**.
+
+Defects are not spread evenly. A model whose entity just changed. A prompt revision that just landed. Records whose input actually differed. Those strata carry a higher prior. Stratified allocation is just that prior, expressed as a budget.
+
+```python
+# stratified_sampler.py
+import random
+from collections import defaultdict
+
+# Per-stratum risk weights. Hand-tuned as you operate.
+RISK_WEIGHTS = {
+    "new_model": 4.0,      # resolved model ID first seen within 7 days
+    "new_prompt": 3.0,     # prompt revision first seen within 7 days
+    "changed_input": 2.0,  # input differs from the previous run
+    "steady": 1.0,         # none of the above
+}
+
+def stratum_of(rec: dict, fresh_models: set[str], fresh_prompts: set[str]) -> str:
+    if rec["model_id"] in fresh_models:
+        return "new_model"
+    if rec["prompt_rev"] in fresh_prompts:
+        return "new_prompt"
+    if rec["changed_input"]:
+        return "changed_input"
+    return "steady"
+
+def allocate(pool: list[dict], budget: int,
+             fresh_models: set[str], fresh_prompts: set[str],
+             min_per_stratum: int = 2, seed: int | None = None) -> list[dict]:
+    rng = random.Random(seed)
+    strata: dict[str, list[dict]] = defaultdict(list)
+    for rec in pool:
+        strata[stratum_of(rec, fresh_models, fresh_prompts)].append(rec)
+
+    present = {k: v for k, v in strata.items() if v}
+    # Always reserve a floor for the steady stratum. Drop this and the layer you
+    # assumed was safe never gets checked again.
+    reserved = {k: min(min_per_stratum, len(v)) for k, v in present.items()}
+    remaining = max(budget - sum(reserved.values()), 0)
+
+    total_w = sum(RISK_WEIGHTS[k] * len(v) for k, v in present.items())
+    picked: list[dict] = []
+    for k, v in present.items():
+        share = 0 if total_w == 0 else remaining * (RISK_WEIGHTS[k] * len(v)) / total_w
+        n = min(len(v), reserved[k] + int(round(share)))
+        picked.extend(rng.sample(v, n))
+    return picked[:budget]
+```
+
+`min_per_stratum` is there because I got this wrong once. For a week I allocated purely by weight, and the steady stratum drew zero samples several days running. Push the budget toward the risky strata and the layer you *assumed* was safe stops being checked at all. Stratification runs on a prior — so leave a thin path for finding out the prior itself was wrong.
+
+The reallocation showed up plainly. For drift that concentrates in the new-model stratum, here is what I measured in my own setup:
+
+<table>
+  <thead>
+    <tr><th>Sampling method</th><th>Items/day</th><th>Allocated to new-model stratum</th><th>Days to first defect (median of 4 swaps)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>No sampling</td><td>0</td><td>—</td><td>4 days (found by luck)</td></tr>
+    <tr><td>Simple random</td><td>20</td><td>~2</td><td>3 days</td></tr>
+    <tr><td>Stratified</td><td>20</td><td>~9</td><td>1 day</td></tr>
+  </tbody>
+</table>
+
+Four swaps is not a sample you can lean on statistically. Still, moving from 2 to 9 items in the new-model stratum on the same budget of 20 should find defects that concentrate there faster — that much is arithmetic. I treat these numbers as a direction confirmed, not a result proven.
+
+## Catch with a cumulative sum what a daily threshold sleeps through
+
+Judging each day's sample against a rule like "alert at 2+ defects" is intuitive and blunt. One defect in 20 happens routinely at a 5% rate and at a 1% rate alike. Judge day by day and gradual decay stays buried in noise.
+
+You need a view that accumulates across days. Fix a baseline rate p0, add up only the excess above it, and floor the running total at zero so downswings don't bank credit. It is the cumulative-sum idea from process control.
+
+```python
+# sequential_monitor.py
+from dataclasses import dataclass
+
+@dataclass
+class CusumState:
+    s: float = 0.0
+    days_above: int = 0
+
+def update(state: CusumState, defects: int, sampled: int,
+           p0: float = 0.01, slack: float = 0.005, limit: float = 0.06) -> tuple[CusumState, bool]:
+    """
+    p0    : the steady-state defect rate you accept
+    slack : day-to-day wobble absorbed without accumulating
+    limit : cross this and you call it drift
+    """
+    if sampled == 0:
+        return state, False
+    observed = defects / sampled
+    state.s = max(0.0, state.s + (observed - p0 - slack))
+    fired = state.s > limit
+    state.days_above = state.days_above + 1 if fired else 0
+    return state, fired
+
+def reset_after_action(state: CusumState) -> CusumState:
+    """Reset once you've fixed the cause -- otherwise it keeps firing."""
+    return CusumState()
+
+if __name__ == "__main__":
+    # Steady at 1% for ten days, then degrade to 3%
+    import random
+    rng = random.Random(7)
+    st = CusumState()
+    for day in range(1, 21):
+        p = 0.01 if day <= 10 else 0.03
+        defects = sum(1 for _ in range(20) if rng.random() < p)
+        st, fired = update(st, defects, 20)
+        print(f"day{day:2d} p={p:.0%} defects={defects} S={st.s:.3f} {'ALERT' if fired else ''}")
+```
+
+Run it and, from day 11 when the rate climbs from 1% to 3%, the sum builds over a few days and crosses the limit. A daily threshold would stay silent throughout: one or two defects out of twenty never trips it.
+
+There is no principled way to derive `slack` and `limit`. I let the thing run dry for about two weeks against steady-state data before choosing. More than one false alarm a fortnight and I stop reading the alerts seriously; missing real drift for a week is worse. `slack=0.005` and `limit=0.06` is where those two pressures met.
+
+`reset_after_action` is a separate function because leaving the sum standing after you fix the cause means it keeps firing, and alerts about an already-handled event dull your judgement fast. A stateful monitor needs a matching operation that collapses the state.
+
+## The parts the docs don't cover
+
+Six months of running this surfaced three things I haven't seen written down.
+
+**Your review form governs detection power.** For the first month I recorded a binary — good or bad — and my standard wandered day to day. "Good" on a tired evening is not "good" on a fresh morning. Once I listed exactly three concrete criteria per surface and recorded a yes/no against each, the judgements started reproducing. Sampling precision is rate-limited by judgement consistency long before it's limited by sample size.
+
+**Finding a defect does not mean fixing that defect.** Early on I'd find one, repair it, and feel done. That misreads what sampling is for. Sampling estimates the state of a population. One defect in your draw implies tens of them sitting in that day's population. The right move is to immediately draw more from the same stratum and re-estimate the rate. I fixed the procedure at "one defect found, pull ten more from that stratum".
+
+**Sampling logs deserve a longer life than the output.** Generated artefacts get overwritten. The record of when, from which stratum, how many drawn and how many defective pays off later — it's the only thing that lets you say how the defect rate moved across an entity swap. Storage cost turned out to be trivial: a few megabytes over six months.
+
+## What to put in place tomorrow
+
+None of this has to arrive at once. I added it a piece at a time.
+
+If you're sampling nothing today, put in the `route` field. One column on the generation record marking "shipped without human eyes". Neither the sampling nor the cumulative sum can start before that population exists.
+
+Once you can carve out the population, run `days_to_detect` once. Plug in the degradation you can tolerate and read off the days. If that number sits fine with you, your current setup is defensible. If it doesn't, you have exactly three moves: buy more review budget, reallocate it across strata, or redraw the line on what you'll tolerate.
+
+Model entities will keep swapping quietly beneath us, and the image generation models shut down in August. You can't stop the changes. You can shorten the number of days it takes to notice them. That's the thinking behind the twenty items I'm still pulling every day.
+
+Sampling is unglamorous work. But for an indie developer handing unattended jobs to the night, knowing you'd notice — in numbers, not by luck — turns out to be worth a lot. Thanks for reading this far.
