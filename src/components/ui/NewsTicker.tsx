@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH35 — Gemini 3.5 Flashが一般提供に。gemini-flash-latestが指す実体となり、エージェント処理とコーディングで持続的な性能を発揮します",
-    "AGENTS — Gemini APIのManaged Agentsが公開プレビューに。Googleがホストする隔離Linuxサンドボックスで状態を保持する自律エージェントを構築できます",
-    "ANTIGRAV — 汎用マネージドエージェントantigravity-preview-05-2026が公開プレビュー。計画・推論・コード実行・ファイル操作・ウェブ閲覧をこなします",
-    "TTS — gemini-3.1-flash-tts-previewがstreamGenerateContent経由の音声生成ストリーミングに対応しました",
-    "NANO — Nano Banana 2 Liteが最速・最省コストのGemini画像モデルとして利用可能になりました",
-    "DEPRECATE — 旧世代の画像生成モデルは2026年8月17日に停止予定です。移行の段取りを早めに固めておきたいところです",
+    "PRO35 — Gemini 3.5 Proのリリース目標が7月17日と報じられています。ただし日付・コンテキスト長・価格のいずれもGoogleの公式発表ではありません",
+    "REBUILD — 2.5 Proのアーキテクチャを白紙化した全面再設計とされ、再帰的なツール呼び出しとSVG生成での構造的な失敗が理由と報じられています",
+    "FLASH35 — 広く提供中の最新リリースはGemini 3.5 Flash。コーディング・エージェント・マルチモーダル・長文書処理を高速かつ低コストで担います",
+    "SAATHI — Gemini 3.5 Flashを核にしたATL Saathiが、インドの100校でパイロット開始。教員向けに24時間対応の授業計画・研修アシスタントを提供します",
+    "SEA — 東南アジアレポートでは、プロンプトの約70%が現地語（ベトナム89%・タイ87%・インドネシア84%）。リクエストの約4分の3がモバイル発です",
+    "SHEETS — 7月15日から、AI Expanded Accessライセンス保有者はFill with GeminiとSheetsのAI関数の利用上限が引き上げられました",
   ],
   en: [
-    "FLASH35 — Gemini 3.5 Flash is GA and now powers gemini-flash-latest, delivering sustained frontier performance on agentic and coding tasks",
-    "AGENTS — Managed Agents launch in public preview in the Gemini API, running stateful autonomous agents in isolated Google-hosted Linux sandboxes",
-    "ANTIGRAV — The general-purpose managed agent antigravity-preview-05-2026 enters public preview: it plans, reasons, runs code, manages files, and browses the web",
-    "TTS — Streaming speech generation is now supported for gemini-3.1-flash-tts-preview via streamGenerateContent",
-    "NANO — Nano Banana 2 Lite arrives as the fastest, most cost-efficient Gemini Image model",
-    "DEPRECATE — Legacy image generation models are deprecated and shut down on August 17, 2026; plan your migration early",
+    "PRO35 — Gemini 3.5 Pro is reported to target July 17, though the date, context window, and pricing all remain unconfirmed by Google",
+    "REBUILD — The model is said to be a ground-up rebuild after the 2.5 Pro architecture was scrapped over structural failures in recursive tool-calling and SVG generation",
+    "FLASH35 — Gemini 3.5 Flash is the newest broadly available release, tuned for faster, lower-cost coding, agents, multimodal, and long-document work",
+    "SAATHI — ATL Saathi, built on Gemini 3.5 Flash, begins piloting in 100 Indian schools as a 24/7 planning and training assistant for Tinkering Lab educators",
+    "SEA — In Southeast Asia, nearly 70% of prompts arrive in native languages — Vietnam 89%, Thailand 87%, Indonesia 84% — and 3 in 4 requests come from mobile",
+    "SHEETS — From July 15, AI Expanded Access licenses raise the usage limits for Fill with Gemini and the AI function in Sheets",
   ],
 };
 
