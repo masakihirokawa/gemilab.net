@@ -1,0 +1,344 @@
+---
+title: "生成ログを丸ごと残すのをやめました — 3層の保持設計とプロンプト指紋で追跡性だけを残す"
+slug: "gemini-api-generation-log-retention-tiers-prompt-fingerprint"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-07-16T13:00"
+author: "Gemini Lab"
+description: "障害調査のために Gemini API のリクエストとレスポンスを丸ごと保存していました。3層の保持設計とプロンプト指紋に切り替え、本文を消しても原因を辿れる状態を保った記録です。"
+tags: ["Gemini API", "ログ設計", "データ保持", "運用", "Firestore"]
+highlights:
+  - "本文を残さずに原因を辿るための「プロンプト指紋」の作り方と、指紋に何を含めて何を含めないかの線引き"
+  - "Tier 0/1/2 の保持階層と Firestore TTL ポリシーの実装。保存量を約 92% 減らしても調査可能率を保った実測"
+  - "失敗100%・成功3%の層別サンプリングと、指紋だけでモデル入れ替えを特定できた実例"
+---
+
+深夜の自動処理が同じカテゴリばかり返してくるようになり、原因を探そうとログを開きました。
+
+3ヶ月前のレコードまで遡れました。リクエスト本文も、レスポンス本文も、そっくり残っていました。便利です。便利すぎました。
+
+そこにはアプリの利用者が打ち込んだ文章が、そのままの形で並んでいました。障害調査のために残したはずのものが、いつのまにか「消す理由を誰も検討していないデータ」になっていた。画面を見ながら、少し手が止まりました。
+
+ストレージの請求額の話ではありません。私が個人で回している処理に、他人の言葉を無期限に置いておく理由があるのか、という話です。
+
+私自身、消す設計を一度も書いていませんでした。書かなければ残る。ログとは、そういうものでした。
+
+## 全部残す設計は、何を抱えていたのか
+
+当時のログは素朴でした。Gemini API を呼ぶラッパーの中で、リクエストとレスポンスを丸ごと JSON にして Firestore へ書く。それだけです。
+
+3ヶ月動かした結果が次の通りでした。壁紙分類・記事メタデータ生成・レビュー返信の下書きを合わせた、個人開発規模の数字です。
+
+<table>
+  <thead>
+    <tr><th>項目</th><th>実測</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>レコード数</td><td>約 41,000 件（3ヶ月）</td></tr>
+    <tr><td>1件あたり平均サイズ</td><td>約 11 KB（本文込み）</td></tr>
+    <tr><td>合計</td><td>約 450 MB</td></tr>
+    <tr><td>実際に人が開いたレコード</td><td>62 件</td></tr>
+  </tbody>
+</table>
+
+41,000 件を保存して、開いたのは 62 件。0.15% です。
+
+しかも開いた 62 件のうち、本文を読む必要が本当にあったのは 20 件ほどでした。残りは「どのモデルで」「いつ」「どれくらいのトークンで」「どう終了したか」を見れば足りていました。
+
+つまり本文は、調査の主役ではなかった。主役は文脈のほうでした。
+
+## 原因を辿るのに、最小限どこまで要るのか
+
+先に「捨てた場合に何が困るか」を書き出しました。実際に過去に起きた調査だけを対象にしています。
+
+1. 出力の傾向が変わった → いつから変わったか、その前後でモデルまたはプロンプトが変わったか
+2. コストが跳ねた → どの処理が、どのトークン内訳で膨らんだか
+3. 特定の入力で必ず失敗する → その入力の**形**（長さ・言語・添付の有無）と finishReason
+4. 出力が途中で切れる → maxOutputTokens と実際の出力トークン
+
+4つとも、本文そのものを必要としていませんでした。必要なのは「そのとき何を投げたかを一意に識別できること」でした。
+
+同じ入力を投げていたのか、違う入力だったのか。それさえ分かれば、あとは条件を再現して手元で試せます。
+
+ここから設計が決まりました。**本文を消す代わりに、本文の同一性だけを残す**。
+
+## プロンプト指紋 — 本文なしで「同じものを投げたか」を判定する
+
+プロンプト指紋は、リクエストを構成する要素を正規化してハッシュしたものです。文章そのものは復元できませんが、2つのリクエストが同じだったかは判定できます。
+
+大切なのは、**何をハッシュに含めて、何を含めないか**でした。ここを間違えると指紋が毎回変わり、比較ができなくなります。
+
+```python
+# fingerprint.py
+# Gemini API のリクエストから「同一性だけ」を取り出す
+import hashlib
+import json
+import re
+import unicodedata
+from typing import Any
+
+
+def _normalize_text(text: str) -> str:
+    """表記ゆれを吸収する。全角/半角・連続空白・行末空白を揃える。"""
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _shape(text: str) -> dict[str, Any]:
+    """本文を捨てても残しておきたい『形』の情報。"""
+    return {
+        "chars": len(text),
+        "lines": text.count("\n") + 1,
+        # 言語の当たりをつけるための粗い判定（保存するのは真偽値だけ）
+        "has_cjk": bool(re.search(r"[぀-ヿ一-鿿]", text)),
+        "has_latin": bool(re.search(r"[A-Za-z]", text)),
+    }
+
+
+def prompt_fingerprint(
+    *,
+    model: str,
+    system_instruction: str,
+    user_text: str,
+    generation_config: dict[str, Any],
+    tool_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """本文を残さずに、同一性・構成・形を記録するための指紋を作る。
+
+    含めるもの: モデル名 / system_instruction / user 入力 / 出力を左右する設定 / ツール名
+    含めないもの: temperature 以外の非決定要因、リクエストID、タイムスタンプ、
+                  ユーザーID（別フィールドで擬似ID化して持つ）
+    """
+    sys_norm = _normalize_text(system_instruction)
+    user_norm = _normalize_text(user_text)
+
+    # 出力に影響する設定だけを取り出して並び順を固定する
+    cfg_keys = ("temperature", "topP", "topK", "maxOutputTokens", "responseMimeType")
+    cfg = {k: generation_config.get(k) for k in cfg_keys if k in generation_config}
+
+    material = json.dumps(
+        {
+            "model": model,
+            "system": sys_norm,
+            "user": user_norm,
+            "config": cfg,
+            "tools": sorted(tool_names or []),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    full = hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    # system だけの指紋を別に持つ。プロンプト改訂の検知に効く
+    sys_only = hashlib.sha256(sys_norm.encode("utf-8")).hexdigest()
+
+    return {
+        "fp": full[:16],           # リクエスト全体の指紋
+        "fp_system": sys_only[:12],  # system_instruction の版
+        "shape_user": _shape(user_norm),
+        "config": cfg,
+        "model": model,
+    }
+```
+
+`fp` と `fp_system` を分けたのは、後から効きました。
+
+`fp` は毎回変わります。ユーザー入力が違うのですから当然です。一方 `fp_system` は、私がプロンプトを書き換えたときだけ変わる。つまり `fp_system` の値が切り替わった日時が、そのままプロンプト改訂の記録になります。
+
+デプロイ履歴を掘らなくても、ログの中に版が残っている。これは想像以上に楽でした。
+
+`shape_user` に文字数と言語の粗い判定を残したのは、「特定の入力で必ず失敗する」の調査のためです。本文はなくても、「1万文字を超える日本語入力で finishReason が変わっている」ところまでは辿れます。そこまで絞れれば、あとは手元で再現できます。
+
+温度などの設定をハッシュに含めた理由も書いておきます。同じ文章でも `temperature` が違えば別の実験です。指紋が同じなら本当に同じ条件だった、と言い切れる状態にしておきたかった。
+
+## 3層に切り分ける
+
+指紋ができたところで、保持を3層に分けました。
+
+<table>
+  <thead>
+    <tr><th>層</th><th>内容</th><th>保持期間</th><th>対象</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Tier 0</td>
+      <td>指紋・モデル・トークン内訳・レイテンシ・finishReason・shape</td>
+      <td>400日</td>
+      <td>全リクエスト</td>
+    </tr>
+    <tr>
+      <td>Tier 1</td>
+      <td>Tier 0 ＋ リクエスト/レスポンス本文</td>
+      <td>14日</td>
+      <td>失敗 100% / 成功 3%</td>
+    </tr>
+    <tr>
+      <td>Tier 2</td>
+      <td>本文を人が確認のため固定保存</td>
+      <td>手動削除まで</td>
+      <td>調査で明示的に引き上げたものだけ</td>
+    </tr>
+  </tbody>
+</table>
+
+Tier 0 を 400 日にしたのは、前年の同じ時期と比べたくなるからです。年に一度の季節変動を1回分は挟みたい。本文がないので、1件あたり約 0.9 KB に収まりました。
+
+Tier 1 の 14 日は、私が異変に気づくまでの実測から決めました。過去の調査を振り返ると、気づいてからログを開くまでの最長が 9 日。倍は取りすぎですが、2週間なら1つのスプリントに収まるので納得しやすい数字でした。
+
+Tier 2 は自動では作りません。調査中に「これは残す」と決めたものだけを、明示的にコピーします。自動で永続化される経路をひとつも残さない、というのが今回の主眼だったからです。
+
+```python
+# logger.py
+import random
+import time
+from datetime import datetime, timedelta, timezone
+
+from google.cloud import firestore
+
+db = firestore.Client()
+
+TIER0_DAYS = 400
+TIER1_DAYS = 14
+SUCCESS_SAMPLE_RATE = 0.03  # 成功したリクエストの 3% だけ本文を残す
+
+
+def _expires_at(days: int) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(days=days)
+
+
+def log_generation(
+    *,
+    fingerprint: dict,
+    usage: dict,          # {"promptTokens":..,"candidatesTokens":..,"totalTokens":..}
+    finish_reason: str,
+    latency_ms: int,
+    ok: bool,
+    request_body: str | None = None,
+    response_text: str | None = None,
+    task: str = "unknown",
+) -> str:
+    """Tier 0 は常に書き、本文は条件を満たしたときだけ添える。"""
+    # 失敗は必ず、成功は抽選で本文を残す
+    keep_body = (not ok) or (random.random() < SUCCESS_SAMPLE_RATE)
+
+    doc = {
+        "task": task,
+        "ts": firestore.SERVER_TIMESTAMP,
+        "fp": fingerprint["fp"],
+        "fp_system": fingerprint["fp_system"],
+        "model": fingerprint["model"],
+        "config": fingerprint["config"],
+        "shape_user": fingerprint["shape_user"],
+        "usage": usage,
+        "finish_reason": finish_reason,
+        "latency_ms": latency_ms,
+        "ok": ok,
+        "tier": 1 if keep_body else 0,
+        # TTL ポリシーが参照するフィールド
+        "expires_at": _expires_at(TIER1_DAYS if keep_body else TIER0_DAYS),
+    }
+
+    if keep_body:
+        doc["body"] = {
+            "request": request_body,
+            "response": response_text,
+            # 本文が消えたあとも Tier 0 側から辿れるようにしておく
+            "expires_at": _expires_at(TIER1_DAYS),
+        }
+
+    ref = db.collection("gen_logs").document()
+    ref.set(doc)
+    return ref.id
+```
+
+ここに落とし穴がありました。Firestore の TTL ポリシーは**ドキュメント単位でしか消せません**。フィールドだけを期限で消すことはできない。
+
+つまり「本文だけ14日で消して、指紋は400日残す」を1つのドキュメントで実現しようとすると、行き詰まります。
+
+コレクションを分けて解決しました。`gen_logs` は Tier 0 として 400 日、`gen_log_bodies` は Tier 1 として 14 日。Tier 0 側のドキュメントIDを本文側のキーにして、必要なときだけ結合します。
+
+```python
+def log_generation_split(...) -> str:
+    ref = db.collection("gen_logs").document()
+    ref.set({...})  # Tier 0（expires_at = 400日後）
+
+    if keep_body:
+        db.collection("gen_log_bodies").document(ref.id).set({
+            "request": request_body,
+            "response": response_text,
+            "expires_at": _expires_at(TIER1_DAYS),  # 14日後に自動削除
+        })
+    return ref.id
+```
+
+TTL ポリシーは Firestore 側で、フィールドを指定して有効化します。
+
+```bash
+gcloud firestore fields ttls update expires_at \
+  --collection-group=gen_logs --enable-ttl
+
+gcloud firestore fields ttls update expires_at \
+  --collection-group=gen_log_bodies --enable-ttl
+```
+
+TTL の削除は即時ではありません。公式には期限到達後 24 時間以内が目安とされています。私の環境では、期限から実際に消えるまで平均 3〜7 時間ほどでした。「14 日で消える」ではなく「14 日を過ぎたら消え始める」と理解しておくのが安全です。
+
+削除件数の多い時間帯は書き込みコストが上がることもあるため、期限を分単位で散らしています。全レコードが同じ時刻に期限を迎えないよう、`expires_at` に 0〜90 分のランダムなずれを足すだけです。
+
+## 成功を 3% にした理由
+
+失敗を 100% 残すのは迷いませんでした。悩んだのは成功側です。
+
+成功したリクエストの本文が要るのは、「静かに品質が下がっているとき」だけです。エラーは出ていないのに、出力が微妙に変わっている。この場合、成功ログを見比べる必要があります。
+
+必要な量は、変化を見つけられる最小の量です。私の処理は1日あたり平均 450 件ほど。3% なら 1 日 13〜14 件が残ります。14 日で約 190 件。文体の変化を並べて確認するには、これで足りました。
+
+ただし全タスク一律 3% にはしていません。壁紙分類のように出力が短く定型のものは 1%、記事メタデータ生成のように文章として読む必要があるものは 8% にしています。読む必要がある場所に厚く配る、というだけの話です。
+
+抜き取りの母集団と検出力の考え方は[自動採用された出力を抜き取り検査する設計](/articles/gemini-api/gemini-auto-accepted-output-acceptance-sampling-review-budget-design)で詳しく書いています。本稿の 3% も、そこで整理した「人が読める上限から逆算する」という発想を保持設計側に持ち込んだものです。
+
+## 切り替えて 3 週間、実際どうだったか
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>切替前</th><th>切替後</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1件あたり平均</td><td>約 11 KB</td><td>約 0.9 KB（Tier 0）</td></tr>
+    <tr><td>月間の保存量</td><td>約 150 MB</td><td>約 12 MB</td></tr>
+    <tr><td>本文を保持する件数</td><td>全件</td><td>約 4.6%（失敗＋抜き取り）</td></tr>
+    <tr><td>本文が無期限に残るか</td><td>残る</td><td>残らない（最長14日）</td></tr>
+  </tbody>
+</table>
+
+保存量は約 92% 減りました。ただ、これは副次的な結果です。私が欲しかったのは下の行、「残らない」のほうでした。
+
+追跡性についても書いておきます。切り替えてから 3 週間で調査が 2 回発生し、どちらも Tier 0 だけで原因まで届きました。
+
+1件目は出力が短くなった件です。`fp_system` の値が変わっていないのに、`usage.candidatesTokens` の中央値が 320 から 190 へ落ちていました。プロンプトは変えていない。そして `model` フィールドを見ると、`gemini-flash-latest` の実体が入れ替わった日と一致していました。エイリアス指定の副作用です。本文は 1 行も読んでいません。
+
+このモデル入れ替わりの検知そのものは[既定モデルの差し替えを静かに検知する仕組み](/articles/gemini-api/gemini-api-default-model-pinning-silent-upgrade-detection-production)で扱っています。今回興味深かったのは、そのための専用の監視を持たなくても、保持設計の副産物として同じことに気づけた点でした。
+
+2件目は逆で、Tier 0 では足りませんでした。特定の入力で分類が揺れる件です。`shape_user.chars` が 200 前後という共通点までは絞れましたが、そこから先は本文が要りました。
+
+3% の抜き取りに該当する本文が 4 件残っていて、そのうち 2 件が同じ揺れ方をしていました。運が良かった、と言うべきだと思います。抜き取りが 0 件だったら手詰まりでした。
+
+うまくいかなかった点も正直に書いておきます。切り替え直後、`shape_user` に `has_cjk` しか入れていませんでした。タイ語やベトナム語の入力が「CJKでもラテンでもない」として同じ扱いになり、言語ごとの傾向が見えませんでした。Unicode ブロックを 3 つ追加して直しましたが、指紋の設計は後から足すのが面倒です。**捨てる前に、何を残すかを一度多めに書き出しておくべきでした。**
+
+もうひとつ。指紋を 16 文字に切り詰めたのは短くしたかっただけで、根拠が薄い判断でした。41,000 件規模では衝突していませんが、桁が変わったら見直す必要があります。今のところ「衝突しても運用が壊れない（同一性の判定が甘くなるだけで、誤った本文を復元することはない）」という理由で据え置いています。
+
+なお出力そのものの変化を継続して見張りたい場合は、[出力の文体指紋でモデル差し替えを追う方法](/articles/gemini-api/gemini-style-fingerprint-drift-detection-default-model-swap)が別の角度から役に立ちます。本稿の指紋が「入力の同一性」なのに対し、あちらは「出力の性質」を見ています。両方あると、原因と結果の両側から挟めます。
+
+## まず 1 週間、指紋だけを並行して書いてみてください
+
+いきなり本文を捨てる必要はありません。
+
+今のログはそのままに、`prompt_fingerprint()` の戻り値を追加のフィールドとして書き足すだけの状態を 1 週間続けてみてください。それだけで、次に調査が発生したときに「本文なしでどこまで届いたか」を実際に測れます。
+
+その手応えを得てから保持期間を縮める。私はこの順番にしなかったので、`shape_user` の作り直しで一度手戻りしました。
+
+自分の処理に他人の言葉が溜まり続けていることに気づいたとき、少し胸がざわつきました。その感覚は、たぶん正しかったのだと思います。お読みいただきありがとうございました。

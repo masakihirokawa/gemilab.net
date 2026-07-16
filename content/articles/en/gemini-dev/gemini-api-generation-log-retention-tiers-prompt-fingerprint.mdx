@@ -1,0 +1,327 @@
+---
+title: "I stopped storing every generation log — three retention tiers and a prompt fingerprint that keeps traceability"
+slug: "gemini-api-generation-log-retention-tiers-prompt-fingerprint"
+category: "gemini-dev"
+level: "advanced"
+premium: true
+date: "2026-07-16T13:00"
+author: "Gemini Lab"
+description: "I was storing every Gemini API request and response body for debugging. Here is how I moved to three retention tiers plus a prompt fingerprint, and kept the ability to diagnose issues without keeping the text."
+tags: ["Gemini API", "Logging", "Data Retention", "Operations", "Firestore"]
+highlights:
+  - "How to build a prompt fingerprint that identifies a request without storing its text, and what belongs in the hash versus what does not"
+  - "A Tier 0/1/2 retention model with Firestore TTL policies. Storage dropped roughly 92% while investigations still landed"
+  - "Stratified sampling at 100% of failures and 3% of successes, plus a real case where the fingerprint alone caught a model swap"
+---
+
+My nightly pipeline started returning the same category over and over, so I opened the logs to find out why.
+
+I could scroll back three months. Full request bodies. Full response bodies. All of it, exactly as sent. Convenient. Too convenient.
+
+Sitting there were sentences that people had typed into my app, preserved verbatim. Something I had kept for debugging had quietly become data that nobody had ever decided to delete. I stopped scrolling.
+
+This is not a storage bill story. It is a question about whether I had any reason to hold other people's words indefinitely inside a pipeline I run by myself.
+
+As an indie developer I had never written the deletion side of the design. What you do not write, you keep. That is simply what logs are.
+
+## What "keep everything" was actually holding
+
+The logging was naive. My Gemini API wrapper serialized the request and response into JSON and wrote it to Firestore. That was the whole design.
+
+Three months of that produced the following, across wallpaper classification, article metadata generation, and review-reply drafting — indie-scale numbers.
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>Measured</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Records</td><td>~41,000 (3 months)</td></tr>
+    <tr><td>Average size per record</td><td>~11 KB (with bodies)</td></tr>
+    <tr><td>Total</td><td>~450 MB</td></tr>
+    <tr><td>Records a human actually opened</td><td>62</td></tr>
+  </tbody>
+</table>
+
+41,000 stored. 62 opened. That is 0.15%.
+
+And of those 62, only about 20 genuinely required the body text. For the rest, knowing the model, the timestamp, the token counts, and the finish reason was enough.
+
+The bodies were never the star of an investigation. Context was.
+
+## How little do you need to trace a cause?
+
+Before deleting anything, I wrote down what would actually hurt to lose — restricted to investigations that had really happened.
+
+1. Output drifted — when did it start, and did the model or the prompt change around that point?
+2. Cost spiked — which task grew, and in which part of the token breakdown?
+3. A specific input always fails — what is the *shape* of that input (length, language, attachments) and the finishReason?
+4. Output gets cut off — what were maxOutputTokens versus actual output tokens?
+
+None of the four needed the text itself. What they needed was the ability to say, unambiguously, whether two calls had sent the same thing.
+
+Same input or different input. Once that is settled, you can reproduce the condition locally and take it from there.
+
+That decided the design: **drop the body, keep its identity**.
+
+## The prompt fingerprint
+
+A prompt fingerprint is a normalized, hashed summary of what made up the request. It cannot reconstruct the text, but it can tell you whether two requests were identical.
+
+What mattered most was **what goes into the hash and what stays out**. Get that wrong and the fingerprint changes every time, which makes comparison useless.
+
+```python
+# fingerprint.py
+# Extract identity — and only identity — from a Gemini API request
+import hashlib
+import json
+import re
+import unicodedata
+from typing import Any
+
+
+def _normalize_text(text: str) -> str:
+    """Absorb cosmetic variation: width, repeated spaces, trailing whitespace."""
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _shape(text: str) -> dict[str, Any]:
+    """What is worth keeping about the text after the text is gone."""
+    return {
+        "chars": len(text),
+        "lines": text.count("\n") + 1,
+        # Coarse language hints — only booleans get stored
+        "has_cjk": bool(re.search(r"[぀-ヿ一-鿿]", text)),
+        "has_latin": bool(re.search(r"[A-Za-z]", text)),
+    }
+
+
+def prompt_fingerprint(
+    *,
+    model: str,
+    system_instruction: str,
+    user_text: str,
+    generation_config: dict[str, Any],
+    tool_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Record identity, composition, and shape without keeping the text.
+
+    In:  model / system_instruction / user input / settings that shape output / tool names
+    Out: request IDs, timestamps, and user IDs (those live in a separate pseudonymized field)
+    """
+    sys_norm = _normalize_text(system_instruction)
+    user_norm = _normalize_text(user_text)
+
+    # Only settings that influence the output, in a fixed order
+    cfg_keys = ("temperature", "topP", "topK", "maxOutputTokens", "responseMimeType")
+    cfg = {k: generation_config.get(k) for k in cfg_keys if k in generation_config}
+
+    material = json.dumps(
+        {
+            "model": model,
+            "system": sys_norm,
+            "user": user_norm,
+            "config": cfg,
+            "tools": sorted(tool_names or []),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    full = hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    # A separate hash for the system instruction alone — this catches prompt revisions
+    sys_only = hashlib.sha256(sys_norm.encode("utf-8")).hexdigest()
+
+    return {
+        "fp": full[:16],             # whole-request fingerprint
+        "fp_system": sys_only[:12],  # version of the system instruction
+        "shape_user": _shape(user_norm),
+        "config": cfg,
+        "model": model,
+    }
+```
+
+Splitting `fp` from `fp_system` paid off later than I expected, and more than I expected.
+
+`fp` changes on every call, since user input differs. `fp_system` changes only when I edit my own prompt. So the moment `fp_system` flips to a new value *is* the record of a prompt revision.
+
+No digging through deploy history. The version lives in the logs themselves. That turned out to be a quiet relief.
+
+`shape_user` carries character count and coarse language flags for case 3 above. Without any body text I can still narrow things to "Japanese inputs over 10,000 characters change the finishReason" — and once it is that narrow, I can reproduce it by hand.
+
+One note on why generation settings belong in the hash. The same sentence at a different `temperature` is a different experiment. I wanted a matching fingerprint to mean the conditions really were identical.
+
+## Three tiers
+
+With the fingerprint in place, retention split into three tiers.
+
+<table>
+  <thead>
+    <tr><th>Tier</th><th>Contents</th><th>Retention</th><th>Applies to</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Tier 0</td>
+      <td>Fingerprint, model, token breakdown, latency, finishReason, shape</td>
+      <td>400 days</td>
+      <td>Every request</td>
+    </tr>
+    <tr>
+      <td>Tier 1</td>
+      <td>Tier 0 plus request/response bodies</td>
+      <td>14 days</td>
+      <td>100% of failures / 3% of successes</td>
+    </tr>
+    <tr>
+      <td>Tier 2</td>
+      <td>Bodies pinned for human review</td>
+      <td>Until manually deleted</td>
+      <td>Only what an investigation explicitly promotes</td>
+    </tr>
+  </tbody>
+</table>
+
+400 days for Tier 0 because I compare against the same period last year. One full pass through seasonal variation, with margin. Without bodies, a record settles at roughly 0.9 KB.
+
+The 14 days for Tier 1 came from measurement, not taste. Looking back at past investigations, the longest gap between noticing something and opening the logs was 9 days. Doubling it is generous, but two weeks maps to a sprint, so the number is easy to live with.
+
+Tier 2 is never automatic. During an investigation I decide "keep this one" and copy it explicitly. Leaving zero automatic paths to permanent storage was the entire point.
+
+```python
+# logger.py
+import random
+from datetime import datetime, timedelta, timezone
+
+from google.cloud import firestore
+
+db = firestore.Client()
+
+TIER0_DAYS = 400
+TIER1_DAYS = 14
+SUCCESS_SAMPLE_RATE = 0.03  # keep bodies for 3% of successful requests
+
+
+def _expires_at(days: int) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(days=days)
+
+
+def log_generation(
+    *,
+    fingerprint: dict,
+    usage: dict,          # {"promptTokens":..,"candidatesTokens":..,"totalTokens":..}
+    finish_reason: str,
+    latency_ms: int,
+    ok: bool,
+    request_body: str | None = None,
+    response_text: str | None = None,
+    task: str = "unknown",
+) -> str:
+    """Tier 0 is always written. Bodies ride along only when they qualify."""
+    keep_body = (not ok) or (random.random() < SUCCESS_SAMPLE_RATE)
+
+    doc = {
+        "task": task,
+        "ts": firestore.SERVER_TIMESTAMP,
+        "fp": fingerprint["fp"],
+        "fp_system": fingerprint["fp_system"],
+        "model": fingerprint["model"],
+        "config": fingerprint["config"],
+        "shape_user": fingerprint["shape_user"],
+        "usage": usage,
+        "finish_reason": finish_reason,
+        "latency_ms": latency_ms,
+        "ok": ok,
+        "tier": 1 if keep_body else 0,
+        "expires_at": _expires_at(TIER0_DAYS),  # the field the TTL policy reads
+    }
+
+    ref = db.collection("gen_logs").document()
+    ref.set(doc)
+
+    if keep_body:
+        # Bodies live in a separate collection with a shorter TTL
+        db.collection("gen_log_bodies").document(ref.id).set({
+            "request": request_body,
+            "response": response_text,
+            "expires_at": _expires_at(TIER1_DAYS),
+        })
+
+    return ref.id
+```
+
+That separate collection exists because of a constraint worth knowing: **Firestore TTL policies delete whole documents, never individual fields.**
+
+So "expire the body at 14 days but keep the fingerprint for 400" cannot happen inside a single document. It simply does not work.
+
+Two collections solve it. `gen_logs` is Tier 0 at 400 days; `gen_log_bodies` is Tier 1 at 14 days, keyed by the Tier 0 document ID so I can join them while both exist.
+
+Enable the policies per field:
+
+```bash
+gcloud firestore fields ttls update expires_at \
+  --collection-group=gen_logs --enable-ttl
+
+gcloud firestore fields ttls update expires_at \
+  --collection-group=gen_log_bodies --enable-ttl
+```
+
+TTL deletion is not instant. Google documents it as typically within 24 hours of the expiration time. In my project, records disappeared 3 to 7 hours after expiry on average. Read it as "starts being deleted after 14 days," not "gone at 14 days."
+
+Because deletion volume can push up write cost in bursts, I now scatter expirations by adding a random 0–90 minute offset to `expires_at`. Nothing expires at the same instant.
+
+## Why successes are sampled at 3%
+
+Keeping 100% of failures needed no thought. Successes did.
+
+You need a successful body only when quality is degrading quietly — no errors, but the output has shifted. That comparison requires reading successes side by side.
+
+The right amount is the smallest amount that still surfaces the change. My pipeline averages about 450 calls per day, so 3% leaves 13–14 bodies daily, roughly 190 over 14 days. Enough to line up and read.
+
+The rate is not uniform, though. Classification for my wallpaper app, whose output is short and formulaic, runs at 1%. Article metadata generation, where I actually have to read prose, runs at 8%. Put the budget where reading happens.
+
+For the underlying reasoning about populations and detection power, see [sampling the outputs you already auto-accepted](/articles/gemini-api/gemini-auto-accepted-output-acceptance-sampling-review-budget-design). The 3% here is that same "work backward from what a human can read" idea, applied to retention instead of review.
+
+## Three weeks in
+
+<table>
+  <thead>
+    <tr><th>Measure</th><th>Before</th><th>After</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Average per record</td><td>~11 KB</td><td>~0.9 KB (Tier 0)</td></tr>
+    <tr><td>Monthly storage</td><td>~150 MB</td><td>~12 MB</td></tr>
+    <tr><td>Records holding bodies</td><td>All</td><td>~4.6% (failures plus sample)</td></tr>
+    <tr><td>Bodies retained indefinitely</td><td>Yes</td><td>No (14 days maximum)</td></tr>
+  </tbody>
+</table>
+
+Storage fell about 92%. That was a side effect. The row I wanted was the last one.
+
+On traceability: two investigations came up in those three weeks, and Tier 0 alone reached the cause in both.
+
+The first was shorter output. `fp_system` had not changed — my prompt was untouched — yet the median `usage.candidatesTokens` had dropped from 320 to 190. The `model` field showed the date lining up exactly with the day the `gemini-flash-latest` alias started pointing somewhere new. A side effect of pinning to an alias. I read zero lines of body text.
+
+Detecting that swap directly is its own topic, covered in [catching a silent default-model upgrade](/articles/gemini-api/gemini-api-default-model-pinning-silent-upgrade-detection-production). What struck me here was landing on the same answer as a byproduct of retention design, without any dedicated monitor.
+
+The second went the other way: Tier 0 was not enough. Classification wobbled on certain inputs. I narrowed it to `shape_user.chars` clustering near 200, and then I needed text.
+
+Four sampled bodies happened to sit in that band, and two showed the same wobble. That was luck, and I should call it that. Zero samples would have left me stuck.
+
+The honest failures, too. At first `shape_user` carried only `has_cjk`. Thai and Vietnamese inputs registered as neither CJK nor Latin, collapsing into one indistinct bucket, so per-language patterns stayed invisible. Adding three Unicode blocks fixed it going forward — but a fingerprint is awkward to extend after the fact, because old records never gain the new field. **Write down more than you think you need before you start throwing text away.**
+
+One more. Truncating the fingerprint to 16 characters was aesthetic, not reasoned. No collisions at 41,000 records, but that deserves review if the scale changes. It stands for now only because a collision would degrade identity matching rather than surface the wrong body.
+
+If you also want to watch the outputs themselves drift, [tracking model swaps through an output style fingerprint](/articles/gemini-api/gemini-style-fingerprint-drift-detection-default-model-swap) approaches it from the other side. This article fingerprints the input; that one characterizes the output. Having both lets you close in from cause and effect at once.
+
+## Run the fingerprint alongside for one week
+
+You do not have to delete anything yet.
+
+Leave your logging exactly as it is and write `prompt_fingerprint()` into an extra field for a week. The next investigation will then tell you, with evidence, how far you can get without bodies.
+
+Shrink retention after you have that feel for it. I did it in the opposite order, which is how I ended up rebuilding `shape_user`.
+
+Noticing that other people's words had been quietly accumulating inside my own pipeline was an uncomfortable moment. I think the discomfort was right. Thank you for reading.
