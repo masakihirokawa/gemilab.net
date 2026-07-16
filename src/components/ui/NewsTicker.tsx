@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PRO35 — Gemini 3.5 Proのリリース目標が7月17日と報じられています。ただし日付・コンテキスト長・価格のいずれもGoogleの公式発表ではありません",
-    "REBUILD — 2.5 Proのアーキテクチャを白紙化した全面再設計とされ、再帰的なツール呼び出しとSVG生成での構造的な失敗が理由と報じられています",
-    "FLASH35 — 広く提供中の最新リリースはGemini 3.5 Flash。コーディング・エージェント・マルチモーダル・長文書処理を高速かつ低コストで担います",
-    "SAATHI — Gemini 3.5 Flashを核にしたATL Saathiが、インドの100校でパイロット開始。教員向けに24時間対応の授業計画・研修アシスタントを提供します",
-    "SEA — 東南アジアレポートでは、プロンプトの約70%が現地語（ベトナム89%・タイ87%・インドネシア84%）。リクエストの約4分の3がモバイル発です",
-    "SHEETS — 7月15日から、AI Expanded Accessライセンス保有者はFill with GeminiとSheetsのAI関数の利用上限が引き上げられました",
+    "PRO35 — Gemini 3.5 Proの報道上の目標日である7月17日を迎えましたが、本日時点でGoogleの公式発表もモデルカードの公開も確認できていません",
+    "UNCONFIRMED — 2Mトークンのコンテキストも価格もGoogleは未確認のままです。Vertex AIでの限定的なエンタープライズプレビューにとどまると報じられています",
+    "FLASH35 — 一般提供中の最新はgemini-3.5-flash。gemini-flash-latestが指すモデルもこちらに切り替わっています",
+    "AGENTS — Gemini APIのManaged Agentsが公開プレビューに。Googleがホストする隔離Linuxサンドボックス上で、状態を持つ自律エージェントを動かせます",
+    "SEARCH — File Searchがマルチモーダル検索に対応。gemini-embedding-2で画像をそのまま埋め込んで検索できます",
+    "WEBHOOKS — Batch APIと長時間実行オペレーションのポーリングを置き換える、イベント駆動のWebhookが追加されました",
   ],
   en: [
-    "PRO35 — Gemini 3.5 Pro is reported to target July 17, though the date, context window, and pricing all remain unconfirmed by Google",
-    "REBUILD — The model is said to be a ground-up rebuild after the 2.5 Pro architecture was scrapped over structural failures in recursive tool-calling and SVG generation",
-    "FLASH35 — Gemini 3.5 Flash is the newest broadly available release, tuned for faster, lower-cost coding, agents, multimodal, and long-document work",
-    "SAATHI — ATL Saathi, built on Gemini 3.5 Flash, begins piloting in 100 Indian schools as a 24/7 planning and training assistant for Tinkering Lab educators",
-    "SEA — In Southeast Asia, nearly 70% of prompts arrive in native languages — Vietnam 89%, Thailand 87%, Indonesia 84% — and 3 in 4 requests come from mobile",
-    "SHEETS — From July 15, AI Expanded Access licenses raise the usage limits for Fill with Gemini and the AI function in Sheets",
+    "PRO35 — July 17, the date reported as Gemini 3.5 Pro's target, has arrived with no official Google announcement or model card confirmed as of today",
+    "UNCONFIRMED — The 2M-token context window and pricing both remain unconfirmed by Google; reports place the model in limited enterprise preview on Vertex AI",
+    "FLASH35 — gemini-3.5-flash is the current GA release, and is now the model that gemini-flash-latest points to",
+    "AGENTS — Managed Agents enter public preview in the Gemini API, running stateful, autonomous agents inside isolated Google-hosted Linux sandboxes",
+    "SEARCH — File Search adds multimodal search, letting you natively embed and query images with gemini-embedding-2",
+    "WEBHOOKS — Event-driven webhooks arrive to replace polling workflows for the Batch API and long-running operations",
   ],
 };
 
