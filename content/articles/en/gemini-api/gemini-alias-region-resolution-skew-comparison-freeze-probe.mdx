@@ -1,0 +1,200 @@
+---
+title: "The Same gemini-flash-latest Pointed to Different Models in Different Regions"
+slug: "gemini-alias-region-resolution-skew-comparison-freeze-probe"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-18T08:00"
+author: "Gemini Lab"
+description: "Alias resolution rolls out region by region. Send the same gemini-flash-latest to Tokyo and us-central1 and, for a few days, different models answer. Here is why that quietly invalidates your comparisons, and how a one-shot probe catches it."
+tags: ["gemini-api", "vertex-ai", "model-versioning", "multi-region", "production"]
+highlights:
+  - "Why alias resolution skews per region during a rollout, and why every cross-region measurement taken in that window is unusable"
+  - "A dependency-free skew probe that sends one tiny request per region and compares the returned model_version"
+  - "A freeze flag that suppresses comparisons while skew is live, plus the cache-key change that stops one model's output from being served as another's"
+---
+
+Same prompt. Same code. Same SDK version. The only difference was the region — and yet `asia-northeast1` and `us-central1` were returning noticeably different response lengths.
+
+This was right after July 15, when `gemini-flash-latest` began resolving to Gemini 3.5 Flash. My setup was the kind of thing an indie developer ends up with: Tokyo for users in Japan, us-central1 for everyone else, the same alias string written in both paths because writing it twice felt like duplication. For a few days, those two strings meant two different models.
+
+The awkward part was that nothing broke. Both responses were valid. The JSON parsed. All that happened is that a week of notes — "Tokyo feels faster," "the English output runs shorter" — turned out to measure something other than what I thought. I had been measuring model differences and calling them regional differences.
+
+## An alias is not a global name
+
+I had quietly assumed `gemini-flash-latest` was a global shortcut: one name, one underlying model, no matter where you call it from. That is not what it is. An alias is a **local name for whatever the current recommended version happens to be in that region**.
+
+When a new version reaches GA, the rollout advances region by region. Not everywhere at once. So an alias does not give you these three things simultaneously:
+
+<table>
+  <thead>
+    <tr><th>What I assumed</th><th>What is actually true</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Same model whenever I call</td><td>Swaps without notice during rollout</td></tr>
+    <tr><td>Same model wherever I call from</td><td><strong>Resolution skews per region for a window</strong></td></tr>
+    <tr><td>I get told when it changes</td><td>Invisible unless you read the response</td></tr>
+  </tbody>
+</table>
+
+The first row is fairly well known. The second is the one I had never accounted for — and pinning, the usual advice, only addresses the first. Anywhere I had left an alias in place across multiple regions, pinning was doing nothing for me.
+
+The good news: the response tells you which model actually answered. That field is `model_version`.
+
+```python
+# What this solves: find out which concrete version answers an alias in each
+# region. While these disagree, any cross-region number you collect is
+# contaminated by a model difference rather than a regional one.
+import os
+from google import genai
+
+def resolve(location: str, alias: str = "gemini-flash-latest") -> str:
+    client = genai.Client(
+        vertexai=True,
+        project=os.environ["GOOGLE_CLOUD_PROJECT"],
+        location=location,
+    )
+    res = client.models.generate_content(
+        model=alias,
+        contents="ok",  # we only want the resolution, so keep input minimal
+    )
+    return res.model_version
+
+for loc in ("asia-northeast1", "us-central1"):
+    print(f"{loc:16s} -> {resolve(loc)}")
+```
+
+Sample output:
+
+```
+asia-northeast1  -> gemini-3.5-flash
+us-central1      -> gemini-3.1-flash
+```
+
+Those two lines were enough to make me close that week's measurement notes. The `"ok"` payload is deliberate — the resolution is all I need, so there is no reason to spend input tokens. At a few tokens per call and $1.50 per million input tokens for `gemini-3.5-flash`, running this across two regions daily costs effectively nothing.
+
+## Skew corrupts more than your comparisons
+
+Working through what actually breaks during the skew window, the damage fell into three directions.
+
+**Comparisons and canaries.** Any design that diffs region A against region B silently assumes both are the same model. Once that assumption fails, you cannot attribute the difference to anything.
+
+**Latency numbers.** "Tokyo's p95 is 200ms faster" reads like a network-distance story. If two model generations are mixed in, it might be inference time instead.
+
+**Caching.** This one hurt most quietly. My response cache keyed on `alias + hash(prompt)`. So output generated by `gemini-3.5-flash` in Tokyo got stored under the name `gemini-flash-latest`, and a us-central1 request read it back. If you share a cache across regions, you end up **serving one model's output as another model's output**.
+
+The fix was a single line: key on what answered, not on what you asked for.
+
+```python
+# What this solves: put the concrete version that answered into the cache key
+# instead of the alias name, so two different models can never share a key
+# during a rollout.
+import hashlib
+
+def cache_key(model_version: str, prompt: str) -> str:
+    # model_version comes from res.model_version (e.g. "gemini-3.5-flash").
+    # Keying on the alias ("gemini-flash-latest") means that the moment
+    # resolution moves, stale output is served under the new model's name.
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:32]
+    return f"{model_version}:{digest}"
+```
+
+On write you obviously have `model_version` in hand; on read you have not called yet, so you do not. I resolved that by having the read path reuse the region's resolution once per day. Less precise than I would like, but keeping two models out of one key mattered more than elegance.
+
+## Keep exactly one probe
+
+I had no appetite for building something elaborate. What I needed was a single boolean: are the regions disagreeing right now?
+
+```python
+# What this solves: record every region's resolution once a day and set
+# skew=True when they disagree. Comparison jobs read this before running, so
+# contaminated data never gets collected in the first place.
+import json
+import pathlib
+from datetime import datetime, timezone
+
+REGIONS = ("asia-northeast1", "us-central1", "europe-west4")
+STATE = pathlib.Path("alias_skew_state.json")
+
+def probe(alias: str = "gemini-flash-latest") -> dict:
+    resolved = {loc: resolve(loc, alias) for loc in REGIONS}
+    versions = set(resolved.values())
+    state = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "alias": alias,
+        "resolved": resolved,
+        "skew": len(versions) > 1,
+    }
+    STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    return state
+
+def comparisons_allowed() -> bool:
+    if not STATE.exists():
+        return False  # no state means fail closed
+    return not json.loads(STATE.read_text())["skew"]
+```
+
+On days when `comparisons_allowed()` returns `False`, I do not generate the cross-region report at all. I considered publishing it with a "treat as indicative only" note attached, then decided that such notes do not get read. Not publishing is more reliable.
+
+Returning `False` when `STATE` is missing is deliberate. I did not want a broken probe to read as "probably fine." Having no evidence and having no problem are different states.
+
+In the one rollout I watched, the regions converged in about three days. That is a single observation, and it will vary by model and region pair. Rather than trusting the number, I found it cheaper to just ask once a day.
+
+## What to do with data you already collected
+
+The probe does not retroactively fix anything you gathered before installing it. You either salvage it or bin it.
+
+I had not been logging `model_version` — on a small indie budget the field looked like noise worth dropping — so my early-July measurements were unsalvageable — there was no way to reconstruct which row came from which model. They went in the bin.
+
+If you do have the field logged, you can often rescue the data by changing the grouping. Wherever you grouped by alias name, group by the resolved version instead. A contaminated "Tokyo vs us-central1" comparison sometimes becomes a meaningful "3.5 Flash vs 3.1 Flash" comparison.
+
+```python
+# What this solves: move the aggregation axis from the alias name to the
+# concrete model_version, so logs spanning a rollout can still be read with
+# the two models separated.
+from collections import defaultdict
+
+def latency_by_resolved(rows: list[dict]) -> dict:
+    # each row: {"region": ..., "model_version": ..., "latency_ms": ...}
+    # Wrong: group by region alone -> mixes models during rollout
+    # Right: group by (region, model_version) -> compares like with like
+    buckets = defaultdict(list)
+    for r in rows:
+        buckets[(r["region"], r["model_version"])].append(r["latency_ms"])
+    return {
+        k: sorted(v)[len(v) // 2]  # median
+        for k, v in buckets.items()
+        if len(v) >= 30  # ignore thin buckets
+    }
+```
+
+The `len(v) >= 30` cutoff exists because at the edges of a rollout one version may have only a handful of samples, and I could not read anything useful from those medians. There is no principle behind 30 — it is simply where my own judgment stopped working. Tune it to your traffic.
+
+## Where an alias still earns its place
+
+After adding the probe, I revisited where aliases belong at all. Pinning everything is not free either: it means everything expires on the same day.
+
+<table>
+  <thead>
+    <tr><th>Code path</th><th>What I put there</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Cross-region comparisons and canaries</td><td><strong>Pinned only</strong></td><td>You are measuring region. A model difference makes the measurement meaningless</td></tr>
+    <tr><td>Anything behind a shared cache</td><td><strong>Pinned, or put the version in the key</strong></td><td>Two models otherwise share one key</td></tr>
+    <tr><td>Output parsed by machines (JSON, function calling)</td><td>Pinned</td><td>Schema strictness shifts across generations</td></tr>
+    <tr><td>User-facing chat UI</td><td>Alias is fine</td><td>Users expect current. Watch quality separately</td></tr>
+    <tr><td>Single-region internal tools</td><td>Alias is fine</td><td>Skew cannot occur, and the blast radius is small</td></tr>
+  </tbody>
+</table>
+
+Running this alone, without a platform team to catch it downstream, my own preference is to pin when in doubt. What an alias buys you is "you get the new model even if you forget to update" — which is the same sentence as "you get moved without noticing." I take that convenience only where being moved costs me nothing. Since drawing that line, I spend far less time deliberating.
+
+Pinning does hand you an expiry to manage; [handling Gemini API model deprecation and migration errors](/articles/gemini-api/gemini-api-model-deprecation-migration-guide) covers that side. For recording which version answered on a per-request basis, [tracking production cost with usageMetadata](/articles/gemini-api/gemini-api-usage-metadata-cost-tracking-production) is the closest neighbour.
+
+## One thing if you never leave a single region
+
+Everything above assumed multiple regions. On a single region, skew cannot happen. If you take one thing away regardless, make it this: **log `model_version`**.
+
+It is one line. With it, "something feels different from last week" becomes a question you can answer with a fact. Without it, you cannot even establish that anything changed, and you will spend hours suspecting your prompt. I have done exactly that.
+
+The legacy image generation models shut down on August 17, and periods around a deadline are periods when rollouts move. If you do one thing this week, `grep` your codebase for `-latest` and check whether those lines cross regions or feed a cache key. The probe can come afterwards.
