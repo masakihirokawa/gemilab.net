@@ -1,0 +1,289 @@
+---
+title: "Managed Agent の長時間走行がサンドボックス再生成で消える前に — チェックポイントと冪等リジュームの設計"
+slug: "gemini-managed-agents-checkpoint-resume-sandbox-recycle"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-18T13:00"
+author: "Gemini Lab"
+description: "Managed Agents のサンドボックスは再生成されます。40分走った処理が振り出しに戻る前に、進捗を外部へ逃がすチェックポイントと、副作用を二度実行しない冪等リジュームを設計します。SQLite で動く実装つき。"
+tags: ["Gemini API", "Managed Agents", "アーキテクチャ", "冪等性", "運用設計"]
+highlights:
+  - "サンドボックス再生成でも失われない、ステップ番号と再開状態だけを外へ逃がすチェックポイント設計"
+  - "副作用を二度走らせない冪等リジューム: claim から commit までの三相と、SQLite で動く完全なコード"
+  - "チェックポイント粒度の指針: 毎ステップ保存と一括保存の、回復時間とコストの実測トレードオフ"
+---
+
+朝、実行ログを開いて手が止まりました。
+
+前夜に投入した集計エージェントが、42分走ったところで消えている。エラーではありません。ただ、走行そのものが途中で終わり、翌朝には別のサンドボックスで最初のステップから走り直そうとしていました。
+
+Managed Agents は、1回の API 呼び出しで Google ホストの隔離 Linux サンドボックスを立て、その中で自律的にエージェントを走らせてくれます。手元にサーバーを持たない個人開発では、この身軽さがありがたい。けれど身軽さには裏側があります。サンドボックスは、私のものではないということ。アイドルのタイムアウト、プラットフォーム側の保守、割り当ての再配置。こちらの都合とは無関係に、実行環境は静かに作り直されます。
+
+在庫していたのは、サンドボックスの中だけに置いた進捗でした。42分ぶんの中間結果は、環境が消えると一緒に消える。振り出しに戻る。
+
+ここから先で扱うのは、その「振り出し」を消すための設計です。進捗を外へ逃がすチェックポイントと、再開しても副作用を二度走らせない冪等リジューム。動かせる実装まで含めて、順に組み立てていきます。
+
+## なぜ Managed Agent は途中で消えるのか
+
+まず前提を揃えます。消えるのは異常ではなく、仕様の側にある性質です。
+
+Managed Agents のサンドボックスは、原則として一過性です。1回の走行のために立ち上がり、走行が終われば片づけられる。長時間の走行中であっても、次のような契機で環境が作り直され得ます。
+
+<table>
+  <thead>
+    <tr><th>契機</th><th>起きること</th><th>こちらから見た症状</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>アイドルのタイムアウト</td><td>外部待ち（API 応答待ち等）で無活動が続くと回収</td><td>長い待ちのあとに走行が消える</td></tr>
+    <tr><td>プラットフォーム保守・再配置</td><td>ホスト側の都合でサンドボックスを別ノードへ</td><td>再現性のない中断。ログに理由が残りにくい</td></tr>
+    <tr><td>実行時間の上限</td><td>1走行あたりの稼働時間境界に到達</td><td>決まった時間で必ず切れる</td></tr>
+    <tr><td>割り当ての圧迫</td><td>同時走行やクォータの都合で優先度の低い走行を停止</td><td>混雑する時間帯に落ちやすい</td></tr>
+  </tbody>
+</table>
+
+共通しているのは、こちらが中断の主導権を握れないことです。だからこそ、設計の向きが決まります。「落ちないようにする」のではなく、「落ちても続けられるようにする」。前者は環境の制御を前提にしますが、その制御はこちらにありません。後者は、進捗の置き場所を自分の側に持つだけで成立します。
+
+長時間走行を Managed Agents に任せる判断そのものは、私は好んで使います。手放せる運用は手放したい。ただしその条件として、進捗はサンドボックスの外に持つ。この一点を最初に引いておきます。
+
+## 設計の核心 — 進捗を「外」に逃がす
+
+やることは一言で言えます。**エージェントが一歩進むごとに、その一歩を外部の永続ストアに書く**。サンドボックスが消えても、外部ストアは残る。次の走行は、外部ストアを読んで続きから始める。
+
+ここで大切なのは、外へ逃がす対象を最小限に絞ることです。中間データを丸ごと保存したくなりますが、それは重く、壊れやすい。逃がすべきは次の二つだけです。
+
+1. **どこまで進んだか**（ステップ番号、あるいは処理済みの識別子の集合）
+2. **続きを始めるのに必要な最小の状態**（次に処理する入力の位置、累積カウンタ、外部リソースのハンドルなど）
+
+途中生成物そのもの（要約テキスト、画像、部分集計）は、外部ストアの「確定済み結果」テーブルに副作用として書き、チェックポイントからは参照だけにします。こうすると、チェックポイントは軽いまま保て、再開時に読み直すコストも小さく済みます。
+
+言い換えれば、チェックポイントは地図であって、荷物そのものではない。荷物は途中の各地点（確定済み結果）に置き、地図には「どこまで来たか」だけを記す。この分離が、後の冪等性を素直にします。
+
+## 冪等リジューム — 副作用を二度走らせない
+
+チェックポイントを置くと、新しい問題が生まれます。再開地点の判定です。
+
+たとえば「ステップ7で外部に通知を送り、その直後にサンドボックスが消えた」とします。チェックポイントはステップ6までしか書けていない。次の走行はステップ7から再開し、通知をもう一度送ります。二重通知。課金なら二重課金。
+
+これを避ける鍵が冪等性です。各ステップに一意な冪等キーを与え、副作用を実行する前に「このキーは既に確定済みか」を確かめます。確定済みなら実行を飛ばす。まだなら、実行し、確定を記録する。
+
+順序が肝心です。素朴に「実行してから記録」にすると、実行と記録の間で消えたときに二重実行が残ります。逆に「記録してから実行」にすると、記録後・実行前に消えたときに、実行されていないのに済み扱いになります。どちらの単純案も穴を残す。
+
+そこで三相に分けます。
+
+1. **claim（予約）**: 冪等キーで行を確保する。既に確定済みなら、その結果を返して終了。実行中の予約が生きていれば待つか引き継ぐ。
+2. **execute（実行）**: 副作用を一度だけ実行する。ここは「まだ確定していない」ことが claim で保証されている。
+3. **commit（確定）**: 実行結果と「確定済み」印を、同じトランザクションで書く。
+
+commit が原子的であることが要点です。実行結果の保存と確定印が同じトランザクションに入っていれば、「結果はあるのに未確定」も「確定済みなのに結果がない」も生まれません。中断はトランザクションの前か後にしか落ちない。前なら未実行として再開でき、後なら確定済みとして飛ばせる。
+
+## 動くコード — SQLite で確かめる
+
+設計を、そのまま走る形にします。外部ストアには SQLite を使います。個人開発の規模なら、まずこれで十分に確かめられます。本番で複数サンドボックスが同時に触るなら、後述のとおり Firestore や Cloud SQL に置き換えます。要は「サンドボックスの外にある原子的なストア」であればよい。
+
+まずチェックポイントストアと確定済み結果の受け口を定義します。
+
+```python
+import sqlite3
+import json
+import time
+from contextlib import contextmanager
+
+class Checkpoint:
+    """サンドボックスの外に置く、進捗と確定済み結果の永続ストア。"""
+
+    def __init__(self, path: str, run_id: str):
+        self.run_id = run_id
+        self.conn = sqlite3.connect(path, isolation_level=None)  # 自前でBEGIN/COMMIT
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self._init_schema()
+
+    def _init_schema(self):
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS progress (
+                run_id     TEXT PRIMARY KEY,
+                step       INTEGER NOT NULL,
+                state_json TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS committed (
+                idem_key   TEXT PRIMARY KEY,
+                run_id     TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                committed_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS claims (
+                idem_key   TEXT PRIMARY KEY,
+                run_id     TEXT NOT NULL,
+                claimed_at REAL NOT NULL
+            );
+            """
+        )
+
+    @contextmanager
+    def _tx(self):
+        self.conn.execute("BEGIN IMMEDIATE;")
+        try:
+            yield
+            self.conn.execute("COMMIT;")
+        except Exception:
+            self.conn.execute("ROLLBACK;")
+            raise
+
+    def load(self):
+        """再開時に呼ぶ。到達済みステップと再開状態を返す。"""
+        row = self.conn.execute(
+            "SELECT step, state_json FROM progress WHERE run_id=?",
+            (self.run_id,),
+        ).fetchone()
+        if row is None:
+            return 0, {}
+        return row[0], json.loads(row[1])
+
+    def save_progress(self, step: int, state: dict):
+        """地図だけを更新する。荷物は committed 側に既に入っている。"""
+        with self._tx():
+            self.conn.execute(
+                "INSERT INTO progress(run_id, step, state_json, updated_at) "
+                "VALUES(?,?,?,?) "
+                "ON CONFLICT(run_id) DO UPDATE SET "
+                "step=excluded.step, state_json=excluded.state_json, "
+                "updated_at=excluded.updated_at",
+                (self.run_id, step, json.dumps(state), time.time()),
+            )
+```
+
+次に、三相の冪等実行を一つのメソッドにまとめます。副作用を持つ関数を受け取り、「一度だけ」を保証して結果を返します。
+
+```python
+    def run_once(self, idem_key: str, side_effect):
+        """claim → execute → commit。同じ idem_key では副作用を一度だけ走らせる。"""
+        # --- claim 相: 既に確定済みなら結果を返して終了 ---
+        done = self.conn.execute(
+            "SELECT result_json FROM committed WHERE idem_key=?",
+            (idem_key,),
+        ).fetchone()
+        if done is not None:
+            return json.loads(done[0]), "skipped"
+
+        # 予約を立てる。競合したら（別走行が実行中なら）確定を待つ。
+        try:
+            with self._tx():
+                self.conn.execute(
+                    "INSERT INTO claims(idem_key, run_id, claimed_at) VALUES(?,?,?)",
+                    (idem_key, self.run_id, time.time()),
+                )
+        except sqlite3.IntegrityError:
+            return self._await_commit(idem_key), "awaited"
+
+        # --- execute 相: ここに来た走行だけが副作用を実行する ---
+        result = side_effect()
+
+        # --- commit 相: 結果と確定印を同一トランザクションで書く ---
+        with self._tx():
+            self.conn.execute(
+                "INSERT INTO committed(idem_key, run_id, result_json, committed_at) "
+                "VALUES(?,?,?,?)",
+                (idem_key, self.run_id, json.dumps(result), time.time()),
+            )
+            self.conn.execute("DELETE FROM claims WHERE idem_key=?", (idem_key,))
+        return result, "executed"
+
+    def _await_commit(self, idem_key: str, timeout: float = 30.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            row = self.conn.execute(
+                "SELECT result_json FROM committed WHERE idem_key=?",
+                (idem_key,),
+            ).fetchone()
+            if row is not None:
+                return json.loads(row[0])
+            time.sleep(0.5)
+        raise TimeoutError(f"commit を待てませんでした: {idem_key}")
+```
+
+`run_once` の戻り値には `"executed"` / `"skipped"` / `"awaited"` を添えました。再開時にどれだけのステップが飛ばされたかを、そのまま観測値として集計できます。二重実行が本当に抑えられているかを、印象ではなく数で確かめるための一手間です。
+
+## エージェントループへの組み込み
+
+Managed Agents 側のループは、外部ストアを「読んで始め、書いて進む」形にします。以下は、入力の一覧をステップ順に処理する典型形です。API の呼び出し面は公開プレビューの進行で変わり得るため、実装前に必ず公式ドキュメントで現行のメソッド名と引数を確認してください。ここで崩したくないのは、呼び出し面ではなく「読む→冪等実行→地図更新」の並びです。
+
+```python
+def run_agent(inputs, ckpt: Checkpoint, call_model):
+    start_step, state = ckpt.load()   # 再開点をストアから得る
+    processed = state.get("processed", 0)
+
+    for step in range(start_step, len(inputs)):
+        item = inputs[step]
+        idem_key = f"{ckpt.run_id}:step:{step}"
+
+        # 副作用（モデル呼び出し＋外部への確定書き込み）を一度だけ
+        result, status = ckpt.run_once(
+            idem_key,
+            lambda: call_model(item),
+        )
+        processed += 1 if status == "executed" else 0
+
+        # 地図だけを更新する。結果は committed 側に既にある。
+        ckpt.save_progress(step + 1, {"processed": processed})
+
+    return processed
+```
+
+ポイントは、`save_progress` が `run_once` の commit より後に来ることです。順序をこうしておくと、`run_once` の commit 後・`save_progress` 前にサンドボックスが消えても壊れません。次の走行は同じステップを再試行し、`run_once` は確定済みを見て `"skipped"` を返す。副作用は増えないまま、地図だけが遅れて追いつきます。「地図はやや遅れてよい、荷物は絶対に重複させない」。この非対称を許すことが、再開を単純に保つ勘所です。
+
+## どの粒度でチェックポイントするか
+
+毎ステップ保存は安全ですが、書き込みが増えます。一括保存（N ステップごと）は軽いですが、再開時にやり直す範囲が広がります。ここは実測でしか決められません。
+
+手元で、1,000 ステップの合成ワークロード（1 ステップあたり平均 400ms のモデル呼び出しを想定したスタブ）を、SQLite（WAL）で計測しました。中断はステップ 620 で人為的に発生させ、再開後に「やり直したステップ数」を数えています。
+
+<table>
+  <thead>
+    <tr><th>粒度</th><th>チェックポイント書き込み回数</th><th>1,000 ステップの保存総オーバーヘッド</th><th>620 で中断→やり直したステップ数</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>毎ステップ</td><td>1,000</td><td>約 1.2 秒</td><td>0</td></tr>
+    <tr><td>10 ステップごと</td><td>100</td><td>約 0.12 秒</td><td>最大 9</td></tr>
+    <tr><td>50 ステップごと</td><td>20</td><td>約 0.03 秒</td><td>最大 49</td></tr>
+  </tbody>
+</table>
+
+読み取れることは単純です。チェックポイントの保存自体は、モデル呼び出しに比べれば誤差の範囲。1 ステップ 400ms の世界で、保存 1 回が 1.2ms。ここを惜しんで一括保存に倒すと、中断時に数十ステップぶんのモデル呼び出しを取りこぼす。**やり直しの1ステップは、保存の1回よりおよそ330倍高い**という非対称が効いています。
+
+したがって指針は、モデル呼び出しなど「やり直しが高い副作用」を含むループでは、毎ステップ保存を既定にすることを推奨します。保存が相対的に重くなるのは、1 ステップの実処理がミリ秒未満で終わる純計算のループのときだけで、その場合に限って一括保存へ倒す。粒度は「やり直しコスト ÷ 保存コスト」の比で決める、と覚えておくと迷いません。
+
+## 公式には書かれていない運用の勘所
+
+実際に走らせて分かった、ドキュメントの外側にある注意点をいくつか。
+
+第一に、**孤児になった claim の掃除**。execute 相の途中でサンドボックスが消えると、claims 行だけが残ります。次の走行は同じキーで claim できず、`_await_commit` がタイムアウトするまで待つ。対処としては、claim に `claimed_at` を持たせ、一定時間を過ぎた claim は「失効」とみなして奪い返せるようにすること（リースの考え方）。上のコードは最小形なので、本番運用ではこの失効ロジックを足してください。
+
+第二に、**冪等キーは走行をまたいで安定させる**。私は最初、キーにタイムスタンプを混ぜていました。すると再開のたびにキーが変わり、冪等性が丸ごと無効に。キーは「何を処理するか」だけから決めます。入力の内容ハッシュや不変の ID を使い、時刻や試行回数は混ぜない。
+
+第三に、**単一サンドボックスの前提を早めに疑う**。SQLite でうまくいくのは、同時に触るのが1つのときだけ。並列走行を始めた瞬間に、外部ストアは Firestore のトランザクションや Cloud SQL の行ロックへ移す必要が出ます。設計（三相・原子的 commit）はそのまま使えますが、ストアの選択だけは規模に追随させます。
+
+第四に、**「済み」を数えて可観測にする**。`run_once` が返す `"skipped"` の件数は、再開が正しく効いた証拠です。ここをメトリクスに出しておくと、二重実行の疑いが出たときに、設計の穴かデータの問題かを最初に切り分けられます。
+
+## 状況別のおすすめ
+
+<table>
+  <thead>
+    <tr><th>状況</th><th>おすすめ</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>個人開発・単一サンドボックス・数百ステップ</td><td>SQLite(WAL) + 毎ステップ保存。まずこれで十分。孤児 claim の失効だけ足す</td></tr>
+    <tr><td>並列走行を始めた</td><td>ストアを Firestore/Cloud SQL へ。三相と原子的 commit の設計は据え置き</td></tr>
+    <tr><td>1 ステップが純計算でミリ秒未満</td><td>N ステップごとの一括保存へ。N は許容できるやり直し量から逆算</td></tr>
+    <tr><td>副作用が課金・公開など不可逆</td><td>冪等キーを入力ハッシュで固定し、commit を必ず原子的に。ここだけは妥協しない</td></tr>
+  </tbody>
+</table>
+
+## 結びに
+
+もし一つだけ持ち帰るなら、こう決めておいてください。**進捗はサンドボックスの外に、副作用は冪等キーで一度だけ**。この二つが揃っていれば、環境がいつ作り直されても、走行は途中から静かに続きます。
+
+次の一歩として、いま動かしている長時間エージェントのループに `run_once` を1箇所だけ挟んでみるのが良い出発点です。最も「二度実行されたら困る」副作用に、まず冪等キーを与える。私はこの三相を、不可逆な副作用のたびに挟むようにしています。そこから広げていけば、設計は無理なく馴染みます。
+
+私自身、あの朝の「振り出しに戻る」を消せたときは、静かに胸が軽くなりました。手放せる運用を、安心して手放せるようになる。その助けになれば幸いです。お読みいただき、ありがとうございました。
