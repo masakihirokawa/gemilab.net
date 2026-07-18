@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PRO35 — 報道が目標日としていた7月17日を過ぎましたが、Gemini 3.5 Proの公式発表もモデルカードも本日時点で確認できていません。予備日として7月24日が挙げられています",
-    "NB2LITE — Nano Banana 2 Lite（Gemini 3.1 Flash-Lite Image）が登場しました。約4秒で画像を生成し、1,000枚あたり0.034ドルという水準です",
-    "OMNI — Gemini Omni Flashが公開プレビューに入りました。最長10秒の動画を生成でき、価格は出力1秒あたり0.10ドルです",
-    "EDIT — Omni Flashは会話による編集を軸に設計されています。登場人物の差し替え、ライティングの変更、アングルの調整を自然文で指示でき、元の音声と映像のトラックは保持されます",
-    "SYNTHID — 新しい2モデルにはSynthIDの電子透かしが組み込まれており、生成物の来歴をGeminiアプリ側から確認できます",
-    "SHUTDOWN — 旧来の画像生成モデルは非推奨となり、8月17日に停止されます。移行の期限をご確認いただければと思います",
+    "NANOLITE — Nano Banana 2 Liteが登場しました。Googleで最も速く、最もコスト効率の高いGemini Imageモデルで、軽量な画像生成を安く回したい用途に向いています",
+    "OMNIFLASH — Gemini Omni Flashがpublic previewになりました。ネイティブにマルチモーダルなモデルで、企業や開発者が独自の動的な動画ワークフローを構築できます",
+    "AGENTS — Managed Agentsが拡張されました。background: trueでサーバー側の非同期実行とポーリング、リモートMCPサーバー連携、対話をまたぐ認証情報のリフレッシュに対応します",
+    "MEMORY — Memory BankのIngestEvents APIが一般提供になりました。イベントの取り込みとメモリ生成を分離し、コンテンツを継続的にストリームできます",
+    "THROUGHPUT — Provisioned Throughputで、同一モデル・同一リージョンに対して最大7件の保留オーダーを提出できるようになりました",
+    "DEPRECATE — 画像生成モデルは8月17日に、Gemini Enterprise Agent PlatformのGrok 4.1系は8月20日に停止される予定です",
   ],
   en: [
-    "PRO35 — July 17, the date reports had pointed to, has passed without an official Gemini 3.5 Pro announcement or model card. July 24 is being cited as the fallback",
-    "NB2LITE — Nano Banana 2 Lite, otherwise known as Gemini 3.1 Flash-Lite Image, arrives as the fastest of the family: roughly four seconds per image at $0.034 per thousand",
-    "OMNI — Gemini Omni Flash enters public preview, generating video up to ten seconds long at $0.10 per second of output",
-    "EDIT — Omni Flash is built around conversational editing. Swap a character, relight a scene, or change the angle in plain language, and the original audio and video tracks stay intact",
-    "SYNTHID — Both new models carry SynthID watermarking, so anything they produce can be checked for provenance from inside the Gemini app",
-    "SHUTDOWN — The older image generation models are deprecated and switch off on August 17. Worth checking your migration window",
+    "NANOLITE — Nano Banana 2 Lite is here: Google's fastest and most cost-efficient Gemini Image model, made for running lightweight image generation cheaply",
+    "OMNIFLASH — Gemini Omni Flash is in public preview, a natively multimodal model that lets enterprises and developers build custom, dynamic video workflows",
+    "AGENTS — Managed Agents expand with background: true for async server-side runs and polling, remote MCP server integration, and refreshing credentials across interactions",
+    "MEMORY — The Memory Bank IngestEvents API is generally available, decoupling event ingestion from memory generation so you can stream content continuously",
+    "THROUGHPUT — Provisioned Throughput now lets you submit up to seven pending orders for the same model and region",
+    "DEPRECATE — Image generation models shut down on August 17, and the Grok 4.1 family on the Gemini Enterprise Agent Platform on August 20",
   ],
 };
 
