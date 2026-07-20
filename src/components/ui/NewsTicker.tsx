@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "OMNI — Gemini Omniが18歳以上の全Google AI加入者へグローバル展開されています。テキスト・写真・動画を組み合わせ、会話するように動画を作成・編集できます",
-    "SPARK — Gemini SparkがmacOS版Geminiアプリに登場しました。Google AI Ultra加入者向けに英語で提供が始まっています",
-    "AGENT — 汎用マネージドエージェントantigravity-preview-05-2026が公開プレビューになりました。サンドボックス内で自律的に計画・コード実行・ウェブ閲覧まで行えます",
-    "SHEETS — 7月15日からAI Expanded AccessライセンスでSheetsのFill with GeminiとAI関数の利用上限が引き上げられています",
-    "STUDENT — 日本を含む4カ国の学生向けGemini無償アップグレードは7月までです。対象の方は今月中の登録をおすすめします",
-    "IMGEND — 旧来の画像生成モデルは8月17日に停止されます。残り28日です。Nano Banana 2 Liteなど新モデルへの移行をおすすめします",
+    "API — Interactions APIが一般提供になりました。Google AI Studio・Gemini API・公式ドキュメントの既定がこちらへ切り替わり、レガシー形式に戻すトグルも用意されています",
+    "AGENTS — Interactions APIのGAでスキーマが安定し、Managed Agentsとバックグラウンド実行が加わりました。長時間バッチの組み方を見直す好機です",
+    "TRANSLATE — 70以上の言語を自動検出する音声間のほぼリアルタイム翻訳が、Live API・AI Studio・Google翻訳アプリへ展開されました。話者の抑揚を保つ設計です",
+    "NOTEBOOK — NotebookLMが「Gemini Notebook」に改称されました。3,000万人・60万組織以上が利用しているとされます",
+    "MODEL — 広く提供されている最新はGemini 3.5 Flashです。旗艦のGemini 3.5 Proはコーディング能力の改善に時間をかけており、数ヶ月の遅れが伝えられています",
+    "SIRI — Appleは新しいSiriに1.2兆パラメータのカスタムGeminiモデルを採用し、iOS 27での搭載を予定しています",
   ],
   en: [
-    "OMNI — Gemini Omni is rolling out globally to all Google AI subscribers 18 and over, letting you create and edit video as easily as having a conversation",
-    "SPARK — Gemini Spark has arrived in the Gemini app for macOS, available in English for Google AI Ultra subscribers",
-    "AGENT — The general-purpose managed agent antigravity-preview-05-2026 is in public preview, autonomously planning, running code, and browsing the web inside its sandbox",
-    "SHEETS — Since July 15, AI Expanded Access licenses get higher limits for Fill with Gemini and the AI function in Sheets",
-    "STUDENT — The free Gemini upgrade for students in Japan, Indonesia, the UK, and Brazil runs through July — sign up this month if you're eligible",
-    "IMGEND — Legacy image generation models shut down on August 17, 28 days away. Now is a good time to migrate to newer models like Nano Banana 2 Lite",
+    "API — The Interactions API is now generally available and is the default for Google AI Studio, the Gemini API, and the docs, with a toggle back to the legacy format",
+    "AGENTS — With GA, the Interactions API schema is stable and adds Managed Agents and background execution — a good moment to revisit how you run long batches",
+    "TRANSLATE — Near-real-time speech-to-speech translation across 70+ auto-detected languages is rolling out in the Live API, AI Studio, and the Google Translate app",
+    "NOTEBOOK — NotebookLM has been renamed Gemini Notebook, now used by over 30 million people and 600,000+ organizations",
+    "MODEL — Gemini 3.5 Flash is the newest broadly available release. The flagship Gemini 3.5 Pro is running months behind while its coding ability is improved",
+    "SIRI — Apple picked a custom 1.2-trillion-parameter Gemini model to power the rebuilt Siri, shipping with iOS 27 later this year",
   ],
 };
 
