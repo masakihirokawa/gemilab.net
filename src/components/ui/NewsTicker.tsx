@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "API — Interactions APIが一般提供になりました。Google AI Studio・Gemini API・公式ドキュメントの既定がこちらへ切り替わり、レガシー形式に戻すトグルも用意されています",
-    "AGENTS — Interactions APIのGAでスキーマが安定し、Managed Agentsとバックグラウンド実行が加わりました。長時間バッチの組み方を見直す好機です",
-    "TRANSLATE — 70以上の言語を自動検出する音声間のほぼリアルタイム翻訳が、Live API・AI Studio・Google翻訳アプリへ展開されました。話者の抑揚を保つ設計です",
-    "NOTEBOOK — NotebookLMが「Gemini Notebook」に改称されました。3,000万人・60万組織以上が利用しているとされます",
-    "MODEL — 広く提供されている最新はGemini 3.5 Flashです。旗艦のGemini 3.5 Proはコーディング能力の改善に時間をかけており、数ヶ月の遅れが伝えられています",
-    "SIRI — Appleは新しいSiriに1.2兆パラメータのカスタムGeminiモデルを採用し、iOS 27での搭載を予定しています",
+    "LOGS — Interactions APIの開発者ログがAI Studioダッシュボードで確認できるようになりました。対応する呼び出しの実行ステップを追え、デバッグと挙動確認がしやすくなっています",
+    "OMNI — Gemini Omni Flash（public preview）は、テキストから3〜10秒・720pの動画生成、静止画のアニメ化に対応し、生成した動画を会話でそのまま編集・洗練できます",
+    "INTERACT — Interactions APIがGAとなり、全ての新規プロジェクトで推奨されています。テキスト生成からマルチモーダル理解・ツール連携・エージェントまでを単一のインターフェースで扱えます",
+    "STATE — previous_interaction_idを使うとサーバー側に会話状態を保持できます。実行ステップは観測可能で、長時間タスクはバックグラウンド実行に対応します",
+    "NOTEBOOK — NotebookLMがGemini Notebookに改称されました。3,000万人・60万組織以上が利用しているとされています",
+    "MODEL — 広く提供されている最新はGemini 3.5 Flashです。旗艦のGemini 3.5 Proは公式発表が未確認で、報道ベースの情報は慎重に扱うのが安全です",
   ],
   en: [
-    "API — The Interactions API is now generally available and is the default for Google AI Studio, the Gemini API, and the docs, with a toggle back to the legacy format",
-    "AGENTS — With GA, the Interactions API schema is stable and adds Managed Agents and background execution — a good moment to revisit how you run long batches",
-    "TRANSLATE — Near-real-time speech-to-speech translation across 70+ auto-detected languages is rolling out in the Live API, AI Studio, and the Google Translate app",
-    "NOTEBOOK — NotebookLM has been renamed Gemini Notebook, now used by over 30 million people and 600,000+ organizations",
-    "MODEL — Gemini 3.5 Flash is the newest broadly available release. The flagship Gemini 3.5 Pro is running months behind while its coding ability is improved",
-    "SIRI — Apple picked a custom 1.2-trillion-parameter Gemini model to power the rebuilt Siri, shipping with iOS 27 later this year",
+    "LOGS — Developer logs for the Interactions API are now viewable in the AI Studio dashboard, so you can trace each execution step for supported calls",
+    "OMNI — Gemini Omni Flash (public preview) generates 3–10s, 720p videos from text or animates a still image, then lets you refine the result conversationally",
+    "INTERACT — The Interactions API is GA and recommended for all new projects — one interface for text, multimodal understanding, tool use, and agentic workflows",
+    "STATE — Use previous_interaction_id to keep conversation state server-side. Execution steps are observable, and long-running tasks support background execution",
+    "NOTEBOOK — NotebookLM has been renamed Gemini Notebook, reportedly used by over 30M people and 600K organizations",
+    "MODEL — Gemini 3.5 Flash is the widely available latest model. The flagship Gemini 3.5 Pro remains unconfirmed officially — treat reports cautiously",
   ],
 };
 
