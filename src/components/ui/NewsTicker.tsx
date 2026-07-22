@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "LOGS — Interactions APIの開発者ログがAI Studioダッシュボードで確認できるようになりました。対応する呼び出しの実行ステップを追え、デバッグと挙動確認がしやすくなっています",
-    "OMNI — Gemini Omni Flash（public preview）は、テキストから3〜10秒・720pの動画生成、静止画のアニメ化に対応し、生成した動画を会話でそのまま編集・洗練できます",
-    "INTERACT — Interactions APIがGAとなり、全ての新規プロジェクトで推奨されています。テキスト生成からマルチモーダル理解・ツール連携・エージェントまでを単一のインターフェースで扱えます",
-    "STATE — previous_interaction_idを使うとサーバー側に会話状態を保持できます。実行ステップは観測可能で、長時間タスクはバックグラウンド実行に対応します",
-    "NOTEBOOK — NotebookLMがGemini Notebookに改称されました。3,000万人・60万組織以上が利用しているとされています",
-    "MODEL — 広く提供されている最新はGemini 3.5 Flashです。旗艦のGemini 3.5 Proは公式発表が未確認で、報道ベースの情報は慎重に扱うのが安全です",
+    "FLASH36 — Gemini 3.6 Flashが、派手な発表を伴わない形で既存Flashの刷新として投入されました。日常的に使われているモデルが静かに入れ替わるため、レイテンシとコストは測り直す価値があります",
+    "VIDS — Google VidsからGemini Omniを直接呼べるようになりました。従来モデルより動画生成の品質が明確に上がり、会話しながらの編集にも対応します",
+    "AGENT — Daily Brief・Gemini Spark・Gemini Liveにより、Geminiはチャットボットから毎朝の文脈を引き継ぐ作業レイヤーへ位置づけを移しています",
+    "RENAME — 企業向けがGemini Notebook Enterpriseへ改称されました。Webアプリと管理コンソールの表記も更新済みです",
+    "DELAY — 旗艦のGemini 3.5 Proは、特にコーディング性能の改善に時間をかけているため予定より遅れていると報じられています",
+    "SSRF — 7月1日以前にAgent Studioで作成したWebアプリの自動生成/api-proxyにSSRF脆弱性が見つかりました。該当アプリは再生成と再デプロイが必要です",
   ],
   en: [
-    "LOGS — Developer logs for the Interactions API are now viewable in the AI Studio dashboard, so you can trace each execution step for supported calls",
-    "OMNI — Gemini Omni Flash (public preview) generates 3–10s, 720p videos from text or animates a still image, then lets you refine the result conversationally",
-    "INTERACT — The Interactions API is GA and recommended for all new projects — one interface for text, multimodal understanding, tool use, and agentic workflows",
-    "STATE — Use previous_interaction_id to keep conversation state server-side. Execution steps are observable, and long-running tasks support background execution",
-    "NOTEBOOK — NotebookLM has been renamed Gemini Notebook, reportedly used by over 30M people and 600K organizations",
-    "MODEL — Gemini 3.5 Flash is the widely available latest model. The flagship Gemini 3.5 Pro remains unconfirmed officially — treat reports cautiously",
+    "FLASH36 — Gemini 3.6 Flash landed quietly as a refresh of the Flash model millions already use daily. When a default swaps out this quietly, it's worth re-measuring latency and cost",
+    "VIDS — Gemini Omni is now available directly inside Google Vids, with noticeably higher video quality than previous models and conversational editing",
+    "AGENT — With Daily Brief, Gemini Spark, and Gemini Live, Gemini is shifting from chatbot toward an operating layer that carries context from one morning to the next",
+    "RENAME — The enterprise edition is now Gemini Notebook Enterprise, with the change reflected across the web app and admin console",
+    "DELAY — The flagship Gemini 3.5 Pro is reportedly running behind schedule while Google works to improve its coding capabilities",
+    "SSRF — An SSRF vulnerability was found in the auto-generated /api-proxy endpoint of web apps built in Agent Studio before July 1. Affected apps need regenerating and redeploying",
   ],
 };
 
