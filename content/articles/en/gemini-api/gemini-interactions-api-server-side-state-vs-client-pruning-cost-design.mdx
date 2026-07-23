@@ -1,0 +1,181 @@
+---
+title: "When to Hand Conversation State to the Server: previous_interaction_id vs. Pruning History Yourself"
+slug: "gemini-interactions-api-server-side-state-vs-client-pruning-cost-design"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-07-23T13:00"
+author: "Gemini Lab"
+description: "With the Interactions API, passing previous_interaction_id lets the server hold conversation state so you stop resending history. But a large tool output that lands mid-conversation can't be pruned afterward, and every later turn drags its weight. Here is a branching design that mixes server-side state with client-side pruning, plus a thin, working Python wrapper."
+tags: ["gemini-api", "interactions-api", "architecture", "cost-optimization", "conversation-state", "automation"]
+highlights:
+  - "Why previous_interaction_id, expected to be cheaper, can cost more: the drag of a bloated turn shown in concrete token math"
+  - "A thin hybrid wrapper (working Python) that stays on server-side state by default but breaks the chain and folds history to a summary when a turn goes heavy"
+  - "How to recover per-user token attribution, which server-side state quietly hides, using a two-ledger approach of developer logs plus your own counter"
+noindex: true
+---
+
+As an indie developer, a few weeks after I wired a chat-style support helper into my automation, I was looking over the monthly cost breakdown and stopped. The total was within range, but a single conversation ID stuck out, far heavier than the rest. Tracing it, I found one turn had injected a roughly 40KB excerpt from a product catalog, and the dozen or so exchanges that followed had each dutifully dragged those 40KB along.
+
+I had switched to `previous_interaction_id` because "I no longer resend the whole history, so it should be cheaper." And the outbound payload did shrink. Yet the bill did not. If anything, a heavy blob that I could have dropped in a single line back when I assembled history myself had, by being handed to the server, become impossible to drop.
+
+This article is a record of that fork in the design. Should conversation state live on the server, or stay in your hands where you can prune it? I want to separate what the Interactions API's `previous_interaction_id` spares you from what it quietly takes custody of, and leave behind a thin wrapper — with working code — for choosing between them by situation.
+
+## What previous_interaction_id spares you, and what it takes custody of
+
+In the Interactions API, you pass the ID that the previous response returns as `previous_interaction_id` on the next request, and the server carries the accumulated conversation context forward for you. It frees you from the loop of stacking up a `messages` array by hand and resending the whole thing every turn.
+
+What it spares you is clear: sending a history array that swells with every exchange, the logic to build and trim it, and the bookkeeping of "how much have I sent so far." From single-turn understanding to stateful conversation, it all sits under one front door.
+
+But there is something it quietly takes custody of: <strong>the right to edit context</strong>. When history lives in your hands, the moment a tool output from three turns ago stops being useful, you can pull just that element out of the array, or swap it for a short summary, and send the next turn. When conversation state is held as a chain on the server, there is no surgical way to extract a heavy blob after it has entered the chain. As long as you continue the chain, that blob lives on as context.
+
+You save the effort of sending; you surrender the freedom to prune. That asymmetry was the real cause of the cost spike above.
+
+## The counterintuitive way the cost grows
+
+Hand state to the server, and traffic drops. So it should be cheaper. Let me follow, in tokens, exactly where that reasoning slipped.
+
+What you are billed for is not bytes on the wire but the total tokens the model reads on each turn. Even when the server holds conversation state, the model re-reads that held context as input tokens every time it generates a response. In other words, <strong>"not sending" and "not being read" are different things</strong>. That is what I had conflated.
+
+Numbers make it concrete. Say one turn injects a catalog excerpt of about 40KB, roughly 18,000 tokens with mixed Japanese and English. If twelve exchanges follow, the server-side chain keeps those 18,000 tokens riding on the input essentially every turn. Even a rough estimate — 18,000 × 12 — piles up over 210,000 tokens for a blob whose job was done on the first call.
+
+<table>
+<thead>
+<tr><th>Design</th><th>Handling of a heavy tool output</th><th>Drag over the next 12 exchanges</th></tr>
+</thead>
+<tbody>
+<tr><td>Server-side chain (previous_interaction_id)</td><td>Cannot be removed from the chain</td><td>~18,000 tokens × 12 remain on input</td></tr>
+<tr><td>Client-held history + pruning</td><td>Swap just that turn for a summary</td><td>Compressed to ~400 tokens × 12 after summarizing</td></tr>
+</tbody>
+</table>
+
+If history is in your hands, you can replace the catalog excerpt with a one-line summary like "product in question: model X, in stock," and from then on each turn costs around 400 tokens. Reaching the same conclusion in the same conversation, the order of magnitude of input tokens changes. It is the kind of gap you cannot see in the light conversations of a preview, surfacing only once real, long conversations start mixing in.
+
+What ran counter to intuition was this: <strong>the choice I made to go lighter had simultaneously given away the means to go lighter.</strong>
+
+## Getting back to a design you can prune: a thin hybrid wrapper
+
+So should you always hold history yourself? That is the other extreme. For short, straightforward conversations, the nimbleness of `previous_interaction_id` pays off. A design that resends all history every turn keeps paying its own cost in traffic and assembly.
+
+So I settled on a hybrid: lean on server-side state by default, and only on the turn where a heavy blob arrives, break the chain and reassemble by hand. The deciding axis is a single question — <strong>"is this turn's output worth dragging along in full through every later turn?"</strong>
+
+Below is a thin wrapper that seals that decision in one place. The caller only passes a conversation ID and never has to think about whether the chain is continued or restarted. Method and parameter names may vary by how the API is offered, so confirm the actual call against the official docs. What I want to show is the layer above that: where to put the pruning decision.
+
+```python
+import re
+from dataclasses import dataclass, field
+
+# If a single turn's tool output exceeds this estimated token count,
+# don't keep it on the chain — fold it into a summary instead.
+HEAVY_TURN_TOKEN_THRESHOLD = 4000
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate for mixed Japanese/English text.
+    Not a real tokenizer; close enough for a threshold decision.
+    ASCII counts as ~4 chars/token, other (mainly Japanese) as ~1.6 chars/token."""
+    ascii_chars = len(re.findall(r"[\x00-\x7F]", text))
+    other_chars = len(text) - ascii_chars
+    return int(ascii_chars / 4 + other_chars / 1.6)
+
+
+@dataclass
+class Conversation:
+    """Per-conversation state. If server_interaction_id is alive, continue the chain.
+    If the chain was restarted, accumulate short client-side summaries in carryover."""
+    server_interaction_id: str | None = None
+    carryover: list[str] = field(default_factory=list)  # short summaries kept client-side
+
+
+def summarize_heavy_output(raw: str) -> str:
+    """Fold a heavy output down to the minimum worth dragging into later turns.
+    In practice, put a single lightweight-model call or rule-based extraction here.
+    Keep only 'what was decided'; discard the original."""
+    head = raw.strip().splitlines()[0][:80] if raw.strip() else ""
+    return f"[summary of previous tool output] {head} … full text discarded"
+
+
+def send_turn(conv: Conversation, user_text: str, tool_output: str | None,
+              call_model) -> tuple[str, Conversation]:
+    """Send one turn. call_model wraps the actual Interactions API call:
+    it takes (prompt_parts, previous_interaction_id) and returns (reply_text, interaction_id)."""
+
+    heavy = tool_output is not None and \
+        estimate_tokens(tool_output) > HEAVY_TURN_TOKEN_THRESHOLD
+
+    if heavy or conv.server_interaction_id is None:
+        # Restart the chain: stack prior carryover in front by hand, and
+        # swap a heavy tool output for a summary before the model ever sees it.
+        parts: list[str] = list(conv.carryover)
+        if tool_output is not None:
+            folded = summarize_heavy_output(tool_output) if heavy else tool_output
+            parts.append(folded)
+            if heavy:
+                conv.carryover.append(folded)  # only the summary is dragged forward
+        parts.append(user_text)
+        reply, new_id = call_model(prompt_parts=parts, previous_interaction_id=None)
+    else:
+        # Happy path: continue the server-side chain plainly. Client stays empty.
+        parts = [tool_output, user_text] if tool_output else [user_text]
+        reply, new_id = call_model(prompt_parts=parts,
+                                   previous_interaction_id=conv.server_interaction_id)
+
+    conv.server_interaction_id = new_id
+    return reply, conv
+```
+
+The crux is only the branch in `send_turn`. Normally it continues the server-side chain, so the client stays light. Only on a turn with heavy output does it break the chain once, move the folded summary from `summarize_heavy_output` into `carryover`, and drag only that summary forward. The 40KB original ends its role the moment the model reads it on that turn. It is not carried into the next.
+
+## What running it taught me
+
+Once it was actually running, a few judgments outside the code turned out to matter.
+
+First, <strong>a conservative threshold is easier to live with</strong>. I started by cutting at around 8,000 tokens, but each restart adds one lightweight-model call for summarizing, so too many switches let that call cost pile up. Set it too high and the drag comes back. Dropping it to around 4,000 tokens — matching the feel of "fold any tool output longer than two or three Japanese paragraphs" — is where it stabilized.
+
+Second, <strong>discarding the original reliably matters more than the quality of the summary</strong>. Try to make the summary careful and your instruction to the lightweight model swells, becoming a new cost source of its own. In practice, if a single line of "what was decided" remains, the conversation continues. The design of not dragging beat any elaborate summary.
+
+Third, the response quality on restarted turns dropped less than I had feared. I had braced for the conversation to break when the chain is cut and context is severed, but as long as `carryover` holds the summary of settled facts, the model picks up the thread fine. If anything, with the unneeded original gone, responses sometimes leaned closer to the point. That was the opposite of what I expected.
+
+## The per-user cost that goes invisible once you hand it over
+
+There is one more thing server-side state quietly takes: <strong>per-user token attribution</strong>.
+
+Back when I assembled history myself, I could count the input tokens of each request. Whose conversation used how much fed straight into internal usage-based allocation. But once you leave it to `previous_interaction_id`, a turn's input tokens include "invisible context the server is holding," and the total can no longer be read from your outbound payload size.
+
+Since July 6, execution logs for supported Interactions API calls have been viewable in the AI Studio dashboard. You can trace each execution step and its consumption, so that becomes your first source of truth. But dashboard logs come with retention and sampling limits, so they cannot themselves be the authoritative record for a billing audit.
+
+So I went with two ledgers. Every turn, I add the token usage the response reports (a usage-style field) to my own counter as `conversation ID → cumulative tokens`, and treat that as authoritative. The dashboard logs are relegated to a reconciliation target. With this in place, I can state which conversations were heavy each month in my own numbers, and a spike like the one above no longer goes unnoticed until the following month.
+
+<table>
+<thead>
+<tr><th>Purpose</th><th>What to use</th><th>Role</th></tr>
+</thead>
+<tbody>
+<tr><td>Authoritative billing audit</td><td>Aggregate response usage per conversation ID yourself</td><td>Durable record independent of retention</td></tr>
+<tr><td>Step-level inspection and debugging</td><td>Developer logs in the AI Studio dashboard</td><td>Per-step behavior tracing and reconciliation</td></tr>
+</tbody>
+</table>
+
+## Where it lands, by situation
+
+Let me fold all of this into a quick decision reference.
+
+<table>
+<thead>
+<tr><th>Nature of the conversation</th><th>Recommendation</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Short-lived, few exchanges</td><td>Lean on previous_interaction_id plainly</td><td>It ends before drag accumulates; nimbleness wins</td></tr>
+<tr><td>Long linear conversation, no heavy output</td><td>Server-side state centered</td><td>Nothing to prune; the send-reduction payoff is large</td></tr>
+<tr><td>A large tool output or search result lands mid-way</td><td>Hybrid (restart on the heavy turn)</td><td>Consume the original in one turn, drag only the summary</td></tr>
+<tr><td>Exploratory conversation with branching and rewinds</td><td>Client-held history as the base</td><td>You need the freedom to edit context per branch</td></tr>
+</tbody>
+</table>
+
+The point, I think, is not to assume `previous_interaction_id` is always the cheap choice. It is cheap only while the context you drag stays light. In conversations where a heavy blob mixes in, keeping a design you can prune in your own hands is exactly what separates one order of magnitude of the bill from another.
+
+## The next step
+
+Start by pulling the cumulative input tokens per conversation ID from your own conversation logs. If even one conversation stands out, it almost always hides a "heavy blob dragged along after its job was done on the first call." Once you find it, drop in just the `send_turn` branch from this article first. Beginning the threshold around 4,000 tokens and adjusting as you watch the switch frequency is plenty.
+
+I am still tuning that threshold per conversation type myself. If you are wrestling with the cost of your own automation in the same way, I hope this is of some use. Thank you for reading.
