@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH36 — Gemini 3.6 Flashが、派手な発表を伴わない形で既存Flashの刷新として投入されました。日常的に使われているモデルが静かに入れ替わるため、レイテンシとコストは測り直す価値があります",
-    "VIDS — Google VidsからGemini Omniを直接呼べるようになりました。従来モデルより動画生成の品質が明確に上がり、会話しながらの編集にも対応します",
-    "AGENT — Daily Brief・Gemini Spark・Gemini Liveにより、Geminiはチャットボットから毎朝の文脈を引き継ぐ作業レイヤーへ位置づけを移しています",
-    "RENAME — 企業向けがGemini Notebook Enterpriseへ改称されました。Webアプリと管理コンソールの表記も更新済みです",
-    "DELAY — 旗艦のGemini 3.5 Proは、特にコーディング性能の改善に時間をかけているため予定より遅れていると報じられています",
-    "SSRF — 7月1日以前にAgent Studioで作成したWebアプリの自動生成/api-proxyにSSRF脆弱性が見つかりました。該当アプリは再生成と再デプロイが必要です",
+    "LOGS — Interactions APIの開発者ログがGoogle AI Studioのダッシュボードで閲覧できるようになりました。対応する呼び出しのログをそのまま確認できます",
+    "OMNI — Gemini Omni Flashが公開プレビューで登場。テキストや静止画から720pの3〜10秒動画を生成でき、会話形式での動画編集にも対応します",
+    "NANO — Nano Banana 2 Liteが登場。Geminiの画像モデルの中で最速・最も低コストと位置づけられ、大量生成やコスト重視の用途に向きます",
+    "SSRF — Gemini Enterprise Agent PlatformのAgent Studioで、7月1日以前に作成されたアプリに影響するSSRF脆弱性が修正されました",
+    "STUDIO — Google AI StudioからGemini Omni FlashをAPI経由で試せます。動的な動画ワークフローを自作できます",
+    "VERTEX — Vertex AIのリリースノートが更新を続け、生成AI機能の追加が進んでいます",
   ],
   en: [
-    "FLASH36 — Gemini 3.6 Flash landed quietly as a refresh of the Flash model millions already use daily. When a default swaps out this quietly, it's worth re-measuring latency and cost",
-    "VIDS — Gemini Omni is now available directly inside Google Vids, with noticeably higher video quality than previous models and conversational editing",
-    "AGENT — With Daily Brief, Gemini Spark, and Gemini Live, Gemini is shifting from chatbot toward an operating layer that carries context from one morning to the next",
-    "RENAME — The enterprise edition is now Gemini Notebook Enterprise, with the change reflected across the web app and admin console",
-    "DELAY — The flagship Gemini 3.5 Pro is reportedly running behind schedule while Google works to improve its coding capabilities",
-    "SSRF — An SSRF vulnerability was found in the auto-generated /api-proxy endpoint of web apps built in Agent Studio before July 1. Affected apps need regenerating and redeploying",
+    "LOGS — Developer logs for the Interactions API now appear in the AI Studio dashboard as of July 6, so you can inspect supported calls in place",
+    "OMNI — Gemini Omni Flash arrives in public preview, generating 3-10 second 720p clips from text or a still image and supporting conversational video editing",
+    "NANO — Nano Banana 2 Lite lands as the fastest, most cost-efficient image model in the Gemini family, suited to high-volume generation",
+    "SSRF — The Agent Studio in the Gemini Enterprise Agent Platform patched an SSRF flaw affecting apps created before July 1",
+    "STUDIO — You can try Gemini Omni Flash from Google AI Studio through the API and build your own dynamic video workflows",
+    "VERTEX — Vertex AI's release notes keep rolling out, with more generative-AI capabilities added over time",
   ],
 };
 
