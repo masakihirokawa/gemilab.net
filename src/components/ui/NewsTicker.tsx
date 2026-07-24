@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "LOGS — Interactions APIの開発者ログがGoogle AI Studioのダッシュボードで閲覧できるようになりました。対応する呼び出しのログをそのまま確認できます",
-    "OMNI — Gemini Omni Flashが公開プレビューで登場。テキストや静止画から720pの3〜10秒動画を生成でき、会話形式での動画編集にも対応します",
-    "NANO — Nano Banana 2 Liteが登場。Geminiの画像モデルの中で最速・最も低コストと位置づけられ、大量生成やコスト重視の用途に向きます",
-    "SSRF — Gemini Enterprise Agent PlatformのAgent Studioで、7月1日以前に作成されたアプリに影響するSSRF脆弱性が修正されました",
-    "STUDIO — Google AI StudioからGemini Omni FlashをAPI経由で試せます。動的な動画ワークフローを自作できます",
-    "VERTEX — Vertex AIのリリースノートが更新を続け、生成AI機能の追加が進んでいます",
+    "FLASH — Gemini 3.6 FlashとGemini 3.5 Flash-Liteが7月21日にリリースされ、速度重視の用途に選択肢が増えました",
+    "NANO — 画像モデルNano Banana 2 Lite（gemini-3.1-flash-lite-image）がGAになりました。ファミリー最速・最安で、大量のバリエーション生成に向きます",
+    "OMNI — Gemini Omni Flashが公開プレビュー。テキストから720p・3〜10秒の動画を生成でき、会話形式の動画編集にも対応します",
+    "LOGS — 7月6日にInteractions APIの開発者ログが追加され、対応する呼び出しをAI Studioダッシュボードで確認できます",
+    "SSRF — Agent Studioの自動生成/api-proxyのSSRF脆弱性が修正されました。7月1日より前に作成したWebアプリは再生成・再デプロイが推奨されます",
+    "STILL — Omni Flashは静止画のアニメーション化にも対応し、素材画像から短い動画を手早く作れます",
   ],
   en: [
-    "LOGS — Developer logs for the Interactions API now appear in the AI Studio dashboard as of July 6, so you can inspect supported calls in place",
-    "OMNI — Gemini Omni Flash arrives in public preview, generating 3-10 second 720p clips from text or a still image and supporting conversational video editing",
-    "NANO — Nano Banana 2 Lite lands as the fastest, most cost-efficient image model in the Gemini family, suited to high-volume generation",
-    "SSRF — The Agent Studio in the Gemini Enterprise Agent Platform patched an SSRF flaw affecting apps created before July 1",
-    "STUDIO — You can try Gemini Omni Flash from Google AI Studio through the API and build your own dynamic video workflows",
-    "VERTEX — Vertex AI's release notes keep rolling out, with more generative-AI capabilities added over time",
+    "FLASH — Gemini 3.6 Flash and Gemini 3.5 Flash-Lite shipped on July 21, adding faster options for latency-sensitive work",
+    "NANO — Nano Banana 2 Lite (gemini-3.1-flash-lite-image) reached GA as the fastest, most cost-efficient image model in the family",
+    "OMNI — Gemini Omni Flash is in public preview, generating 720p, 3-10s clips from text and supporting conversational video editing",
+    "LOGS — Developer logs for the Interactions API arrived July 6, viewable right in the AI Studio dashboard",
+    "SSRF — A fix landed for an SSRF flaw in Agent Studio's auto-generated /api-proxy; apps built before July 1 should be regenerated and redeployed",
+    "STILL — Omni Flash can also animate still images, turning a source picture into a short clip in seconds",
   ],
 };
 
