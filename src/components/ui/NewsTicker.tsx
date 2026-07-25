@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH — Gemini 3.6 FlashとGemini 3.5 Flash-Liteが7月21日にリリースされ、速度重視の用途に選択肢が増えました",
-    "NANO — 画像モデルNano Banana 2 Lite（gemini-3.1-flash-lite-image）がGAになりました。ファミリー最速・最安で、大量のバリエーション生成に向きます",
-    "OMNI — Gemini Omni Flashが公開プレビュー。テキストから720p・3〜10秒の動画を生成でき、会話形式の動画編集にも対応します",
-    "LOGS — 7月6日にInteractions APIの開発者ログが追加され、対応する呼び出しをAI Studioダッシュボードで確認できます",
-    "SSRF — Agent Studioの自動生成/api-proxyのSSRF脆弱性が修正されました。7月1日より前に作成したWebアプリは再生成・再デプロイが推奨されます",
-    "STILL — Omni Flashは静止画のアニメーション化にも対応し、素材画像から短い動画を手早く作れます",
+    "FLASH36 — 7月21日公開のGemini 3.6 Flashは出力トークンが約17%少なく、3.5 Flashより低価格です。コード編集の余計な書き換えや実行ループも減っています",
+    "CYBER — Gemini 3.5 Flash Cyberは脆弱性の発見・検証・修正パッチ作成に絞った軽量モデルです",
+    "COMPUTER — Computer UseがGemini APIとGemini Enterpriseの組み込みクライアントサイドツールとして利用できるようになりました",
+    "SPARK — Gemini Sparkの日本語提供が7月16日に始まりました。Google AI Ultraプランのユーザーから順次展開されています",
+    "PARALLEL — Sparkが複数の参照ソースを並行処理できるようになり、Docs・Sheets・Slidesでの画像追加や編集を代行できる範囲も広がりました",
+    "STUDENT — 日本を含む4か国で18歳以上の学生向け無料アップグレードが提供され、Google AI ProとNotebookLM、2TBのストレージが使えます",
   ],
   en: [
-    "FLASH — Gemini 3.6 Flash and Gemini 3.5 Flash-Lite shipped on July 21, adding faster options for latency-sensitive work",
-    "NANO — Nano Banana 2 Lite (gemini-3.1-flash-lite-image) reached GA as the fastest, most cost-efficient image model in the family",
-    "OMNI — Gemini Omni Flash is in public preview, generating 720p, 3-10s clips from text and supporting conversational video editing",
-    "LOGS — Developer logs for the Interactions API arrived July 6, viewable right in the AI Studio dashboard",
-    "SSRF — A fix landed for an SSRF flaw in Agent Studio's auto-generated /api-proxy; apps built before July 1 should be regenerated and redeployed",
-    "STILL — Omni Flash can also animate still images, turning a source picture into a short clip in seconds",
+    "FLASH36 — Gemini 3.6 Flash, shipped July 21, uses about 17% fewer output tokens than 3.5 Flash at a lower price, with fewer stray code edits and execution loops",
+    "CYBER — Gemini 3.5 Flash Cyber is a lightweight model focused on finding, validating, and patching vulnerabilities",
+    "COMPUTER — Computer use is now available as a built-in client-side tool through the Gemini API and Gemini Enterprise",
+    "SPARK — Gemini Spark began rolling out in Japanese on July 16, starting with Google AI Ultra subscribers",
+    "PARALLEL — Spark now processes multiple reference sources in parallel, and handles a wider range of image edits across Docs, Sheets, and Slides",
+    "STUDENT — Students 18 and older in four countries, Japan included, get a free upgrade to Google AI Pro with NotebookLM and 2TB of storage",
   ],
 };
 
