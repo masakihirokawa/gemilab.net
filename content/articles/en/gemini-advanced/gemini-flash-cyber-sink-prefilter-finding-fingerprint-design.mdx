@@ -1,0 +1,319 @@
+---
+title: "Wiring a Security-Focused Model Into a Solo Developer's Audit — The Extraction Layer and Fingerprints That Stop Re-Reporting"
+slug: "gemini-flash-cyber-sink-prefilter-finding-fingerprint-design"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-26T13:00"
+author: "Gemini Lab"
+description: "A three-layer design that extracts outbound-request sinks with the AST, then accepts a model's hypothesis only when the reproduction actually runs. Four fingerprint schemes measured, including the collision that hides a real finding behind a safe twin."
+tags: ["security", "static analysis", "AST", "Gemini API", "design patterns"]
+highlights:
+  - "A ~90-line AST scanner for outbound-request sinks, measured at 4,016 files in 28.2 seconds (7.0ms per file)"
+  - "Line-based fingerprints re-reported 8 of 8 findings as brand new after only comments and a variable rename — with the fix that survives both"
+  - "Why the coarser fingerprint reaches 7/7 tracking yet lets an allowlisted function swallow a vulnerable one, reproduced step by step"
+---
+
+The notice said that Agent Studio's auto-generated `/api-proxy` backend had an SSRF flaw, and that web apps created before July 1, 2026 should be regenerated and redeployed.
+
+I stopped reading and realised I had no way to answer the obvious follow-up question: which of my own services actually take a URL from the outside and go fetch it?
+
+As an indie developer I have accumulated a handful of small services over several years. Grepping for `requests.get` returned dozens of hits, and none of them told me which ones were genuinely reachable from user input. The only honest answer was to read each one.
+
+The arrival of purpose-built security models — Gemini 3.5 Flash Cyber is scoped to discovering, verifying, and patching vulnerabilities — made it tempting to hand the whole job over. My first attempt did exactly that, and it stopped working after two weeks. Here is why it stopped, the three-layer setup I rebuilt, and the part that took the longest to get right: fingerprinting findings so the same one never arrives twice.
+
+Every number below comes from fixtures and real code trees I ran on my own machine. The reproduction steps are included.
+
+## Why handing over the whole repository stopped working
+
+The first version was naive. Bundle the changed files, ask the model to point out anything that looks like SSRF, file the answers as issues. It worked, in the sense that it produced output. It failed for three reasons.
+
+The same finding kept coming back. Add one comment line and the model flags the same function again. I built a ledger to suppress duplicates, and immediately discovered that the design of the ledger key was the actual problem — most of this article is about that key.
+
+Confidence scores were unusable. I asked for `high / medium / low`. Sending identical input three times swapped `high` and `medium`. Any threshold I drew was drawing on sand.
+
+And it cost money for nothing. Even on a small diff, the surrounding context inflates input tokens, so I was paying full price on days when every single finding was a known re-report. If you want the per-request accounting that makes this visible, the approach in [Track Gemini API Costs in Production with usageMetadata](/articles/gemini-api/gemini-api-usage-metadata-cost-tracking-production) is the foundation I use.
+
+The underlying mistake was asking the model to do discovery and judgement in the same breath. Discovery is a great fit for a machine. Judgement, handed to a model, gives you a verdict whose basis moves every time you ask.
+
+## Three layers: extract, hypothesise, verify
+
+<table>
+  <thead>
+    <tr><th>Layer</th><th>Owner</th><th>Output</th><th>Deterministic?</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Extract</td><td>Your own AST scanner</td><td>Candidate sinks plus fingerprints</td><td>Yes</td></tr>
+    <tr><td>Hypothesise</td><td>The model</td><td>A reproduction and a patch</td><td>No, and that is fine</td></tr>
+    <tr><td>Verify</td><td>Your own harness</td><td>Accept or reject</td><td>Yes</td></tr>
+  </tbody>
+</table>
+
+The whole point is to confine the non-deterministic layer to the middle. The model is never asked whether something is dangerous. It is asked: assuming this is dangerous, how would you reproduce it, and how would you fix it? Whether it was dangerous is settled entirely by whether that reproduction runs.
+
+Once the model's self-assessment is out of the acceptance path, swapping models stops being a migration. I call the hypothesis layer through an interface, which lets me compare a general Flash model against a purpose-built one using the same ledger.
+
+## Own the extraction layer
+
+Write this layer yourself. Outsourcing it costs you both money and reproducibility.
+
+Python's `ast` module is enough to find outbound-request sinks whose first argument traces back to request-derived input.
+
+```python
+# scan_sinks.py — extract outbound-request sinks and fingerprint them
+import ast, hashlib, json, sys
+from pathlib import Path
+
+SINKS = {
+    ("requests", "get"), ("requests", "post"),
+    ("httpx", "get"), ("httpx", "post"),
+    ("urllib.request", "urlopen"),
+}
+TAINT_ROOTS = ("request",)
+
+
+def dotted(node):
+    if isinstance(node, ast.Attribute):
+        left = dotted(node.value)
+        return f"{left}.{node.attr}" if left else node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return ""
+
+
+def taint_key(node):
+    """Normalise request.args.get("src") and request.json["url"] into a stable key."""
+    if isinstance(node, ast.Call):
+        base = dotted(node.func)
+        if base.startswith(TAINT_ROOTS) and node.args and isinstance(node.args[0], ast.Constant):
+            return f"{base}({node.args[0].value})"
+        return None
+    if isinstance(node, ast.Subscript):
+        base = dotted(node.value)
+        if base.startswith(TAINT_ROOTS) and isinstance(node.slice, ast.Constant):
+            return f"{base}[{node.slice.value}]"
+        return None
+    if isinstance(node, ast.Attribute):
+        base = dotted(node)
+        return base if base.startswith(TAINT_ROOTS) else None
+    return None
+
+
+class FnScanner(ast.NodeVisitor):
+    def __init__(self, relpath):
+        self.relpath = relpath
+        self.findings = []
+
+    def visit_FunctionDef(self, fn):
+        env = {}  # local name -> taint key
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                key = taint_key(node.value)
+                if key:
+                    for t in node.targets:
+                        if isinstance(t, ast.Name):
+                            env[t.id] = key
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            fq = dotted(node.func)
+            if "." not in fq or not node.args:
+                continue
+            mod, _, fname = fq.rpartition(".")
+            if (mod, fname) not in SINKS:
+                continue
+            arg = node.args[0]
+            local = arg.id if isinstance(arg, ast.Name) else ""
+            src = env.get(local) if local else taint_key(arg)
+            if src is None:
+                continue
+            self.findings.append({
+                "file": self.relpath, "line": node.lineno,
+                "sink": f"{mod}.{fname}", "source": src,
+                "local": local, "fn": fn.name,
+            })
+        self.generic_visit(fn)
+
+
+def h(*parts):
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+
+
+def scan(root: Path):
+    out = []
+    for p in sorted(root.rglob("*.py")):
+        rel = str(p.relative_to(root))
+        s = FnScanner(rel)
+        s.visit(ast.parse(p.read_text()))
+        for f in s.findings:
+            f["fp_line"] = h(f["file"], str(f["line"]), f["sink"])        # scheme A
+            f["fp_v1"] = h(f["file"], f["fn"], f["sink"], f["local"])     # scheme B
+            f["fp_v2"] = h(f["sink"], f["source"], f["fn"])               # scheme C
+            f["fp_v3"] = h(f["sink"], f["source"])                        # scheme D
+            out.append(f)
+    return out
+
+
+if __name__ == "__main__":
+    print(json.dumps(scan(Path(sys.argv[1])), ensure_ascii=False, indent=2))
+```
+
+Taint is followed exactly one hop, and that is deliberate rather than lazy. A two-hop pattern — `payload = request.json` followed by `target = payload["callback_url"]` — slips through. On my fixture of 4 files containing 9 sinks, the scanner found 8 and missed that two-hop case, for a recall of 88.9%.
+
+Deepening the taint analysis to close that gap immediately widens the candidate set feeding the model. A slightly leaky extractor that runs fast and never argues with you turned out to be the version I could actually keep running. I close gaps by adding sink definitions, not by chasing longer taint chains.
+
+Throughput, measured against real Python trees:
+
+<table>
+  <thead>
+    <tr><th>Target</th><th>.py files</th><th>Wall time</th><th>Per file</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>/usr/lib/python3.10</td><td>651</td><td>6.0 s</td><td>9.2 ms</td></tr>
+    <tr><td>/usr/lib/python3/dist-packages</td><td>4,016</td><td>28.2 s</td><td>7.0 ms</td></tr>
+  </tbody>
+</table>
+
+Four thousand files in under thirty seconds is cheap enough to run on every CI job. Putting it in front of the model drops what reaches the hypothesis layer to a few dozen candidates.
+
+## The ledger broke on day one because I keyed it by line number
+
+Findings need identifiers. Without a stable key, everything is new every day and the ledger means nothing.
+
+I started with `path + line + sink`. Scheme A. The next morning I added a module docstring, two TODO comments, and one logging helper — and every entry in the ledger was orphaned.
+
+So I switched to `path + function + sink + local variable`. Scheme B. Line numbers were gone, so I assumed I was safe. Then I renamed `src` to `image_url` and `hook` to `endpoint`, and scheme B collapsed just as completely. The local variable name carries no meaning, and I had baked it into the identity.
+
+What finally held was the triple `sink + taint source + enclosing function`. Scheme C. However the local variable is spelled, `request.args.get(src)` stays `request.args.get(src)`.
+
+Here is the fixture rescanned after adding comments, adding a helper function, and renaming local variables:
+
+<table>
+  <thead>
+    <tr><th>Scheme</th><th>Components</th><th>Tracked</th><th>Re-reported as new</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>A</td><td>path + line + sink</td><td>0 / 8</td><td>8 (100%)</td></tr>
+    <tr><td>B</td><td>path + function + sink + variable</td><td>0 / 8</td><td>8 (100%)</td></tr>
+    <tr><td>C</td><td>sink + taint source + function</td><td>8 / 8</td><td>0 (0%)</td></tr>
+  </tbody>
+</table>
+
+Scheme B failing as badly as scheme A was the result that stung. I had assumed line numbers were the only volatile ingredient and never asked what else in my key moves for reasons unrelated to meaning. A fingerprint may only contain things that change when the meaning changes — never things that change when the author changes their mind about naming.
+
+## Coarser is more stable, and that is exactly the trap
+
+This is the part that ran against my expectations.
+
+Scheme C still contains the function name, so renaming a function breaks it. I renamed `api/proxy.py` to `api/gateway.py` and `api_proxy` to `proxy_get`: 6 of 8 findings survived, 2 arrived as new.
+
+Dropping the function name to leave `sink + taint source` looks like the obvious fix. Scheme D. Measured, it tracks 7 of 7 — flawless.
+
+The interesting question is why 8 findings became 7.
+
+```text
+collision: 97d2524cdca2 -> ['services/thumbnail.py:8  fetch_remote_thumbnail',
+                            'services/thumbnail.py:16 fetch_allowlisted_thumbnail']
+```
+
+One file held two functions calling `requests.get` with `request.args.get("src")`. One fetches the URL directly. The other checks the host against an allowlist first. Scheme D flattens them into a single identity.
+
+Review the safe one, mark it handled, and the vulnerable one never surfaces again. Tracking went up; what disappeared was the finding that mattered.
+
+<table>
+  <thead>
+    <tr><th>Scheme</th><th>Tracked after refactor</th><th>Uniqueness in fixture</th><th>Verdict</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>C (sink + source + function)</td><td>6 / 8</td><td>8 / 8, no collisions</td><td>Adopted</td></tr>
+    <tr><td>D (sink + source)</td><td>7 / 7</td><td>7 / 8, one collision</td><td>Rejected</td></tr>
+  </tbody>
+</table>
+
+Fingerprint design pulls you toward stability, but stability and discriminative power trade against each other. I chose discrimination, kept scheme C, and absorbed rename churn a different way: the ledger carries an `aliases` array, and when I rename a function I add the old fingerprint by hand. That happens a few times a year. One manual line beats an automatic merge that silently unifies two findings that were never the same.
+
+## Acceptance is decided by reproduction, not by wording
+
+The hypothesis layer returns exactly two things:
+
+1. The smallest test that reproduces the failure
+2. A patch that makes that test pass
+
+Acceptance means the test fails before the patch and passes after it. The model's prose is never read by the gate.
+
+```python
+# verify_gate.py — accept only on a fail-then-pass transition
+import subprocess, tempfile, pathlib
+
+def run(cmd, cwd):
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True).returncode
+
+def verify(repo: pathlib.Path, repro_test: str, patch: str) -> dict:
+    """Write to the ledger only when accepted is True."""
+    test_path = repo / "tests" / "test_repro_generated.py"
+    test_path.parent.mkdir(exist_ok=True)
+    test_path.write_text(repro_test)
+
+    before = run(["python", "-m", "pytest", "-q", str(test_path)], repo)
+    if before == 0:
+        # A repro that already passes has not reproduced anything
+        test_path.unlink()
+        return {"accepted": False, "reason": "repro_did_not_fail"}
+
+    with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as fp:
+        fp.write(patch)
+        patch_file = fp.name
+
+    if run(["git", "apply", "--check", patch_file], repo) != 0:
+        test_path.unlink()
+        return {"accepted": False, "reason": "patch_does_not_apply"}
+
+    run(["git", "apply", patch_file], repo)
+    after = run(["python", "-m", "pytest", "-q", str(test_path)], repo)
+    suite = run(["python", "-m", "pytest", "-q"], repo)
+    run(["git", "checkout", "--", "."], repo)   # always restore
+    test_path.unlink(missing_ok=True)
+
+    return {
+        "accepted": after == 0 and suite == 0,
+        "reason": "ok" if after == 0 and suite == 0 else f"after={after} suite={suite}",
+    }
+```
+
+The `before == 0` branch earns its keep more than anything else here. A reproduction that passes before the fix is proof that nothing was reproduced, however confidently the explanation was written.
+
+Always restoring with `git checkout -- .` matters just as much. I originally placed that call where an exception could skip it, left a patch applied, and started the next verification from a dirty tree. That is when I moved the whole gate onto a throwaway clone rather than the working repository. The same instinct — never carry a broken state into the next run — shows up in [Self-Healing Architecture for Gemini Computer Use](/articles/gemini-advanced/gemini-computer-use-production-error-recovery-self-healing-patterns).
+
+## What the ledger holds, and what it deliberately does not
+
+<table>
+  <thead>
+    <tr><th>Field</th><th>Contents</th><th>Why it is there</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>fingerprint</td><td>Scheme C triple hash</td><td>The only key used for suppression</td></tr>
+    <tr><td>aliases</td><td>Array of prior fingerprints</td><td>Carries renames forward by hand</td></tr>
+    <tr><td>state</td><td>open / accepted / wontfix</td><td>Drives suppression on rescan</td></tr>
+    <tr><td>verified_at</td><td>Timestamp the gate passed</td><td>Records that acceptance was mechanical</td></tr>
+    <tr><td>evidence</td><td>Path to the reproduction test</td><td>Lets a human re-run it later</td></tr>
+  </tbody>
+</table>
+
+Model prose and confidence scores are intentionally absent. If they are stored, the next person to read the ledger will reason from them. The only admissible basis is the test sitting in `evidence`.
+
+`wontfix` requires a one-line human reason. Leave that field optional and the suppression list quietly becomes a graveyard for findings nobody read.
+
+## Porting this to another stack
+
+1. Define 3 to 5 sinks and get the extraction layer running. No model calls yet
+2. Fingerprint with scheme C and do nothing but rescan for two weeks, watching whether re-reports converge to zero
+3. Only after they converge, connect the hypothesis layer
+4. Write to the ledger only past the verify gate, and make the `wontfix` reason mandatory
+
+Reverse that order and findings pile up before the ledger stabilises, which is precisely how my first attempt died at the two-week mark. With extraction and fingerprinting settled, the model becomes a component you can replace at will — which is what makes each new purpose-built model an upgrade rather than a rebuild.
+
+Back to the Agent Studio notice: the useful move was never to enumerate apps built before a given date. It was to reach a state where a machine can tell me how many `/api-proxy`-shaped paths exist right now. With the extractor in place, the next notice of this kind takes about fifteen seconds to answer.
+
+Run `scan_sinks.py` against one of your own repositories and look at the count. Mine came back with more than twice what I expected, which was a quiet and unwelcome surprise.
+
+Thank you for reading through a fairly long set of notes — I hope some of it saves you an afternoon.
