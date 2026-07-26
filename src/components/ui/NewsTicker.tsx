@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH36 — 7月21日公開のGemini 3.6 Flashは出力トークンが約17%少なく、3.5 Flashより低価格です。コード編集の余計な書き換えや実行ループも減っています",
-    "CYBER — Gemini 3.5 Flash Cyberは脆弱性の発見・検証・修正パッチ作成に絞った軽量モデルです",
-    "COMPUTER — Computer UseがGemini APIとGemini Enterpriseの組み込みクライアントサイドツールとして利用できるようになりました",
-    "SPARK — Gemini Sparkの日本語提供が7月16日に始まりました。Google AI Ultraプランのユーザーから順次展開されています",
-    "PARALLEL — Sparkが複数の参照ソースを並行処理できるようになり、Docs・Sheets・Slidesでの画像追加や編集を代行できる範囲も広がりました",
-    "STUDENT — 日本を含む4か国で18歳以上の学生向け無料アップグレードが提供され、Google AI ProとNotebookLM、2TBのストレージが使えます",
+    "VIDS — Gemini OmniがGoogle Vidsに直接組み込まれました。テキストで指示するだけでスタイル変更・カラーグレーディング・背景ノイズ除去まで扱えます",
+    "HOME — Gemini for Homeの会話メモリ保持が15分に延びました。直前の指示を言い直さずに追加の依頼ができます",
+    "LIVE — Gemini Liveが第1世代のGoogle Home MiniとNest Hubでも使えるようになりました。Nest Camの7月アップデートも順次展開中です",
+    "DOCS — Google DocsのGeminiによる文書作成・編集が11言語追加されました。Workspaceのデータを踏まえた文脈つきの支援が受けられます",
+    "LOGS — 7月6日から、対応するInteractions API呼び出しの開発者ログをAI Studioのダッシュボードで確認できるようになりました",
+    "SAATHI — Geminiを用いた教育者向けWebアプリATL Saathiが、インドの100校でパイロット提供されています",
   ],
   en: [
-    "FLASH36 — Gemini 3.6 Flash, shipped July 21, uses about 17% fewer output tokens than 3.5 Flash at a lower price, with fewer stray code edits and execution loops",
-    "CYBER — Gemini 3.5 Flash Cyber is a lightweight model focused on finding, validating, and patching vulnerabilities",
-    "COMPUTER — Computer use is now available as a built-in client-side tool through the Gemini API and Gemini Enterprise",
-    "SPARK — Gemini Spark began rolling out in Japanese on July 16, starting with Google AI Ultra subscribers",
-    "PARALLEL — Spark now processes multiple reference sources in parallel, and handles a wider range of image edits across Docs, Sheets, and Slides",
-    "STUDENT — Students 18 and older in four countries, Japan included, get a free upgrade to Google AI Pro with NotebookLM and 2TB of storage",
+    "VIDS — Gemini Omni is now built directly into Google Vids, so a text prompt can change style, color grading, or strip background noise",
+    "HOME — The Gemini for Home conversation memory window stretched to 15 minutes, so follow-ups no longer need the full context repeated",
+    "LIVE — Gemini Live reached the first-generation Google Home Mini and Nest Hub, and the July Nest Cam update is rolling out alongside it",
+    "DOCS — Gemini-powered document creation and editing in Google Docs added 11 more languages, with context drawn from your Workspace data",
+    "LOGS — Since July 6, developer logs for supported Interactions API calls are viewable right in the AI Studio dashboard",
+    "SAATHI — ATL Saathi, a Gemini-powered web app for educators, is piloting across 100 schools in India",
   ],
 };
 
