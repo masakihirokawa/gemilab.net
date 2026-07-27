@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "VIDS — Gemini OmniがGoogle Vidsに直接組み込まれました。テキストで指示するだけでスタイル変更・カラーグレーディング・背景ノイズ除去まで扱えます",
-    "HOME — Gemini for Homeの会話メモリ保持が15分に延びました。直前の指示を言い直さずに追加の依頼ができます",
-    "LIVE — Gemini Liveが第1世代のGoogle Home MiniとNest Hubでも使えるようになりました。Nest Camの7月アップデートも順次展開中です",
-    "DOCS — Google DocsのGeminiによる文書作成・編集が11言語追加されました。Workspaceのデータを踏まえた文脈つきの支援が受けられます",
-    "LOGS — 7月6日から、対応するInteractions API呼び出しの開発者ログをAI Studioのダッシュボードで確認できるようになりました",
-    "SAATHI — Geminiを用いた教育者向けWebアプリATL Saathiが、インドの100校でパイロット提供されています",
+    "PRICE — Gemini 3.6 Flash は出力トークンを約17%削減し、価格も 100万トークンあたり入力$1.50・出力$7.50 に下がりました（3.5 Flash は出力$9）",
+    "LITE — Gemini 3.5 Flash-Lite は 100万入力トークンあたり$0.3 で、高スループットの処理に振った選択肢です",
+    "CYBER — Gemini 3.5 Flash Cyber は Google の CodeMender エージェントの中で、脆弱性の検出とパッチ作成を担います",
+    "GEMINI4 — Google は「これまでで最も野心的な事前学習を Gemini 4 に向けて開始した」と述べています。3.5 Pro の遅延と合わせて動向が注目されます",
+    "SUNSET — Imagen 4 系と Gemini 3 Image 系の画像生成モデルは 2026年8月17日に停止します。新しい安定版・プレビュー版への移行が必要です",
+    "STUDIO — Gemini Omni Flash が Google AI Studio で初めて使えるようになりました。動画生成と会話型編集を低コストで試せます",
   ],
   en: [
-    "VIDS — Gemini Omni is now built directly into Google Vids, so a text prompt can change style, color grading, or strip background noise",
-    "HOME — The Gemini for Home conversation memory window stretched to 15 minutes, so follow-ups no longer need the full context repeated",
-    "LIVE — Gemini Live reached the first-generation Google Home Mini and Nest Hub, and the July Nest Cam update is rolling out alongside it",
-    "DOCS — Gemini-powered document creation and editing in Google Docs added 11 more languages, with context drawn from your Workspace data",
-    "LOGS — Since July 6, developer logs for supported Interactions API calls are viewable right in the AI Studio dashboard",
-    "SAATHI — ATL Saathi, a Gemini-powered web app for educators, is piloting across 100 schools in India",
+    "PRICE — Gemini 3.6 Flash consumes about 17% fewer output tokens and costs less at $1.50 per 1M input and $7.50 per 1M output, against $9 output for 3.5 Flash",
+    "LITE — Gemini 3.5 Flash-Lite targets high-throughput work at $0.3 per million input tokens",
+    "CYBER — Gemini 3.5 Flash Cyber powers vulnerability detection and patching inside Google's CodeMender agent",
+    "GEMINI4 — Google says it has already begun its most ambitious pre-training run yet, for Gemini 4, even as 3.5 Pro slips",
+    "SUNSET — The Imagen 4 and Gemini 3 Image generation models shut down on August 17, 2026, so integrations need moving to newer stable or preview endpoints",
+    "STUDIO — Gemini Omni Flash is available in Google AI Studio for the first time, putting cost-efficient video generation and conversational editing within reach",
   ],
 };
 
