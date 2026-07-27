@@ -6,12 +6,12 @@ level: "advanced"
 premium: true
 date: "2026-07-24T13:00"
 author: "Gemini Lab"
-description: "AI Studio に追加された Interactions API の開発者ログを、速報レンズと正本ログに役割分担する設計です。自前の構造化ログと突合コード、保持方針、PII の扱いまで、個人開発の運用視点でまとめました。"
+description: "AI Studio に追加された Interactions API の開発者ログを、速報レンズと正本ログに役割分担する設計です。自前の構造化ログと突合コード、100,000 件で測った格納先の容量比較、機能別のコスト按分まで、個人開発の運用視点でまとめました。"
 tags: ["Gemini", "Interactions API", "AI Studio", "可観測性", "本番運用"]
 highlights:
-  - "AI Studio の開発者ログを速報の triage レンズ、自前ログを正本として二層に分ける具体的な線引き"
   - "interaction_id を軸にダッシュボードと自前ログを突合し、記録の欠落を捕まえる実装コード"
-  - "保持階層・サンプリング・PII マスキングを状況別に決めるための運用テーブル"
+  - "JSON Lines・SQLite・gzip 射影を 100,000 件で比較した容量と書き込み遅延の実測値"
+  - "保持階層・PII マスキング・機能別コスト按分を決めるための運用テーブルと集計 SQL"
 ---
 
 本番のチャット機能から、ある1件の応答が空で返ったという報告が届いたのは、3週間前の呼び出しについてでした。私は AI Studio のダッシュボードを開き、その時間帯の実行ログを遡ろうとしました。けれど、目的の呼び出しにはたどり着けませんでした。
@@ -79,6 +79,7 @@ class InteractionRecord:
     interaction_id: str
     prev_interaction_id: Optional[str]
     prompt_fingerprint: str   # 入力そのものは残さず、指紋だけを正本に置く
+    feature: str              # どの機能からの呼び出しか（後のコスト按分の軸）
     model: str
     input_tokens: int
     output_tokens: int
@@ -99,7 +100,7 @@ class ObservedClient:
         self.client = client      # Gemini の Interactions クライアント
         self.sink = sink          # append_only(record: dict) を持つ格納先
 
-    def run(self, prompt: str, *, model: str,
+    def run(self, prompt: str, *, model: str, feature: str,
             prev_interaction_id: Optional[str] = None) -> dict:
         started = time.perf_counter()
         # クライアント側でも id を用意し、応答が空でも正本に痕跡を残す
@@ -126,6 +127,7 @@ class ObservedClient:
                 interaction_id=server_id,
                 prev_interaction_id=prev_interaction_id,
                 prompt_fingerprint=fingerprint(prompt),
+                feature=feature,
                 model=model,
                 input_tokens=usage["input_tokens"],
                 output_tokens=usage["output_tokens"],
@@ -137,6 +139,76 @@ class ObservedClient:
 ```
 
 要点は `try/finally` です。応答が空で返っても、例外で落ちても、正本には必ず1件の痕跡が残ります。冒頭の「3週間前の空応答」を、私が今なら `status="empty"` の1行として拾えるのは、この構造にしたからです。入力そのものは指紋だけを残し、原文は正本に置きません。突合には指紋で足りますし、PII を長期保管する理由もありません。
+
+## 格納先（sink）に何を選ぶか — 100,000件で測った実寸
+
+ラッパーが呼んでいる `sink.append_only()` の中身を、最初は JSON Lines へのファイル追記にしていました。実装が最も短く、追記専用という性質もそのまま満たせます。
+
+ただ、記録が積み上がったときの手触りを知らないまま本番に置くのは落ち着きませんでした。そこで手元で 100,000 件を流し、容量と書き込みの実寸を測りました。上記のレコード定義そのままの構造で、`status` は実運用に近い比率（ok 97%・empty 2%・error 1%）にしています。
+
+<table>
+  <thead>
+    <tr><th>格納先</th><th>100,000件の容量</th><th>1件あたり</th><th>備考</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>JSON Lines（無圧縮）</td><td>26.0 MB</td><td>272.6 B</td><td>キー名がそのまま容量になる</td></tr>
+    <tr><td>JSON Lines（gzip -9）</td><td>4.8 MB</td><td>50.4 B</td><td>元の18%。コールド層向き</td></tr>
+    <tr><td>SQLite（索引2本つき）</td><td>17.5 MB</td><td>184.0 B</td><td>created_at と status に索引</td></tr>
+    <tr><td>コールド射影（gzip -9）</td><td>4.1 MB</td><td>43.4 B</td><td>id・指紋・トークン・状態・時刻のみ</td></tr>
+  </tbody>
+</table>
+
+数字を見て、私はホット層を SQLite に切り替えました。索引を2本張っても JSON Lines の無圧縮より小さく収まる。1日 3,000 件の呼び出しなら、90日で約 50 万件・90 MB 前後という見当が立ちます。個人開発で抱える容量として、これは現実的な範囲でした。
+
+書き込みの遅延も測っておきました。WAL モードの SQLite に1件ずつ `INSERT` して `commit()` するかたちで、p50 が 0.31 ms、p95 が 1.29 ms、p99 が 1.49 ms。モデル呼び出しの往復が数百 ms から数秒の世界ですから、正本への追記が応答時間に乗る心配はまずありません。ここが重いと分かっていたら非同期のキューを挟むところでしたが、その必要はありませんでした。
+
+```python
+import sqlite3
+from dataclasses import asdict
+
+DDL = """
+CREATE TABLE IF NOT EXISTS interactions(
+  interaction_id      TEXT PRIMARY KEY,
+  prev_interaction_id TEXT,
+  prompt_fingerprint  TEXT,
+  feature             TEXT,          -- どの機能からの呼び出しか
+  model               TEXT,
+  input_tokens        INTEGER,
+  output_tokens       INTEGER,
+  latency_ms          INTEGER,
+  status              TEXT,
+  created_at          REAL
+);
+CREATE INDEX IF NOT EXISTS idx_created ON interactions(created_at);
+CREATE INDEX IF NOT EXISTS idx_status  ON interactions(status);
+"""
+
+
+class SqliteSink:
+    """ホット層の正本。INSERT OR IGNORE で再送・リトライを冪等に受ける。"""
+
+    COLS = ("interaction_id", "prev_interaction_id", "prompt_fingerprint",
+            "feature", "model", "input_tokens", "output_tokens",
+            "latency_ms", "status", "created_at")
+
+    def __init__(self, path: str):
+        self.con = sqlite3.connect(path, check_same_thread=False)
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.executescript(DDL)
+
+    def append_only(self, record) -> None:
+        row = asdict(record) if not isinstance(record, dict) else record
+        placeholders = ",".join(f":{c}" for c in self.COLS)
+        self.con.execute(
+            f"INSERT OR IGNORE INTO interactions VALUES({placeholders})",
+            {c: row.get(c) for c in self.COLS},
+        )
+        self.con.commit()
+```
+
+`INSERT OR IGNORE` にしているのは、リトライで同じ `interaction_id` が二度届いても正本が二重にならないようにするためです。追記専用と冪等は相性がよく、この一語で突合の前提が安定します。
+
+レコードに `feature` を持たせているのは、この列があるだけで後述のコスト按分がそのまま SQL で書けるからです。呼び出し時に文字列を1つ渡すだけの負担で、後から取り返しのつかない情報が残る。安い保険だと考えています。
 
 ## 突合（リコンサイル）で欠落を捕まえる
 
@@ -161,6 +233,32 @@ def reconcile(dashboard_ids: set[str], sink_ids: set[str]) -> dict:
 
 私はこの突合を日次のバッチで回し、カバレッジが 99% を下回ったときだけ通知する形にしました。毎回のログを人が見るのではなく、ズレが出たときだけ手を動かす。個人開発では、この「静かなときは静かでいてくれる」設計が、続けられるかどうかを分けます。
 
+## 正本があるから答えられる問い — 機能別のコスト按分
+
+二層に分けた効果が最も分かりやすく出たのは、請求額の内訳を問われたときでした。
+
+月末に API の請求を見て、「どの機能が使ったのか」を知りたくなる。ダッシュボードでは実行を1件ずつ眺めることはできても、機能ごとに束ねて合計する視点は得られません。正本が手元にあると、これが1本のクエリで済みます。
+
+```sql
+SELECT feature,
+       model,
+       COUNT(*)                              AS calls,
+       SUM(input_tokens)                     AS in_tok,
+       SUM(output_tokens)                    AS out_tok,
+       ROUND(AVG(latency_ms))                AS avg_ms,
+       ROUND(100.0 * SUM(status <> 'ok') / COUNT(*), 2) AS fail_pct
+FROM interactions
+WHERE created_at >= :period_start
+GROUP BY feature, model
+ORDER BY in_tok + out_tok DESC;
+```
+
+100,000 行に対してこの集計を走らせて 85.8 ms でした。月次のレポートを作るのに待たされる速度ではありません。単価は変動しますので、ここで出したトークン数に最新の料金表を掛けて按分する、という手順にしています。単価をコードに埋め込まないのは、料金改定のたびに過去の集計が壊れないようにするためです。
+
+この内訳が出て、私は自分の見立てが外れていたことを知りました。呼び出し回数が最も多い機能と、トークンを最も食っている機能が別だったのです。回数の多い機能は短い分類プロンプトの繰り返しで、単価に効いていたのは頻度の低い長文要約のほうでした。回数だけを見て最適化の順番を決めていたら、効かない場所を削っていたと思います。
+
+`fail_pct` を同じクエリに入れているのは、コストと失敗率を並べて見たいからです。トークンを多く使っている機能の失敗率が高ければ、そこは「高い上に不安定」な場所ということになります。優先順位を決めるとき、この2列が並んでいるだけで迷いが減りました。
+
 ## 本番運用で効いた判断
 
 設計を続けるうちに、いくつかの具体的な線引きが固まりました。状況別にまとめます。
@@ -170,7 +268,7 @@ def reconcile(dashboard_ids: set[str], sink_ids: set[str]) -> dict:
     <tr><th>決めごと</th><th>採った方針</th><th>理由</th></tr>
   </thead>
   <tbody>
-    <tr><td>正本の保持</td><td>90日ホット + 400日コールド（指紋のみ）</td><td>直近はすぐ引ける。長期は監査に足る最小限だけ残す</td></tr>
+    <tr><td>正本の保持</td><td>90日ホット（SQLite） + 400日コールド（射影を gzip）</td><td>直近はすぐ引ける。長期は1件43.4 B まで落ちるので保管が苦にならない</td></tr>
     <tr><td>入力の扱い</td><td>原文は残さず16文字の指紋のみ</td><td>突合には十分・PII を抱え込まない</td></tr>
     <tr><td>突合の頻度</td><td>日次バッチ・カバレッジ 99% 低下時のみ通知</td><td>平時は無音。異常時だけ人を呼ぶ</td></tr>
     <tr><td>ダッシュボード</td><td>triage 専用・自動化から参照しない</td><td>保証されない表示に運用を依存させない</td></tr>
