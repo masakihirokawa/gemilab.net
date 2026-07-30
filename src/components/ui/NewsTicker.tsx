@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLASH36 — Gemini 3.6 Flash が7月21日に登場しました。3.5 Flash と比べて出力トークンを17%削減し、価格は入力 $1.50・出力 $7.50 per 1M です",
-    "STEPS — 3.6 Flash は多段のワークフローで推論ステップとツール呼び出しの回数が減る方向の改善が入っています",
-    "LITE — Gemini 3.5 Flash-Lite は高スループットと低遅延に振ったモデルです。入力 $0.30・出力 $2.50 per 1M で、エージェント検索や文書処理の大量処理に向きます",
-    "CYBER — 3.6 Flash と 3.5 Flash-Lite にあわせて 3.5 Flash Cyber も発表され、Gemini 4 が予告されました",
-    "WHERE — 3.6 Flash と 3.5 Flash-Lite は Google Antigravity・AI Studio・Android Studio から使えます",
-    "HOME — Gemini for Home の会話の文脈を保つ窓が15分に広がり、Gemini Live が第1世代の Google Home Mini と Nest Hub にも届きました",
+    "G4PRE — 7月21日、Google が Gemini 4 の事前学習開始を明らかにしました。リリース日・モデル ID・価格・仕様はいずれも未発表で、公開最新は 3.6 Flash のままです",
+    "ORACLE — 7月30日、Oracle が Google Cloud との提携を拡大しました。Fusion Applications の AI Agent Studio から Gemini を使えるようにし、NetSuite の組み込み AI にも採用する計画です",
+    "ROBOT2 — 7月30日、Google DeepMind がヒューマノイド向けの新モデルを発表しました。全身の動きを協調させ、多段のタスクを計画しながら人間の環境へ適応することを狙っています",
+    "ENTGA — Gemini Enterprise のワークフローエージェントとスキルが GA になり、Slack 連携も GA へ。Vertex AI は Gemini Enterprise Agent Platform へ改称され、参照先の差し替えが要ります",
+    "NBAPP — Gemini Notebook に、取り込んだソースからプロンプト経由で対話的な HTML アプリを生成する App アーティファクトが開発中と伝えられています",
+    "SPARK — Gemini Spark に Chrome でのウェブ閲覧が加わり、提供地域が広がりました。複雑なウェブ上の用事を代行する機能も追加されています",
   ],
   en: [
-    "FLASH36 — Gemini 3.6 Flash arrived on July 21, consuming 17% fewer output tokens than 3.5 Flash and priced at $1.50 input and $7.50 output per 1M tokens",
-    "STEPS — 3.6 Flash takes fewer reasoning steps and tool calls to finish multi-step workflows, which shows up as lower spend on agentic runs",
-    "LITE — Gemini 3.5 Flash-Lite targets high throughput and low latency at $0.30 input and $2.50 output per 1M tokens, aimed at agentic search and document processing at volume",
-    "CYBER — Google announced 3.5 Flash Cyber alongside 3.6 Flash and 3.5 Flash-Lite, and teased Gemini 4",
-    "WHERE — Both 3.6 Flash and 3.5 Flash-Lite are available through Google Antigravity, AI Studio, and Android Studio",
-    "HOME — Gemini for Home now holds conversational context for 15 minutes, and Gemini Live reached the first-generation Google Home Mini and Nest Hub",
+    "G4PRE — Google said on July 21 that pre-training has begun for Gemini 4, with no release date, model ID, pricing, or specs announced — 3.6 Flash remains the latest public model",
+    "ORACLE — Oracle expanded its Google Cloud partnership on July 30, bringing Gemini models to AI Agent Studio for Fusion Applications and planning embedded Gemini across Fusion and NetSuite",
+    "ROBOT2 — Google DeepMind unveiled a robotics model on July 30 that coordinates whole-body movement, letting humanoids plan multi-step tasks and adapt to human environments",
+    "ENTGA — Gemini Enterprise workflow agents and skills reached GA along with the Slack integration, and Vertex AI was renamed the Gemini Enterprise Agent Platform — check your doc links",
+    "NBAPP — Gemini Notebook is reportedly gaining an App artifact that generates interactive HTML apps, such as dashboards and small games, from your sources via a prompt",
+    "SPARK — Gemini Spark added Chrome web browsing and rolled out to more regions, plus a new capability for handling complex errands on the web",
   ],
 };
 
