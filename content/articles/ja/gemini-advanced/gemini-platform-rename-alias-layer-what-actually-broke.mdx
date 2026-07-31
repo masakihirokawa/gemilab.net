@@ -1,0 +1,337 @@
+---
+title: "Vertex AI 改称後に検索基盤を測ったら、壊れていたのは順位ではなく集計層でした"
+slug: "gemini-platform-rename-alias-layer-what-actually-broke"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-07-31T13:00"
+author: "Gemini Lab"
+description: "Vertex AI から Gemini Enterprise Agent Platform への改称を受けて、自前の運用ドキュメント検索を実測しました。順位はほとんど動かず、完全一致に依存した集計層だけが静かに欠落していました。"
+tags: ["Gemini Enterprise Agent Platform", "Vertex AI", "検索設計", "エイリアス", "運用設計"]
+highlights:
+  - "改称直後の検索劣化を BM25 で実測した結果と、再現できる最小コード一式"
+  - "チャンク一括書き換えが招く逆方向の損失（P@5 が 0.92 から 0.08 へ）"
+  - "壊れるのはランキングではなく完全一致ゲート。エイリアス層を置くべき位置の判断基準"
+---
+
+リリースノートに「Vertex AI は Gemini Enterprise Agent Platform へ改称されました」という一行を見つけたのは、7月30日の夜でした。
+
+最初に浮かんだのは、手元の運用手順書のことです。個人開発でアプリを6本ほど並行して回しておりますと、自分用の手順書とアプリ内ヘルプの検索インデックスが、いつのまにか小さな知識ベースになっています。そこに書かれた「Vertex AI」は、もう存在しない名前になりました。
+
+明日から新しい名前で検索したとき、何も出てこなくなるのではないか。
+
+そう思って、翌朝に測ってみました。結果は予想と逆でした。順位はほとんど動かず、代わりに、まったく別の層が静かに欠けていました。
+
+## 何を測ったのか
+
+手元の状況を再現できる最小構成を作りました。外部サービスへの依存をなくし、誰でも同じ数字を出せる形にしています。
+
+- **コーパス**: 運用ドキュメントの断片 30 件。うち 12 件が基盤側（デプロイ・クォータ・IAM・課金など）の記述で、10 件は旧名称「Vertex AI」を、2 件は新名称「Gemini Enterprise Agent Platform」を含みます
+- **検索器**: BM25（k1=1.5、b=0.75）。日本語は 2-gram、英数字は語単位でトークン化
+- **クエリ**: 3 種類を各 5 問
+  - トピック語つき（「クォータ超過はどう対処する」など、名称以外の手がかりがある）
+  - 名称のみ（「◯◯ とは」「◯◯ の設定」など、名称が唯一の手がかり）
+  - 無関係（キャッシュ TTL・AdMob など、対照群）
+
+比べたのは 3 通りの対処です。
+
+<table>
+<thead>
+<tr><th>条件</th><th>やること</th><th>索引の再構築</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>A: 何もしない</strong></td><td>旧名称のまま放置</td><td>不要</td></tr>
+<tr><td><strong>B: 一括書き換え</strong></td><td>チャンク内の旧名称を新名称へ置換して再索引</td><td>必要</td></tr>
+<tr><td><strong>C: クエリ側展開</strong></td><td>索引はそのまま、クエリに双方向でエイリアスを足す</td><td>不要</td></tr>
+</tbody>
+</table>
+
+直感的には B が正解に見えます。データを新しい世界に合わせる、いちばん素直な対処だからです。
+
+## 計測に使ったコード
+
+依存パッケージなしで動きます。手元の環境に写して、コーパスを自分のものに差し替えれば、そのまま同じ計測ができます。
+
+```python
+# -*- coding: utf-8 -*-
+"""名称の改称が語彙検索に与える影響を測る最小構成（外部依存なし）"""
+import math, re
+from collections import Counter
+
+OLD = "vertex ai"
+NEW = "gemini enterprise agent platform"
+
+def tok(s: str):
+    """日本語は 2-gram、英数字は語単位。BM25 の語彙をこれで揃える"""
+    s = s.lower()
+    s = re.sub(r"[、。（）()「」・,.]", " ", s)
+    parts = []
+    for w in s.split():
+        if re.fullmatch(r"[a-z0-9_\-\.]+", w):
+            parts.append(w)          # ascii はそのまま 1 語
+        else:
+            for i in range(len(w) - 1):
+                parts.append(w[i:i + 2])   # 日本語は 2-gram
+            if len(w) == 1:
+                parts.append(w)      # 1 文字語の取りこぼしを防ぐ
+    return parts
+
+class BM25:
+    def __init__(self, docs, k1=1.5, b=0.75):
+        self.ids = [d[0] for d in docs]
+        self.toks = [tok(d[1]) for d in docs]
+        self.k1, self.b = k1, b
+        self.N = len(docs)
+        self.avgdl = sum(len(t) for t in self.toks) / self.N
+        self.df = Counter()
+        for t in self.toks:
+            self.df.update(set(t))       # 文書頻度は集合で数える
+        self.tf = [Counter(t) for t in self.toks]
+
+    def search(self, q: str, topk=5):
+        qt = tok(q)
+        scores = []
+        for i in range(self.N):
+            s, dl = 0.0, len(self.toks[i])
+            for w in qt:
+                f = self.tf[i].get(w, 0)
+                if not f:
+                    continue
+                idf = math.log(1 + (self.N - self.df[w] + 0.5) / (self.df[w] + 0.5))
+                s += idf * (f * (self.k1 + 1)) / (
+                    f + self.k1 * (1 - self.b + self.b * dl / self.avgdl))
+            scores.append((s, self.ids[i]))
+        # 同点のときの順序を固定しないと、計測が実行ごとにぶれます
+        scores.sort(key=lambda x: (-x[0], x[1]))
+        return [i for s, i in scores[:topk] if s > 0]
+
+def expand_bidirectional(q: str) -> str:
+    """条件 C。旧→新、新→旧の両方向に足す。片方向だけでは半分しか救えません"""
+    ql = q.lower()
+    if OLD in ql:
+        return q + " " + NEW
+    if NEW in ql:
+        return q + " " + OLD
+    return q
+
+def precision_at_k(idx: BM25, queries, gold: set, k=5, expand=None):
+    total = 0.0
+    for q in queries:
+        got = idx.search(expand(q) if expand else q, k)
+        if not got:
+            continue
+        total += sum(1 for d in got if d in gold) / k
+    return round(total / len(queries), 3)
+```
+
+`expand_bidirectional` を片方向だけにしなかったのには理由があります。旧名称のクエリだけを新名称へ寄せる実装をいちど書いたのですが、それだと「新名称で聞いてくる読者」を取りこぼしました。展開は双方向でないと意味がありません。
+
+## 予想と逆だった一つ目
+
+まず Recall@3、つまり「上位 3 件のどこかに正解が入っているか」で測りました。
+
+トピック語つきのクエリでは、**A・B・C のすべてで 1.000** でした。差がまったく出ません。
+
+理由は測ってみれば当たり前でした。「クォータ超過はどう対処する」というクエリには、「クォータ」「超過」「対処」という手がかりが載っています。BM25 にとって、これらの語のほうが「Vertex」「AI」よりも文書頻度が低く、識別力が高い。製品名は、そもそも主役ではなかったのです。
+
+改称でいちばん怖いのは検索が壊れることだと思い込んでいたのですが、少なくともトピック語を含む問い合わせでは、名前は脇役でした。
+
+粒度を上げて P@5（上位 5 件のうち何件が正解か）で見ると、ようやく差が現れます。
+
+<table>
+<thead>
+<tr><th>クエリ種別</th><th>A: 何もしない</th><th>B: 一括書き換え</th><th>C: クエリ側展開</th></tr>
+</thead>
+<tbody>
+<tr><td>名称のみ・旧名称で質問</td><td>0.920</td><td><strong>0.080</strong></td><td>0.920</td></tr>
+<tr><td>名称のみ・新名称で質問</td><td><strong>0.440</strong></td><td>1.000</td><td>0.920</td></tr>
+<tr><td>トピック語つき・旧名称で質問</td><td>0.760</td><td>0.400</td><td><strong>0.840</strong></td></tr>
+<tr><td>トピック語つき・新名称で質問</td><td>0.680</td><td>0.840</td><td><strong>0.840</strong></td></tr>
+</tbody>
+</table>
+
+放置（A）の弱点は、名称だけで聞かれたときの 0.440 に集中しています。上位 5 件のうち 2 件強しか関連文書が入らない状態です。
+
+## 予想と逆だった二つ目
+
+問題は B の列です。
+
+一括書き換えは、新名称のクエリを 1.000 まで押し上げます。理想的に見えます。ところが同じ操作で、旧名称のクエリが **0.920 から 0.080 へ落ちました**。トピック語つきでも 0.760 から 0.400 へ、ほぼ半減しています。
+
+改称の当日に、旧名称で検索する人がいなくなるわけではありません。むしろ既存の利用者ほど古い名前を使い続けます。手元のヘルプ検索でも、新しい呼び方が定着するまでに数か月はかかるはずです。
+
+つまり B は、**まだ来ていない読者のために、いま目の前にいる読者を切り捨てる**取引でした。純損失です。
+
+C（クエリ側展開）は 0.840〜0.920 の帯にすべてを収めます。どの列でも最高ではありませんが、どの列でも落ちません。しかも索引を作り直す必要がないので、改称の当日にデプロイできます。
+
+一方で、C にも代償はあります。クエリ 1 件あたりの処理時間を 200 回平均で測ったところ、素の検索が **102.7 µs**、展開ありが **125.6 µs** でした。約 22% の増加です。相対値は無視できませんが、絶対値としては 1 クエリあたり 23 µs 程度なので、ネットワーク往復のある構成では誤差に沈みます。この判断は自分の構成の実測で決めるべきところです。
+
+## 本当に壊れていた場所
+
+ここまでは検索の話です。実際に手を止めたのは、次の数字でした。
+
+基盤側の文書 12 件に対して、素朴な完全一致ゲートを当ててみます。
+
+<table>
+<thead>
+<tr><th>判定方法</th><th>12 件中のヒット数</th></tr>
+</thead>
+<tbody>
+<tr><td><code>"Vertex AI" in text</code>（旧名称で固定）</td><td>10</td></tr>
+<tr><td><code>"Gemini Enterprise Agent Platform" in text</code>（新名称で固定）</td><td><strong>2</strong></td></tr>
+<tr><td>エイリアス集合で判定</td><td>12</td></tr>
+</tbody>
+</table>
+
+新名称に更新した瞬間、12 件のうち 10 件が視界から消えます。しかもこの層は、検索と違って「それらしい 2 件」を返してくるので、**空になったことに気づけません**。
+
+ランキングは、多少ずれても上位に何かは残ります。人間が目で見て「違うな」と分かります。ところが完全一致で動く層は、静かに 2 件だけ返して正常終了します。
+
+自分の環境で、この構造を持っている箇所を数えてみました。
+
+1. **コスト集計**: 請求データを製品名でグルーピングして月次の内訳を出す処理。名称が変われば、その分だけ「その他」に落ちます
+2. **アラートのルーティング**: ログのメッセージに製品名が含まれるかで通知先を振り分ける条件。振り分けられなかったものは既定のチャンネルへ流れ、埋もれます
+3. **ドキュメントのタグ付け**: 手順書を製品ごとに分類するバッチ。改称後に追加した文書だけが別の箱に入ります
+4. **CI の禁止語チェック**: 廃止予定の製品名を検出する仕組み自体が、名称にハードコードされていました
+
+4 つとも、失敗しても例外を投げません。数字が少し小さくなるだけです。改称から数週間経って月次の集計を見たときに、はじめて違和感を持つ類の壊れ方でした。
+
+## エイリアス層をどこに置くか
+
+以上の実測から、置き場所の判断基準がはっきりしました。
+
+<table>
+<thead>
+<tr><th>層</th><th>改称の影響</th><th>気づけるか</th><th>対処</th></tr>
+</thead>
+<tbody>
+<tr><td>ランキング（BM25・ベクトル検索）</td><td>小〜中</td><td>目視で気づける</td><td>クエリ側で双方向展開</td></tr>
+<tr><td>完全一致ゲート・フィルタ</td><td><strong>大</strong></td><td><strong>気づけない</strong></td><td>正規化してから比較</td></tr>
+<tr><td>集計・グルーピング</td><td><strong>大</strong></td><td>数週間後に気づく</td><td>正規化キーで集計</td></tr>
+<tr><td>チャンク本文</td><td>—</td><td>—</td><td><strong>書き換えない</strong></td></tr>
+</tbody>
+</table>
+
+最下段が今回の結論です。データの本文は、書かれた当時の名前のまま残すのが正しいと考えるようになりました。本文は「いつ何が書かれたか」の記録であって、現在の呼称に合わせて塗り替えるものではありません。
+
+名称の解決は、読む側の責任として持つ。この分担にしておくと、次の改称が来ても索引の再構築が要りません。
+
+## 実装
+
+エイリアスの定義を一箇所に集め、検索・フィルタ・集計の三層がそこだけを見るようにします。
+
+```python
+# -*- coding: utf-8 -*-
+"""製品名エイリアスの単一情報源。検索・フィルタ・集計の三層がここだけを参照する"""
+from dataclasses import dataclass, field
+from datetime import date
+import re
+
+@dataclass(frozen=True)
+class ProductAlias:
+    canonical: str              # 集計キーに使う正規名（表示名とは分ける）
+    surfaces: tuple             # 実際に文書やクエリに現れる表記のゆれ
+    renamed_on: date | None = None   # 改称日。失効管理のために持つ
+    note: str = ""
+
+ALIASES: list[ProductAlias] = [
+    ProductAlias(
+        canonical="google.ai.platform",
+        surfaces=("vertex ai", "vertex-ai", "vertexai", "aiplatform",
+                  "gemini enterprise agent platform"),
+        renamed_on=date(2026, 7, 30),
+        note="2026-07-30 に Vertex AI から改称。旧名称は当面ヒットさせ続ける",
+    ),
+    ProductAlias(
+        canonical="google.ai.studio",
+        surfaces=("ai studio", "google ai studio", "aistudio"),
+    ),
+]
+
+# 表記 -> 正規名 の逆引きを起動時に一度だけ作る
+_SURFACE_TO_CANONICAL = {
+    s: a.canonical for a in ALIASES for s in a.surfaces
+}
+# 長い表記から先に当てないと "vertex ai" が
+# "gemini enterprise agent platform" の一部を食い合います
+_SURFACES_BY_LENGTH = sorted(_SURFACE_TO_CANONICAL, key=len, reverse=True)
+
+
+def canonical_keys(text: str) -> set[str]:
+    """集計・フィルタ用。テキストに含まれる製品を正規名の集合で返す"""
+    tl = text.lower()
+    found, consumed = set(), tl
+    for surface in _SURFACES_BY_LENGTH:
+        if surface in consumed:
+            found.add(_SURFACE_TO_CANONICAL[surface])
+            # 一度当たった表記は伏せ字にして二重カウントを防ぐ
+            consumed = consumed.replace(surface, " " * len(surface))
+    return found
+
+
+def expand_query(q: str) -> str:
+    """検索用。クエリに現れた製品の別表記を全部足す（双方向）"""
+    ql = q.lower()
+    extra = []
+    for alias in ALIASES:
+        if any(s in ql for s in alias.surfaces):
+            extra += [s for s in alias.surfaces if s not in ql]
+    return q if not extra else q + " " + " ".join(dict.fromkeys(extra))
+
+
+def stale_aliases(today: date, months: int = 18) -> list[ProductAlias]:
+    """改称から一定期間が過ぎたものを棚卸し候補として返す。
+    エイリアスは足すのは簡単で、消す判断だけが難しいので機械に思い出させます"""
+    out = []
+    for a in ALIASES:
+        if a.renamed_on and (today - a.renamed_on).days > months * 30:
+            out.append(a)
+    return out
+
+
+if __name__ == "__main__":
+    doc = "Vertex AI のクォータ超過は 429 で返る。指数バックオフで再試行する。"
+    print(canonical_keys(doc))
+    # {'google.ai.platform'}  ← 旧名称の文書でも正規名で拾える
+
+    print(canonical_keys("Gemini Enterprise Agent Platform のスキル定義は YAML"))
+    # {'google.ai.platform'}  ← 新名称でも同じキーに寄る
+
+    print(expand_query("Gemini Enterprise Agent Platform のIAM ロール"))
+    # 旧表記が足されたクエリが返る
+
+    print(stale_aliases(date(2026, 7, 31)))
+    # []  ← まだ改称直後なので棚卸し対象なし
+```
+
+`_SURFACES_BY_LENGTH` で長い表記から順に当てているのは、実装中につまずいた点です。素直に辞書の順で回すと、「gemini enterprise agent platform」という文字列の中に「vertex ai」は含まれないので大丈夫だろうと考えていたのですが、逆のケースで事故りました。表記集合に短い別名（`aiplatform` など）を足した途端、長い名称の一部と衝突して二重カウントが発生します。伏せ字で潰す 2 行がそれを防いでいます。
+
+## 運用に落とすときの判断
+
+エイリアスは足すのが簡単で、消すのが難しい仕組みです。放っておくと表記集合が肥大し、無関係な文書まで拾い始めます。
+
+そこで `renamed_on` を持たせました。改称から 18 か月を過ぎたエイリアスを棚卸し候補として機械が挙げてくれるようにしておくと、判断そのものは人間が下しつつ、忘却だけは防げます。18 か月という数字に根拠はありません。自分のアプリの利用者が旧バージョンから移行しきるまでの実測がおおむね 1 年強だったので、それに少し足しています。
+
+私自身、この仕組みを入れるまでは「そのうち直そう」と思ったまま半年ほど放置していた別名がありました。判断を先送りできる仕組みにしておくと、先送りしたことすら忘れます。
+
+いま Gemini 周りは名称の変化が続いています。Gemini 4 の事前学習開始が伝えられ、モデル ID の体系も 3.5 系と 3.6 系が並走しています。モデル ID を設定ファイルから読む設計はよく語られますが、**設定ファイルに書いた名前で集計している箇所**は、その外側に取り残されがちです。
+
+なお、名称と提供範囲は変わり続けます。ここで挙げた改称の詳細は、必ず[Gemini Enterprise のリリースノート](https://docs.cloud.google.com/gemini/enterprise/docs/release-notes)で一次情報を確認してください。
+
+## 今日できること
+
+手元の構成で、次の一行を走らせるところから始められます。
+
+```bash
+# 製品名がハードコードされた比較・フィルタ・集計を洗い出す
+grep -rn --include='*.py' --include='*.ts' --include='*.sql' \
+  -e '"Vertex AI"' -e "'Vertex AI'" -e 'Vertex AI' . \
+  | grep -Ev '^\s*#|^\s*//' \
+  | grep -E '==|in |LIKE|GROUP BY|filter|includes'
+```
+
+ヒットした行のうち、**失敗しても例外が飛ばない箇所**を先に直します。検索の順位は後回しで構いません。今回の実測が示したのは、目に見える劣化より、静かに数が減る場所のほうが先に手当てを要するということでした。
+
+自分の環境で同じ計測をされる場合は、コーパスを 30 件のままにせず、実際の文書量で回してみてください。件数が増えると文書頻度が変わり、製品名の識別力も変わります。ここに載せた数字は「30 件・2-gram・BM25」という条件下のものでしかありません。
+
+改称の知らせを見て慌てて索引を作り直す前に、まず測る。その順番だけは、今回はっきりと学びました。お読みいただきありがとうございました。
