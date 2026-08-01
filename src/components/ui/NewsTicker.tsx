@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "IMGEOL — 旧来の画像生成モデルが非推奨となり8月17日に停止します。新しい stable もしくは preview のエンドポイントへ移行してください",
-    "REGION — Gemini Enterprise アプリの global リージョンから、8月4日に Gemini 3.5 Flash が選択肢として外れます。リージョンとモデルを組で管理している構成は要確認です",
-    "GROK — Gemini Enterprise Agent Platform 上の Grok 4.1 モデルファミリが非推奨となり、8月20日に停止します",
-    "FSMM — File Search が gemini-embedding-2 によるマルチモーダル検索に対応しました。テキストへ書き起こす前処理を挟まずに画像を検索対象へ入れられます",
-    "FLASH36 — Gemini 3.6 Flash と 3.5 Flash-Lite が GA になりました。3.6 Flash はトークン効率と計画能力を上げつつ 3.5 Flash より安い価格帯に置かれています",
-    "SAMPLING — サンプリング引数の temperature・top_p・top_k が非推奨になりました。これらを前提にした出力制御は別の手段へ置き換える設計変更が要ります",
+    "HOOKS — Managed Agents に environment hooks が入りました。ツール呼び出しの前後でサンドボックス内のスクリプトを走らせ、検証・記録・外部パイプラインの起動を境界で挟めます",
+    "DEFAULT — antigravity-preview-05-2026 の既定モデルが Gemini 3.6 Flash になりました。コード変更は不要で、次の対話から自動的に切り替わります",
+    "BUDGET — Managed Agents にトークン予算・明示的なモデル選択・スケジュール実行・無料枠が加わり、サンドボックス環境を直接扱う API も公開されました",
+    "BG — 7月7日の更新で長時間のバックグラウンドタスクとリモート MCP サーバー連携が入っており、今回の hooks はその土台の上に積まれています",
+    "SUNSET — 旧来の画像生成モデルは8月17日、gemini-robotics-er-1.6-preview は8月31日に停止します。移行先の確認は早めが安全です",
+    "SAMPLING — temperature・top_p・top_k が非推奨になりました。あわせて gemini-3.1-flash-tts-preview で音声生成のストリーミングが使えるようになっています",
   ],
   en: [
-    "IMGEOL — The older image generation models are deprecated and shut down on August 17. Move to the newer stable or preview endpoints before then",
-    "REGION — Gemini 3.5 Flash disappears from the global region in the Gemini Enterprise app on August 4, so check any config that pins region and model together",
-    "GROK — The Grok 4.1 model family on the Gemini Enterprise Agent Platform is deprecated and will be shut down on August 20",
-    "FSMM — File Search now handles multimodal search through gemini-embedding-2, letting you index and query images natively instead of transcribing them first",
-    "FLASH36 — Gemini 3.6 Flash and 3.5 Flash-Lite are generally available. 3.6 Flash improves token efficiency and agentic planning while sitting below 3.5 Flash on price",
-    "SAMPLING — The temperature, top_p, and top_k sampling parameters are now deprecated, so any output control built on them needs a different approach",
+    "HOOKS — Managed Agents now support environment hooks. Custom scripts run before or after a tool call inside the sandbox, letting you validate, log, or trigger external pipelines at the boundary",
+    "DEFAULT — The antigravity-preview-05-2026 agent now runs Gemini 3.6 Flash by default. No code changes needed; your next interaction picks it up",
+    "BUDGET — Token budgets, explicit model selection, scheduled triggers, and free-tier access have landed for Managed Agents, along with an API for managing sandbox environments directly",
+    "BG — The July 7 release added long-running background tasks and remote MCP server integration. The new hooks build directly on that foundation",
+    "SUNSET — Older image generation models shut down August 17, and gemini-robotics-er-1.6-preview follows on August 31. Worth confirming your migration path early",
+    "SAMPLING — The temperature, top_p, and top_k sampling parameters are now deprecated. Separately, gemini-3.1-flash-tts-preview gained streaming support for speech generation",
   ],
 };
 
