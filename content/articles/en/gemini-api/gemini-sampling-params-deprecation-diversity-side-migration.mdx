@@ -1,0 +1,509 @@
+---
+title: "When Sampling Parameters Were Deprecated, Diversity Broke Before Determinism Did"
+slug: "gemini-sampling-params-deprecation-diversity-side-migration"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-08-01T13:00"
+author: "Gemini Lab"
+description: "Deprecating temperature, top_p and top_k hurt the diversity-generating side of my pipeline, not the deterministic side. Counting real call sites, moving diversity to the input layer, and measuring effective diversity."
+tags: ["Gemini API", "temperature", "migration", "regression testing", "cost design"]
+highlights:
+  - "grep reported 6 declaration sites but only 4 call sites actually needed changes, and one of them lived in a file that never mentions temperature"
+  - "Moving diversity to the input layer cut the monthly bill from $125.28 to $82.75 at a 75% cache discount, and changed nothing at all at 0%"
+  - "Round-robin stratification balanced the axes but produced 5 duplicates out of 8 prompts; a greedy balanced selector reached 0 duplicates with a max skew of 1"
+---
+
+I was working through the August 17 image model shutdown notice when a short line caught my eye much further down the same changelog. temperature, top_p and top_k had been deprecated.
+
+Compared to the entries with hard shutdown dates attached, it was placed very quietly.
+
+I did not brace for it. Most of the Gemini calls in the pipeline I run as an indie developer are extraction paths, and those have been pinned to `temperature: 0` for a long time. If I can no longer write zero, I simply stop writing it. That was roughly my reaction.
+
+Once I started actually touching the code, the order turned out to be reversed.
+
+What wobbled was not the side where I had pushed the value down. It was the side where I had pushed it up.
+
+## Count call sites, not declarations
+
+The first job was scoping. Running `grep -r temperature` is easy, but what it returns is where you wrote the value, not where it takes effect.
+
+The size of the migration is determined by how many `generate_content` calls the value flows into. If your defaults live in one shared module, you get one declaration and dozens of affected calls. Meanwhile values that live in config files never show up in a code grep at all.
+
+So I wrote a scanner that resolves one hop of indirection. It collects identifiers that carry sampling parameters outward, treats any layer that merely re-wraps a known carrier as a carrier itself, and propagates that to a fixed point.
+
+```python
+#!/usr/bin/env python3
+"""scan_sampling.py — count the call sites affected by deprecated
+sampling parameters, rather than the places they were declared."""
+import re
+import sys
+from pathlib import Path
+
+SAMPLING_KEYS = ("temperature", "top_p", "topP", "top_k", "topK")
+CODE_EXT = {".py", ".ts", ".tsx", ".js", ".mjs"}
+CONF_EXT = {".json", ".yaml", ".yml", ".toml"}
+CALL_RE = re.compile(r"generate_?[Cc]ontent")
+
+CARRIER_RE = [
+    re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*[:=]", re.M),
+    re.compile(r"^\s*([A-Z][A-Z0-9_]*)\s*=", re.M),                    # Python constants
+    re.compile(r"^\s*(?:export\s+)?function\s+([A-Za-z_]\w*)", re.M),
+    re.compile(r"^\s*def\s+([a-z_]\w*)", re.M),
+]
+
+
+def carriers_in(text, seeds):
+    """Names exported out of a block that contains sampling keys,
+    or that references an already-known carrier."""
+    found = set()
+    for rx in CARRIER_RE:
+        for m in rx.finditer(text):
+            name = m.group(1)
+            tail = text[m.start(): m.start() + 400]
+            if any(k in tail for k in SAMPLING_KEYS):
+                found.add(name)
+            elif any(re.search(rf"\b{re.escape(s)}\b", tail) for s in seeds):
+                found.add(name)   # a layer that only re-wraps a carrier is one too
+    return found
+
+
+def scan(root):
+    decl, conf, carriers = [], [], set()
+    files = [p for p in root.rglob("*") if p.is_file()]
+
+    for p in files:
+        if p.suffix not in CODE_EXT | CONF_EXT:
+            continue
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        hits = [k for k in SAMPLING_KEYS if k in text]
+        if not hits:
+            continue
+        rel = str(p.relative_to(root))
+        if p.suffix in CONF_EXT:
+            conf.append((rel, sorted(set(hits))))
+        else:
+            decl.append((rel, sorted(set(hits))))
+            carriers |= carriers_in(text, set())
+
+    # propagate to a fixed point: defaults -> buildConfig -> cfg
+    code_files = [(p, p.read_text(encoding="utf-8", errors="ignore"))
+                  for p in files if p.suffix in CODE_EXT]
+    for _ in range(5):
+        grown = set(carriers)
+        for _p, text in code_files:
+            grown |= carriers_in(text, carriers)
+        if grown == carriers:
+            break
+        carriers = grown
+
+    direct, indirect = [], []
+    for p in files:
+        if p.suffix not in CODE_EXT:
+            continue
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        lines = text.splitlines()
+        rel = str(p.relative_to(root))
+        for i, line in enumerate(lines, 1):
+            if not CALL_RE.search(line):
+                continue
+            window = "\n".join(lines[max(0, i - 6): i + 6])
+            if any(k in window for k in SAMPLING_KEYS):
+                direct.append(f"{rel}:{i}")
+            elif any(re.search(rf"\b{re.escape(n)}\b", window) for n in carriers):
+                indirect.append(f"{rel}:{i}")
+    return decl, conf, sorted(carriers), direct, indirect
+
+
+if __name__ == "__main__":
+    root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+    decl, conf, carriers, direct, indirect = scan(root)
+    print(f"[declarations] code   : {len(decl)}")
+    for rel, ks in decl:
+        print(f"  - {rel}  {','.join(ks)}")
+    print(f"[declarations] config : {len(conf)}")
+    for rel, ks in conf:
+        print(f"  - {rel}  {','.join(ks)}")
+    print(f"[carriers]            : {len(carriers)} -> {', '.join(carriers)}")
+    print(f"[call sites] direct   : {len(direct)} -> {', '.join(direct)}")
+    print(f"[call sites] indirect : {len(indirect)} -> {', '.join(indirect)}")
+    print(f"[total] to migrate    : {len(direct) + len(indirect)}")
+```
+
+Here is the output against a reduced tree that mirrors my own layout: two extraction files, one paraphrase file, two shared-defaults files, two config files.
+
+```text
+[declarations] code   : 4
+  - src/variation/paraphrase.py  temperature,top_k,top_p
+  - src/shared/defaults.ts  temperature,topK,topP
+  - src/extract/receipt.py  temperature
+  - src/extract/tags.py  temperature
+[declarations] config : 2
+  - config/profiles.json  temperature,topK,topP
+  - config/batch.yaml  temperature,top_k
+[carriers]            : 9 -> BASE, CFG, GEN_DEFAULTS, buildConfig, call, cfg, extract, run, variants
+[call sites] direct   : 3 -> src/variation/paraphrase.py:4, src/extract/receipt.py:4, src/extract/tags.py:2
+[call sites] indirect : 1 -> src/shared/agent.ts:3
+[total] to migrate    : 4
+```
+
+The second-to-last line is the one that matters. `src/shared/agent.ts` does not contain the string temperature, top_p or top_k anywhere. It just calls `buildConfig()`. Deprecated values still reach that call, and a work list built purely from grep leaves it stranded until the very end.
+
+<table>
+  <thead>
+    <tr><th>How you count</th><th>Count</th><th>What it actually measures</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Files matched by grep</td><td>6</td><td>Where the keyword was typed, including config</td></tr>
+    <tr><td>Direct call sites</td><td>3</td><td>A key appears within 6 lines of the call</td></tr>
+    <tr><td>Indirect call sites</td><td>1</td><td>Reached via a carrier. <strong>Invisible to grep</strong></td></tr>
+    <tr><td>Total to migrate</td><td>4</td><td>Places that genuinely need editing</td></tr>
+  </tbody>
+</table>
+
+Six declarations against four call sites. The numbers are close, but the sets do not overlap. Closing that gap first is what let me track the rest of the work as "how many are left."
+
+## The extraction paths barely moved
+
+I started with the extraction paths, assuming they were the main event: pulling amounts and merchant names out of receipt images, and tagging images.
+
+I dropped the zero and watched what changed.
+
+Almost nothing did. In hindsight the reason is plain — both paths were already passing `response_schema`.
+
+Temperature adjusts how far into the tail of the output distribution you reach. A schema closes the set of outputs you can produce at all. If an `enum` restricts a field to five values, no shift in the distribution produces a sixth. If a numeric field is declared `integer`, the only room to wobble is inside the digits.
+
+Stability in those paths was carried by the schema, not by the temperature. The zero was a comfort setting layered on top.
+
+That was the opposite of what I expected. I had planned to handle these paths with the most care, and in the end I deleted one line from a `config` dict.
+
+The more structured output you already have, the smaller this deprecation is for you. Implementations that tightened their output using temperature alone, without a schema, have some design to walk back.
+
+## What broke was the diversity generator
+
+The real problem lived in `src/variation/paraphrase.py`.
+
+That file produces paraphrase candidates for search intents. People type wildly different things into a wallpaper app's search box, so instead of hand-growing a synonym dictionary I generate paraphrases from representative intents and feed them into the regression suite as test inputs.
+
+There I had temperature at 1.2 and pulled the same prompt eight times. The temperature was the diversity generator.
+
+Turn it down and re-run, and of the eight candidates only two or three are meaningfully different. As test input, that is thin. Verifying the same phrasing over and over is guaranteed to pass.
+
+What struck me was that the diversity had been working by accident. I never once declared what I wanted to vary. I delegated it to the width of a distribution, so when the width was taken away, there was no fallback.
+
+Determinism was protected by design. Diversity was left to chance. Laid side by side, the priorities look inverted.
+
+## Move diversity into the input layer
+
+I changed the approach. Instead of pulling one prompt eight times, I pull eight different prompts once each.
+
+That requires naming what you want to vary. In my case three axes: vocabulary, length, and noise.
+
+```python
+#!/usr/bin/env python3
+"""variation_axes.py — build diversity in the input layer, not the sampler."""
+import itertools
+import random
+
+AXES = {
+    "vocabulary": ["everyday words only", "official in-app terms", "slang and abbreviations"],
+    "length": ["3 words or fewer", "one sentence", "two or more explanatory sentences"],
+    "noise": ["clean spelling", "phonetic spelling", "one typo included"],
+}
+PREFIX = "Paraphrase the following search intent. Intent: '{intent}'\nConstraints: "
+
+
+def build(intent, n, seed=0):
+    """Naive: shuffle the full product and take the first n."""
+    combos = list(itertools.product(*AXES.values()))
+    random.Random(seed).shuffle(combos)
+    keys = list(AXES)
+    out = []
+    for combo in combos[:n]:
+        cond = ", ".join(f"{k} = {v}" for k, v in zip(keys, combo))
+        out.append(PREFIX.format(intent=intent) + cond)
+    return out
+```
+
+Three axes at three levels each gives 27 combinations. I take eight of them.
+
+Because the seed is fixed, the same seed reproduces the same input set. For regression testing that reproducibility is the decisive difference from temperature-driven generation: when results change between runs, you can tell whether the inputs moved or the model did.
+
+## Balancing the axes created duplicates
+
+The naive output looked off immediately.
+
+```text
+combinations: 27  / selected: 8
+1. vocabulary = official in-app terms, length = one sentence, noise = one typo included
+2. vocabulary = official in-app terms, length = one sentence, noise = clean spelling
+3. vocabulary = slang and abbreviations, length = 3 words or fewer, noise = phonetic spelling
+4. vocabulary = official in-app terms, length = one sentence, noise = phonetic spelling
+...
+```
+
+Five of the eight used "official in-app terms." Drawing eight at random from a pool this small skews as a matter of course.
+
+So I wrote a stratified version that cycles each axis: shuffle the levels per axis, then assign with `i % number_of_levels`. The skew vanished exactly as intended.
+
+In exchange, I got duplicates.
+
+All three axes have three levels, so all three cycle with the same period, which makes `i` and `i+3` identical combinations. Five of the eight prompts were repeats.
+
+Trying to spread the set evenly destroyed the very diversity I was after.
+
+I settled on greedy selection instead. At each step, pick the unused combination containing the levels used least so far. Fixing only the tie-break order with a seed preserves reproducibility.
+
+```python
+def build_balanced(intent, n, seed=0):
+    """Minimize level skew without emitting duplicates."""
+    keys, levels = list(AXES), list(AXES.values())
+    pool = list(itertools.product(*levels))
+    random.Random(seed).shuffle(pool)        # seed fixes tie-break order only
+    used = {k: {v: 0 for v in vals} for k, vals in AXES.items()}
+    chosen = []
+    for _ in range(min(n, len(pool))):
+        best = min(pool, key=lambda c: (sum(used[k][v] for k, v in zip(keys, c)),
+                                        pool.index(c)))
+        pool.remove(best)
+        for k, v in zip(keys, best):
+            used[k][v] += 1
+        cond = ", ".join(f"{k} = {v}" for k, v in zip(keys, best))
+        chosen.append(PREFIX.format(intent=intent) + cond)
+    return chosen
+
+
+def coverage(prompts):
+    """How evenly the selected set touches each axis level."""
+    rep = {}
+    for k, vals in AXES.items():
+        c = {v: sum(1 for p in prompts if f"{k} = {v}" in p) for v in vals}
+        rep[k] = (c, max(c.values()) - min(c.values()))
+    return rep
+```
+
+The three strategies compared over the same seed and the same eight prompts:
+
+<table>
+  <thead>
+    <tr><th>Selection</th><th>Duplicates</th><th>Vocabulary skew</th><th>Length</th><th>Noise</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Random subset</td><td>0</td><td>4</td><td>3</td><td>3</td></tr>
+    <tr><td>Round-robin stratified</td><td><strong>5</strong></td><td>1</td><td>1</td><td>1</td></tr>
+    <tr><td>Greedy balanced</td><td>0</td><td>1</td><td>1</td><td>1</td></tr>
+  </tbody>
+</table>
+
+Writing the axes down turned out to be a more valuable by-product than the code. While I was running on temperature, I never articulated what variation I actually wanted. Once it was written out, I noticed I had never deliberately tested an input containing a typo.
+
+## Judge the output by effective diversity, not by count
+
+Spreading the inputs is pointless if the returned candidates still look alike. So the pass condition is not how many candidates came back, but how many genuinely different phrasings survive.
+
+I built a two-layer gate: collapse near-identical candidates with a SimHash over character bigrams, then sieve the survivors again with token-set Jaccard. I did not want to pull in a morphological analyzer for Japanese, so character trigrams stand in for words.
+
+```python
+#!/usr/bin/env python3
+"""diversity_gate.py — measure the effective diversity of paraphrase candidates."""
+import hashlib
+import re
+import sys
+import unicodedata
+
+SIMHASH_BITS = 64
+HAMMING_MAX = 12      # at or below this distance, treat as the same phrasing
+JACCARD_MAX = 0.72    # above this overlap, treat the token set as redundant
+
+
+def normalize(s):
+    s = unicodedata.normalize("NFKC", s).lower()
+    return re.sub(r"[\s、。,.!?！？「」『』（）()・\-—]+", "", s)
+
+
+def shingles(s, n=2):
+    s = normalize(s)
+    return [s[i:i + n] for i in range(max(len(s) - n + 1, 1))]
+
+
+def simhash(s):
+    v = [0] * SIMHASH_BITS
+    for sh in shingles(s):
+        h = int.from_bytes(hashlib.blake2b(sh.encode(), digest_size=8).digest(), "big")
+        for i in range(SIMHASH_BITS):
+            v[i] += 1 if (h >> i) & 1 else -1
+    out = 0
+    for i, x in enumerate(v):
+        if x > 0:
+            out |= 1 << i
+    return out
+
+
+def hamming(a, b):
+    return bin(a ^ b).count("1")
+
+
+def tokens(s):
+    # approximation that avoids a morphological analyzer: trigrams stand in for words
+    t = normalize(s)
+    return {t[i:i + 3] for i in range(max(len(t) - 2, 1))}
+
+
+def jaccard(a, b):
+    return len(a & b) / len(a | b) if (a | b) else 0.0
+
+
+def gate(cands):
+    kept, dropped = [], []
+    for c in cands:
+        h, tk = simhash(c), tokens(c)
+        clash = next((k for k in kept
+                      if hamming(h, k[1]) <= HAMMING_MAX
+                      or jaccard(tk, k[2]) >= JACCARD_MAX), None)
+        if clash:
+            dropped.append((c, clash[0]))
+        else:
+            kept.append((c, h, tk))
+    return [k[0] for k in kept], dropped
+
+
+if __name__ == "__main__":
+    cands = [l.rstrip("\n") for l in sys.stdin if l.strip()]
+    kept, dropped = gate(cands)
+    print(f"candidates          : {len(cands)}")
+    print(f"survivors (effective): {len(kept)}  = {len(kept) / len(cands):.0%}")
+    for c in kept:
+        print(f"  + {c}")
+    for c, by in dropped:
+        print(f"  - {c}  <- collapsed into: {by}")
+```
+
+Running ten Japanese candidates through it:
+
+```text
+candidates          : 10
+survivors (effective): 8  = 80%
+  + 壁紙を検索する
+  + 壁紙をさがす
+  + 背景画像を検索する
+  + 待ち受けを変えたい
+  + ホーム画面の画像を差し替える
+  + スマホの背景を選ぶ
+  + かべがみをけんさくする
+  + ロック画面に使う画像がほしい
+  - 壁紙を探す  <- collapsed into: 壁紙を検索する
+  - 壁紙 を 検索 する  <- collapsed into: 壁紙を検索する
+```
+
+Choosing the threshold took some deliberation. Sweeping `HAMMING_MAX` over the same candidate set:
+
+<table>
+  <thead>
+    <tr><th>HAMMING_MAX</th><th>Survivors</th><th>Rate</th><th>Newly collapsed</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>6</td><td>9</td><td>90%</td><td>Whitespace-only variant</td></tr>
+    <tr><td>10</td><td>9</td><td>90%</td><td>Same as above</td></tr>
+    <tr><td>12</td><td>8</td><td>80%</td><td>A true synonym of the verb</td></tr>
+    <tr><td>16</td><td>8</td><td>80%</td><td>Same as above</td></tr>
+    <tr><td>20</td><td>6</td><td>60%</td><td>"background image" and the all-kana form</td></tr>
+  </tbody>
+</table>
+
+Loosen it to 20 and "background image" gets collapsed into "wallpaper." For validating search synonyms, that is a candidate I want to keep. Tighten it to 6 and a genuine verb synonym slips through as if it were a distinct phrasing.
+
+Twelve was the knee. Past that point, what gets removed shifts from redundant spelling variants to meaningful paraphrases.
+
+Your threshold will depend on your use case, so rather than copying my number, run the sweep on your own candidate set once. Watching which candidates start disappearing makes the choice obvious.
+
+One honest limitation: character-level methods have a ceiling. In Japanese, the kanji and kana spellings of the same verb differ sharply at the bigram level, so at 12 they survive as separate entries. Without reading data you cannot collapse that class of variation by string distance alone. I chose to keep them, because users really do type both.
+
+## What it does to the bill
+
+You often see the claim that moving diversity to the input layer is cheaper. Decomposing it, the claim is conditional.
+
+Pulling the same prompt eight times bills the shared prefix — instructions, output contract, few-shot examples — in full every time. Varying only the tail lets the prefix sit in cache.
+
+So the saving depends entirely on whether prefix caching applies. Discount rates shift with the spec, so I made it a parameter rather than hard-coding it.
+
+```python
+#!/usr/bin/env python3
+"""diversity_cost.py — decompose the bill by which layer produces diversity."""
+IN_PER_1M = {"gemini-3.6-flash": 1.50, "gemini-3.5-flash-lite": 0.30}
+OUT_PER_1M = {"gemini-3.6-flash": 7.50, "gemini-3.5-flash-lite": 2.50}
+
+SHARED_PREFIX = 1500   # instructions, output contract, few-shot examples
+VARIABLE_TAIL = 300    # the part that differs per target
+OUT_TOKENS = 220       # output per candidate
+N_VARIANTS = 8
+N_TARGETS = 120
+DAYS = 30
+
+
+def cost(model, cache_discount):
+    ip, op = IN_PER_1M[model], OUT_PER_1M[model]
+    calls = N_VARIANTS * N_TARGETS * DAYS
+
+    # A: same long prompt n times; prefix billed in full every call
+    in_a = (SHARED_PREFIX + VARIABLE_TAIL) * calls
+
+    # B: prefix billed once per target, then at the cached rate
+    per_target = (SHARED_PREFIX
+                  + SHARED_PREFIX * (N_VARIANTS - 1) * (1 - cache_discount)
+                  + VARIABLE_TAIL * N_VARIANTS)
+    in_b = per_target * N_TARGETS * DAYS
+
+    out = OUT_TOKENS * calls
+    return in_a / 1e6 * ip + out / 1e6 * op, in_b / 1e6 * ip + out / 1e6 * op
+
+
+if __name__ == "__main__":
+    for model in IN_PER_1M:
+        print(f"[{model}] in ${IN_PER_1M[model]}/1M, out ${OUT_PER_1M[model]}/1M")
+        for d in (0.0, 0.50, 0.75, 0.90):
+            a, b = cost(model, d)
+            print(f"  discount {d:>4.0%} | A ${a:>7,.2f} | B ${b:>7,.2f} "
+                  f"| delta ${a - b:>5,.2f} | {(a - b) / a:>5.1%}")
+```
+
+The assumption is 8 candidates over 120 targets across 30 days, or 28,800 calls a month.
+
+<table>
+  <thead>
+    <tr><th>Model</th><th>Cache discount</th><th>A: sampling layer</th><th>B: input layer</th><th>Reduction</th></tr>
+  </thead>
+  <tbody>
+    <tr><td rowspan="4">gemini-3.6-flash</td><td>0%</td><td>$125.28</td><td>$125.28</td><td>0.0%</td></tr>
+    <tr><td>50%</td><td>$125.28</td><td>$96.93</td><td>22.6%</td></tr>
+    <tr><td>75%</td><td>$125.28</td><td>$82.75</td><td>33.9%</td></tr>
+    <tr><td>90%</td><td>$125.28</td><td>$74.25</td><td>40.7%</td></tr>
+    <tr><td rowspan="4">gemini-3.5-flash-lite</td><td>0%</td><td>$31.39</td><td>$31.39</td><td>0.0%</td></tr>
+    <tr><td>50%</td><td>$31.39</td><td>$25.72</td><td>18.1%</td></tr>
+    <tr><td>75%</td><td>$31.39</td><td>$22.89</td><td>27.1%</td></tr>
+    <tr><td>90%</td><td>$31.39</td><td>$21.19</td><td>32.5%</td></tr>
+  </tbody>
+</table>
+
+The first row is the important one. At a 0% discount, A and B differ by nothing.
+
+Which makes sense: moving diversity into the input layer does not reduce total input tokens. It only reduces the unit price of the portion you were resending. If your prefix is not structured to land in cache, the redesign buys you no money at all.
+
+Read the other way: the longer and more stable your shared prefix, the more this pays. I took the opportunity to reorder my prompts so instructions and the output contract sit at the front and everything target-specific collects at the tail.
+
+For high-volume, low-stakes work, the $21 to $31 per month band on gemini-3.5-flash-lite is also worth weighing. Regression-test input generation does not demand top-tier quality, so I moved that job over.
+
+## The order I would migrate in
+
+For anyone about to do the same, here is the sequence I ended up glad about.
+
+1. **Count call sites by effect, not by declaration.** Propagate carriers so you catch files that never mention the keyword
+2. **Clear the paths that already have structured output first.** With `response_schema` in place, dropping the temperature is usually the whole job
+3. **Find the paths where temperature was producing diversity.** This is the real work. Anything set above 1.0 almost certainly belongs here
+4. **Write down the axes you actually want to vary.** The act of articulating what the distribution was doing for you surfaces gaps in coverage
+5. **Define the pass condition as effective diversity before you swap the generator.** Without a measure in place first, you will not notice the set going thin
+
+Schemas protect determinism for you. Diversity only survives if you build the mechanism yourself. This deprecation was a useful occasion to see that asymmetry clearly.
+
+Specs and prices move, so please confirm against the [Gemini API changelog](https://ai.google.dev/gemini-api/docs/changelog) and the [pricing page](https://ai.google.dev/gemini-api/docs/pricing) before you implement. Every figure above is raw output from the scripts as printed. Swap in your own assumptions and run them again.
+
+I am still learning where the right knee sits for my own workloads, and I would be glad if any of this saves you a detour.

@@ -1,0 +1,522 @@
+---
+title: "temperature 非推奨で先に困ったのは、決定性ではなく多様性の側でした"
+slug: "gemini-sampling-params-deprecation-diversity-side-migration"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-08-01T13:00"
+author: "Gemini Lab"
+description: "temperature・top_p・top_k の非推奨化で影響が出たのは決定性ではなく多様性を作る側でした。呼び出し箇所の数え方、多様性を入力層へ移す設計、実効多様度の測り方を実測値とともに残します。"
+tags: ["Gemini API", "temperature", "移行", "回帰テスト", "コスト設計"]
+highlights:
+  - "grep が示す宣言 6 箇所に対し、実際に移行が要る呼び出しは 4 箇所。うち 1 箇所は temperature を一度も書いていないファイルにありました"
+  - "多様性を入力層へ移すとキャッシュ割引 75% 時に月額 $125.28 から $82.75 へ（33.9% 減）。割引 0% では 1 ドルも変わらない理由まで分解しています"
+  - "候補を均等に散らす層別巡回は 8 本中 5 本が重複。貪欲バランス選択で重複 0・最大偏り 1 に収めた実装を載せています"
+---
+
+8月17日の画像生成モデル停止について確認していたとき、同じ更新履歴のずっと下の方に短い一行が混ざっていました。temperature・top_p・top_k が非推奨になった、という記載です。
+
+停止日まで明記された項目に比べると、ずいぶん静かな置かれ方でした。
+
+私自身、最初はそれほど身構えていませんでした。個人開発で回しているパイプラインのうち Gemini を呼んでいるのは抽出系が大半で、そこは以前から temperature を 0 に固定していたためです。0 を書けなくなるだけなら、書かなければ済む。その程度の受け止めでした。
+
+実際に手を動かしてみると、順番が逆でした。
+
+揺れて困ったのは、値を 0 に寄せていた側ではありません。値を上げて使っていた側でした。
+
+## 何箇所が動くのかを、宣言ではなく呼び出しで数える
+
+最初にやったのは影響範囲の把握です。`grep -r temperature` を打つのは簡単ですが、返ってくるのは「書いた場所」であって「動かす場所」ではありません。
+
+移行の作業量を決めるのは、その値が流れ込む `generate_content` 呼び出しの数です。デフォルト値を 1 ファイルにまとめてあると、宣言は 1 箇所でも呼び出しは何十箇所にもなります。逆に設定ファイルに書いた値は、コードを grep しても一生出てきません。
+
+そこで、一段だけ間接参照を解決するスキャナを書きました。サンプリング引数を含むブロックから外へ配られる識別子を「運び手」として拾い、その運び手を包み直しただけの層も運び手とみなして、不動点まで伝播させます。
+
+```python
+#!/usr/bin/env python3
+"""scan_sampling.py — 非推奨サンプリング引数の依存を、
+宣言ではなく「影響を受ける呼び出し箇所」で数える。"""
+import re
+import sys
+from pathlib import Path
+
+SAMPLING_KEYS = ("temperature", "top_p", "topP", "top_k", "topK")
+CODE_EXT = {".py", ".ts", ".tsx", ".js", ".mjs"}
+CONF_EXT = {".json", ".yaml", ".yml", ".toml"}
+CALL_RE = re.compile(r"generate_?[Cc]ontent")
+
+CARRIER_RE = [
+    re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*[:=]", re.M),
+    re.compile(r"^\s*([A-Z][A-Z0-9_]*)\s*=", re.M),                    # Python 定数
+    re.compile(r"^\s*(?:export\s+)?function\s+([A-Za-z_]\w*)", re.M),
+    re.compile(r"^\s*def\s+([a-z_]\w*)", re.M),
+]
+
+
+def carriers_in(text, seeds):
+    """サンプリング引数、または既知の運び手を含むブロックから
+    外へ配られる識別子名を抽出する。"""
+    found = set()
+    for rx in CARRIER_RE:
+        for m in rx.finditer(text):
+            name = m.group(1)
+            tail = text[m.start(): m.start() + 400]
+            if any(k in tail for k in SAMPLING_KEYS):
+                found.add(name)
+            elif any(re.search(rf"\b{re.escape(s)}\b", tail) for s in seeds):
+                found.add(name)   # 運び手を包み直しただけの層も運び手
+    return found
+
+
+def scan(root):
+    decl, conf, carriers = [], [], set()
+    files = [p for p in root.rglob("*") if p.is_file()]
+
+    for p in files:
+        if p.suffix not in CODE_EXT | CONF_EXT:
+            continue
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        hits = [k for k in SAMPLING_KEYS if k in text]
+        if not hits:
+            continue
+        rel = str(p.relative_to(root))
+        if p.suffix in CONF_EXT:
+            conf.append((rel, sorted(set(hits))))
+        else:
+            decl.append((rel, sorted(set(hits))))
+            carriers |= carriers_in(text, set())
+
+    # 不動点まで伝播させる（defaults -> buildConfig -> cfg の包み直しを追う）
+    code_files = [(p, p.read_text(encoding="utf-8", errors="ignore"))
+                  for p in files if p.suffix in CODE_EXT]
+    for _ in range(5):
+        grown = set(carriers)
+        for _p, text in code_files:
+            grown |= carriers_in(text, carriers)
+        if grown == carriers:
+            break
+        carriers = grown
+
+    direct, indirect = [], []
+    for p in files:
+        if p.suffix not in CODE_EXT:
+            continue
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        lines = text.splitlines()
+        rel = str(p.relative_to(root))
+        for i, line in enumerate(lines, 1):
+            if not CALL_RE.search(line):
+                continue
+            window = "\n".join(lines[max(0, i - 6): i + 6])
+            if any(k in window for k in SAMPLING_KEYS):
+                direct.append(f"{rel}:{i}")
+            elif any(re.search(rf"\b{re.escape(n)}\b", window) for n in carriers):
+                indirect.append(f"{rel}:{i}")
+    return decl, conf, sorted(carriers), direct, indirect
+
+
+if __name__ == "__main__":
+    root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+    decl, conf, carriers, direct, indirect = scan(root)
+    print(f"[declarations] code   : {len(decl)}")
+    for rel, ks in decl:
+        print(f"  - {rel}  {','.join(ks)}")
+    print(f"[declarations] config : {len(conf)}")
+    for rel, ks in conf:
+        print(f"  - {rel}  {','.join(ks)}")
+    print(f"[carriers]            : {len(carriers)} -> {', '.join(carriers)}")
+    print(f"[call sites] 直接      : {len(direct)} -> {', '.join(direct)}")
+    print(f"[call sites] 間接      : {len(indirect)} -> {', '.join(indirect)}")
+    print(f"[total] 移行対象       : {len(direct) + len(indirect)}")
+```
+
+手元の構成を切り出した検証用ツリー（抽出2ファイル・言い換え1ファイル・共有デフォルト2ファイル・設定2ファイル）に当てたときの出力がこちらです。
+
+```text
+[declarations] code   : 4
+  - src/variation/paraphrase.py  temperature,top_k,top_p
+  - src/shared/defaults.ts  temperature,topK,topP
+  - src/extract/receipt.py  temperature
+  - src/extract/tags.py  temperature
+[declarations] config : 2
+  - config/profiles.json  temperature,topK,topP
+  - config/batch.yaml  temperature,top_k
+[carriers]            : 9 -> BASE, CFG, GEN_DEFAULTS, buildConfig, call, cfg, extract, run, variants
+[call sites] 直接      : 3 -> src/variation/paraphrase.py:4, src/extract/receipt.py:4, src/extract/tags.py:2
+[call sites] 間接      : 1 -> src/shared/agent.ts:3
+[total] 移行対象       : 4
+```
+
+注目したのは最後から二番目の行です。`src/shared/agent.ts` には temperature も top_p も top_k も一文字も書かれていません。`buildConfig()` を呼んでいるだけです。それでも実際には非推奨の値が流れ込む呼び出しであり、grep だけで作業リストを組むと、ここが最後まで残ります。
+
+<table>
+  <thead>
+    <tr><th>数え方</th><th>件数</th><th>何を数えているか</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>grep のヒットファイル</td><td>6</td><td>キーワードを書いた場所。設定ファイルを含む</td></tr>
+    <tr><td>直接指定の呼び出し</td><td>3</td><td>呼び出しの前後6行にキーワードがある箇所</td></tr>
+    <tr><td>間接の呼び出し</td><td>1</td><td>運び手経由。<strong>grep では出てこない</strong></td></tr>
+    <tr><td>移行対象の合計</td><td>4</td><td>実際に書き換えが要る箇所</td></tr>
+  </tbody>
+</table>
+
+宣言 6 に対して呼び出し 4。数としては近いのですが、集合が一致していません。この差を先に潰しておくと、以降の作業が「残りいくつ」で管理できるようになります。
+
+## 抽出系は、ほとんど揺れませんでした
+
+移行の本命だと思っていた抽出系から手を付けました。レシート画像から金額と店名を取り出す処理と、画像にタグを付ける処理です。どちらも `temperature: 0` で運用してきました。
+
+その 0 を落としてみて、出力がどう変わるかを見ました。
+
+結論から書くと、目に見える変化はほとんどありませんでした。理由は考えてみれば単純で、この 2 つはどちらも `response_schema` を渡していたからです。
+
+温度は出力分布の裾をどれだけ拾うかを調整します。スキーマは出力できる集合そのものを閉じます。`enum` で選択肢を 5 つに限定してあれば、分布がどう変わろうと 5 つの外は出てきません。数値フィールドを `integer` で宣言してあれば、揺れる余地は桁の中だけです。
+
+つまり抽出系の安定は、温度ではなくスキーマが担っていました。温度 0 は、その上に重ねた気休めに近い設定だったわけです。
+
+これは事前の想定と逆でした。私はこの経路をいちばん慎重に扱うつもりでいましたが、実際には `config` から 1 行消すだけで終わりました。
+
+構造化出力を先に入れてある実装ほど、今回の非推奨化の影響は小さくなります。逆に、スキーマを渡さず温度だけで出力を締めていた実装は、ここで一度設計を戻す必要が出てきます。
+
+## 壊れたのは、多様性を作る側でした
+
+問題は `src/variation/paraphrase.py` の方にありました。
+
+このファイルは、検索意図の言い換え候補を作ります。壁紙アプリの検索窓に入る表現は人によってばらつくため、同義語辞書を人手で育てるのではなく、代表的な意図から言い換えを生成して回帰テストの入力集合に流し込んでいました。
+
+そこでは temperature を 1.2 まで上げ、同じプロンプトを 8 回引いていました。温度が、そのまま多様性の発生装置でした。
+
+値を落として引き直すと、8 本のうち実質的に違うのは 2 本か 3 本という状態になりました。テスト入力としては痩せます。同じ言い方ばかりを検証しても、通るに決まっています。
+
+ここで気づいたのは、温度による多様性が「たまたま動いていた」ものだったという点です。何を変えたいのかを一度も宣言しないまま、分布の広がりに任せていました。だから広がりが取り上げられた瞬間に、代わりが何もありませんでした。
+
+決定性は設計で守られていて、多様性は運任せだった。並べてみると、守るべき順序が逆だったように思えます。
+
+## 多様性を入力層へ移し、軸を書き出す
+
+やり方を変えました。同じプロンプトを 8 回引くのをやめ、8 通りの違うプロンプトを 1 回ずつ引きます。
+
+そのために、何を変えたいのかを軸として明示します。私の場合は語彙・長さ・揺らぎの 3 軸でした。
+
+```python
+#!/usr/bin/env python3
+"""variation_axes.py — 多様性をサンプリング層ではなく入力層で作る。"""
+import itertools
+import random
+
+AXES = {
+    "語彙": ["日常語だけ", "アプリ内の正式名称", "略語・俗称"],
+    "長さ": ["3語以内", "1文", "2文以上の説明調"],
+    "揺らぎ": ["表記ゆれなし", "ひらがな寄り", "打ち間違いを1箇所含む"],
+}
+PREFIX = "次の検索意図を言い換えてください。意図: 「{intent}」\n制約: "
+
+
+def build(intent, n, seed=0):
+    """素朴版: 全組み合わせをシャッフルして先頭 n 件を採る。"""
+    combos = list(itertools.product(*AXES.values()))
+    random.Random(seed).shuffle(combos)
+    keys = list(AXES)
+    out = []
+    for combo in combos[:n]:
+        cond = "・".join(f"{k}は{v}" for k, v in zip(keys, combo))
+        out.append(PREFIX.format(intent=intent) + cond)
+    return out
+```
+
+3 軸それぞれ 3 水準なので、組み合わせは 27 通りです。ここから 8 本を採ります。
+
+seed を固定してあるため、同じ seed なら同じ入力集合が再現します。回帰テストの入力としては、この再現性が温度による生成との決定的な違いになります。前回と今回で結果が変わったとき、入力が変わったのかモデルが変わったのかを切り分けられるからです。
+
+## 均等に散らそうとして、重複を作りました
+
+素朴版の出力を眺めて、すぐに違和感がありました。
+
+```text
+組み合わせ総数: 27  / 採用: 8
+1. 語彙はアプリ内の正式名称・長さは1文・揺らぎは打ち間違いを1箇所含む
+2. 語彙はアプリ内の正式名称・長さは1文・揺らぎは表記ゆれなし
+3. 語彙は略語・俗称・長さは3語以内・揺らぎはひらがな寄り
+4. 語彙はアプリ内の正式名称・長さは1文・揺らぎはひらがな寄り
+...
+```
+
+8 本のうち 5 本が「アプリ内の正式名称」でした。ランダムに 8 本抜くと、この規模では普通に偏ります。
+
+そこで各軸の水準を巡回させる層別版を書きました。軸ごとに水準の並びをシャッフルし、`i % 水準数` で順番に割り当てる方式です。偏りは狙いどおり消えました。
+
+代わりに、重複が出ました。
+
+3 軸ともに水準数が 3 で、全部が同じ周期で回るため、`i` と `i+3` が完全に同じ組み合わせになります。8 本のうち 5 本が既出という結果でした。
+
+均等にしようとして、多様性そのものを壊したわけです。
+
+最終的には貪欲な選び方に落ち着きました。未使用の組み合わせのうち、「今いちばん使っていない水準」を多く含むものを毎回選びます。同点時の順序だけを seed で固定すれば、再現性も保てます。
+
+```python
+def build_balanced(intent, n, seed=0):
+    """重複を出さずに水準の偏りを最小化する。"""
+    keys, levels = list(AXES), list(AXES.values())
+    pool = list(itertools.product(*levels))
+    random.Random(seed).shuffle(pool)        # 同点時の順序を seed で固定
+    used = {k: {v: 0 for v in vals} for k, vals in AXES.items()}
+    chosen = []
+    for _ in range(min(n, len(pool))):
+        best = min(pool, key=lambda c: (sum(used[k][v] for k, v in zip(keys, c)),
+                                        pool.index(c)))
+        pool.remove(best)
+        for k, v in zip(keys, best):
+            used[k][v] += 1
+        cond = "・".join(f"{k}は{v}" for k, v in zip(keys, best))
+        chosen.append(PREFIX.format(intent=intent) + cond)
+    return chosen
+
+
+def coverage(prompts):
+    """採用した集合が各軸の水準をどれだけ均等に踏んでいるか。"""
+    rep = {}
+    for k, vals in AXES.items():
+        c = {v: sum(1 for p in prompts if f"{k}は{v}" in p) for v in vals}
+        rep[k] = (c, max(c.values()) - min(c.values()))
+    return rep
+```
+
+3 方式を同じ seed・同じ 8 本で比べた結果です。
+
+<table>
+  <thead>
+    <tr><th>選び方</th><th>重複</th><th>語彙の最大偏り</th><th>長さ</th><th>揺らぎ</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ランダム抽出</td><td>0</td><td>4</td><td>3</td><td>3</td></tr>
+    <tr><td>層別巡回</td><td><strong>5</strong></td><td>1</td><td>1</td><td>1</td></tr>
+    <tr><td>貪欲バランス</td><td>0</td><td>1</td><td>1</td><td>1</td></tr>
+  </tbody>
+</table>
+
+貪欲版の 8 本はこうなりました。
+
+```text
+1. 語彙はアプリ内の正式名称・長さは1文・揺らぎは打ち間違いを1箇所含む
+2. 語彙は略語・俗称・長さは3語以内・揺らぎはひらがな寄り
+3. 語彙は日常語だけ・長さは2文以上の説明調・揺らぎは表記ゆれなし
+4. 語彙はアプリ内の正式名称・長さは1文・揺らぎは表記ゆれなし
+5. 語彙は略語・俗称・長さは3語以内・揺らぎは打ち間違いを1箇所含む
+6. 語彙は日常語だけ・長さは2文以上の説明調・揺らぎはひらがな寄り
+7. 語彙はアプリ内の正式名称・長さは1文・揺らぎはひらがな寄り
+8. 語彙は略語・俗称・長さは3語以内・揺らぎは表記ゆれなし
+```
+
+軸を書き出すという作業自体が、思っていたより価値のある副産物でした。温度で回していた頃は、自分が何のバリエーションを欲しかったのかを言語化しないまま運用していました。書き出してみると、「打ち間違いを含む入力」を一度も意図して検証していなかったことに気づきます。
+
+## 出た候補は、件数ではなく実効多様度で見る
+
+入力を散らしても、返ってくる候補が似通っていては意味がありません。合否は本数ではなく、実際に違う言い方が何本あるかで判定します。
+
+文字 bigram の SimHash で近すぎる候補を畳み、残った候補をトークン集合の Jaccard でもう一度篩う二層構成にしました。日本語で形態素解析器を持ち込みたくなかったため、語の代用として文字 trigram を使っています。
+
+```python
+#!/usr/bin/env python3
+"""diversity_gate.py — 言い換え候補の実効多様度を測る二層ゲート。"""
+import hashlib
+import re
+import sys
+import unicodedata
+
+SIMHASH_BITS = 64
+HAMMING_MAX = 12      # これ以下の距離は「同じ言い方」とみなす
+JACCARD_MAX = 0.72    # これ以上重なるトークン集合は冗長
+
+
+def normalize(s):
+    s = unicodedata.normalize("NFKC", s).lower()
+    return re.sub(r"[\s、。,.!?！？「」『』（）()・\-—]+", "", s)
+
+
+def shingles(s, n=2):
+    s = normalize(s)
+    return [s[i:i + n] for i in range(max(len(s) - n + 1, 1))]
+
+
+def simhash(s):
+    v = [0] * SIMHASH_BITS
+    for sh in shingles(s):
+        h = int.from_bytes(hashlib.blake2b(sh.encode(), digest_size=8).digest(), "big")
+        for i in range(SIMHASH_BITS):
+            v[i] += 1 if (h >> i) & 1 else -1
+    out = 0
+    for i, x in enumerate(v):
+        if x > 0:
+            out |= 1 << i
+    return out
+
+
+def hamming(a, b):
+    return bin(a ^ b).count("1")
+
+
+def tokens(s):
+    # 形態素解析器を持ち込まずに済ませる近似: 文字 trigram を語の代用にする
+    t = normalize(s)
+    return {t[i:i + 3] for i in range(max(len(t) - 2, 1))}
+
+
+def jaccard(a, b):
+    return len(a & b) / len(a | b) if (a | b) else 0.0
+
+
+def gate(cands):
+    kept, dropped = [], []
+    for c in cands:
+        h, tk = simhash(c), tokens(c)
+        clash = next((k for k in kept
+                      if hamming(h, k[1]) <= HAMMING_MAX
+                      or jaccard(tk, k[2]) >= JACCARD_MAX), None)
+        if clash:
+            dropped.append((c, clash[0]))
+        else:
+            kept.append((c, h, tk))
+    return [k[0] for k in kept], dropped
+
+
+if __name__ == "__main__":
+    cands = [l.rstrip("\n") for l in sys.stdin if l.strip()]
+    kept, dropped = gate(cands)
+    print(f"入力候補          : {len(cands)}")
+    print(f"生存（実効多様度） : {len(kept)}  = {len(kept) / len(cands):.0%}")
+    for c in kept:
+        print(f"  ✓ {c}")
+    for c, by in dropped:
+        print(f"  ✗ {c}  ← 既出: {by}")
+```
+
+10 本の候補を流したときの出力です。
+
+```text
+入力候補          : 10
+生存（実効多様度） : 8  = 80%
+  ✓ 壁紙を検索する
+  ✓ 壁紙をさがす
+  ✓ 背景画像を検索する
+  ✓ 待ち受けを変えたい
+  ✓ ホーム画面の画像を差し替える
+  ✓ スマホの背景を選ぶ
+  ✓ かべがみをけんさくする
+  ✓ ロック画面に使う画像がほしい
+  ✗ 壁紙を探す  ← 既出: 壁紙を検索する
+  ✗ 壁紙 を 検索 する  ← 既出: 壁紙を検索する
+```
+
+しきい値の置き所には迷いました。同じ候補集合で `HAMMING_MAX` だけを動かした結果が次の表です。
+
+<table>
+  <thead>
+    <tr><th>HAMMING_MAX</th><th>生存</th><th>生存率</th><th>新たに畳まれた候補</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>6</td><td>9</td><td>90%</td><td>「壁紙 を 検索 する」（空白のみの差）</td></tr>
+    <tr><td>10</td><td>9</td><td>90%</td><td>同上</td></tr>
+    <tr><td>12</td><td>8</td><td>80%</td><td>「壁紙を探す」</td></tr>
+    <tr><td>16</td><td>8</td><td>80%</td><td>同上</td></tr>
+    <tr><td>20</td><td>6</td><td>60%</td><td>「背景画像を検索する」「かべがみをけんさくする」</td></tr>
+  </tbody>
+</table>
+
+20 まで緩めると「背景画像を検索する」が畳まれます。検索同義語の検証という目的からすると、これは残したい候補です。逆に 6 だと「壁紙を探す」と「壁紙を検索する」が別物として通ってしまいます。
+
+12 が膝でした。ここを超えると、削られるのが冗長な表記ゆれから意味のある言い換えへ変わります。
+
+しきい値は用途で変わるはずですので、数字を写すより、この掃引をご自身の候補集合で一度回してみることをお勧めします。畳まれ始める候補を目で見ると、置き所はすぐ決まります。
+
+なお、文字ベースの近似には限界があります。「壁紙をさがす」と「壁紙を探す」は漢字とかなの差が bigram に強く出るため、12 では別物として残りました。読み仮名を持たない限り、この種の表記ゆれを文字距離だけで畳むのは難しいところです。私は残す側に倒しました。ユーザーの入力としては実際に両方あり得るためです。
+
+## 請求はどう変わるか
+
+多様性を入力層へ移すと安くなる、という説明をよく見かけます。実際に分解してみると、条件付きでした。
+
+同じプロンプトを 8 回引く方式では、共有プレフィクス（指示・出力規約・少数例）が毎回フルに課金されます。入力層で散らす方式では、可変なのは末尾だけなので、プレフィクスはキャッシュに乗ります。
+
+つまり得をするかどうかは、プレフィクスのキャッシュ割引が効くかどうかで決まります。割引率は仕様の変動を受けるため、決め打ちにせず引数で振れるようにしました。
+
+```python
+#!/usr/bin/env python3
+"""diversity_cost.py — 多様性をどの層で作るかで請求がどう変わるかを分解する。"""
+IN_PER_1M = {"gemini-3.6-flash": 1.50, "gemini-3.5-flash-lite": 0.30}
+OUT_PER_1M = {"gemini-3.6-flash": 7.50, "gemini-3.5-flash-lite": 2.50}
+
+SHARED_PREFIX = 1500   # 指示・出力規約・少数例
+VARIABLE_TAIL = 300    # 対象ごとに異なる部分
+OUT_TOKENS = 220       # 候補1本あたりの出力
+N_VARIANTS = 8
+N_TARGETS = 120
+DAYS = 30
+
+
+def cost(model, cache_discount):
+    ip, op = IN_PER_1M[model], OUT_PER_1M[model]
+    calls = N_VARIANTS * N_TARGETS * DAYS
+
+    # A: 同じ長いプロンプトを n 回。プレフィクスは毎回フル課金
+    in_a = (SHARED_PREFIX + VARIABLE_TAIL) * calls
+
+    # B: プレフィクスは対象ごとに1回だけ実費、以降はキャッシュ単価
+    per_target = (SHARED_PREFIX
+                  + SHARED_PREFIX * (N_VARIANTS - 1) * (1 - cache_discount)
+                  + VARIABLE_TAIL * N_VARIANTS)
+    in_b = per_target * N_TARGETS * DAYS
+
+    out = OUT_TOKENS * calls
+    return in_a / 1e6 * ip + out / 1e6 * op, in_b / 1e6 * ip + out / 1e6 * op
+
+
+if __name__ == "__main__":
+    for model in IN_PER_1M:
+        print(f"[{model}] 入力 ${IN_PER_1M[model]}/1M・出力 ${OUT_PER_1M[model]}/1M")
+        for d in (0.0, 0.50, 0.75, 0.90):
+            a, b = cost(model, d)
+            print(f"  割引 {d:>4.0%} | A ${a:>7,.2f} | B ${b:>7,.2f} "
+                  f"| 差 ${a - b:>5,.2f} | {(a - b) / a:>5.1%}")
+```
+
+前提は、候補 8 本 × 対象 120 件 × 30 日で月 28,800 呼び出しです。
+
+<table>
+  <thead>
+    <tr><th>モデル</th><th>キャッシュ割引</th><th>A: サンプリング層</th><th>B: 入力層</th><th>削減率</th></tr>
+  </thead>
+  <tbody>
+    <tr><td rowspan="4">gemini-3.6-flash</td><td>0%</td><td>$125.28</td><td>$125.28</td><td>0.0%</td></tr>
+    <tr><td>50%</td><td>$125.28</td><td>$96.93</td><td>22.6%</td></tr>
+    <tr><td>75%</td><td>$125.28</td><td>$82.75</td><td>33.9%</td></tr>
+    <tr><td>90%</td><td>$125.28</td><td>$74.25</td><td>40.7%</td></tr>
+    <tr><td rowspan="4">gemini-3.5-flash-lite</td><td>0%</td><td>$31.39</td><td>$31.39</td><td>0.0%</td></tr>
+    <tr><td>50%</td><td>$31.39</td><td>$25.72</td><td>18.1%</td></tr>
+    <tr><td>75%</td><td>$31.39</td><td>$22.89</td><td>27.1%</td></tr>
+    <tr><td>90%</td><td>$31.39</td><td>$21.19</td><td>32.5%</td></tr>
+  </tbody>
+</table>
+
+いちばん大事なのは一行目です。割引 0% のとき、A と B は 1 セントも変わりません。
+
+当然といえば当然で、入力層へ移しても総入力トークン数は減っていないためです。減っているのは「同じ内容を再送している分の単価」だけです。プレフィクスがキャッシュに乗る構成になっていなければ、この設計変更に金銭的な見返りはありません。
+
+裏を返せば、共有プレフィクスを長く安定させておくほど効きます。私は指示と出力規約を先頭へ寄せ、対象ごとに変わる部分を末尾にまとめる並べ替えを、この機会に済ませました。
+
+軽い処理を大量に流す用途なら、gemini-3.5-flash-lite 側の月 $21〜31 という水準も判断材料になります。回帰テストの入力生成は品質要求がそれほど高くないため、私はこちらへ寄せました。
+
+## 移行の順序について
+
+同じことをされる方のために、私が結果的に良かったと感じた順序を残します。
+
+1. **呼び出し箇所を、宣言ではなく実効で数える。** 運び手を伝播させて、キーワードを書いていないファイルまで拾う
+2. **構造化出力が入っている経路から先に潰す。** `response_schema` があれば温度を落とすだけで済むことが多く、作業が軽い
+3. **温度で多様性を作っていた経路を洗い出す。** ここが本丸になります。値が 1 を超えている箇所は、ほぼ確実にこちら側です
+4. **何を変えたいのかを軸として書き出す。** 分布に任せていた部分を言語化する工程で、検証漏れが見つかります
+5. **合否を実効多様度で定義してから、生成方式を差し替える。** 測る物差しが先にないと、痩せたことに気づけません
+
+決定性はスキーマで守れます。多様性は、守る仕組みを自分で書かないと残りません。今回の非推奨化は、その非対称性を確認する機会になりました。
+
+仕様と価格は変わりますので、実装前に [Gemini API の更新履歴](https://ai.google.dev/gemini-api/docs/changelog) と[料金ページ](https://ai.google.dev/gemini-api/docs/pricing)でご確認ください。ここに載せた数値は、上のスクリプトをそのまま走らせた出力です。手元の前提に置き換えて回していただければと思います。
+
+長い記事にお付き合いいただき、ありがとうございました。
