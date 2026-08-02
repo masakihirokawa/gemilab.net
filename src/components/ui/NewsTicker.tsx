@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "HOOKS — Managed Agents に environment hooks が入りました。ツール呼び出しの前後でサンドボックス内のスクリプトを走らせ、検証・記録・外部パイプラインの起動を境界で挟めます",
-    "DEFAULT — antigravity-preview-05-2026 の既定モデルが Gemini 3.6 Flash になりました。コード変更は不要で、次の対話から自動的に切り替わります",
-    "BUDGET — Managed Agents にトークン予算・明示的なモデル選択・スケジュール実行・無料枠が加わり、サンドボックス環境を直接扱う API も公開されました",
-    "BG — 7月7日の更新で長時間のバックグラウンドタスクとリモート MCP サーバー連携が入っており、今回の hooks はその土台の上に積まれています",
-    "SUNSET — 旧来の画像生成モデルは8月17日、gemini-robotics-er-1.6-preview は8月31日に停止します。移行先の確認は早めが安全です",
-    "SAMPLING — temperature・top_p・top_k が非推奨になりました。あわせて gemini-3.1-flash-tts-preview で音声生成のストリーミングが使えるようになっています",
+    "GA — Gemini 3.6 Flash が7月21日に一般提供へ移りました。入力 $1.50 / 出力 $7.50 per Mtok で、3.5 Flash の出力 $9.00 から下がっています",
+    "TOKENS — 3.6 Flash は Artificial Analysis Index で出力トークンが 3.5 Flash 比17%減。DeepSWE のようなエージェント系では平均 276K から 97K トークンまで縮んだと報告されています",
+    "LITE — Gemini 3.5 Flash-Lite も一般提供になりました。$0.30 / $2.50 per Mtok で、低レイテンシと高頻度の自動化に向いた価格帯です",
+    "OMNI — gemini-omni-flash-preview が公開プレビューに入りました。720p で3〜10秒の動画を生成し、そのまま対話的に編集できます",
+    "SUNSET — 旧来の画像生成モデルは8月17日、Gemini Enterprise Agent Platform の Grok 4.1 系は8月20日、gemini-robotics-er-1.6-preview は8月31日に停止します",
+    "COMPUTER — Gemini 3.5 Flash の Computer Use が公開プレビューになりました。ブラウザ・モバイル・デスクトップに対応し、プロンプトインジェクション検出と設定可能な安全ポリシーを備えます",
   ],
   en: [
-    "HOOKS — Managed Agents now support environment hooks. Custom scripts run before or after a tool call inside the sandbox, letting you validate, log, or trigger external pipelines at the boundary",
-    "DEFAULT — The antigravity-preview-05-2026 agent now runs Gemini 3.6 Flash by default. No code changes needed; your next interaction picks it up",
-    "BUDGET — Token budgets, explicit model selection, scheduled triggers, and free-tier access have landed for Managed Agents, along with an API for managing sandbox environments directly",
-    "BG — The July 7 release added long-running background tasks and remote MCP server integration. The new hooks build directly on that foundation",
-    "SUNSET — Older image generation models shut down August 17, and gemini-robotics-er-1.6-preview follows on August 31. Worth confirming your migration path early",
-    "SAMPLING — The temperature, top_p, and top_k sampling parameters are now deprecated. Separately, gemini-3.1-flash-tts-preview gained streaming support for speech generation",
+    "GA — Gemini 3.6 Flash reached general availability on July 21. Pricing is $1.50 input and $7.50 output per million tokens, down from $9.00 output on 3.5 Flash",
+    "TOKENS — On the Artificial Analysis Index, 3.6 Flash uses 17% fewer output tokens than 3.5 Flash. On agentic benchmarks like DeepSWE the average reportedly fell from 276K to 97K tokens per task",
+    "LITE — Gemini 3.5 Flash-Lite is also generally available at $0.30 / $2.50 per million tokens, aimed at low-latency, high-volume automation",
+    "OMNI — gemini-omni-flash-preview entered public preview. It generates 3 to 10 second videos at 720p and lets you refine them conversationally",
+    "SUNSET — Older image generation models shut down August 17, the Grok 4.1 family on the Gemini Enterprise Agent Platform on August 20, and gemini-robotics-er-1.6-preview on August 31",
+    "COMPUTER — Computer Use is in public preview for Gemini 3.5 Flash, covering browser, mobile, and desktop environments with configurable safety policies and prompt injection detection",
   ],
 };
 
