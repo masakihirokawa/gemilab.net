@@ -1,0 +1,411 @@
+---
+title: "environment hooks に置いた門番の実測 — 判定は46マイクロ秒、起動は23ミリ秒"
+slug: "gemini-environment-hooks-command-guard-startup-cost-measured"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-08-02T13:00"
+author: "Gemini Lab"
+description: "Managed Agents の environment hooks に破壊的コマンドのガードを置くまでの記録です。正規表現の denylist が20件中9件を素通りさせた実測から、argv 分解による検出率100パーセントまでの3段階と、判定より500倍重い起動コストの内訳をまとめました。"
+tags: ["Gemini API", "Managed Agents", "environment hooks", "サンドボックス", "エージェント設計"]
+highlights:
+  - "正規表現の denylist が破壊的コマンド20件中9件を素通りさせた実測と、argv 分解で検出率100パーセント・誤検知0パーセントまで詰めた3段階の設計"
+  - "判定ロジックは46マイクロ秒、プロセス起動は23.1ミリ秒。import re 単体で7.1ミリ秒という内訳と、フックを1本に束ねる根拠"
+  - "そのまま動く pre-tool-call ガードの完全な実装（ラッパ剥がし・サブシェル再帰・書き込みパススコープ付き）"
+---
+
+7月28日、Gemini API の Managed Agents に environment hooks が加わりました。ツール呼び出しの前後で、サンドボックスの内側からカスタムスクリプトを走らせられる仕組みです。
+
+告知を読んで最初に思い浮かんだのは、機能の使い道ではなく、以前に自分が肝を冷やした場面のほうでした。個人開発で回している自動化パイプラインで、エージェントに作業ディレクトリの掃除をさせたとき、消してほしくない中間生成物まで一緒に消えたことがあります。復旧そのものは十数分で済みました。ただ、あのとき手元にあったのは「実行が終わったログ」だけで、実行を止める場所がどこにもなかった。
+
+environment hooks は、まさにその「止める場所」をツール呼び出しの境界に作るものです。
+
+そこで、破壊的なシェルコマンドを弾く門番を書きました。書き始めたときは30分で終わる作業だと思っていました。実際には、最初に書いた実装が半分近くを素通りさせ、そのうえ性能の想定が完全に逆でした。以下はその記録です。
+
+> ※ 以下の計測は、隔離された Linux 環境（Ubuntu 22.04 / Python 3.10.12）でフックスクリプト単体を走らせて取得した値です。フックの契約は「ツール呼び出しの内容を受け取り、許可か拒否を返すプロセス」なので、判定ロジックと起動コストはエージェントへ組み込む前に単独で測れます。API 側の仕様・引数名は変更され得るため、実装前に [Gemini API の Agents ドキュメント](https://ai.google.dev/gemini-api/docs/agents) で確認してください。
+
+## 止めたいものを、まず34行のリストにする
+
+ガードを書く前に、判定対象を確定させました。頭の中の「危ないコマンド」は輪郭がぼやけていて、実装しながら考えると必ず取りこぼします。
+
+破壊的として止めたいもの20件、通したいもの14件。合計34件のコーパスを作りました。意図的に入れたのは次の3種類です。
+
+<table>
+<thead><tr><th>種別</th><th>狙い</th><th>例</th></tr></thead>
+<tbody>
+<tr><td>教科書的な破壊</td><td>どんな実装でも止まるはず</td><td><code>rm -rf /</code></td></tr>
+<tr><td>表記違いの破壊</td><td>同じ意味で書き方だけ違う</td><td><code>rm -fr /workspace</code> / <code>rm --recursive --force ...</code></td></tr>
+<tr><td>紛らわしい正常系</td><td>誤爆させたいケース</td><td><code>grep -rn 'rm -rf' /workspace/docs</code></td></tr>
+</tbody>
+</table>
+
+3番目を入れたことが、あとで効きました。ガードの価値は「止めた数」ではなく「止めずに済ませた数」との比で決まります。安全側に倒しすぎたフックは、数日で外されて終わります。
+
+```python
+# corpus.py — 判定対象の固定コーパス（True = 破壊的として止めたい）
+CORPUS = [
+    # 教科書的な破壊
+    ("rm -rf /", True),
+    ("rm -rf /workspace", True),
+    ("rm -rf ~", True),
+    # 同じ意味だが表記が違う
+    ("rm -fr /workspace", True),
+    ("rm -r -f /workspace", True),
+    ("rm --recursive --force /workspace", True),
+    ("/bin/rm -rf /workspace", True),
+    ("env rm -rf /workspace", True),
+    ("sh -c 'rm -rf /workspace'", True),
+    ("cd /workspace && rm -rf .", True),
+    ("find /workspace -delete", True),
+    ("truncate -s 0 /workspace/db.sqlite", True),
+    (": > /workspace/db.sqlite", True),
+    ("dd if=/dev/zero of=/workspace/db.sqlite", True),
+    ("git clean -xfd", True),
+    ("git reset --hard origin/main", True),
+    ("mkfs.ext4 /dev/nvme1n1", True),
+    ("chmod -R 000 /workspace", True),
+    ("mv /workspace /tmp/gone", True),
+    # 通したい正常系
+    ("ls -la /workspace", False),
+    ("cat /workspace/report.json", False),
+    ("python3 /workspace/analyze.py --input data.csv", False),
+    ("grep -rn 'TODO' /workspace/src", False),
+    ("git status", False),
+    ("git log --oneline -20", False),
+    ("npm test", False),
+    # 紛らわしい正常系（誤爆を測るために置く）
+    ("grep -rn 'rm -rf' /workspace/docs", False),
+    ("echo 'never run rm -rf /' >> /workspace/NOTES.md", False),
+    ("python3 -c \"print('rm -rf /')\"", False),
+    ("git log --grep='remove -rf flag'", False),
+]
+```
+
+## 最初の実装は、20件中9件を素通りさせた
+
+素朴に、危険なパターンを正規表現で並べました。おそらく多くの人が最初に書くであろう形です。
+
+```python
+import re
+
+DENY_PATTERNS = [
+    r"rm\s+-rf\s+/",
+    r"rm\s+-rf\s+~",
+    r"mkfs",
+    r"dd\s+if=/dev/zero",
+    r"git\s+reset\s+--hard",
+    r"git\s+clean\s+-xfd",
+]
+DENY_RE = [re.compile(p) for p in DENY_PATTERNS]
+
+def guard_denylist(cmd: str) -> bool:
+    """True を返したら「破壊的なので拒否」"""
+    return any(r.search(cmd) for r in DENY_RE)
+```
+
+コーパスに通した結果です。
+
+```
+破壊的 20件中 11件を阻止（検出率 55.0%）
+正常  14件中  2件を誤って阻止（誤検知率 14.3%）
+```
+
+素通りした9件を並べると、傾向がはっきりしました。
+
+<table>
+<thead><tr><th>素通りしたコマンド</th><th>なぜ漏れたか</th></tr></thead>
+<tbody>
+<tr><td><code>rm -fr /workspace</code></td><td>フラグの並びが <code>-rf</code> ではない</td></tr>
+<tr><td><code>rm -r -f /workspace</code></td><td>フラグが分かれている</td></tr>
+<tr><td><code>rm --recursive --force /workspace</code></td><td>ロングオプション</td></tr>
+<tr><td><code>cd /workspace &amp;&amp; rm -rf .</code></td><td>削除対象がスラッシュ始まりではない</td></tr>
+<tr><td><code>find /workspace -delete</code></td><td>そもそも <code>rm</code> ではない</td></tr>
+<tr><td><code>truncate -s 0 ...</code> / <code>: &gt; ...</code></td><td>削除ではなく中身の消去</td></tr>
+<tr><td><code>chmod -R 000 /workspace</code></td><td>消さないが読めなくする</td></tr>
+<tr><td><code>mv /workspace /tmp/gone</code></td><td>消さないが消えたのと同じ</td></tr>
+</tbody>
+</table>
+
+パターンを追加すれば個別には塞げます。ただ、この一覧を眺めていて手が止まりました。塞いだところで、次に来るのは私が思いつかなかった10件目です。denylist は「私が想像できた危険」の上限までしか働かない。
+
+誤検知のほうも示唆的でした。`echo 'never run rm -rf /' >> NOTES.md` と `python3 -c "print('rm -rf /')"` が止められています。文字列の中身とコマンドの構造を、正規表現は区別できません。
+
+つまりこの方式は、構造を見るべき対象を文字列として扱っている点で、そもそも土台がずれていました。
+
+## argv へ分解して、構造として読み直す
+
+方針を変えました。文字列として照合するのをやめ、シェルと同じようにトークンへ分解して、先頭コマンドとフラグを構造として読む。そして「危険なものを列挙する」のではなく「安全なものだけを通す」。
+
+分解には `shlex` を使いますが、シェルの制御構文（`&&`、`||`、`;`、`|`）はそのままでは扱えないため、自前で区切ってから各セグメントを argv 化します。
+
+```python
+import os, re, shlex
+
+READ_ONLY = {
+    "ls","cat","head","tail","wc","grep","stat","file","du","df",
+    "python3","python","node","npm","pytest","echo","printf","jq",
+    "sed","awk","sort","uniq","diff",
+}
+GIT_READ_ONLY = {"status","log","diff","show","branch","rev-parse","ls-files","describe","blame"}
+DESTRUCTIVE_BIN = {"rm","mkfs","mkfs.ext4","dd","truncate","shred","mv","chmod","chown"}
+WRAPPERS = {"env","sudo","nohup","time","xargs"}
+SHELLS = {"sh","bash","zsh"}
+
+def _split_segments(cmd: str):
+    """&& || ; | で区切り、各セグメントを argv 化する。解析不能なら None"""
+    segs, buf, i, quote = [], "", 0, None
+    while i < len(cmd):
+        c = cmd[i]
+        if quote:
+            buf += c
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "\"'":
+            quote = c; buf += c; i += 1; continue
+        if cmd.startswith("&&", i) or cmd.startswith("||", i):
+            segs.append(buf); buf = ""; i += 2; continue
+        if c in ";|":
+            segs.append(buf); buf = ""; i += 1; continue
+        buf += c; i += 1
+    segs.append(buf)
+
+    out = []
+    for s in segs:
+        s = s.strip()
+        if not s:
+            continue
+        try:
+            argv = shlex.split(s)
+        except ValueError:
+            return None  # 引用符が閉じていない等。安全側に倒す
+        if argv:
+            out.append(argv)
+    return out
+
+
+def guard_allowlist(cmd: str, depth: int = 0) -> bool:
+    """True を返したら拒否。深さ制限つきで sh -c の中身も再帰的に見る"""
+    if depth > 3:
+        return True
+    segments = _split_segments(cmd)
+    if segments is None:
+        return True
+
+    for argv in segments:
+        head = os.path.basename(argv[0])   # /bin/rm → rm
+        args = argv[1:]
+
+        # env / sudo などのラッパを剥がす
+        while head in WRAPPERS and args:
+            head = os.path.basename(args[0]); args = args[1:]
+
+        # sh -c '...' は中身を再帰検査
+        if head in SHELLS:
+            inner = next((a for a in args if not a.startswith("-")), None)
+            if inner is None or guard_allowlist(inner, depth + 1):
+                return True
+            continue
+
+        if head in DESTRUCTIVE_BIN:
+            return True
+        if head == "find":            # -delete / -exec を持ちうる
+            return True
+        if head == "git":
+            sub = next((a for a in args if not a.startswith("-")), None)
+            if sub not in GIT_READ_ONLY:
+                return True
+            continue
+        if head not in READ_ONLY:     # 知らないコマンドは通さない
+            return True
+
+    # `: > file` のような、コマンドを持たない上書きリダイレクト
+    if re.search(r"(^|[^>\w])>\s*\S", cmd) and not re.search(r">>\s*\S", cmd):
+        return True
+    return False
+```
+
+設計で意識した点は3つです。
+
+1. **`os.path.basename` を通す**。`/bin/rm` と `rm` を同じものとして扱わないと、フルパス指定で簡単に抜けます。
+2. **ラッパを剥がしてから判定する**。`env rm -rf ...` は先頭が `env` なので、剥がさなければ `rm` に到達しません。
+3. **知らないコマンドは拒否**。ここが denylist との決定的な差です。`truncate` を思いつかなくても、allowlist に無い以上は止まります。私が想像できなかった危険も、同じ理由で止まります。
+
+結果です。
+
+```
+破壊的 20件中 20件を阻止（検出率 100.0%）
+正常  14件中  1件を誤って阻止（誤検知率 7.1%）
+```
+
+## 残った1件の誤爆が、設計の穴を教えてくれた
+
+止められてしまった1件は `echo 'never run rm -rf /' >> /workspace/NOTES.md` でした。
+
+最初は判定の甘さだと思いました。しばらく眺めて、そうではないと気づきます。`echo` は読み取り専用コマンドですが、`>>` が付いた瞬間に書き込み操作になる。ガードが「書き込みだから止める」と判断したのは、判定として正しい。
+
+正しくないのは、私の allowlist の粒度のほうでした。コマンド名だけを見て可否を決める設計には、「どこへ書くのか」という軸が抜けています。`>> NOTES.md` は通したいが、`>> /etc/hosts` や `> config.json` は通したくない。この2つはコマンド名では区別できません。
+
+そこで、リダイレクト先のパスを見る層を足しました。
+
+```python
+WRITABLE_PREFIXES = ("/workspace/out/", "/workspace/NOTES.md", "/tmp/")
+
+def _redirect_targets(cmd: str):
+    return re.findall(r">>?\s*([^\s;|&]+)", cmd)
+
+def guard_scoped(cmd: str) -> bool:
+    targets = _redirect_targets(cmd)
+    if not targets:
+        return guard_allowlist(cmd)
+    for t in targets:
+        if not t.strip("\"'").startswith(WRITABLE_PREFIXES):
+            return True
+    # 書き込み先が全て許可スコープ内なら、リダイレクトを外した本体だけ再検査
+    body = re.sub(r">>?\s*[^\s;|&]+", "", cmd)
+    return guard_allowlist(body)
+```
+
+3方式を並べた最終結果です。
+
+<table>
+<thead><tr><th>方式</th><th>検出率（破壊的20件）</th><th>誤検知率（正常14件）</th></tr></thead>
+<tbody>
+<tr><td>A. 正規表現 denylist</td><td>55.0%（11/20）</td><td>14.3%（2/14）</td></tr>
+<tr><td>B. argv 分解 + allowlist</td><td><strong>100.0%</strong>（20/20）</td><td>7.1%（1/14）</td></tr>
+<tr><td>C. B + 書き込みパススコープ</td><td><strong>100.0%</strong>（20/20）</td><td><strong>0.0%</strong>（0/14）</td></tr>
+</tbody>
+</table>
+
+コーパスが34件と小さいので、この数字をそのまま一般化するつもりはありません。それでも「denylist から allowlist へ移した瞬間に検出率が45ポイント上がった」という差の大きさは、方式の優劣として受け取ってよいと考えています。
+
+## フック本体
+
+hooks は標準入力でツール呼び出しの内容を受け取り、許可か拒否を返すプロセスとして書けます。判定部分を切り出しておくと、エージェントへ組み込む前に単体で検証できます。
+
+```python
+#!/usr/bin/env python3
+# hook_pre_tool.py — ツール呼び出し前に走るガード
+import sys, json
+from guards import guard_scoped
+
+def main() -> int:
+    payload = json.load(sys.stdin)
+    if payload.get("tool") != "shell":
+        return 0                       # シェル以外は素通し
+    cmd = payload.get("input", {}).get("command", "")
+    if guard_scoped(cmd):
+        print(json.dumps({
+            "decision": "deny",
+            "reason": "書き込み許可スコープ外、または読み取り専用 allowlist にないコマンドです",
+        }))
+        return 1
+    print(json.dumps({"decision": "allow"}))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+動作確認です。
+
+```bash
+$ echo '{"tool":"shell","input":{"command":"rm -rf /workspace"}}' | python3 hook_pre_tool.py
+{"decision": "deny", "reason": "書き込み許可スコープ外、または読み取り専用 allowlist にないコマンドです"}
+$ echo $?
+1
+
+$ echo '{"tool":"shell","input":{"command":"git log --oneline -5"}}' | python3 hook_pre_tool.py
+{"decision": "allow"}
+$ echo $?
+0
+```
+
+拒否時の `reason` は素っ気なく見えますが、ここは丁寧に書く価値があります。フックの拒否はエージェントの次の行動を決める入力になるため、理由が曖昧だと同じコマンドを言い換えて再試行し、フック呼び出しだけが積み上がります。
+
+## 判定より、起動のほうが500倍重かった
+
+性能はほとんど気にしていませんでした。フックはツール呼び出しのたびに走るので、念のため測っておこうという程度の動機です。
+
+判定ロジック単体を、プロセス内で34コマンド×300周まわした結果がこちらです。
+
+<table>
+<thead><tr><th>方式</th><th>1コマンドあたり中央値</th><th>p95</th></tr></thead>
+<tbody>
+<tr><td>A. denylist</td><td>1.4 マイクロ秒</td><td>1.7 マイクロ秒</td></tr>
+<tr><td>B. allowlist</td><td>47.3 マイクロ秒</td><td>48.5 マイクロ秒</td></tr>
+<tr><td>C. + パススコープ</td><td>46.1 マイクロ秒</td><td>47.7 マイクロ秒</td></tr>
+</tbody>
+</table>
+
+argv 分解は正規表現の33倍重い。ただ、絶対値は46マイクロ秒です。この時点では「どちらでも誤差」と判断しました。
+
+次に、実際の呼ばれ方 —— つまりプロセス起動を含めて測りました。60回試行の中央値です。
+
+<table>
+<thead><tr><th>実行形態</th><th>中央値</th><th>p95</th></tr></thead>
+<tbody>
+<tr><td><code>python3 hook_pre_tool.py</code></td><td>23.1 ms</td><td>23.8 ms</td></tr>
+<tr><td><code>python3 -c pass</code>（起動のみ）</td><td>17.2 ms</td><td>18.1 ms</td></tr>
+<tr><td><code>/bin/sh -c 'exit 0'</code></td><td>1.1 ms</td><td>1.2 ms</td></tr>
+</tbody>
+</table>
+
+判定 0.046 ms に対して、実行 23.1 ms。**500倍以上の開きがありました。**
+
+しかも 23.1 ms のうち 17.2 ms は、何もしない Python インタプリタの起動です。残りの約6 ms がどこへ消えているのか気になり、`import` 単位まで分解しました（`-S` で site 初期化を切った状態）。
+
+<table>
+<thead><tr><th>内容</th><th>中央値</th><th>起動のみとの差</th></tr></thead>
+<tbody>
+<tr><td><code>python3 -S -c pass</code></td><td>8.1 ms</td><td>—</td></tr>
+<tr><td><code>+ import os</code></td><td>10.5 ms</td><td>+2.5 ms</td></tr>
+<tr><td><code>+ import re</code></td><td>15.2 ms</td><td>+7.1 ms</td></tr>
+<tr><td><code>+ import shlex</code></td><td>16.8 ms</td><td>+8.7 ms</td></tr>
+<tr><td><code>+ import json</code></td><td>17.0 ms</td><td>+8.9 ms</td></tr>
+<tr><td><code>+ 4モジュール全部</code></td><td>18.2 ms</td><td>+10.2 ms</td></tr>
+</tbody>
+</table>
+
+`import re` の 7.1 ms が目に留まりました。ガードの判定そのもの（46マイクロ秒）の、およそ150倍です。
+
+正規表現エンジンを読み込むコストが、正規表現を使う処理の150倍。この比率を見たとき、それまで自分が最適化しようとしていた対象が完全に的外れだったと分かりました。判定ロジックをどれだけ丁寧に書いても、性能上はほぼ無料です。逆に、`import` を1つ足すことのほうが、判定の複雑さを10倍にするより高くつきます。
+
+## 何本置くか、が唯一の性能設計になる
+
+この比率が分かると、フックの設計判断は1つに集約されます。**何を判定するかではなく、プロセスを何回起動するか。**
+
+40回ツール呼び出しをする run に換算しました。
+
+<table>
+<thead><tr><th>構成</th><th>フック起因のオーバーヘッド</th></tr></thead>
+<tbody>
+<tr><td>Python フック 1本</td><td>0.92 秒 / run</td></tr>
+<tr><td>Python フック 3本を個別登録</td><td>2.77 秒 / run</td></tr>
+<tr><td><code>sh</code> フック 1本</td><td>0.04 秒 / run</td></tr>
+</tbody>
+</table>
+
+「破壊的コマンドの検査」「書き込み先の検査」「監査ログの送出」を素直に3本のフックへ分けると、1 run あたり2.77秒。1本に束ねれば0.92秒です。責務ごとにファイルを分けたくなる場面ですが、ここでは分岐で束ねるほうを選びました。ファイル分割は Python モジュールの側でやれば、起動回数を増やさずに構造は保てます。
+
+`sh` 版が桁違いに速いのも事実です。ただし、私は移しませんでした。argv 分解・ラッパ剥がし・再帰検査を shell で書き直すと、それ自体がバグの温床になります。0.9 秒を削るために、門番の正しさを賭ける取引には見えませんでした。
+
+代わりに実務的な緩和として置いたのは次の2つです。
+
+1. **判定対象を絞る**。`payload.get("tool") != "shell"` の分岐を最初に置き、シェル以外のツール呼び出しでは `import guards` に到達させない。ファイル読み取り中心の run では、この分岐だけでフック起因のコストがほぼ消えます。
+2. **`__pycache__` を温めておく**。初回実行は `.pyc` の生成を含みます。手元では中央値23.0 ms とほぼ差が出ませんでしたが、モジュールが増えれば効いてくる項目です。
+
+## この先に測りたいこと
+
+門番としては、いまの形で満足しています。検出率100パーセント、誤検知0パーセント、1 run あたり1秒弱。冒頭に書いた「消してほしくない中間生成物」は、方式Cなら `mv /workspace /tmp/gone` の時点で止まります。
+
+一方で、コーパス34件はあくまで私が想像できた範囲です。次に測りたいのは、実際の run で拒否された履歴を集めて、そのうち何件が「本当に止めるべきだった」ものだったか —— つまり誤検知率を、私が書いたテストではなくエージェントの実際の振る舞いで採り直すことです。allowlist 方式は安全側に倒れる設計なので、運用で削れる余地がまだあるはずです。私自身、この門番はまだ育てている途中だと思っています。
+
+手を動かして分かったのは、フックの難所が判定ロジックではなかったということでした。判定は46マイクロ秒で終わります。設計として重いのは、境界をどこに引くか（コマンド名か、書き込み先か）と、その境界を何回またぐか。この2つだけでした。
+
+もし同じようにガードを書かれるなら、実装より先に、止めたいコマンドと通したいコマンドを20件ずつ書き出すところから始めてみてください。私の場合、そのリストがそのまま設計の答えになりました。
+
+サンドボックスの稼働時間そのものに予算境界を引く話は「[Managed Agents の請求はトークンだけでは読めない — サンドボックス稼働時間に予算境界を引く設計](/articles/gemini-api/gemini-managed-agents-sandbox-runtime-budget-boundary-design)」に、長時間ランを画面を止めずに回す構成は「[Managed Agents を background: true で走らせて画面を止めない](/articles/gemini-api/gemini-managed-agents-background-async-run-polling-indie)」にまとめています。
+
+最後までお読みいただき、ありがとうございました。

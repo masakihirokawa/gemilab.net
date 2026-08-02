@@ -1,0 +1,409 @@
+---
+title: "Measuring a Guard in environment hooks: 46 Microseconds to Decide, 23 Milliseconds to Start"
+slug: "gemini-environment-hooks-command-guard-startup-cost-measured"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-08-02T13:00"
+author: "Gemini Lab"
+description: "A record of building a destructive-command guard for Managed Agents environment hooks. A regex denylist let 9 of 20 dangerous commands through; argv parsing reached 100 percent detection. The startup cost turned out to be 500 times the decision cost."
+tags: ["Gemini API", "Managed Agents", "environment hooks", "sandbox", "agent design"]
+highlights:
+  - "Measured results across three guard designs, from a regex denylist that missed 9 of 20 destructive commands to an argv-parsing allowlist at 100 percent detection and 0 percent false positives"
+  - "The decision logic runs in 46 microseconds while process startup costs 23.1 milliseconds, with import re alone accounting for 7.1 milliseconds"
+  - "A complete, working pre-tool-call guard including wrapper stripping, subshell recursion, and write-path scoping"
+---
+
+On July 28, environment hooks landed in the Managed Agents feature of the Gemini API. They let you run your own scripts inside the sandbox, before and after each tool call.
+
+The first thing that came to mind when I read the announcement wasn't a use case. It was a moment from a few months back. In an automation pipeline I run as an indie developer, I asked an agent to clean up a working directory, and it took some intermediate artifacts I wanted to keep along with it. Recovery took maybe fifteen minutes. What stayed with me was that all I had afterwards was a log of what had already happened. There was no place to stop it.
+
+environment hooks create exactly that place, right at the tool-call boundary.
+
+So I wrote a guard to block destructive shell commands. I expected it to take half an hour. In practice, my first implementation let nearly half of the dangerous cases through, and my assumptions about its performance turned out to be backwards.
+
+> Note: all measurements below come from running the hook script standalone in an isolated Linux environment (Ubuntu 22.04, Python 3.10.12). A hook is contractually just a process that receives a tool call and returns allow or deny, so both the decision logic and the startup cost can be measured before wiring anything into an agent. Argument names and behavior may change, so confirm against the [Gemini API Agents documentation](https://ai.google.dev/gemini-api/docs/agents) before implementing.
+
+## Start by writing the list, not the code
+
+Before writing the guard, I pinned down what it was supposed to judge. My mental model of "dangerous commands" was fuzzy at the edges, and designing while implementing guarantees you miss cases.
+
+I built a corpus of 34 commands: 20 I wanted blocked, 14 I wanted allowed. Three categories went in deliberately.
+
+<table>
+<thead><tr><th>Category</th><th>Purpose</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>Textbook destruction</td><td>Any implementation should catch these</td><td><code>rm -rf /</code></td></tr>
+<tr><td>Same meaning, different spelling</td><td>Variants of the same operation</td><td><code>rm -fr /workspace</code> / <code>rm --recursive --force ...</code></td></tr>
+<tr><td>Deceptive but benign</td><td>Cases designed to trigger false positives</td><td><code>grep -rn 'rm -rf' /workspace/docs</code></td></tr>
+</tbody>
+</table>
+
+That third group ended up mattering most. A guard's value isn't the number of things it stops — it's the ratio of what it stops to what it needlessly blocks. A hook that errs too far toward safety gets disabled within a few days.
+
+```python
+# corpus.py — fixed evaluation corpus (True = should be blocked)
+CORPUS = [
+    # textbook destruction
+    ("rm -rf /", True),
+    ("rm -rf /workspace", True),
+    ("rm -rf ~", True),
+    # same meaning, different spelling
+    ("rm -fr /workspace", True),
+    ("rm -r -f /workspace", True),
+    ("rm --recursive --force /workspace", True),
+    ("/bin/rm -rf /workspace", True),
+    ("env rm -rf /workspace", True),
+    ("sh -c 'rm -rf /workspace'", True),
+    ("cd /workspace && rm -rf .", True),
+    ("find /workspace -delete", True),
+    ("truncate -s 0 /workspace/db.sqlite", True),
+    (": > /workspace/db.sqlite", True),
+    ("dd if=/dev/zero of=/workspace/db.sqlite", True),
+    ("git clean -xfd", True),
+    ("git reset --hard origin/main", True),
+    ("mkfs.ext4 /dev/nvme1n1", True),
+    ("chmod -R 000 /workspace", True),
+    ("mv /workspace /tmp/gone", True),
+    # should be allowed
+    ("ls -la /workspace", False),
+    ("cat /workspace/report.json", False),
+    ("python3 /workspace/analyze.py --input data.csv", False),
+    ("grep -rn 'TODO' /workspace/src", False),
+    ("git status", False),
+    ("git log --oneline -20", False),
+    ("npm test", False),
+    # deceptive but benign (these measure false positives)
+    ("grep -rn 'rm -rf' /workspace/docs", False),
+    ("echo 'never run rm -rf /' >> /workspace/NOTES.md", False),
+    ("python3 -c \"print('rm -rf /')\"", False),
+    ("git log --grep='remove -rf flag'", False),
+]
+```
+
+## The first version let 9 of 20 through
+
+I started the obvious way: a list of dangerous patterns matched with regular expressions.
+
+```python
+import re
+
+DENY_PATTERNS = [
+    r"rm\s+-rf\s+/",
+    r"rm\s+-rf\s+~",
+    r"mkfs",
+    r"dd\s+if=/dev/zero",
+    r"git\s+reset\s+--hard",
+    r"git\s+clean\s+-xfd",
+]
+DENY_RE = [re.compile(p) for p in DENY_PATTERNS]
+
+def guard_denylist(cmd: str) -> bool:
+    """Returns True when the command should be rejected."""
+    return any(r.search(cmd) for r in DENY_RE)
+```
+
+Against the corpus:
+
+```
+Destructive: 11 of 20 blocked  (detection 55.0%)
+Benign:       2 of 14 blocked  (false positives 14.3%)
+```
+
+Lining up the nine that slipped past made the pattern clear.
+
+<table>
+<thead><tr><th>Command that got through</th><th>Why it was missed</th></tr></thead>
+<tbody>
+<tr><td><code>rm -fr /workspace</code></td><td>Flags in a different order</td></tr>
+<tr><td><code>rm -r -f /workspace</code></td><td>Flags split apart</td></tr>
+<tr><td><code>rm --recursive --force /workspace</code></td><td>Long options</td></tr>
+<tr><td><code>cd /workspace &amp;&amp; rm -rf .</code></td><td>Target doesn't start with a slash</td></tr>
+<tr><td><code>find /workspace -delete</code></td><td>Not <code>rm</code> at all</td></tr>
+<tr><td><code>truncate -s 0 ...</code> / <code>: &gt; ...</code></td><td>Empties the file rather than deleting it</td></tr>
+<tr><td><code>chmod -R 000 /workspace</code></td><td>Doesn't delete, but makes everything unreadable</td></tr>
+<tr><td><code>mv /workspace /tmp/gone</code></td><td>Doesn't delete, but the effect is identical</td></tr>
+</tbody>
+</table>
+
+Each of these can be patched with another pattern. But looking at the list, I stopped. Patch all nine and the tenth is the one I didn't think of. A denylist only works up to the limit of the danger I was able to imagine.
+
+The false positives were telling too. `echo 'never run rm -rf /' >> NOTES.md` and `python3 -c "print('rm -rf /')"` both got blocked. A regular expression can't distinguish the contents of a string from the structure of a command.
+
+The approach was treating something structural as text. That was the actual problem, not the specific patterns.
+
+## Parsing into argv and reading the structure
+
+I changed direction. Instead of matching text, tokenize the way a shell does, read the leading command and its flags as structure — and instead of enumerating what's dangerous, allow only what's known to be safe.
+
+`shlex` handles tokenization, but it doesn't understand shell control operators (`&&`, `||`, `;`, `|`), so I split on those first and parse each segment separately.
+
+```python
+import os, re, shlex
+
+READ_ONLY = {
+    "ls","cat","head","tail","wc","grep","stat","file","du","df",
+    "python3","python","node","npm","pytest","echo","printf","jq",
+    "sed","awk","sort","uniq","diff",
+}
+GIT_READ_ONLY = {"status","log","diff","show","branch","rev-parse","ls-files","describe","blame"}
+DESTRUCTIVE_BIN = {"rm","mkfs","mkfs.ext4","dd","truncate","shred","mv","chmod","chown"}
+WRAPPERS = {"env","sudo","nohup","time","xargs"}
+SHELLS = {"sh","bash","zsh"}
+
+def _split_segments(cmd: str):
+    """Split on && || ; | and parse each segment into argv. None if unparseable."""
+    segs, buf, i, quote = [], "", 0, None
+    while i < len(cmd):
+        c = cmd[i]
+        if quote:
+            buf += c
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "\"'":
+            quote = c; buf += c; i += 1; continue
+        if cmd.startswith("&&", i) or cmd.startswith("||", i):
+            segs.append(buf); buf = ""; i += 2; continue
+        if c in ";|":
+            segs.append(buf); buf = ""; i += 1; continue
+        buf += c; i += 1
+    segs.append(buf)
+
+    out = []
+    for s in segs:
+        s = s.strip()
+        if not s:
+            continue
+        try:
+            argv = shlex.split(s)
+        except ValueError:
+            return None  # unbalanced quotes, etc. — fail closed
+        if argv:
+            out.append(argv)
+    return out
+
+
+def guard_allowlist(cmd: str, depth: int = 0) -> bool:
+    """Returns True to reject. Recurses into sh -c payloads with a depth limit."""
+    if depth > 3:
+        return True
+    segments = _split_segments(cmd)
+    if segments is None:
+        return True
+
+    for argv in segments:
+        head = os.path.basename(argv[0])   # /bin/rm becomes rm
+        args = argv[1:]
+
+        # strip wrappers such as env / sudo
+        while head in WRAPPERS and args:
+            head = os.path.basename(args[0]); args = args[1:]
+
+        # inspect the payload of sh -c '...' recursively
+        if head in SHELLS:
+            inner = next((a for a in args if not a.startswith("-")), None)
+            if inner is None or guard_allowlist(inner, depth + 1):
+                return True
+            continue
+
+        if head in DESTRUCTIVE_BIN:
+            return True
+        if head == "find":            # can carry -delete / -exec
+            return True
+        if head == "git":
+            sub = next((a for a in args if not a.startswith("-")), None)
+            if sub not in GIT_READ_ONLY:
+                return True
+            continue
+        if head not in READ_ONLY:     # unknown commands don't pass
+            return True
+
+    # overwrite redirects with no command, such as `: > file`
+    if re.search(r"(^|[^>\w])>\s*\S", cmd) and not re.search(r">>\s*\S", cmd):
+        return True
+    return False
+```
+
+Three decisions shaped this.
+
+1. **Normalize with `os.path.basename`.** Without it, `/bin/rm` walks straight past a check written for `rm`.
+2. **Strip wrappers before judging.** `env rm -rf ...` leads with `env`, so `rm` is never reached unless you unwrap first.
+3. **Reject unknown commands.** This is the decisive difference from a denylist. I don't need to have thought of `truncate` — it isn't on the allowlist, so it stops. The dangers I failed to imagine stop for the same reason.
+
+The result:
+
+```
+Destructive: 20 of 20 blocked  (detection 100.0%)
+Benign:       1 of 14 blocked  (false positives 7.1%)
+```
+
+## The one remaining false positive pointed at a real gap
+
+The command that got wrongly blocked was `echo 'never run rm -rf /' >> /workspace/NOTES.md`.
+
+My first reading was that the guard was too blunt. After sitting with it, I decided it wasn't. `echo` is a read-only command, but the moment `>>` appears it becomes a write. The guard blocking a write is the correct call.
+
+What was wrong was the granularity of my allowlist. A design that decides purely on command name has no axis for *where* the write goes. I want `>> NOTES.md` allowed and `>> /etc/hosts` or `> config.json` rejected, and no amount of looking at the command name distinguishes those.
+
+So I added a layer that inspects redirect targets.
+
+```python
+WRITABLE_PREFIXES = ("/workspace/out/", "/workspace/NOTES.md", "/tmp/")
+
+def _redirect_targets(cmd: str):
+    return re.findall(r">>?\s*([^\s;|&]+)", cmd)
+
+def guard_scoped(cmd: str) -> bool:
+    targets = _redirect_targets(cmd)
+    if not targets:
+        return guard_allowlist(cmd)
+    for t in targets:
+        if not t.strip("\"'").startswith(WRITABLE_PREFIXES):
+            return True
+    # every target is in scope, so re-check the body with redirects removed
+    body = re.sub(r">>?\s*[^\s;|&]+", "", cmd)
+    return guard_allowlist(body)
+```
+
+All three designs side by side:
+
+<table>
+<thead><tr><th>Design</th><th>Detection (20 destructive)</th><th>False positives (14 benign)</th></tr></thead>
+<tbody>
+<tr><td>A. Regex denylist</td><td>55.0% (11/20)</td><td>14.3% (2/14)</td></tr>
+<tr><td>B. argv parsing + allowlist</td><td><strong>100.0%</strong> (20/20)</td><td>7.1% (1/14)</td></tr>
+<tr><td>C. B + write-path scoping</td><td><strong>100.0%</strong> (20/20)</td><td><strong>0.0%</strong> (0/14)</td></tr>
+</tbody>
+</table>
+
+A 34-command corpus is small, and I wouldn't generalize these exact figures. But a 45-point jump in detection the moment I moved from denylist to allowlist is large enough to read as a difference in approach rather than in tuning.
+
+## The hook itself
+
+A hook reads the tool call from stdin and returns allow or deny. Keeping the decision logic in a separate module means you can validate it before wiring anything into an agent.
+
+```python
+#!/usr/bin/env python3
+# hook_pre_tool.py — runs before each tool call
+import sys, json
+from guards import guard_scoped
+
+def main() -> int:
+    payload = json.load(sys.stdin)
+    if payload.get("tool") != "shell":
+        return 0                       # anything other than shell passes through
+    cmd = payload.get("input", {}).get("command", "")
+    if guard_scoped(cmd):
+        print(json.dumps({
+            "decision": "deny",
+            "reason": "Write target is outside the permitted scope, or the command is not on the read-only allowlist.",
+        }))
+        return 1
+    print(json.dumps({"decision": "allow"}))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+Checking it works:
+
+```bash
+$ echo '{"tool":"shell","input":{"command":"rm -rf /workspace"}}' | python3 hook_pre_tool.py
+{"decision": "deny", "reason": "Write target is outside the permitted scope, ..."}
+$ echo $?
+1
+
+$ echo '{"tool":"shell","input":{"command":"git log --oneline -5"}}' | python3 hook_pre_tool.py
+{"decision": "allow"}
+$ echo $?
+0
+```
+
+The `reason` field looks like an afterthought, but it's worth writing carefully. A rejection becomes input to the agent's next decision. When the reason is vague, the agent rephrases the same command and retries, and all you accumulate is hook invocations.
+
+## Startup cost turned out to be 500 times the decision cost
+
+I wasn't especially concerned about performance. Hooks run on every tool call, so I measured mostly out of diligence.
+
+Running the decision logic in-process, 34 commands across 300 iterations:
+
+<table>
+<thead><tr><th>Design</th><th>Median per command</th><th>p95</th></tr></thead>
+<tbody>
+<tr><td>A. denylist</td><td>1.4 microseconds</td><td>1.7 microseconds</td></tr>
+<tr><td>B. allowlist</td><td>47.3 microseconds</td><td>48.5 microseconds</td></tr>
+<tr><td>C. + path scoping</td><td>46.1 microseconds</td><td>47.7 microseconds</td></tr>
+</tbody>
+</table>
+
+argv parsing costs 33 times what the regex costs. In absolute terms it's 46 microseconds, so at this point I filed it under "noise."
+
+Then I measured the way it actually gets invoked, process startup included. Medians over 60 runs:
+
+<table>
+<thead><tr><th>Invocation</th><th>Median</th><th>p95</th></tr></thead>
+<tbody>
+<tr><td><code>python3 hook_pre_tool.py</code></td><td>23.1 ms</td><td>23.8 ms</td></tr>
+<tr><td><code>python3 -c pass</code> (startup only)</td><td>17.2 ms</td><td>18.1 ms</td></tr>
+<tr><td><code>/bin/sh -c 'exit 0'</code></td><td>1.1 ms</td><td>1.2 ms</td></tr>
+</tbody>
+</table>
+
+0.046 ms to decide, 23.1 ms to run. **More than a 500-fold gap.**
+
+And 17.2 ms of that 23.1 is a Python interpreter starting up and doing nothing. Curious where the remaining six milliseconds went, I broke it down per import, with site initialization disabled via `-S`.
+
+<table>
+<thead><tr><th>Command</th><th>Median</th><th>Delta vs. bare startup</th></tr></thead>
+<tbody>
+<tr><td><code>python3 -S -c pass</code></td><td>8.1 ms</td><td>—</td></tr>
+<tr><td><code>+ import os</code></td><td>10.5 ms</td><td>+2.5 ms</td></tr>
+<tr><td><code>+ import re</code></td><td>15.2 ms</td><td>+7.1 ms</td></tr>
+<tr><td><code>+ import shlex</code></td><td>16.8 ms</td><td>+8.7 ms</td></tr>
+<tr><td><code>+ import json</code></td><td>17.0 ms</td><td>+8.9 ms</td></tr>
+<tr><td><code>+ all four</code></td><td>18.2 ms</td><td>+10.2 ms</td></tr>
+</tbody>
+</table>
+
+The 7.1 ms for `import re` is the number that stopped me. That's roughly 150 times the entire guard decision (46 microseconds).
+
+Loading the regex engine costs 150 times more than the work that uses it. Seeing that ratio told me the thing I had been preparing to optimize was entirely beside the point. However carefully you write the decision logic, it's effectively free. Adding a single `import`, on the other hand, costs more than making the logic ten times more complex.
+
+## The only performance decision is how many hooks you register
+
+Once the ratio is clear, hook design collapses to a single question. **Not what you check, but how many processes you start.**
+
+Converted to a run with 40 tool calls:
+
+<table>
+<thead><tr><th>Configuration</th><th>Hook overhead</th></tr></thead>
+<tbody>
+<tr><td>One Python hook</td><td>0.92 s / run</td></tr>
+<tr><td>Three Python hooks registered separately</td><td>2.77 s / run</td></tr>
+<tr><td>One <code>sh</code> hook</td><td>0.04 s / run</td></tr>
+</tbody>
+</table>
+
+Splitting "destructive command check," "write target check," and "audit log emission" into three hooks — the natural decomposition — costs 2.77 seconds per run. Folding them into one costs 0.92. I went with branching inside a single hook. You can still split the code across Python modules; you just don't split the entry point.
+
+The `sh` version is genuinely an order of magnitude faster. I didn't move to it. Rewriting argv parsing, wrapper stripping, and recursive inspection in shell would make the guard itself the most likely source of bugs. Trading the correctness of the gatekeeper for 0.9 seconds didn't look like a good deal.
+
+What I did instead were two practical mitigations:
+
+1. **Narrow what gets inspected.** Putting the `payload.get("tool") != "shell"` branch first means `import guards` is never reached for non-shell tool calls. On runs dominated by file reads, that branch alone erases most of the hook cost.
+2. **Keep `__pycache__` warm.** The first execution includes `.pyc` generation. Locally the difference was negligible (median 23.0 ms), but it grows with the number of modules.
+
+## What I want to measure next
+
+As a gatekeeper, I'm satisfied with where this landed: 100 percent detection, zero false positives, just under a second per run. The intermediate artifacts I mentioned at the start would have been saved — design C stops at `mv /workspace /tmp/gone`.
+
+That said, 34 commands is only as broad as my imagination. What I want to measure next is the rejection history from real runs: of everything the guard blocked, how many genuinely should have been blocked. In other words, recomputing the false positive rate from the agent's actual behavior rather than from a corpus I wrote. An allowlist fails closed by design, so there should still be room to loosen it safely.
+
+The thing I took away from building this is that the hard part of a hook isn't the decision logic. The decision takes 46 microseconds. What's expensive, structurally, is choosing where the boundary sits — command name, or write target — and how many times you cross it.
+
+If you're writing something similar, try listing twenty commands you want blocked and twenty you want allowed before you write any code. In my case that list turned out to be the design.
+
+For budgeting against sandbox wall-clock time rather than tokens, see [Managed Agents billing isn't only tokens](/articles/gemini-api/gemini-managed-agents-sandbox-runtime-budget-boundary-design). For keeping long runs off the critical path, see [Running Managed Agents with background: true](/articles/gemini-api/gemini-managed-agents-background-async-run-polling-indie).
