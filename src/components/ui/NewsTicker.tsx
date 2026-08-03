@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GA — Gemini 3.6 Flash が7月21日に一般提供へ移りました。入力 $1.50 / 出力 $7.50 per Mtok で、3.5 Flash の出力 $9.00 から下がっています",
-    "TOKENS — 3.6 Flash は Artificial Analysis Index で出力トークンが 3.5 Flash 比17%減。DeepSWE のようなエージェント系では平均 276K から 97K トークンまで縮んだと報告されています",
-    "LITE — Gemini 3.5 Flash-Lite も一般提供になりました。$0.30 / $2.50 per Mtok で、低レイテンシと高頻度の自動化に向いた価格帯です",
-    "OMNI — gemini-omni-flash-preview が公開プレビューに入りました。720p で3〜10秒の動画を生成し、そのまま対話的に編集できます",
-    "SUNSET — 旧来の画像生成モデルは8月17日、Gemini Enterprise Agent Platform の Grok 4.1 系は8月20日、gemini-robotics-er-1.6-preview は8月31日に停止します",
-    "COMPUTER — Gemini 3.5 Flash の Computer Use が公開プレビューになりました。ブラウザ・モバイル・デスクトップに対応し、プロンプトインジェクション検出と設定可能な安全ポリシーを備えます",
+    "REGION — Gemini Enterprise app の global リージョンから Gemini 3.5 Flash が本日除去されます。リージョン指定を明示していない構成ほど、選択肢が黙って変わる形で表面化します",
+    "IMAGE — Imagen 4 系と Gemini 3 Image 系の画像生成モデルが8月17日に停止します。移行の猶予は残り2週間です",
+    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日に停止します。プレビュー系は代替経路を用意しておく前提で扱うのが現実的です",
+    "SAMPLING — Gemini 3.6 Flash では temperature・top-K・top-P のカスタム値が無視され、frequency penalty と presence penalty は API エラーになります",
+    "FLASH — Gemini 3.6 Flash と 3.5 Flash-Lite が一般提供に移りました。3.6 Flash はトークン効率と計画能力が改善し、3.5 Flash より低価格です",
+    "AGENTS — Gemini API の Managed Agents に 3.6 Flash と hooks が加わり、エージェントの実行途中に処理を挟む設計が公式にサポートされました",
   ],
   en: [
-    "GA — Gemini 3.6 Flash reached general availability on July 21. Pricing is $1.50 input and $7.50 output per million tokens, down from $9.00 output on 3.5 Flash",
-    "TOKENS — On the Artificial Analysis Index, 3.6 Flash uses 17% fewer output tokens than 3.5 Flash. On agentic benchmarks like DeepSWE the average reportedly fell from 276K to 97K tokens per task",
-    "LITE — Gemini 3.5 Flash-Lite is also generally available at $0.30 / $2.50 per million tokens, aimed at low-latency, high-volume automation",
-    "OMNI — gemini-omni-flash-preview entered public preview. It generates 3 to 10 second videos at 720p and lets you refine them conversationally",
-    "SUNSET — Older image generation models shut down August 17, the Grok 4.1 family on the Gemini Enterprise Agent Platform on August 20, and gemini-robotics-er-1.6-preview on August 31",
-    "COMPUTER — Computer Use is in public preview for Gemini 3.5 Flash, covering browser, mobile, and desktop environments with configurable safety policies and prompt injection detection",
+    "REGION — Gemini 3.5 Flash is being removed from the global region in the Gemini Enterprise app today. Setups that never pinned a region will see the option quietly change",
+    "IMAGE — Imagen 4 and Gemini 3 Image generation models shut down on August 17. That leaves about two weeks to migrate",
+    "ROBOTICS — The gemini-robotics-er-1.6-preview model shuts down on August 31. Preview models are best treated as needing a fallback path from the start",
+    "SAMPLING — On Gemini 3.6 Flash, custom temperature, top-K, and top-P values are ignored, while frequency and presence penalties now raise an API error",
+    "FLASH — Gemini 3.6 Flash and 3.5 Flash-Lite reached general availability. 3.6 Flash improves token efficiency and agentic planning at a lower price than 3.5 Flash",
+    "AGENTS — Managed Agents in the Gemini API gained 3.6 Flash and hooks, giving official support for injecting logic partway through an agent run",
   ],
 };
 
