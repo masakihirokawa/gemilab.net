@@ -119,6 +119,93 @@ if __name__ == "__main__":
 
 母数が3枚に満たないカテゴリで警告を出しているのも意図があります。そういうカテゴリは、そもそも学習側にも実運用側にもデータが足りていないので、モデルを替えても解決しません。評価の前に分かるだけで、判断の順序が変わります。
 
+## 予測は1つの関数に揃えてから測る
+
+`evaluate.py` が受け取っている `predict` は、モデルごとの差し替え口です。ここを先に揃えておかないと、比較のたびにプロンプトや後処理が少しずつ変わってしまいます。私は一度それをやって、出た差がモデルのものなのかプロンプトのものなのか説明できなくなりました。
+
+揃える条件は2つです。プロンプトを完全に同一にすること。返ってきた文字列を、必ず30カテゴリのいずれかへ落とすこと。
+
+```python
+# predictors.py — モデルごとの差し替え口を1つに揃える
+import base64
+import json
+import os
+import re
+from pathlib import Path
+
+import requests
+
+LABELS = json.loads(Path("config/labels.json").read_text())  # 30カテゴリの正式名
+PROMPT = (
+    "次の画像を、以下のカテゴリのうち1つに分類してください。\n"
+    "カテゴリ名以外の語・説明・記号は一切出力しないでください。\n\n"
+    + "\n".join(f"- {label}" for label in LABELS)
+)
+
+
+def _encode(path: str) -> str:
+    return base64.b64encode(Path(path).read_bytes()).decode()
+
+
+def _normalize(raw: str) -> str:
+    """生出力を正式カテゴリ名へ落とす。落とせなければ unknown を返す"""
+    text = re.sub(r"[\s。、.:：\-*`]", "", raw)
+    for label in LABELS:
+        if label in text:
+            return label
+    return "unknown"  # 近いラベルへ寄せて救わない
+
+
+def local_predict(path: str, model: str = "gemma-4-mm") -> str:
+    """llama.cpp server / Ollama など OpenAI 互換エンドポイント向け"""
+    res = requests.post(
+        "http://127.0.0.1:8080/v1/chat/completions",
+        json={
+            "model": model,
+            "temperature": 0,
+            "max_tokens": 16,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{_encode(path)}"}},
+                ],
+            }],
+        },
+        timeout=120,
+    )
+    res.raise_for_status()
+    return _normalize(res.json()["choices"][0]["message"]["content"])
+
+
+def cloud_predict(path: str, model: str = "gemini-3.5-flash") -> str:
+    res = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+        json={
+            "contents": [{
+                "parts": [
+                    {"text": PROMPT},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": _encode(path)}},
+                ]
+            }],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 16},
+        },
+        timeout=60,
+    )
+    res.raise_for_status()
+    return _normalize(res.json()["candidates"][0]["content"]["parts"][0]["text"])
+```
+
+`_normalize` が `unknown` を返すようにしているのには理由があります。編集距離で最も近いカテゴリへ寄せる書き方もありますが、それをすると**指示に従えていないモデルほど得をします**。指示に従えるかどうかは採否の材料そのものですから、ここで黙って救ってしまうと材料が消えます。
+
+`unknown` は正解ラベルと一致しないので、そのまま誤りとして数えられます。混同行列に `(夜景, unknown)` のような行が並んだなら、それは分類能力ではなく出力形式の追従性の問題です。切り分けができるようになります。
+
+実測では、`unknown` になった割合は Gemma 4 が0%、Nemotron 3 Nano Omni が3%でした。Nemotron は「これは夜の街並みを写した写真です」といった説明を添える傾向が残っていて、`max_tokens` を16に絞ってもなお前置きから書き始めることがありました。この3%も、先ほどの79%という一致率の中に含まれています。
+
+もうひとつ。この `predict` は評価専用にせず、本番の分類処理からも同じものを呼びます。評価用の実装を別に持つと、プロンプトを直したときに片方だけが古くなります。
+
 ## 一致率は「どこで外したか」を隠す
 
 100枚が用意できたら測ります。ローカルモデルとクラウドの両方に同じ100枚を通し、一致率と混同行列を出します。
@@ -164,7 +251,12 @@ def evaluate(predict: Callable[[str], str], name: str) -> dict:
         share = n / per_label_total[truth]
         print(f"  {truth} -> {pred}: {n} ({share:.0%} of {truth})")
 
-    return {"name": name, "accuracy": accuracy, "confusion": dict(confusion)}
+    # キーはタプルのままだと JSON に落ちないので、この時点で文字列へ寄せておく
+    return {
+        "name": name,
+        "accuracy": accuracy,
+        "confusion": {f"{t}\t{p}": n for (t, p), n in confusion.items()},
+    }
 ```
 
 私の100枚での実測はこうなりました。
@@ -348,6 +440,60 @@ if __name__ == "__main__":
 ```
 
 25行ほどのスクリプトです。ローカルモデルを使うということは、Google が黙って面倒を見てくれていた部分を自分で持つということでした。その負担のうち、少なくとも「気づけない」部分だけは、この程度の仕掛けで消せます。
+
+## 100枚では、何ポイント差までが誤差か
+
+量子化の節で 82% → 84% と書きました。2ポイントの改善です。ただ、この2ポイント自体には意味がありません。
+
+100枚での一致率には、二項分布から来る揺れが乗ります。Wilson 区間で 82%（100枚）の95%信頼区間を引くと、およそ 73.3%〜88.3% になります。幅は15ポイント。2ポイントの上下は、その中に完全に埋もれます。
+
+```python
+# interval.py — 一致率の95%信頼区間（Wilson）と、必要枚数の逆算
+from math import sqrt
+
+Z = 1.96  # 95%
+
+
+def wilson(hits: int, n: int, z: float = Z) -> tuple[float, float]:
+    if n == 0:
+        return (0.0, 0.0)
+    p = hits / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    margin = z * sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return (center - margin, center + margin)
+
+
+def required_n(p: float, half_width: float, z: float = Z) -> int:
+    """半幅 half_width（0.03 なら ±3ポイント）を得るのに要るおおよその枚数"""
+    return int((z * z * p * (1 - p)) / (half_width * half_width)) + 1
+
+
+if __name__ == "__main__":
+    lo, hi = wilson(82, 100)
+    print(f"82/100 -> 95% CI [{lo:.1%}, {hi:.1%}]")
+    for hw in (0.05, 0.03, 0.02):
+        print(f"±{hw:.0%} で測るには約 {required_n(0.82, hw)} 枚")
+```
+
+出力はこうなります。
+
+```
+82/100 -> 95% CI [73.3%, 88.3%]
+±5% で測るには約 227 枚
+±3% で測るには約 631 枚
+±2% で測るには約 1418 枚
+```
+
+一致率を±3ポイントの分解能で語ろうとすると、600枚を超えます。100枚は、そこまでの分解能を持っていません。
+
+では100枚に意味がないのかというと、そうではありません。私がこの100枚で読んでいたのは一致率の絶対値ではなく、**誤りがどこに寄っているか**でした。「夜景 ⇄ 都市に7件」「動物 → 人物に2件」という並びは、信頼区間の幅とは別の情報です。偏りの形は、平均値の精度よりも少ない枚数で見えてきます。
+
+量子化を上げたときの 0.31 → 0.38 も、同じ読み方をしています。0.07 という値の大きさより、誤りの型が隣接から系統跨ぎへ移ったという**向き**のほうを見ました。件数が少なくても、向きは読めます。
+
+ですから、82% と 79% の3ポイント差を根拠にモデルを選ぶことは、私はしていません。判断したのは 0.31 と 0.44 の開きと、その中身のほうでした。一致率を並べた表は、そこへ入るための入口でしかありません。
+
+枚数を増やすべき場面もあります。コスト重み付き誤りが予算ラインのすぐ近くに来たときです。そのときだけ `required_n` を引いて追加します。最初から600枚を用意しないのは、境界事例を1枚選ぶたびに過去の指摘を辿り直す必要があり、そこが枚数に比例して重くなるからです。
 
 ## エッジ機器で先に音を上げるのは GPU ではない
 
