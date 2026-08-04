@@ -1,0 +1,293 @@
+---
+title: "停止済みモデルの再試行は、成功レイテンシには出ませんでした"
+slug: "gemini-retired-model-permanent-error-queue-wait-measured"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-08-04T13:00"
+author: "Gemini Lab"
+description: "画像生成モデルの停止日が近づいています。停止済みモデルを呼んだときリトライ層が何をするのかを、モックサーバーで再現して計測しました。壊れ方は所要時間と待ち行列に出て、成功レイテンシには出ませんでした。"
+tags: ["Gemini API", "エラーハンドリング", "リトライ設計", "モデル移行", "可観測性"]
+highlights:
+  - "恒久エラーを再試行する実装が、バッチ全体の所要時間を 1.56 秒から 8.36 秒へ伸ばした実測（同一条件・3回の中央値）"
+  - "壊れ方が現れる指標: 成功レイテンシ p95 ではなく、投入から実行開始までの待ち時間 p95（759ms → 4,682ms）"
+  - "停止済みモデル ID を境界の1箇所で落とす preflight 実装と、それを速度目的で置いてはいけない理由"
+---
+
+8月4日、Gemini Enterprise アプリの global リージョンのモデル一覧から Gemini 3.5 Flash が外れる日でした。8月17日には旧来の画像生成モデルが停止します。手元の設定ファイルを開いて、モデル ID が何箇所に散っているかを数えたところで、手が止まりました。
+
+数えるべきはそこではありませんでした。
+
+停止日を過ぎたあと、自分のコードが**どう壊れるか**を、私は説明できませんでした。呼び出しが失敗することは分かります。ただ、その失敗をリトライ層がどう扱い、バッチ全体がどうなるのかは、想像の域を出ていませんでした。
+
+想像で移行計画を立てるのは落ち着かないので、手元で再現して測ることにしました。
+
+## 恒久エラーと一時エラーを、同じ箱に入れていました
+
+個人開発で回している定期バッチのリトライ層を読み返して、すぐに気づいたことがあります。
+
+失敗したら指数バックオフで4回まで再試行する。それだけでした。何が失敗したのかは見ていません。
+
+この作りは、過負荷（503 UNAVAILABLE）やレート超過（429 RESOURCE_EXHAUSTED）に対しては正しく働きます。時間を置けば直る種類のエラーだからです。
+
+停止したモデルは、時間を置いても直りません。3.5 秒待ってもう一度呼んでも、返ってくるのは同じ 404 NOT_FOUND です。
+
+つまり移行漏れが1件あるたびに、私のバッチは**確実に失敗すると分かっている呼び出しを4回投げ、その間に 3.5 秒眠る**ことになります。
+
+問題はここからです。それがどれくらいの実害になるのか、私には見当がつきませんでした。「多少遅くなる」で済むのか、それとも致命的なのか。
+
+## 計測ハーネス: 停止済みモデルの応答を手元で再現する
+
+実 API に停止済みモデルを叩き続けるわけにはいきませんので、公式ドキュメントに記載されているエラー形（停止済みモデルは 404 NOT_FOUND、過負荷は 503 UNAVAILABLE）を返すモックサーバーを立てました。
+
+停止済みモデル ID を叩いたら必ず 404、生きているモデルは 6% の確率で 503、残りは 40ms の生成レイテンシを模して 200 を返します。
+
+```python
+# server.py — 停止済みモデルの応答を手元で再現するモック
+import json, random, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+RETIRED = {"imagen-4.0-generate-001", "gemini-3-image-preview"}
+AVAILABLE = {"gemini-3.6-flash", "nano-banana-2-lite"}
+rng = random.Random(20260804)   # 再現性のため固定シード
+COUNT = {"total": 0, "retired": 0, "transient": 0, "ok": 0}
+LOCK = threading.Lock()
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"   # keep-alive。これを外すと計測がTCP接続コストに支配されます
+    def log_message(self, *a): pass
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        model = json.loads(self.rfile.read(n) or b"{}").get("model", "")
+        with LOCK:
+            COUNT["total"] += 1
+
+        if model in RETIRED:
+            with LOCK:
+                COUNT["retired"] += 1
+            self._send(404, {"error": {"code": 404, "status": "NOT_FOUND",
+                "message": f"models/{model} is not found or no longer supported."}})
+            return
+
+        if rng.random() < 0.06:      # 一時的な過負荷
+            with LOCK:
+                COUNT["transient"] += 1
+            self._send(503, {"error": {"code": 503, "status": "UNAVAILABLE",
+                "message": "The model is overloaded. Please try again later."}})
+            return
+
+        time.sleep(0.04)             # 生成レイテンシの模擬
+        with LOCK:
+            COUNT["ok"] += 1
+        self._send(200, {"model": model, "output": "ok"})
+
+    def do_GET(self):
+        if self.path == "/models":
+            self._send(200, {"models": [{"name": f"models/{m}"} for m in sorted(AVAILABLE)]})
+        else:
+            self._send(404, {"error": {"code": 404, "status": "NOT_FOUND"}})
+
+    def _send(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+ThreadingHTTPServer(("127.0.0.1", 8931), H).serve_forever()
+```
+
+`protocol_version` を HTTP/1.1 に上げている点だけ補足させてください。既定の HTTP/1.0 のままだと毎回 TCP 接続が張り直され、計測したい差分が接続コストに埋もれます。最初の試行でこれに気づかず、3クライアントの差がほとんど出ずに首をかしげました。
+
+## 3つのクライアント: 何を再試行するかだけを変える
+
+比較する実装は3つです。バックオフの係数もワーカー数も揃えて、**エラーの扱い方だけ**を変えています。
+
+```python
+# client.py — 再試行の判断だけが異なる3実装
+import json, time, urllib.request, urllib.error
+from concurrent.futures import ThreadPoolExecutor
+
+BASE = "http://127.0.0.1:8931"
+RETRYABLE = {429, 500, 502, 503, 504}   # 時間を置けば直る可能性のあるものだけ
+
+def call(model):
+    req = urllib.request.Request(
+        BASE + "/generate", method="POST",
+        data=json.dumps({"model": model}).encode(),
+        headers={"content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+def naive(model, attempts=4, base=0.5):
+    """A: 失敗したら理由を問わず再試行する（移行前の私の実装）"""
+    t0 = time.perf_counter(); n = 0
+    for i in range(attempts):
+        n += 1
+        code, _ = call(model)
+        if code == 200:
+            return True, n, time.perf_counter() - t0
+        if i < attempts - 1:
+            time.sleep(base * (2 ** i))     # 0.5s → 1s → 2s
+    return False, n, time.perf_counter() - t0
+
+def classified(model, attempts=4, base=0.5):
+    """B: 恒久エラーは即座に諦める"""
+    t0 = time.perf_counter(); n = 0
+    for i in range(attempts):
+        n += 1
+        code, _ = call(model)
+        if code == 200:
+            return True, n, time.perf_counter() - t0
+        if code not in RETRYABLE:           # 404 / 400 はここで打ち切る
+            return False, n, time.perf_counter() - t0
+        if i < attempts - 1:
+            time.sleep(base * (2 ** i))
+    return False, n, time.perf_counter() - t0
+
+def preflight(models):
+    """C: 投入前に生存モデルの一覧と突き合わせて落とす"""
+    with urllib.request.urlopen(BASE + "/models", timeout=5) as r:
+        live = {m["name"].split("/")[-1] for m in json.loads(r.read())["models"]}
+    return [m for m in models if m in live], [m for m in models if m not in live]
+```
+
+投入するジョブは 200 件。うち 12% を停止済みモデル ID にしました。移行作業を一通り終えたつもりでも、設定ファイルやフォールバック経路に取りこぼしが残る、という状態の再現です。
+
+計測したのは4つです。
+
+<table>
+<thead>
+<tr><th>指標</th><th>意味</th></tr>
+</thead>
+<tbody>
+<tr><td>wall</td><td>バッチ全体の所要時間</td></tr>
+<tr><td>upstream</td><td>API へ実際に投げた総リクエスト数</td></tr>
+<tr><td>success_p95</td><td>成功したリクエストの所要時間 p95</td></tr>
+<tr><td>queue_p95</td><td>ジョブを投入してから実行が始まるまでの待ち時間 p95</td></tr>
+</tbody>
+</table>
+
+4つ目は、当初は入れていませんでした。後述する理由で、途中から足しています。
+
+## 測った結果
+
+ワーカー16並列・200件・停止済み 12%。同一条件で3回走らせた中央値です。
+
+<table>
+<thead>
+<tr><th>実装</th><th>wall</th><th>upstream</th><th>queue_p95</th><th>成功</th></tr>
+</thead>
+<tbody>
+<tr><td>A 理由を問わず再試行</td><td>8.36 s</td><td>296</td><td>4,682 ms</td><td>169/200</td></tr>
+<tr><td>B エラー分類あり</td><td><strong>1.56 s</strong></td><td>217</td><td><strong>759 ms</strong></td><td>169/200</td></tr>
+<tr><td>C preflight + 分類</td><td>1.18 s</td><td>180</td><td>631 ms</td><td>169/169</td></tr>
+</tbody>
+</table>
+
+ワーカーを4並列に絞り、120件で1回走らせた結果も並べます。並列度が下がるほど差が開きます。
+
+<table>
+<thead>
+<tr><th>実装</th><th>wall</th><th>upstream</th><th>queue_p95</th></tr>
+</thead>
+<tbody>
+<tr><td>A 理由を問わず再試行</td><td>16.05 s</td><td>169</td><td>13,120 ms</td></tr>
+<tr><td>B エラー分類あり</td><td><strong>1.98 s</strong></td><td>126</td><td><strong>1,515 ms</strong></td></tr>
+<tr><td>C preflight + 分類</td><td>2.77 s</td><td>117</td><td>2,142 ms</td></tr>
+</tbody>
+</table>
+
+16並列で 5.4 倍、4並列で 8.1 倍。停止済みモデルの混入率は同じ 12% です。
+
+差が生まれる仕組みは単純でした。A の実装では、失敗すると分かっている 31 件が 3.5 秒ずつワーカーを占有します。ワーカーは有限ですから、その間、後ろに並んだ**成功するはずのジョブが実行を待たされます**。
+
+並列度が低いほど占有の影響が大きくなる。数字はそのとおりに動きました。
+
+なお、これらはローカルのモックサーバーに対する計測です。エラー形は公式ドキュメントに記載されたものを再現していますが、実 API のレイテンシ分布とは異なります。比べているのは絶対値ではなく、3実装の相対差です。
+
+## 予想が外れた点: 成功レイテンシには何も出ませんでした
+
+当初、私が置いていた指標は success_p95 でした。成功したリクエストが遅くなるはずだ、と考えていたからです。
+
+その予想は外れました。
+
+success_p95 は A で 46 ms、B で 543 ms。**壊れている側のほうが速く見えた**のです。走らせ直すと 44 ms と 544 ms で入れ替わりました。
+
+理由を追うと、この指標は 503 を1回踏んで 0.5 秒待ったジョブが p95 の境界に何件乗るかで決まっていました。169 件の成功に対する p95 は上位 8 件目あたりで、一時エラーの発生数が1〜2件ぶれるだけで値が二値的に飛びます。停止済みモデルの再試行は、成功したリクエストの所要時間には**そもそも含まれません**。当たり前でした。
+
+ここが、この計測でいちばん引っかかった点です。
+
+停止済みモデルの取りこぼしは、成功レイテンシを見ているダッシュボードには映りません。エラー率にも、実は大きくは映りません。169/200 という成功件数は A も B も同じです。分類を入れても、失敗するジョブが失敗することに変わりはないからです。
+
+映るのは、バッチ全体の所要時間と、待ち行列の待ち時間だけでした。
+
+そして待ち行列の待ち時間は、私が計装していなかった指標です。ジョブを投入した時刻を記録して、実行が始まった時刻との差を取る。それだけの話ですが、成功したリクエストの中だけを見ている限り、永久に出てきません。
+
+途中で queue_p95 を足したのは、A と B の差が wall にしか出ず、原因の説明がつかなかったからです。足してみたら 4,682 ms と 759 ms。ここに全部出ていました。
+
+計測する対象を1つ間違えていると、正しく測っているつもりで「差はなかった」と結論できてしまう。手元で走らせなければ、私はこの結論に辿り着けませんでした。
+
+## preflight は速度のためではなく、境界を1箇所に集めるために置く
+
+C の preflight は、投入前にモデル一覧を1回取得して、生存しないモデル ID のジョブを落とします。
+
+数字だけ見ると、16並列では B より速く（1.18 s / 1.56 s）、4並列では B より遅い（2.77 s / 1.98 s）という結果でした。1回計測の揺れの範囲で、速度目的で導入するほどの差ではありません。この場合は速さを判断材料から外すのが正しい読み方でした。
+
+それでも私が C を採ったのは、別の列を見たからです。
+
+<table>
+<thead>
+<tr><th>実装</th><th>API への総リクエスト</th><th>404 を発生させた回数</th><th>成功率</th></tr>
+</thead>
+<tbody>
+<tr><td>A</td><td>296</td><td>124</td><td>84.5%（169/200）</td></tr>
+<tr><td>B</td><td>217</td><td>31</td><td>84.5%（169/200）</td></tr>
+<tr><td>C</td><td>180</td><td>0</td><td>100%（169/169）</td></tr>
+</tbody>
+</table>
+
+C では、停止済みモデルの検出が**API 呼び出しではなく設定検証の問題**に変わります。落ちた31件はエラーログではなく「投入前に弾いた ID の一覧」として出てきますので、どの設定ファイルを直せばよいかがそのまま分かります。
+
+分母も変わります。C の成功率は 169/169 です。投入したジョブは全部成功した、という状態になり、監視のしきい値を素直に置けます。A と B の 84.5% は「移行漏れがあるから下がっている」のですが、その 84.5% を見て過負荷を疑い始めると、時間を無駄にします。
+
+preflight の弱点も書いておきます。モデル一覧の取得は1回の往復ですから、短命なバッチに毎回入れると相対コストが無視できません。これを回避するため、私自身は起動時に1回だけ取得してプロセス内でキャッシュする形にしました。数分で終わるバッチならこれで十分です。数時間走り続けるワーカーであれば、一定間隔で取り直す設計を推奨します。
+
+停止が予告された日をまたいで走り続けるプロセスがある場合は、キャッシュの有効期限を停止日より短くしておく必要があります。
+
+## 8月17日までにやること
+
+停止日が近いものから順に並べます。日付は本稿執筆時点の公式情報ですので、実施前に一次情報でご確認ください。
+
+1. **モデル ID の棚卸し**: コード・設定ファイル・環境変数・フォールバック経路を横断して、文字列としてのモデル ID を全部集める。動的に組み立てている箇所は文字列検索に引っかからないため、組み立て関数の側から辿る
+2. **リトライ層のエラー分類を先に直す**: これは移行作業ではなく防御です。移行が完全でなくても、恒久エラーで再試行しない実装になっていれば被害が待ち行列に波及しません
+3. **preflight を境界に置く**: 生存モデル一覧との突き合わせを、ジョブ投入の直前に1箇所だけ入れる
+4. **queue wait を計装する**: 投入時刻と実行開始時刻の差を記録する。停止日をまたいだときに、最初に動く指標がこれです
+5. **移行先で同じ入力を流して差を見る**: 画像生成の移行先候補は出力の傾向が変わりますので、代表的なプロンプトを固定して前後を並べる
+
+順序に意味を持たせています。2 を 1 より先にやってもよいくらいです。棚卸しは漏れる前提で、漏れたときに静かに壊れる作りを先に潰すほうが、私は安心できました。
+
+## 選ばなかった案
+
+サーキットブレーカーを入れる案も検討しました。同じモデル ID で連続して失敗したら、一定時間そのモデルへの呼び出しを遮断する構成です。
+
+採らなかった理由は、状態を持つ層が1つ増えるからです。恒久エラーは「連続失敗したら止める」ではなく「1回で確定する」性質のもので、閾値と復帰時間という調整項目を抱え込む対価に見合いませんでした。
+
+一時エラーが慢性化する状況、たとえば特定リージョンが継続的に不安定なケースにはブレーカーが効きます。目的が違いますので、必要になった時点で別に足すつもりです。
+
+エラーメッセージの本文で判定する案も見送りました。`is not found or no longer supported` のような文言は変わり得ます。ステータスコードと `status` フィールドで判定して、本文はログに残すだけにしています。
+
+## 次の一歩
+
+まず `queue wait` を1本だけ計装してみてください。投入時刻を持ち回すだけの変更です。
+
+そのうえで、停止済みモデル ID を1つだけ意図的に混ぜたジョブを流してみると、自分のリトライ層が何をするかが数字で出ます。想像していた壊れ方と違っていたら、それが直すべき箇所です。
+
+私はこの計測をするまで、成功レイテンシを見ていれば異常には気づけると思い込んでいました。測ってみたら、見ていた指標のほうが動かなかったという結果でした。
+
+同じ思い込みを持っている方の役に立てば嬉しいです。お読みいただきありがとうございました。

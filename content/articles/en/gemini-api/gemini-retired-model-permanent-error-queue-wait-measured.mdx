@@ -1,0 +1,291 @@
+---
+title: "Retrying a Retired Model Never Showed Up in Success Latency"
+slug: "gemini-retired-model-permanent-error-queue-wait-measured"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-08-04T13:00"
+author: "Gemini Lab"
+description: "With the image generation models shutting down soon, I rebuilt a mock server to see what my retry layer actually does when it hits a retired model ID. The damage landed in wall time and queue wait, and never touched the metric I was watching."
+tags: ["Gemini API", "Error Handling", "Retry Design", "Model Migration", "Observability"]
+highlights:
+  - "Measured impact of retrying permanent errors: batch wall time went from 1.56s to 8.36s under identical conditions (median of 3 runs)"
+  - "The metric that actually moves: not success-latency p95, but queue wait p95 from submission to execution start (759ms vs 4,682ms)"
+  - "A preflight check that drops retired model IDs at one boundary, and why you should not adopt it for speed"
+---
+
+August 4 was the day Gemini 3.5 Flash dropped off the model list in the global region of the Gemini Enterprise app. On August 17, the older image generation models shut down. I opened my config files to count how many places a model ID was hard-coded, and then stopped.
+
+Counting was not the useful part.
+
+I could not actually describe how my code would break the day after a shutdown. Calls would fail, sure. But what my retry layer would do with those failures, and what that would cost the batch as a whole, was pure guesswork.
+
+Planning a migration on guesswork felt uncomfortable, so I reproduced the failure locally and measured it.
+
+## Permanent and Transient Errors Were Sitting in the Same Bucket
+
+Reading back through the retry layer of a scheduled batch I keep running as an indie developer, one thing was immediately obvious.
+
+On failure, retry with exponential backoff, up to four attempts. That was the entire policy. Nothing looked at *why* the call failed.
+
+For overload (503 UNAVAILABLE) or rate limits (429 RESOURCE_EXHAUSTED), that policy is correct. Those are errors that time fixes.
+
+A retired model is not. Wait 3.5 seconds and call again, and you get the same 404 NOT_FOUND back.
+
+So for every model ID I failed to migrate, my batch would throw four calls it was guaranteed to fail, sleeping 3.5 seconds along the way.
+
+The part I could not size was the actual damage. Was this "somewhat slower," or was it serious?
+
+## The Harness: Reproducing a Retired Model's Response Locally
+
+Hammering the live API with retired model IDs is not an option, so I stood up a mock server that returns the error shapes documented in the official docs — 404 NOT_FOUND for a retired model, 503 UNAVAILABLE for overload.
+
+Retired IDs always get a 404. Live models return 503 six percent of the time, and otherwise a 200 after a simulated 40ms of generation latency.
+
+```python
+# server.py - a mock that reproduces retired-model responses locally
+import json, random, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+RETIRED = {"imagen-4.0-generate-001", "gemini-3-image-preview"}
+AVAILABLE = {"gemini-3.6-flash", "nano-banana-2-lite"}
+rng = random.Random(20260804)   # fixed seed for reproducibility
+COUNT = {"total": 0, "retired": 0, "transient": 0, "ok": 0}
+LOCK = threading.Lock()
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"   # keep-alive; without this the measurement drowns in TCP setup
+    def log_message(self, *a): pass
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        model = json.loads(self.rfile.read(n) or b"{}").get("model", "")
+        with LOCK:
+            COUNT["total"] += 1
+
+        if model in RETIRED:
+            with LOCK:
+                COUNT["retired"] += 1
+            self._send(404, {"error": {"code": 404, "status": "NOT_FOUND",
+                "message": f"models/{model} is not found or no longer supported."}})
+            return
+
+        if rng.random() < 0.06:      # transient overload
+            with LOCK:
+                COUNT["transient"] += 1
+            self._send(503, {"error": {"code": 503, "status": "UNAVAILABLE",
+                "message": "The model is overloaded. Please try again later."}})
+            return
+
+        time.sleep(0.04)             # simulated generation latency
+        with LOCK:
+            COUNT["ok"] += 1
+        self._send(200, {"model": model, "output": "ok"})
+
+    def do_GET(self):
+        if self.path == "/models":
+            self._send(200, {"models": [{"name": f"models/{m}"} for m in sorted(AVAILABLE)]})
+        else:
+            self._send(404, {"error": {"code": 404, "status": "NOT_FOUND"}})
+
+    def _send(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+ThreadingHTTPServer(("127.0.0.1", 8931), H).serve_forever()
+```
+
+One note on `protocol_version`. Left at the default HTTP/1.0, every call re-establishes a TCP connection, and the difference you are trying to measure disappears into connection setup. My first run produced almost no separation between the three clients, and this was why.
+
+## Three Clients That Differ Only in What They Retry
+
+The three implementations share backoff factors and worker counts. The only thing that changes is how each one treats an error.
+
+```python
+# client.py - three implementations, differing only in the retry decision
+import json, time, urllib.request, urllib.error
+from concurrent.futures import ThreadPoolExecutor
+
+BASE = "http://127.0.0.1:8931"
+RETRYABLE = {429, 500, 502, 503, 504}   # only things that time might fix
+
+def call(model):
+    req = urllib.request.Request(
+        BASE + "/generate", method="POST",
+        data=json.dumps({"model": model}).encode(),
+        headers={"content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+def naive(model, attempts=4, base=0.5):
+    """A: retry on any failure, no questions asked (my pre-migration code)"""
+    t0 = time.perf_counter(); n = 0
+    for i in range(attempts):
+        n += 1
+        code, _ = call(model)
+        if code == 200:
+            return True, n, time.perf_counter() - t0
+        if i < attempts - 1:
+            time.sleep(base * (2 ** i))     # 0.5s -> 1s -> 2s
+    return False, n, time.perf_counter() - t0
+
+def classified(model, attempts=4, base=0.5):
+    """B: give up immediately on permanent errors"""
+    t0 = time.perf_counter(); n = 0
+    for i in range(attempts):
+        n += 1
+        code, _ = call(model)
+        if code == 200:
+            return True, n, time.perf_counter() - t0
+        if code not in RETRYABLE:           # 404 / 400 stop here
+            return False, n, time.perf_counter() - t0
+        if i < attempts - 1:
+            time.sleep(base * (2 ** i))
+    return False, n, time.perf_counter() - t0
+
+def preflight(models):
+    """C: reconcile against the live model list before submitting anything"""
+    with urllib.request.urlopen(BASE + "/models", timeout=5) as r:
+        live = {m["name"].split("/")[-1] for m in json.loads(r.read())["models"]}
+    return [m for m in models if m in live], [m for m in models if m not in live]
+```
+
+The workload is 200 jobs, 12 percent of them pointing at retired model IDs. That models the realistic state after a migration you believe is finished, with stragglers left in config files and fallback paths.
+
+I tracked four numbers.
+
+<table>
+<thead>
+<tr><th>Metric</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td>wall</td><td>Total elapsed time for the batch</td></tr>
+<tr><td>upstream</td><td>Total requests actually sent to the API</td></tr>
+<tr><td>success_p95</td><td>p95 duration of successful requests</td></tr>
+<tr><td>queue_p95</td><td>p95 wait from job submission to execution start</td></tr>
+</tbody>
+</table>
+
+The fourth one was not there originally. I added it partway through, for reasons below.
+
+## Results
+
+Sixteen workers, 200 jobs, 12 percent retired. Median of three runs under identical conditions.
+
+<table>
+<thead>
+<tr><th>Implementation</th><th>wall</th><th>upstream</th><th>queue_p95</th><th>Succeeded</th></tr>
+</thead>
+<tbody>
+<tr><td>A retry everything</td><td>8.36 s</td><td>296</td><td>4,682 ms</td><td>169/200</td></tr>
+<tr><td>B error classification</td><td><strong>1.56 s</strong></td><td>217</td><td><strong>759 ms</strong></td><td>169/200</td></tr>
+<tr><td>C preflight + classification</td><td>1.18 s</td><td>180</td><td>631 ms</td><td>169/169</td></tr>
+</tbody>
+</table>
+
+Tightening to four workers with 120 jobs, single run. The gap widens as parallelism drops.
+
+<table>
+<thead>
+<tr><th>Implementation</th><th>wall</th><th>upstream</th><th>queue_p95</th></tr>
+</thead>
+<tbody>
+<tr><td>A retry everything</td><td>16.05 s</td><td>169</td><td>13,120 ms</td></tr>
+<tr><td>B error classification</td><td><strong>1.98 s</strong></td><td>126</td><td><strong>1,515 ms</strong></td></tr>
+<tr><td>C preflight + classification</td><td>2.77 s</td><td>117</td><td>2,142 ms</td></tr>
+</tbody>
+</table>
+
+A factor of 5.4 at sixteen workers, 8.1 at four. The retired-model contamination rate is the same 12 percent in both.
+
+The mechanism turned out to be simple. Under A, 31 jobs that are guaranteed to fail each hold a worker for 3.5 seconds. Workers are finite, so behind them, **jobs that would have succeeded sit waiting to start**.
+
+Lower parallelism means the occupancy hurts more. The numbers followed exactly that shape.
+
+These measurements come from a local mock server. The error shapes match what the docs describe, but the latency distribution is not the live API's. What I am comparing is the relative difference between three implementations, not absolute values.
+
+## What I Got Wrong: Success Latency Never Moved
+
+The metric I started with was success_p95. My assumption was that successful requests would get slower.
+
+That assumption was wrong.
+
+success_p95 came out at 46 ms for A and 543 ms for B. **The broken configuration looked faster.** On a rerun the values swapped, 44 ms and 544 ms.
+
+Chasing it down, the metric was entirely determined by how many jobs that hit a single 503 and slept 0.5 seconds landed on the p95 boundary. Across 169 successes, p95 sits around the eighth item from the top, so a one- or two-job swing in transient failures flips the value between two states. And retries against retired models are never *in* the success set to begin with. Obvious in hindsight.
+
+This is the part of the exercise that stuck with me.
+
+Missed model IDs do not show up on a dashboard watching success latency. They barely show up in error rate either — 169 out of 200 succeed under both A and B. Classification does not rescue jobs that were always going to fail.
+
+What does show up is wall time and queue wait, and nothing else.
+
+Queue wait was the one metric I had never instrumented. Record the submission timestamp, subtract it from the execution start timestamp. That is the whole change, but as long as you only look inside successful requests, it never surfaces.
+
+I added queue_p95 midway because the A/B difference only appeared in wall time and I could not explain the cause. Once it was there — 4,682 ms against 759 ms — the whole story was in that column.
+
+Measure the wrong thing and you can conclude "no difference" while believing you measured correctly. I would not have found this without running it.
+
+## Preflight Is Not for Speed — It Moves the Boundary
+
+C's preflight fetches the model list once before submission and drops jobs whose model is not live.
+
+On raw speed it beat B at sixteen workers (1.18 s vs 1.56 s) and lost at four (2.77 s vs 1.98 s). Within single-run noise. Not a reason to adopt it.
+
+I chose C anyway, because of a different column.
+
+<table>
+<thead>
+<tr><th>Implementation</th><th>Total API requests</th><th>404s generated</th><th>Success rate</th></tr>
+</thead>
+<tbody>
+<tr><td>A</td><td>296</td><td>124</td><td>84.5% (169/200)</td></tr>
+<tr><td>B</td><td>217</td><td>31</td><td>84.5% (169/200)</td></tr>
+<tr><td>C</td><td>180</td><td>0</td><td>100% (169/169)</td></tr>
+</tbody>
+</table>
+
+Under C, detecting retired models stops being an API problem and becomes a **config validation problem**. The 31 dropped jobs arrive as a list of rejected IDs rather than a pile of error logs, which tells you directly which file to fix.
+
+The denominator changes too. C's success rate is 169/169 — every job submitted succeeded — which makes monitoring thresholds easy to set honestly. The 84.5 percent under A and B is depressed by migration stragglers, and if you see that number and start investigating overload, you will lose an afternoon.
+
+The weakness is worth stating. Fetching the model list is a round trip, so for short-lived batches the relative cost is real. I fetch once at startup and cache it in-process. For long-running workers, refreshing on an interval is safer.
+
+If a process will stay alive across an announced shutdown date, the cache TTL needs to be shorter than the gap to that date.
+
+## What to Do Before August 17
+
+Ordered by proximity of the deadline. Dates reflect the official information at the time of writing, so please confirm against primary sources before acting.
+
+1. **Inventory your model IDs.** Sweep code, config files, environment variables, and fallback paths for model ID strings. IDs assembled dynamically will not match a text search, so trace those from the assembling function instead.
+2. **Fix error classification in the retry layer first.** This is defense, not migration. Even with an incomplete migration, a layer that refuses to retry permanent errors keeps the damage from spreading into the queue.
+3. **Put a preflight at the boundary.** One reconciliation against the live model list, immediately before job submission.
+4. **Instrument queue wait.** Record submission time and execution start time. It is the first metric that moves when a shutdown date passes.
+5. **Replay identical inputs on the replacement model.** Image generation replacements shift output characteristics, so pin a set of representative prompts and put before and after side by side.
+
+The ordering is deliberate. You could reasonably do step 2 before step 1. Assume the inventory will miss something, and close off the silent failure mode first.
+
+## What I Decided Against
+
+I considered a circuit breaker — block calls to a model ID for a period after consecutive failures.
+
+I skipped it because it adds another stateful layer. A permanent error is not "stop after N consecutive failures," it is "settled on the first response," and carrying a threshold plus a recovery window was not worth that.
+
+Breakers earn their keep when transient errors turn chronic, say a region that stays unstable. Different problem, so I will add one separately if that day comes.
+
+I also passed on matching error message text. Wording like `is not found or no longer supported` can change. I branch on the status code and the `status` field, and keep the message body in logs only.
+
+## Where to Start
+
+Instrument queue wait first. It is a matter of carrying the submission timestamp through.
+
+Then deliberately mix one retired model ID into a batch and watch what your retry layer does. If the failure mode differs from what you pictured, that gap is the thing to fix.
+
+Until I ran this, I assumed that watching success latency would catch the anomaly. What I found was that the metric I was watching was the one that stayed still.
