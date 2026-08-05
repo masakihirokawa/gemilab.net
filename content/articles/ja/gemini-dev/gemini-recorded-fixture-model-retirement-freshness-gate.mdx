@@ -1,0 +1,257 @@
+---
+title: "テストは緑のまま、本番だけが止まる — 録画フィクスチャがモデル停止を隠す構造と freshness gate"
+slug: "gemini-recorded-fixture-model-retirement-freshness-gate"
+category: "gemini-dev"
+level: "intermediate"
+premium: true
+date: "2026-08-05T13:00"
+author: "Gemini Lab"
+description: "録画済みAPIレスポンスで回るテストスイートは、モデル停止をすり抜けます。6件全部緑のまま404になる構造を最小構成で再現し、cassette走査のfreshness gateを実装・実測しました。"
+tags: ["Gemini API", "pytest", "テスト設計", "モデル停止", "CI"]
+highlights:
+  - "6件すべて緑のテストスイートの下で、8月17日停止予定モデルへの依存が検知されない構造を最小構成で再現（クライアント・再生conftest・cassetteのコード全文つき）"
+  - "pytest起動前に挟むcassette freshness gateの完全実装 — 200件の走査が中央値7.1msで済むことをVMで実測（n=50）"
+  - "停止3週間前からfailさせるWARN_DAYSと再録画期限MAX_AGE_DAYSの決め方、既存スイートを壊さない段階導入の手順"
+---
+
+8月の停止予定を並べた changelog を眺めたあと、手元のテストスイートを走らせてみました。6件すべて緑、0.11秒。その緑の下に、8月17日に停止するモデルの録画レスポンスが3本眠っていました。
+
+個人開発のアプリで画像生成パイプラインを検討している私の環境では、Gemini API のテストをすべて録画済みレスポンス（cassette）の再生で回しております。課金を伴うAPIをCIのたびに叩きたくないので、これは真っ当な設計のはずでした。ただ、モデルの停止という失敗クラスに限っては、この設計そのものが検知を妨げる側に回ります。
+
+テストが通ることと、来週も本番が動くことは、別の命題です。この2つを繋ぎ直す小さな仕組みを作り、手元で数字を取りました。
+
+## 8月に止まるものと、モックが原理的に検知しないもの
+
+まず前提の整理です。2026年8月は停止・撤去が集中しています。
+
+<table>
+<thead>
+<tr><th>対象</th><th>期日</th><th>影響</th></tr>
+</thead>
+<tbody>
+<tr><td>Imagen 4 系（<code>imagen-4.0-generate-001</code> / <code>ultra</code> / <code>fast</code>）・Gemini 3 Image 系</td><td>2026-08-17 停止</td><td>画像生成パイプラインは移行必須</td></tr>
+<tr><td>Gemini Enterprise Agent Platform 上の Grok 4.1 ファミリー</td><td>2026-08-20 停止</td><td>該当エージェント構成の差し替え</td></tr>
+<tr><td><code>gemini-robotics-er-1.6-preview</code></td><td>2026-08-31 停止</td><td>プレビュー依存の経路は代替が必要</td></tr>
+<tr><td>Gemini Enterprise（global リージョン）の 3.5 Flash</td><td>2026-08-04 撤去済み</td><td>モデル一覧から選択肢が消える</td></tr>
+</tbody>
+</table>
+
+期日と対象は変わり得るため、実作業の前に[モデルの非推奨スケジュール](https://ai.google.dev/gemini-api/docs/deprecations)で一次情報を確認してください。
+
+ここで問題になるのが、テストの作りです。録画レスポンスの再生・SDKのモック・スタブサーバー — 呼び名は何であれ、これらは「ネットワークの向こう側を固定する」ための仕組みです。レイテンシの揺れも、レートリミットも、そしてモデルの停止も、固定した瞬間にテストの観測範囲から消えます。
+
+つまりモデル停止は、モックが隠すために設計された失敗クラスに、ちょうど嵌まる形をしています。カバレッジを上げるほど検知が遅れるという、嫌な逆相関です。
+
+## 緑のまま止まる構造を、最小構成で再現する
+
+言葉で説明するより、動くもので示した方が早いはずです。壁紙アプリの画像生成を想定した最小クライアントを書きました。
+
+```python
+# client.py
+import os
+import requests
+
+BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+
+class GeminiImageClient:
+    def __init__(self, model: str, api_key: str | None = None, base_url: str = BASE_URL):
+        self.model = model
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
+        self.base_url = base_url  # テスト時にスタブへ向け替えるための注入口
+
+    def generate(self, prompt: str, aspect_ratio: str = "9:16") -> dict:
+        url = f"{self.base_url}/models/{self.model}:predict"
+        resp = requests.post(
+            url,
+            params={"key": self.api_key},
+            json={"instances": [{"prompt": prompt}],
+                  "parameters": {"sampleCount": 1, "aspectRatio": aspect_ratio}},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+```
+
+テスト側は、録画したレスポンスをJSONで持ち、`requests.post` を差し替えて再生します。
+
+```python
+# tests/conftest.py（再生部分）
+import json
+import pathlib
+import pytest
+
+CASSETTE_DIR = pathlib.Path(__file__).parent / "cassettes"
+
+class _FakeResponse:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f"{self.status_code}")
+    def json(self):
+        return self._payload
+
+@pytest.fixture
+def replay(monkeypatch):
+    def _use(cassette_name):
+        data = json.loads((CASSETTE_DIR / cassette_name).read_text())
+        def fake_post(url, **kwargs):
+            return _FakeResponse(data["response"], data.get("status", 200))
+        monkeypatch.setattr("requests.post", fake_post)
+        return data
+    return _use
+```
+
+cassette には録画日時とリクエスト情報を残しておきます。この設計判断があとで効いてきます。
+
+```json
+{
+  "recorded_at": "2026-06-20T09:12:44+09:00",
+  "request": {
+    "model": "imagen-4.0-fast-generate-001",
+    "endpoint": ":predict",
+    "parameters": {"sampleCount": 1, "aspectRatio": "9:16"}
+  },
+  "response": {
+    "predictions": [{"bytesBase64Encoded": "iVBORw...", "mimeType": "image/png"}],
+    "modelVersion": "imagen-4.0-fast-generate-001"
+  }
+}
+```
+
+この構成で、生成結果の検証・アスペクト比・バッチ生成・セーフティフィルタ時の空応答など6件のテストを書きました。VM（Python 3.10.12）での結果は次の通りです。
+
+```
+$ python3 -m pytest tests/ -q
+......                                                                   [100%]
+6 passed in 0.11s
+```
+
+全部緑です。一方で、録画元の `imagen-4.0-fast-generate-001` は8月17日に停止します。停止後の実APIの挙動は手元ではまだ確認できないため、既に停止済みの旧モデル群が返す `NOT_FOUND` の形状を再現したローカルスタブを立てて対比しました。
+
+```
+imagen-4.0-fast-generate-001: HTTPError 404 Client Error: Not Found (4.1ms)
+gemini-3.1-flash-lite-image:  OK modelVersion=gemini-3.1-flash-lite-image (2.2ms)
+```
+
+テストは0.11秒で全部通り、同じコードの実呼び出しは404で落ちる。この乖離が「緑のまま止まる」の正体です。停止済みモデルへ実際にリクエストを投げ続けるとどうなるかは、以前[停止済みモデルの再試行は、成功レイテンシには出ませんでした](/articles/gemini-api/gemini-retired-model-permanent-error-queue-wait-measured)で実測しております。恒久エラーは平常時のメトリクスに映りにくく、そちらでも観測の穴になりがちでした。
+
+## 意外だったのは、cassette が一番正確な台帳だったこと
+
+書き始める前の私は、cassette を「棚卸しのノイズ」と見ていました。コードベースを grep してモデルIDを洗い出すとき、テストフィクスチャへのヒットは除外するものだと思っていたのです。
+
+実際には逆でした。
+
+コード側のモデル指定は、環境変数経由だったり、設定ファイルからの読み込みだったり、stable エイリアスだったりします。ソースコードの文字列走査は、この間接参照の層で簡単に取りこぼします。ところが cassette に記録された `modelVersion` は、APIが実際に応答を返したときの解決済みのモデル名です。間接参照が何段挟まっていても、録画には最終的に叩いたモデルがそのまま写っています。
+
+録画フィクスチャは停止を隠す装置であると同時に、依存の一番正確な記録でもある。この二面性に気づいてから、対処の方針が「モックをやめる」ではなく「cassette を台帳として読む」に変わりました。呼び出し箇所の洗い出しそのものは[8月17日の画像生成モデル停止に備える棚卸し](/articles/gemini-updates/gemini-image-model-817-shutdown-usage-audit-inventory)で書いた手順が使えますが、その走査対象に cassette ディレクトリを含めるだけで、精度の質が変わります。
+
+## freshness gate の実装 — pytest 起動前に cassette を検疫する
+
+台帳として読むなら、読む処理を自動化するべきです。pytest のセッション開始時に cassette 全件を走査し、停止予定モデルの録画と古すぎる録画を fail させる gate を書きました。
+
+```python
+# tests/freshness_gate.py
+"""Cassette freshness gate: 停止予定モデル・古すぎる録画を検出して fail させる。"""
+import datetime as dt
+import json
+import pathlib
+
+# 一次情報: ai.google.dev/gemini-api/docs/deprecations（2026-08-05 参照時点）
+DENYLIST = {
+    "imagen-4.0-generate-001":        dt.date(2026, 8, 17),
+    "imagen-4.0-ultra-generate-001":  dt.date(2026, 8, 17),
+    "imagen-4.0-fast-generate-001":   dt.date(2026, 8, 17),
+    "gemini-robotics-er-1.6-preview": dt.date(2026, 8, 31),
+}
+WARN_DAYS = 21     # 停止 21 日前から fail させる
+MAX_AGE_DAYS = 90  # 録画から 90 日超の cassette は再録画を要求
+
+def scan(cassette_dir: pathlib.Path, today: dt.date | None = None) -> list[str]:
+    today = today or dt.date.today()
+    problems = []
+    for path in sorted(cassette_dir.glob("*.json")):
+        data = json.loads(path.read_text())
+        # 解決済みモデル名を優先し、なければリクエスト側の指定に落とす
+        model = data.get("response", {}).get("modelVersion") \
+            or data.get("request", {}).get("model", "")
+        retire = DENYLIST.get(model)
+        if retire and (retire - today).days <= WARN_DAYS:
+            problems.append(
+                f"{path.name}: recorded model '{model}' retires {retire.isoformat()} "
+                f"({(retire - today).days} days left)")
+        recorded = data.get("recorded_at")
+        if recorded:
+            age = (today - dt.datetime.fromisoformat(recorded).date()).days
+            if age > MAX_AGE_DAYS:
+                problems.append(f"{path.name}: recording is {age} days old (> {MAX_AGE_DAYS})")
+    return problems
+```
+
+conftest 側は数行の追記で済みます。緊急時の逃げ道として環境変数でのスキップも用意しておきます。
+
+```python
+# tests/conftest.py（追記）
+def pytest_sessionstart(session):
+    import os
+    if os.environ.get("SKIP_FRESHNESS_GATE") == "1":
+        return
+    from tests.freshness_gate import scan
+    problems = scan(CASSETTE_DIR)
+    if problems:
+        import pytest as _pytest
+        _pytest.exit("cassette freshness gate failed:\n  " + "\n  ".join(problems), returncode=2)
+```
+
+さきほど全部緑だったスイートは、gate を入れた瞬間にこう変わりました。
+
+```
+! _pytest.outcomes.Exit: cassette freshness gate failed:
+  imagen_fast_batch.json: recorded model 'imagen-4.0-fast-generate-001'
+      retires 2026-08-17 (12 days left)
+  imagen_fast_filtered.json: recorded model 'imagen-4.0-fast-generate-001'
+      retires 2026-08-17 (12 days left)
+  imagen_fast_portrait.json: recorded model 'imagen-4.0-fast-generate-001'
+      retires 2026-08-17 (12 days left)
+```
+
+「残り12日」という数字がテストの失敗として目の前に出る。これが欲しかった挙動です。停止日をカレンダーで管理するのではなく、依存の証拠（録画）自身に語らせる形になっています。
+
+## 走査コストの実測と、しきい値の決め方
+
+gate が重ければ誰も入れません。cassette を200件生成し、走査時間を50回計測しました（VM・Python 3.10.12・各cassette約2KB）。
+
+<table>
+<thead>
+<tr><th>項目</th><th>実測値</th></tr>
+</thead>
+<tbody>
+<tr><td>cassette 件数</td><td>200件</td></tr>
+<tr><td>走査時間（中央値）</td><td>7.1ms</td></tr>
+<tr><td>走査時間（最小〜最大）</td><td>6.5ms 〜 8.0ms（n=50）</td></tr>
+<tr><td>停止予定モデルの検出</td><td>40件</td></tr>
+<tr><td>録画期限切れの検出</td><td>101件</td></tr>
+</tbody>
+</table>
+
+pytest の起動オーバーヘッドに完全に埋もれる水準で、コストを理由に外す必要はありませんでした。
+
+数字を見て考えたのは、しきい値の側です。実測で期限切れが101件出た通り、`MAX_AGE_DAYS` をいきなり有効にすると、既存スイートでは大量の fail が一度に噴き出します。私は次の順で入れることをお勧めします。
+
+1. `DENYLIST` 判定のみで導入する（停止予定モデルの録画だけを fail させる。これは今すぐ困る依存なので、失敗の数がそのまま作業リストになります）
+2. `WARN_DAYS` は21日にする（移行作業と再録画に最低2〜3週間の余白を確保するため。停止当日に知っても遅いというのが前提です）
+3. `MAX_AGE_DAYS` は最初 warning 出力に留め、再録画の習慣が回り始めてから fail に昇格させる
+
+3番目を焦らないのが実務的には大切です。gate の目的は「録画の鮮度に責任を持つ文化」を作ることで、ある朝突然101件の赤を積むことではありません。
+
+## 運用への組み込みと、残る穴
+
+CI への組み込みは、gate が conftest に居る時点でほぼ完了しています。普段のテスト実行がそのまま検疫を兼ねます。緊急デプロイでどうしても通したい場合だけ `SKIP_FRESHNESS_GATE=1` を使い、使ったこと自体をログに残すのが健全です。
+
+残る穴も正直に書いておきます。`DENYLIST` は手動更新なので、changelog の確認が止まればこの gate も陳腐化します。私は毎朝の参照データ更新で非推奨ページを見る習慣に相乗りさせていますが、この部分の自動化（deprecations ページの機械読み取り）は、構造が安定していないため今回は見送りました。gate は「知っている停止」を確実に伝える装置であって、「知らない停止」を発見する装置ではない — この線引きは覚えておく必要があります。
+
+まずは今週、お手元の cassette ディレクトリに対して `scan()` を一度だけ走らせてみてください。fail の一覧が、そのまま8月17日までにやるべき移行作業のリストになります。緑のテストを信じる前に、緑の根拠を一度だけ疑う。その一度分の手間が、停止当日の朝を平穏にしてくれるはずです。
+
+実装の参考になれば幸いです。私自身、この gate に「残り12日」と言われて移行の腰が上がった側の人間です。

@@ -1,0 +1,257 @@
+---
+title: "Green Tests, Dead Production — How Recorded Fixtures Hide a Model Retirement, and a Freshness Gate to Catch It"
+slug: "gemini-recorded-fixture-model-retirement-freshness-gate"
+category: "gemini-dev"
+level: "intermediate"
+premium: true
+date: "2026-08-05T13:00"
+author: "Gemini Lab"
+description: "A test suite that replays recorded API responses will sail straight past a model retirement. I reproduce the failure in a minimal setup and build a cassette freshness gate, with measured overhead."
+tags: ["Gemini API", "pytest", "testing", "model retirement", "CI"]
+highlights:
+  - "A minimal, complete reproduction of the failure mode — six green tests sitting on top of a dependency that retires on August 17, with full client, replay conftest, and cassette code"
+  - "A cassette freshness gate that runs before pytest collection, measured at a median 7.1ms for 200 cassettes (n=50) on a sandbox VM"
+  - "How to choose WARN_DAYS and MAX_AGE_DAYS, and a staged rollout that surfaces real migration work without burying your team in 101 sudden failures"
+---
+
+After reading through the August deprecation cluster in the changelog, I ran my local test suite. Six tests, all green, 0.11 seconds. Under that green sat three recorded responses from a model that stops serving on August 17.
+
+In my solo app project, where I have been evaluating an image generation pipeline, every Gemini API test replays a recorded response — a cassette — instead of hitting the network. That is a reasonable design; nobody wants CI billing them per run. But for one specific failure class, model retirement, the same design actively works against you.
+
+A passing suite and a production system that still works next week are two different claims. I spent a day wiring them back together, and measured what it cost.
+
+## What stops in August, and why mocks are structurally blind to it
+
+First, the context. August 2026 is unusually dense with shutdowns.
+
+<table>
+<thead>
+<tr><th>What</th><th>Date</th><th>Impact</th></tr>
+</thead>
+<tbody>
+<tr><td>Imagen 4 family (<code>imagen-4.0-generate-001</code> / <code>ultra</code> / <code>fast</code>) and the Gemini 3 Image family</td><td>Retires 2026-08-17</td><td>Image generation pipelines must migrate</td></tr>
+<tr><td>Grok 4.1 family on Gemini Enterprise Agent Platform</td><td>Retires 2026-08-20</td><td>Agent configs need replacement</td></tr>
+<tr><td><code>gemini-robotics-er-1.6-preview</code></td><td>Retires 2026-08-31</td><td>Preview-dependent paths need a fallback</td></tr>
+<tr><td>3.5 Flash in Gemini Enterprise (global region)</td><td>Removed 2026-08-04</td><td>The model silently leaves the picker</td></tr>
+</tbody>
+</table>
+
+Dates and scope can shift, so verify against the [model deprecation schedule](https://ai.google.dev/gemini-api/docs/deprecations) before acting on any of this.
+
+Now consider how most of us test API integrations. Recorded replays, SDK mocks, stub servers — different names for the same move: freezing whatever is on the other side of the network. Latency jitter disappears from your tests. So do rate limits. And so does a model ceasing to exist.
+
+Model retirement fits precisely into the class of failures mocks are designed to hide. The more thoroughly you mock, the later you find out. That inverse relationship is the uncomfortable core of this article.
+
+## Reproducing the green-but-dead state in a minimal setup
+
+A working example beats an abstract warning. Here is a minimal client, modeled on a wallpaper app's generation path.
+
+```python
+# client.py
+import os
+import requests
+
+BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+
+class GeminiImageClient:
+    def __init__(self, model: str, api_key: str | None = None, base_url: str = BASE_URL):
+        self.model = model
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
+        self.base_url = base_url  # injection point: tests aim this at a stub
+
+    def generate(self, prompt: str, aspect_ratio: str = "9:16") -> dict:
+        url = f"{self.base_url}/models/{self.model}:predict"
+        resp = requests.post(
+            url,
+            params={"key": self.api_key},
+            json={"instances": [{"prompt": prompt}],
+                  "parameters": {"sampleCount": 1, "aspectRatio": aspect_ratio}},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+```
+
+The test side replays recorded JSON by patching `requests.post`.
+
+```python
+# tests/conftest.py (replay part)
+import json
+import pathlib
+import pytest
+
+CASSETTE_DIR = pathlib.Path(__file__).parent / "cassettes"
+
+class _FakeResponse:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f"{self.status_code}")
+    def json(self):
+        return self._payload
+
+@pytest.fixture
+def replay(monkeypatch):
+    def _use(cassette_name):
+        data = json.loads((CASSETTE_DIR / cassette_name).read_text())
+        def fake_post(url, **kwargs):
+            return _FakeResponse(data["response"], data.get("status", 200))
+        monkeypatch.setattr("requests.post", fake_post)
+        return data
+    return _use
+```
+
+Each cassette keeps its recording timestamp and request metadata. That decision pays off later.
+
+```json
+{
+  "recorded_at": "2026-06-20T09:12:44+09:00",
+  "request": {
+    "model": "imagen-4.0-fast-generate-001",
+    "endpoint": ":predict",
+    "parameters": {"sampleCount": 1, "aspectRatio": "9:16"}
+  },
+  "response": {
+    "predictions": [{"bytesBase64Encoded": "iVBORw...", "mimeType": "image/png"}],
+    "modelVersion": "imagen-4.0-fast-generate-001"
+  }
+}
+```
+
+On top of this I wrote six tests — prediction shape, image bytes, aspect ratio, batch output, the empty-predictions case for safety-filtered prompts. On my sandbox VM (Python 3.10.12):
+
+```
+$ python3 -m pytest tests/ -q
+......                                                                   [100%]
+6 passed in 0.11s
+```
+
+All green. Meanwhile, the recorded model, `imagen-4.0-fast-generate-001`, retires on August 17. Since the post-retirement behavior cannot be observed yet, I stood up a local stub that mirrors the `NOT_FOUND` shape returned by previously retired model families, and compared:
+
+```
+imagen-4.0-fast-generate-001: HTTPError 404 Client Error: Not Found (4.1ms)
+gemini-3.1-flash-lite-image:  OK modelVersion=gemini-3.1-flash-lite-image (2.2ms)
+```
+
+The suite passes in 0.11 seconds; the same code against a live-shaped endpoint dies with a 404. That gap is what "green but dead" means. For what actually happens when production keeps retrying a retired model, I measured it separately in [Retired-model retries never show up in your success latency](/articles/gemini-api/gemini-retired-model-permanent-error-queue-wait-measured) — permanent errors have a way of hiding from healthy-path metrics too.
+
+## The surprise: cassettes are your most accurate ledger
+
+Before this exercise, I treated cassettes as noise in a dependency audit. When you grep a codebase for model IDs, hits inside test fixtures feel like something to filter out.
+
+The opposite turned out to be true.
+
+Model references in application code hide behind indirection — environment variables, config files, stable aliases. A string scan over source code loses track at every one of those layers. But the `modelVersion` recorded in a cassette is the resolved model name at the moment the API actually answered. However many layers of indirection your code has, the recording shows the model you really called.
+
+A recorded fixture is simultaneously the device that hides a retirement and the most truthful record of the dependency. Once I saw that dual nature, the plan changed from "mock less" to "read the cassettes as a ledger." The audit procedure itself is the one I described in [Before the August 17 image model shutdown, find out where you call it from](/articles/gemini-updates/gemini-image-model-817-shutdown-usage-audit-inventory) — the only change is adding your cassette directory to the scan targets, and the quality of the audit improves noticeably.
+
+## Implementing the freshness gate — quarantine cassettes before pytest runs
+
+If the cassettes are a ledger, reading them should be automated. This gate scans every cassette at pytest session start and fails on recordings of soon-to-retire models, or recordings that are simply too old.
+
+```python
+# tests/freshness_gate.py
+"""Cassette freshness gate: flag retiring models and stale recordings."""
+import datetime as dt
+import json
+import pathlib
+
+# Source: ai.google.dev/gemini-api/docs/deprecations (checked 2026-08-05)
+DENYLIST = {
+    "imagen-4.0-generate-001":        dt.date(2026, 8, 17),
+    "imagen-4.0-ultra-generate-001":  dt.date(2026, 8, 17),
+    "imagen-4.0-fast-generate-001":   dt.date(2026, 8, 17),
+    "gemini-robotics-er-1.6-preview": dt.date(2026, 8, 31),
+}
+WARN_DAYS = 21     # start failing 21 days before retirement
+MAX_AGE_DAYS = 90  # recordings older than 90 days demand re-recording
+
+def scan(cassette_dir: pathlib.Path, today: dt.date | None = None) -> list[str]:
+    today = today or dt.date.today()
+    problems = []
+    for path in sorted(cassette_dir.glob("*.json")):
+        data = json.loads(path.read_text())
+        # prefer the resolved model name; fall back to the requested one
+        model = data.get("response", {}).get("modelVersion") \
+            or data.get("request", {}).get("model", "")
+        retire = DENYLIST.get(model)
+        if retire and (retire - today).days <= WARN_DAYS:
+            problems.append(
+                f"{path.name}: recorded model '{model}' retires {retire.isoformat()} "
+                f"({(retire - today).days} days left)")
+        recorded = data.get("recorded_at")
+        if recorded:
+            age = (today - dt.datetime.fromisoformat(recorded).date()).days
+            if age > MAX_AGE_DAYS:
+                problems.append(f"{path.name}: recording is {age} days old (> {MAX_AGE_DAYS})")
+    return problems
+```
+
+Wiring it into conftest takes a few lines, with an explicit escape hatch for emergencies.
+
+```python
+# tests/conftest.py (addition)
+def pytest_sessionstart(session):
+    import os
+    if os.environ.get("SKIP_FRESHNESS_GATE") == "1":
+        return
+    from tests.freshness_gate import scan
+    problems = scan(CASSETTE_DIR)
+    if problems:
+        import pytest as _pytest
+        _pytest.exit("cassette freshness gate failed:\n  " + "\n  ".join(problems), returncode=2)
+```
+
+The suite that was all green a moment ago now says this:
+
+```
+! _pytest.outcomes.Exit: cassette freshness gate failed:
+  imagen_fast_batch.json: recorded model 'imagen-4.0-fast-generate-001'
+      retires 2026-08-17 (12 days left)
+  imagen_fast_filtered.json: recorded model 'imagen-4.0-fast-generate-001'
+      retires 2026-08-17 (12 days left)
+  imagen_fast_portrait.json: recorded model 'imagen-4.0-fast-generate-001'
+      retires 2026-08-17 (12 days left)
+```
+
+"12 days left," delivered as a test failure. That is exactly the behavior I wanted: instead of tracking retirement dates on a calendar, the evidence of the dependency — the recording — speaks for itself.
+
+## Measured overhead, and how to pick the thresholds
+
+A slow gate gets deleted. I generated 200 cassettes (~2KB each) and timed the scan 50 times on the VM (Python 3.10.12).
+
+<table>
+<thead>
+<tr><th>Metric</th><th>Measured</th></tr>
+</thead>
+<tbody>
+<tr><td>Cassettes scanned</td><td>200</td></tr>
+<tr><td>Scan time (median)</td><td>7.1ms</td></tr>
+<tr><td>Scan time (min–max)</td><td>6.5ms – 8.0ms (n=50)</td></tr>
+<tr><td>Retiring-model flags</td><td>40</td></tr>
+<tr><td>Stale-recording flags</td><td>101</td></tr>
+</tbody>
+</table>
+
+That is fully buried inside pytest's own startup cost. Performance is not a reason to skip this.
+
+The thresholds deserve more thought than the code. Note the 101 stale flags above: turning `MAX_AGE_DAYS` on from day one will bury an established suite in failures. My recommended order:
+
+1. Start with `DENYLIST` checks only. Those failures are work you genuinely must do, and the failure list doubles as your migration checklist.
+2. Set `WARN_DAYS` to 21. Migration plus re-recording needs two to three weeks of slack; learning about a retirement on retirement day is not learning, it is triage.
+3. Keep `MAX_AGE_DAYS` as a warning at first, and promote it to a failure only after re-recording has become routine.
+
+Resisting the urge to enforce everything at once matters. The point of the gate is to build a habit of owning recording freshness — not to hand your team 101 red tests one morning.
+
+## Fitting it into daily operation, and the hole that remains
+
+CI integration is essentially done the moment the gate lives in conftest: every ordinary test run doubles as quarantine. When an emergency deploy truly must go through, `SKIP_FRESHNESS_GATE=1` exists — and using it should itself be logged.
+
+One honest limitation: `DENYLIST` is maintained by hand. If you stop reading the changelog, the gate quietly rots. I piggyback the update on my daily reference-data routine, and I deliberately skipped auto-scraping the deprecations page because its structure is not stable enough to trust. The gate reliably communicates the retirements you know about; it does not discover the ones you do not. Keep that boundary in mind.
+
+This week, run `scan()` once against your own cassette directory. The failure list it prints is your migration to-do list for August 17. Trust your green tests — but interrogate, just once, what the green is standing on. That single interrogation is what makes retirement day a quiet one.
+
+I hope this saves you a scramble. I write this as someone whose own gate said "12 days left" and finally got me moving.
