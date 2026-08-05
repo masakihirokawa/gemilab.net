@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PRICE — Gemini 3.6 Flash は出力トークンが $9.00/1M から $7.50/1M へ下がりました。入力は $1.50/1M で据え置きのため、長い出力を伴う処理ほど差が出ます",
-    "DEFAULT — Managed Agents の Antigravity エージェントを動かす既定モデルが 3.6 Flash になりました。モデルを明示していない構成は挙動が変わり得ます",
-    "VERBOSE — 3.6 Flash は「出力が冗長すぎる」という 3.5 Flash への指摘に応える形で、トークン効率とエージェント的な計画立案を改善しています",
-    "GROK — Gemini Enterprise Agent Platform 上の Grok 4.1 モデルファミリーが非推奨となり、8月20日に停止します",
-    "CLASSROOM — 8月10日から、管理者が許可済みであれば K-12 と高等教育の全学齢の学生が Gemini in Classroom を使えます。教材をフラッシュカードや練習クイズへ変換できます",
-    "PIXEL — 8月12日のイベントで Pixel 11 のハードウェア詳細と、エコシステム全体の AI 機能に関する発表が見込まれています",
+    "TOKENS — Gemini 3.6 Flash は 3.5 Flash より約17%少ないトークンで同じ仕事をこなし、不要なコード編集と実行ループも減っています",
+    "CUTOFF — 知識のカットオフが2025年1月から2026年3月へ前進しました。直近1年の事情を前提にした質問の当たり方が変わります",
+    "BREAKING — 3.6 Flash では temperature・top-K・top-P のカスタム値が無視され、frequency penalty と presence penalty の指定は API エラーになります",
+    "LITE — Gemini 3.5 Flash-Lite が GA になりました。低レイテンシで単価の低い選択肢として、大量の自動化処理に向きます",
+    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日に停止します。preview 版を組み込んでいる箇所は移行先の確認が必要です",
+    "DOCS — Google Docs の Gemini 執筆・書式ツールが8月1日から Scheduled Release ドメインへ段階展開されています。Google Vids では Gemini Omni が直接使えます",
   ],
   en: [
-    "PRICE — Gemini 3.6 Flash drops output tokens from $9.00 to $7.50 per million while input holds at $1.50, so verbose workloads feel the difference most",
-    "DEFAULT — The Antigravity agent in Managed Agents now runs on 3.6 Flash by default. Setups that never pinned a model may behave differently",
-    "VERBOSE — 3.6 Flash answers the developer complaint that 3.5 Flash rambled, tightening token efficiency and agentic planning at the same time",
-    "GROK — The Grok 4.1 model family on the Gemini Enterprise Agent Platform is deprecated and shuts down on August 20",
-    "CLASSROOM — From August 10, students of all ages in K-12 and higher education can use Gemini in Classroom where admins have granted access, turning materials into flashcards and quizzes",
-    "PIXEL — Google's August 12 event is expected to fill in the Pixel 11 hardware details along with AI features across the wider ecosystem",
+    "TOKENS — Gemini 3.6 Flash does the same work on roughly 17% fewer tokens than 3.5 Flash, with fewer unwanted code edits and shorter execution loops",
+    "CUTOFF — The knowledge cutoff moves forward from January 2025 to March 2026, which changes how questions about the last year land",
+    "BREAKING — On 3.6 Flash, custom temperature, top-K, and top-P values are ignored, and frequency or presence penalty values now return an API error",
+    "LITE — Gemini 3.5 Flash-Lite reaches general availability as the low-latency, low-cost option aimed at high-volume automation",
+    "ROBOTICS — The gemini-robotics-er-1.6-preview model shuts down on August 31, so anything still pinned to the preview needs a migration target",
+    "DOCS — Gemini writing and formatting tools began a gradual rollout to Scheduled Release domains in Docs on August 1, and Gemini Omni is now available inside Google Vids",
   ],
 };
 
