@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "TOKENS — Gemini 3.6 Flash は 3.5 Flash より約17%少ないトークンで同じ仕事をこなし、不要なコード編集と実行ループも減っています",
-    "CUTOFF — 知識のカットオフが2025年1月から2026年3月へ前進しました。直近1年の事情を前提にした質問の当たり方が変わります",
-    "BREAKING — 3.6 Flash では temperature・top-K・top-P のカスタム値が無視され、frequency penalty と presence penalty の指定は API エラーになります",
-    "LITE — Gemini 3.5 Flash-Lite が GA になりました。低レイテンシで単価の低い選択肢として、大量の自動化処理に向きます",
-    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日に停止します。preview 版を組み込んでいる箇所は移行先の確認が必要です",
-    "DOCS — Google Docs の Gemini 執筆・書式ツールが8月1日から Scheduled Release ドメインへ段階展開されています。Google Vids では Gemini Omni が直接使えます",
+    "EXTENSIONS — Vertex AI Extensions が非推奨となり、2026年11月26日以降に停止します。移行先は Agent Platform です",
+    "PLATFORM — Vertex AI は Gemini Enterprise Agent Platform の一部になりました。機能は名前を変えて移っているため、旧名でのドキュメント検索は当たりにくくなっています",
+    "SUNSET — 8月は停止日が4つ並びます。17日に Imagen 系、20日に Grok 4.1 ファミリー、23日に Claude 3 Haiku、31日に gemini-robotics-er-1.6-preview です",
+    "IMAGE — Imagen 4.0 の GA エンドポイントは8月17日に停止し、移行先は gemini-3.1-flash-image です。同じプロンプトでの出力差を先に測っておく必要があります",
+    "FLASH — Gemini 3.6 Flash は7月21日に GA となり、入力は $1.50/1M、出力は $9.00/1M から $7.50/1M へ下がっています",
+    "REGION — Gemini Enterprise が日本（asia-northeast1）と英国（europe-west2）で GA になりました。allowlist ベースでの提供です",
   ],
   en: [
-    "TOKENS — Gemini 3.6 Flash does the same work on roughly 17% fewer tokens than 3.5 Flash, with fewer unwanted code edits and shorter execution loops",
-    "CUTOFF — The knowledge cutoff moves forward from January 2025 to March 2026, which changes how questions about the last year land",
-    "BREAKING — On 3.6 Flash, custom temperature, top-K, and top-P values are ignored, and frequency or presence penalty values now return an API error",
-    "LITE — Gemini 3.5 Flash-Lite reaches general availability as the low-latency, low-cost option aimed at high-volume automation",
-    "ROBOTICS — The gemini-robotics-er-1.6-preview model shuts down on August 31, so anything still pinned to the preview needs a migration target",
-    "DOCS — Gemini writing and formatting tools began a gradual rollout to Scheduled Release domains in Docs on August 1, and Gemini Omni is now available inside Google Vids",
+    "EXTENSIONS — Vertex AI Extensions is deprecated and shuts down after November 26, 2026. Agent Platform is the migration target",
+    "PLATFORM — Vertex AI is now part of the Gemini Enterprise Agent Platform, and features have moved under new names — worth knowing when old doc searches come up empty",
+    "SUNSET — Four shutdown dates land in August: Imagen models on the 17th, the Grok 4.1 family on the 20th, Claude 3 Haiku on the 23rd, and gemini-robotics-er-1.6-preview on the 31st",
+    "IMAGE — Imagen 4.0 GA endpoints shut down August 17, with gemini-3.1-flash-image as the successor. Measure how the same prompts render before you switch",
+    "FLASH — Gemini 3.6 Flash reached GA on July 21 at $1.50/1M input, with output pricing down from $9.00/1M to $7.50/1M",
+    "REGION — Gemini Enterprise is generally available in Japan (asia-northeast1) and the UK (europe-west2), on an allowlist basis",
   ],
 };
 
