@@ -1,0 +1,326 @@
+---
+title: "ストリーミング応答の日本語が静かに欠ける — バイト境界とイベント境界を実測で切り分ける"
+slug: "gemini-streaming-utf8-event-boundary-japanese-corruption-measured"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-08-07T13:00"
+author: "Gemini Lab"
+description: "ストリーミング表示の日本語だけが欠ける現象を、ローカルの疑似SSEサーバで実測しました。壊れていた層は二つあり、片方は例外にすらならず、英語のテストでは検出率がゼロでした。"
+tags: ["Gemini API", "ストリーミング", "SSE", "UTF-8", "日本語処理"]
+highlights:
+  - "チャンクサイズ別に測った日本語の破損率（8バイトで本文の24.7%、256バイトで0%）と、誰でも再現できる疑似SSEサーバの全コード"
+  - "同じ誤りがPythonでは例外、Node.jsでは無言のU+FFFD置換になる理由と、両ランタイムの正しい受け方"
+  - "バイト境界を直しても残る第二の境界。イベントが丸ごと消えるのに応答200が返る構造と、CIに置く意地悪サーバの作り方"
+---
+
+壁紙アプリの説明文を Gemini に書かせて、生成中の文字を画面へ流し込む処理を書いておりました。個人開発でアプリを並行して回しておりますと、こうした表示まわりの実装は、つい後回しになりがちです。
+
+動作は問題ないように見えました。文章が一文字ずつ増えていき、最後まで表示されます。手元では何度試しても崩れません。
+
+気になったのは、実機で確認したときの末尾でした。文章が、ほんの少しだけ短いのです。
+
+意味は通っています。日本語としても自然です。ただ、同じプロンプトを非ストリーミングで叩いたときの応答と並べると、最後の一文が丸ごとありませんでした。
+
+エラーログは空でした。ステータスは 200 です。例外も出ておりません。
+
+何も壊れていないように見えるのに、届いていない。この気持ち悪さを放置したくなくて、ローカルに疑似サーバを立てて測ることにしました。
+
+結果として、壊れていた層は二つありました。しかもそのうち一つは、私が想定していた壊れ方と逆の形をしていました。
+
+## 測定環境と、再現できる疑似サーバ
+
+外部サービスに依存すると数字が揺れます。Gemini の `streamGenerateContent?alt=sse` と同じ形の応答を返すサーバを、ローカルに立てました。
+
+- Python 3.10.12 / Node.js v22.22.3
+- ペイロード: SSE イベント 8 個、全体 1,406 バイト。うち日本語本文は 85 文字（3 バイト文字なので 255 バイト、全体の 18.1%）
+- 比較用に、同じ構造で本文だけを英語にしたペイロード（1,315 バイト）も用意
+
+肝心なのは、**サーバ側が何バイト単位でソケットへ書き込むかを指定できる**ことです。実際の経路では TCP の分割やプロキシのバッファリングで断片化しますが、それは観測も制御もできません。ならば、テスト側で強制するのが確実です。
+
+```python
+# server.py — 指定バイト数ずつソケットへ書き込む疑似 SSE サーバ
+import socket, sys, time, json
+
+JA_PARTS = [
+    "画像分類パイプラインの", "移行を進めています。", "停止予定のモデルを",
+    "洗い出したところ、", "参照箇所は思ったより", "広範囲に散っていました。",
+    "特に設定ファイル側の", "既定値が見落とされがちです。",
+]
+
+def build(parts, model="gemini-3.6-flash"):
+    """Gemini の SSE 応答と同じ形の本文を組み立てます。"""
+    out = []
+    for i, p in enumerate(parts):
+        obj = {
+            "candidates": [{
+                "content": {"parts": [{"text": p}], "role": "model"},
+                "index": 0,
+            }],
+            "modelVersion": model,
+        }
+        if i == len(parts) - 1:
+            obj["candidates"][0]["finishReason"] = "STOP"
+            obj["usageMetadata"] = {
+                "promptTokenCount": 48,
+                "candidatesTokenCount": 96,
+                "totalTokenCount": 144,
+            }
+        # ensure_ascii=False が要点です。日本語をそのまま UTF-8 で流します
+        out.append("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n")
+    return "".join(out)
+
+def serve(port, chunk):
+    body = build(JA_PARTS).encode("utf-8")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", port))
+    s.listen(8)
+    conn, _ = s.accept()
+    with conn:
+        conn.recv(65536)  # リクエスト行は読み捨てます
+        conn.sendall((
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream; charset=utf-8\r\n"
+            "Cache-Control: no-cache\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode())
+        # ここが本題。chunk バイトずつ、意図的に細切れで送ります
+        for i in range(0, len(body), chunk):
+            conn.sendall(body[i:i + chunk])
+            time.sleep(0.001)
+    s.close()
+
+if __name__ == "__main__":
+    serve(int(sys.argv[1]), int(sys.argv[2]))
+```
+
+`time.sleep(0.001)` を挟んでいるのは、カーネルが送信バッファ内で結合してしまうのを防ぐためです。これを入れないと、指定したチャンクサイズが受信側に伝わらず、測定になりません。最初はこれを忘れて、どのチャンクサイズでも同じ結果が出て首をひねりました。
+
+## バイト境界 — 壊れるのは日本語だけでした
+
+まず、受信したバイト列をチャンクごとに `decode("utf-8", errors="replace")` する、という書き方で測りました。ありがちな一行です。
+
+サーバの書き込み単位を変えながら、本文中に U+FFFD（置換文字）が何個現れるかを数えます。あわせて、境界がマルチバイト文字の途中に落ちた回数を、ペイロードのバイト列から解析的に数えました。
+
+<table>
+<thead>
+<tr><th>書き込み単位</th><th>境界の数</th><th>文字を割った回数</th><th>U+FFFD の数</th><th>日本語本文85文字のうち破損</th></tr>
+</thead>
+<tbody>
+<tr><td>8 バイト</td><td>175</td><td>21</td><td>54</td><td><strong>24.7%</strong></td></tr>
+<tr><td>12 バイト</td><td>117</td><td>20</td><td>40</td><td>23.5%</td></tr>
+<tr><td>16 バイト</td><td>87</td><td>10</td><td>26</td><td>11.8%</td></tr>
+<tr><td>24 バイト</td><td>58</td><td>9</td><td>18</td><td>10.6%</td></tr>
+<tr><td>32 バイト</td><td>43</td><td>5</td><td>13</td><td>5.9%</td></tr>
+<tr><td>48 バイト</td><td>29</td><td>4</td><td>8</td><td>4.7%</td></tr>
+<tr><td>64 バイト</td><td>21</td><td>2</td><td>5</td><td>2.4%</td></tr>
+<tr><td>128 バイト</td><td>10</td><td>1</td><td>2</td><td>1.2%</td></tr>
+<tr><td>256 バイト</td><td>5</td><td>0</td><td>0</td><td>0%</td></tr>
+</tbody>
+</table>
+
+割られた 1 文字あたり U+FFFD が 2 個または 3 個出ています。3 バイト文字を「2 バイト＋1 バイト」で割ると 2 個、「1 バイト＋2 バイト」で割ると 3 個になるためで、実測値もその通りに分かれました。
+
+同じ測定を英語ペイロードで回した結果が、この記事を書こうと思った直接の理由です。
+
+**全 40 条件（5 実装 × 8 チャンクサイズ）で、破損はゼロでした。**
+
+ASCII は 1 バイト文字なので、境界がどこに落ちても文字を割れません。日本語は 3 バイトなので、1 文字につき「割ってはいけない位置」が 2 箇所あります。絵文字は 4 バイトで 3 箇所です。
+
+```python
+# 文字幅ごとに、割ってはいけない位置がいくつあるかを確かめます
+s = "完了しました🎉"
+b = s.encode()
+for i in range(1, len(b)):
+    joined = b[:i].decode("utf-8", "replace") + b[i:].decode("utf-8", "replace")
+    n = joined.count("�")
+    if n:
+        print(f"split@{i:2} -> U+FFFD={n}  {joined!r}")
+# split@ 1 -> U+FFFD=3  '���了しました🎉'
+# split@19 -> U+FFFD=4  '完了しました����'
+```
+
+4 バイトの絵文字は、一度の分割で最大 4 個の U+FFFD を生みます。日本語より脆いということです。UI に絵文字を混ぜる設計をしているなら、影響は日本語よりさらに大きくなります。
+
+## 同じ誤りが、ランタイムによって例外にも無言の置換にもなります
+
+ここが、予想と最も食い違った箇所でした。
+
+私は「文字化けするなら、どこかで例外が上がるはずだ」と考えておりました。実際には、上がる環境と上がらない環境に分かれます。
+
+<table>
+<thead>
+<tr><th>受け方</th><th>結果</th><th>気づけるか</th></tr>
+</thead>
+<tbody>
+<tr><td>Python 生ソケット + <code>chunk.decode("utf-8")</code></td><td><code>UnicodeDecodeError</code> が送出</td><td>気づけます</td></tr>
+<tr><td>Python 生ソケット + <code>decode("utf-8", errors="replace")</code></td><td>例外なし・U+FFFD 26 個</td><td>気づけません</td></tr>
+<tr><td>Node.js <code>new TextDecoder().decode(value)</code></td><td>例外なし・U+FFFD 26 個</td><td>気づけません</td></tr>
+<tr><td>Node.js <code>decoder.decode(value, stream オプション付き)</code></td><td>全条件で完全一致</td><td>—</td></tr>
+<tr><td>Python <code>codecs.getincrementaldecoder("utf-8")()</code></td><td>全条件で完全一致</td><td>—</td></tr>
+</tbody>
+</table>
+
+Node.js の `TextDecoder` は、`stream` オプションを付けないと、渡されたバイト列をその場で完結した文字列として解釈します。末尾に中途半端なバイトが残っていれば、黙って U+FFFD に置き換えます。仕様どおりの挙動であり、バグではありません。
+
+問題は、`try` で囲んでも何も捕まらないことです。ログにも残りません。JSON としては正しいまま（U+FFFD は文字列内の正当な一文字です）なので、`JSON.parse` も成功します。実測でも、パースできたイベント数は常に 8 のままでした。
+
+つまり、**すべての監視が緑のまま、表示だけが壊れます。**
+
+`stream: true` は、デコーダに「この続きがまだ来る」と伝えるフラグです。中途半端なバイトを内部に保持し、次のチャンクと連結してから文字にします。
+
+```javascript
+// Node.js / ブラウザ共通。デコーダは 1 本を使い回すことが要点です
+const res = await fetch(url, { headers: { Accept: "text/event-stream" } });
+const reader = res.body.getReader();
+const decoder = new TextDecoder("utf-8");   // ループの外で 1 回だけ生成します
+let buffer = "";
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buffer += decoder.decode(value, { stream: true });   // 続きが来る前提で解釈します
+  // ここでイベント境界の処理へ（次の節）
+}
+buffer += decoder.decode();   // 最後に保留中のバイトを吐き出させます
+```
+
+チャンクごとに `new TextDecoder()` を作り直すと、`stream: true` を付けていても意味がありません。保留バイトは各インスタンスの内部状態だからです。この書き方は、ループの中でデコーダを生成する形にリファクタした瞬間に壊れます。
+
+## 二つ目の境界 — 文字化けではなく、消えます
+
+バイト境界を直したので終わりだと思っておりました。ところが、末尾が足りない現象は消えませんでした。
+
+SSE のイベントは空行（`\n\n`）で区切られます。チャンクの切れ目は、この区切りとも無関係に落ちます。
+
+読み取るたびに手元のバッファを解析して捨てる実装と、`\n\n` が現れるまで溜める実装を並べて測りました。
+
+<table>
+<thead>
+<tr><th>書き込み単位</th><th>読み取り回数</th><th>溜めない実装：取得イベント</th><th>溜めない実装：パース失敗</th><th>溜める実装：取得イベント</th></tr>
+</thead>
+<tbody>
+<tr><td>32 バイト</td><td>45</td><td><strong>0 / 8</strong></td><td>5</td><td>8 / 8</td></tr>
+<tr><td>64 バイト</td><td>23</td><td><strong>0 / 8</strong></td><td>7</td><td>8 / 8</td></tr>
+<tr><td>128 バイト</td><td>12</td><td><strong>0 / 8</strong></td><td>8</td><td>8 / 8</td></tr>
+<tr><td>256 バイト</td><td>7</td><td>3 / 8</td><td>5</td><td>8 / 8</td></tr>
+<tr><td>512 バイト</td><td>4</td><td>6 / 8</td><td>2</td><td>8 / 8</td></tr>
+<tr><td>1,406 バイト（一括）</td><td>2</td><td>8 / 8</td><td>0</td><td>8 / 8</td></tr>
+</tbody>
+</table>
+
+512 バイトの行を見てください。8 個のうち 6 個は取得できています。文字化けは一切ありません。ただ、2 個が消えています。
+
+これが、私が実機で見た「最後の一文がない」の正体でした。壊れた文字が出るのではなく、イベントが丸ごと落ちるのです。
+
+そして落ちたイベントは、失敗として扱われません。パースに失敗した断片を握り潰す実装（`try` して `continue` する形は珍しくありません）では、カウンタすら増えません。応答は 200 で、文章は自然で、ただ短い。
+
+イベント境界を守る受け方は、それほど複雑ではありません。
+
+```javascript
+// 前節の while ループの中身。buffer は関数の外で保持します
+while (true) {
+  const idx = buffer.indexOf("\n\n");
+  if (idx === -1) break;                    // 区切りが未着なら、次の read を待ちます
+  const block = buffer.slice(0, idx).trim();
+  buffer = buffer.slice(idx + 2);           // 消費した分だけ捨てます
+  if (!block.startsWith("data:")) continue; // コメント行（":" 始まり）などは無視します
+  const payload = block.slice(5).trim();
+  if (payload === "[DONE]") continue;
+  const obj = JSON.parse(payload);
+  const text = obj?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (text) onDelta(text);                  // ここで初めて画面へ流します
+}
+```
+
+要点は「区切りが来るまで消費しない」ことです。`buffer` をループの外に置き、`indexOf` で見つかった分だけを切り出します。見つからなければ何もせずに次の読み取りへ戻ります。
+
+## なぜ手元では一度も再現しないのか
+
+測定表の最終行が、その答えです。
+
+1,406 バイトを一括で送った場合、溜めない実装でも 8 個すべてを取得し、文字化けもゼロでした。ローカル開発では、応答全体が一度に届きます。境界が存在しないので、境界のバグは起きません。
+
+Python の `requests` を使う場合は、もう少し具体的な形で同じ罠に触れます。
+
+<table>
+<thead>
+<tr><th>書き方</th><th>結果</th></tr>
+</thead>
+<tbody>
+<tr><td><code>iter_lines(chunk_size=16, decode_unicode=True)</code></td><td>全条件で完全一致</td></tr>
+<tr><td><code>iter_content(chunk_size=16, decode_unicode=True)</code></td><td>全条件で完全一致</td></tr>
+<tr><td><code>iter_content(chunk_size=16)</code> + 手動で <code>.decode()</code></td><td>U+FFFD 26 個</td></tr>
+<tr><td><code>iter_content(chunk_size=8192)</code> + 手動で <code>.decode()</code></td><td>破損ゼロ</td></tr>
+</tbody>
+</table>
+
+`decode_unicode=True` を渡した場合、`requests` は内部で増分デコーダを使います。自分でデコーダを組む必要はありません。付け忘れてバイト列を受け取り、その場で `.decode()` する書き方だけが壊れます。
+
+そして最後の行が厄介です。`chunk_size=8192` は多くの記事やサンプルで使われている値で、今回のペイロード全体（1,406 バイト）より大きいため、チャンクは 1 個しか生まれません。**誤った実装のまま、破損ゼロで通ります。**
+
+長い応答を扱う本番では 8,192 バイトを超えるので、そこで初めて境界が生まれます。手元では通り、本番でだけ壊れる条件が、こうして揃います。
+
+なお `iter_content(chunk_size=16)` の破損数は、サーバ側の書き込み単位を 16 / 64 / 256 バイトと変えても 26 個で一定でした。`requests` は受信バイト列を指定サイズへ再分割するため、経路の断片化とは独立に境界が作られます。裏を返せば、`chunk_size` を小さく指定するだけで、ローカルで確実に再現できるということです。
+
+## CI に置いておく、意地悪なサーバ
+
+再現条件が分かったので、テストにします。難しい仕組みは要りません。上の `server.py` をそのまま使い、書き込み単位を極端に小さくするだけです。
+
+```python
+# test_streaming_boundary.py
+import subprocess, sys, time, socket, json
+import pytest
+
+EXPECTED = (
+    "画像分類パイプラインの移行を進めています。停止予定のモデルを洗い出したところ、"
+    "参照箇所は思ったより広範囲に散っていました。特に設定ファイル側の既定値が"
+    "見落とされがちです。"
+)
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+@pytest.mark.parametrize("chunk", [8, 16, 32, 64, 128, 512])
+def test_streaming_client_survives_fragmentation(chunk):
+    """細切れの応答でも、本文が一字一句一致することを確かめます。"""
+    port = _free_port()
+    srv = subprocess.Popen([sys.executable, "server.py", str(port), str(chunk)])
+    time.sleep(0.1)
+    try:
+        # 本番と同じクライアント実装を呼びます。ここを差し替えないことが要点です
+        from myapp.gemini_stream import collect_stream
+        text = collect_stream(f"http://127.0.0.1:{port}/v1beta/stream")
+    finally:
+        srv.wait(timeout=10)
+
+    assert "�" not in text, f"U+FFFD が {text.count(chr(0xfffd))} 個混入しています"
+    assert text == EXPECTED, f"本文が一致しません（{len(text)} 文字 / 期待 {len(EXPECTED)} 文字）"
+```
+
+判定を 2 つに分けているのには理由があります。U+FFFD の有無だけを見るとバイト境界の問題しか捕まらず、イベントが丸ごと消える壊れ方は「きれいな短い文字列」として通過してしまうためです。長さと内容の完全一致まで見て、初めて両方の層を押さえられます。
+
+そして本文には、必ず日本語を入れてください。英語のフィクスチャでは、今回測った 40 条件すべてが緑になります。テストは通り、バグは残ります。
+
+チャンクサイズを `8` から始めているのは、そこが最も検出力が高いからです。実測では書き込み単位 8 バイトで本文の 24.7% が破損しました。本番の断片化がここまで細かくなることは稀ですが、テストは稀な条件を安く再現できる場所です。
+
+## 実装を見直すときの順序
+
+同じ症状に心当たりがある場合、次の順で確かめるのが早いと考えております。
+
+1. **応答の長さを比べます。** 同じプロンプトを非ストリーミングで叩き、文字数を並べます。短ければイベント境界、U+FFFD が混ざっていればバイト境界です。両方なら両方です
+2. **デコーダの生成位置を見ます。** `TextDecoder` や増分デコーダがループの内側で作られていないかを確認します。1 リクエストにつき 1 インスタンスです
+3. **バッファの消費方法を見ます。** 読み取りごとにバッファを空にしていないかを確認します。`\n\n` が見つかった分だけを切り出す形になっているかどうかです
+4. **`chunk_size` を小さくして手元で回します。** `requests` なら 16、独自実装なら疑似サーバで 8 バイトです。ここで再現しなければ、原因は別の層にあります
+
+私自身、2 番目までを直した時点で「解決した」と判断して閉じかけました。文字化けが消えたので、直ったように見えたのです。実際に残っていたのは 3 番目で、症状が文字化けから欠落へ変わっただけでした。
+
+壊れ方が変わることを、修正の完了と読み違えないようにしたいと思っております。
+
+ストリーミングは、届いた分から見せられるところに価値があります。その途中経過を信じて画面へ流す以上、境界の扱いは表示品質そのものです。数字で押さえておけば、実機で首をかしげる時間を減らせます。
+
+境界の数字は、一度測ってしまえば長く使えます。この記事のハーネスが、どなたかの調査時間を短くできましたら嬉しく思います。
