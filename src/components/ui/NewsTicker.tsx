@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "EXTENSIONS — Vertex AI Extensions が非推奨となり、2026年11月26日以降に停止します。移行先は Agent Platform です",
-    "PLATFORM — Vertex AI は Gemini Enterprise Agent Platform の一部になりました。機能は名前を変えて移っているため、旧名でのドキュメント検索は当たりにくくなっています",
-    "SUNSET — 8月は停止日が4つ並びます。17日に Imagen 系、20日に Grok 4.1 ファミリー、23日に Claude 3 Haiku、31日に gemini-robotics-er-1.6-preview です",
-    "IMAGE — Imagen 4.0 の GA エンドポイントは8月17日に停止し、移行先は gemini-3.1-flash-image です。同じプロンプトでの出力差を先に測っておく必要があります",
-    "FLASH — Gemini 3.6 Flash は7月21日に GA となり、入力は $1.50/1M、出力は $9.00/1M から $7.50/1M へ下がっています",
-    "REGION — Gemini Enterprise が日本（asia-northeast1）と英国（europe-west2）で GA になりました。allowlist ベースでの提供です",
+    "ROBOTICS — Gemini Robotics ER 2 が公開プレビューになりました。空間推論・エージェント的なコード実行・複数ロボットの協調に対応します",
+    "STREAMING — gemini-robotics-er-2-streaming-preview は Live API による実時間ストリーミング向けで、音声と映像の双方向入力を扱えます",
+    "SUNSET — 停止日が近づいています。8月17日に Imagen 系（移行先は gemini-3.1-flash-image）、20日に Grok 4.1 ファミリー、31日に gemini-robotics-er-1.6-preview です",
+    "SAMPLING — temperature・top_p・top_k が非推奨になりました。これらを設定として公開しているアプリケーションは、扱いの見直しが要ります",
+    "LOGS — Interactions API の開発者ログに対応し、AI Studio のダッシュボードから閲覧できるようになりました",
+    "MODELS — Gemini 3.1 Pro は依然プレビューです。3.6 Flash は7月21日に GA、3.5 Flash-Lite は大量処理のサブエージェント用途に向きます",
   ],
   en: [
-    "EXTENSIONS — Vertex AI Extensions is deprecated and shuts down after November 26, 2026. Agent Platform is the migration target",
-    "PLATFORM — Vertex AI is now part of the Gemini Enterprise Agent Platform, and features have moved under new names — worth knowing when old doc searches come up empty",
-    "SUNSET — Four shutdown dates land in August: Imagen models on the 17th, the Grok 4.1 family on the 20th, Claude 3 Haiku on the 23rd, and gemini-robotics-er-1.6-preview on the 31st",
-    "IMAGE — Imagen 4.0 GA endpoints shut down August 17, with gemini-3.1-flash-image as the successor. Measure how the same prompts render before you switch",
-    "FLASH — Gemini 3.6 Flash reached GA on July 21 at $1.50/1M input, with output pricing down from $9.00/1M to $7.50/1M",
-    "REGION — Gemini Enterprise is generally available in Japan (asia-northeast1) and the UK (europe-west2), on an allowlist basis",
+    "ROBOTICS — Gemini Robotics ER 2 is in public preview, covering spatial reasoning, agentic code execution, and multi-robot coordination",
+    "STREAMING — gemini-robotics-er-2-streaming-preview targets real-time streaming over the Live API, with bidirectional audio and video input",
+    "SUNSET — Shutdown dates are close: Imagen models on August 17 (gemini-3.1-flash-image is the successor), the Grok 4.1 family on the 20th, and gemini-robotics-er-1.6-preview on the 31st",
+    "SAMPLING — temperature, top_p, and top_k are now deprecated. If your app exposes them as user settings, that surface needs rethinking",
+    "LOGS — The Interactions API now supports developer logs, viewable from the AI Studio dashboard",
+    "MODELS — Gemini 3.1 Pro remains in preview. 3.6 Flash reached GA on July 21, and 3.5 Flash-Lite suits high-volume subagent work",
   ],
 };
 
