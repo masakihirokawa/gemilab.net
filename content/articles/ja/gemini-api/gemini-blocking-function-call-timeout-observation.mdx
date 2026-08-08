@@ -1,0 +1,310 @@
+---
+title: "打ち切りは失敗の合図ではありませんでした — ブロッキング挙動を伴う関数呼び出しの設計"
+slug: "gemini-blocking-function-call-timeout-observation"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-08-08T13:00"
+author: "Gemini Lab"
+description: "呼び出しが返るまで待つ種類のツールをエージェントに持ち込むと、並列化と打ち切りの常識が反転します。サンドボックスで実測した数値とともに、再試行を観測へ振り替える設計をまとめました。"
+tags: ["Gemini API", "Function Calling", "エージェント設計", "タイムアウト", "冪等性"]
+highlights:
+  - "打ち切りが発火したケースのうち97〜100%は、実際には動作が成功していた（実測3水準）"
+  - "共有資源を持つツールを4本並列にすると壁時計は1203ms→301msになる一方、重なりが3回発生する"
+  - "再試行を観測に振り替えると二重実行は30件→0件、追加の待ちは中央値67msで済む"
+---
+
+ロボティクス向けのモデルカードを読んでいて、ある一文で手が止まりました。関数呼び出しが「物理的なロボット動作に合わせたブロッキング挙動」に対応する、という記述です。
+
+実機を持たない私には縁のない話に見えました。読み流しかけて、しかし引っかかりが残りました。
+
+自分の自動化にも、返るまで待つしかない処理がいくつもあるからです。
+
+App Store Connect へのビルド送信。壁紙アセットの一括変換。課金レシートの検証。どれも「呼んだ瞬間に終わる」ものではなく、呼び出し側が待っている間に外の世界が変わっていきます。ロボットアームが動くのと構造は同じでした。
+
+そこで、手元のサンドボックスで測ってみることにしました。結論から書きますと、私がそれまで安全だと思っていた二つの習慣 — 並列化と、余裕を持たせたタイムアウト — は、この種のツールに対しては両方とも逆に働いていました。
+
+## 「返るまで待つ」ツールは、どこにでもある
+
+ブロッキング挙動という言葉はロボティクス文脈で出てきますが、条件を抽象化すると身近になります。
+
+<table>
+  <thead>
+    <tr><th>条件</th><th>意味</th><th>個人開発での例</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>効果が外にある</strong></td><td>戻り値ではなく、外部の状態が変わることが目的</td><td>ビルド送信、メール送信、決済確定</td></tr>
+    <tr><td><strong>取り消せない</strong></td><td>開始後に呼び出し側から止める手段がない</td><td>アセット変換ジョブ、通知の配信</td></tr>
+    <tr><td><strong>重ねられない</strong></td><td>同じ資源に対して同時に走らせてはいけない</td><td>同一ファイルの書き換え、在庫の引き当て</td></tr>
+  </tbody>
+</table>
+
+三つのうち二つ以上が当てはまるツールを、私は「ブロッキング側」と呼んで別扱いすることにしました。通常のツール（検索、要約、参照）とは設計の前提がまるで違うからです。
+
+通常のツールは、失敗したらもう一度呼べば済みます。ブロッキング側は、もう一度呼ぶことそのものが事故になります。
+
+## 手元で再現する — 動作を止められないツールの最小ハーネス
+
+実機もクラウド課金も使わずに、この構造だけを取り出したハーネスを書きました。動作の代わりにファイルへ追記し、「同時に走ってはいけない区間」の重なりを数えます。
+
+```python
+import asyncio, time
+
+class Actuator:
+    """物理動作の代役。開始から完了までの間、外から観測すると『動作中』。"""
+    def __init__(self):
+        self.busy = False
+        self.overlaps = 0   # 重ねてはいけない区間が重なった回数
+        self.effects = 0    # 外の世界に実際に起きた効果の数
+
+    async def move(self, action_id: str, dur: float) -> None:
+        if self.busy:
+            self.overlaps += 1
+        self.busy = True
+        try:
+            await asyncio.sleep(dur)          # ここが実際の物理動作・外部ジョブ
+            self.effects += 1
+            with open("effects.log", "a") as f:
+                f.write(action_id + "\n")
+        finally:
+            self.busy = False
+
+
+async def blocking_call(act: Actuator, action_id: str, dur: float, timeout: float | None = None) -> str:
+    """ツール呼び出し。timeout はクライアント側の待ちを切り上げるだけで、動作自体は止まらない。"""
+    task = asyncio.create_task(act.move(action_id, dur))
+    if timeout is None:
+        await task
+        return "ok"
+    try:
+        # shield が要点。wait_for は通常タスクを cancel するが、
+        # 現実の物理動作・外部ジョブは cancel できないため、その非対称性を再現する
+        await asyncio.wait_for(asyncio.shield(task), timeout)
+        return "ok"
+    except asyncio.TimeoutError:
+        return "timeout"    # 呼び出しは返る。しかし動作は続いている
+```
+
+`asyncio.shield` を挟んでいるのが肝でした。`asyncio.wait_for` は素朴に書くと待っているタスクを取り消します。それでは「打ち切ったら動作も止まった」という、現実には成立しない世界を再現してしまいます。
+
+実機のアームは、こちらが待つのをやめても動き続けます。決済も、ビルドの送信も同じです。shield はその非対称性をコードの上で正直に表現するための一行でした。
+
+ここは実装上の落とし穴でもありました。`shield` を外したハーネスで最初に測ったとき、二重実行はきれいに0件で並びます。安全な設計ができた証拠に見えました。
+
+実際には、テスト側だけが取り消しに応じていただけです。本番運用に置き換えれば、HTTP リクエストを中断してもサーバー側の処理は進みますし、`subprocess` を待つのをやめてもプロセスは走り続けます。取り消しが効くのはローカルの `await` だけでした。
+
+自分の書いた抽象が、現実より都合よく振る舞っていないか。ブロッキング側を扱うときは、まずそこを疑うことをお勧めします。数字が最初から良すぎるときは、たいてい模型の方が甘くできています。
+
+## 並列化が効いた、という数字の読み方
+
+まず、共有資源を持つ4本のツール呼び出しを、逐次と並列で比べました。1動作あたり300ミリ秒です。
+
+```
+E1 sequential  wall= 1203.3ms  effects=4  overlaps=0
+E1 parallel    wall=  301.3ms  effects=4  overlaps=3
+```
+
+壁時計は1203.3ミリ秒から301.3ミリ秒へ、ちょうど4分の1になりました。並列化の教科書どおりの結果です。
+
+しかし `overlaps=3` が同時に出ています。重ねてはいけない区間が3回重なった、という意味です。
+
+実機なら衝突。ファイルなら書き潰し。在庫なら二重引き当て。効果の総数 `effects=4` は両者で同じですから、ログを眺めているだけでは異常に見えません。
+
+ここが最初のつまずきでした。並列化の成否をレイテンシで評価している限り、この失敗は永久に「成功」として記録され続けます。**ブロッキング側のツールでは、壁時計の短縮は品質指標ではなく、危険の兆候として読むべきでした。**
+
+対処そのものは平凡です。ツールごとに資源キーを宣言し、同じキーを持つ呼び出しはディスパッチャで直列化します。
+
+```python
+class ResourceQueue:
+    """資源キーごとに直列化する。異なるキー同士は従来どおり並列で走る。"""
+    def __init__(self):
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def lock(self, key: str) -> asyncio.Lock:
+        return self._locks.setdefault(key, asyncio.Lock())
+
+RESOURCE_OF = {
+    "submit_build": "appstore:myapp",     # 同一アプリへの送信は重ねられない
+    "convert_assets": "fs:wallpapers",    # 同一ディレクトリの書き換え
+    "search_docs": None,                  # 通常ツール。直列化は不要
+}
+
+async def dispatch(queues, act, name, action_id, dur, timeout=None):
+    key = RESOURCE_OF.get(name)
+    if key is None:
+        return await blocking_call(act, action_id, dur, timeout)
+    async with queues.lock(key):
+        return await blocking_call(act, action_id, dur, timeout)
+```
+
+モデルが並列に関数呼び出しを返してきても、実行側で束ねてしまえば安全側に倒れます。並列呼び出しそのものを禁止する必要はありませんでした。禁止すべきは、同じ資源に触れる呼び出しの同時実行だけです。
+
+## 打ち切りの意味を測ったら、予想と逆でした
+
+二つめの習慣がタイムアウトです。私はこれまで、実測の裾を見て「p99の1.5倍くらい」に設定するのが穏当だと考えていました。長すぎず、短すぎず、という発想です。
+
+そこで、完了時間が裾の重い分布（中央値およそ150ミリ秒の対数正規分布）に従うツールに対し、打ち切りの閾値を3水準振ってみました。本当に失敗する動作を5%混ぜてあります。
+
+```
+timeout= 100ms  発火= 34/50 ( 68.0%)  発火のうち実は成功= 33 ( 97.1%)
+timeout= 200ms  発火= 11/50 ( 22.0%)  発火のうち実は成功= 11 (100.0%)
+timeout= 300ms  発火=  5/50 ( 10.0%)  発火のうち実は成功=  5 (100.0%)
+```
+
+閾値を100ミリ秒から300ミリ秒へ延ばすと、発火率は68.0%から10.0%へ下がります。ここまでは予想どおりでした。
+
+予想と違ったのは右の列です。**発火したケースのうち実際には成功していた割合は、97.1%・100%・100%と、閾値をどれだけ延ばしても下がりませんでした。**
+
+つまり、打ち切りが起きたという事実は、動作が失敗したことを何も示していません。示しているのは「私が待つのをやめた」という、こちら側の都合だけです。
+
+閾値の調整は発火の頻度を変えるだけで、発火が持つ意味の方は変えられませんでした。この列が下がらない限り、どこに閾値を置いても「打ち切り＝失敗」という解釈は成り立ちません。
+
+素朴な再試行を足すと、結果はそのまま被害になります。
+
+```
+E2 trials=120 timeout=200ms fired=30 (25.0%) 二重実行=30 打ち切り後に成功していた=30
+```
+
+120回のうち30回で打ち切りが発火し、その30回すべてで二重実行が起きました。再試行が悪いのではありません。**失敗の証拠がないまま再試行を発火させた判断が誤りでした。**
+
+## 再試行を観測へ振り替える
+
+対処は、打ち切り後の分岐を「もう一度やる」から「どうなったか見に行く」へ変えることでした。そのために、呼び出しの前に行動IDを台帳へ登録しておきます。
+
+```python
+import time, uuid
+
+class IntentLedger:
+    """呼ぶ前に意図を記録し、打ち切り後は再実行ではなく観測で決着させる。"""
+    def __init__(self):
+        self._rows: dict[str, str] = {}
+
+    def open(self, tool: str, args: dict) -> str:
+        action_id = f"{tool}:{uuid.uuid4().hex[:12]}"
+        self._rows[action_id] = "started"     # 実運用では KV や SQLite など、
+        return action_id                      # プロセスが落ちても残る場所へ
+
+    def close(self, action_id: str, state: str) -> None:
+        self._rows[action_id] = state
+
+
+async def call_with_observation(ledger, act, tool, args, dur,
+                                timeout=0.20, observe_budget=2.0, poll=0.005):
+    action_id = ledger.open(tool, args)
+    result = await blocking_call(act, action_id, dur, timeout=timeout)
+
+    if result == "ok":
+        ledger.close(action_id, "done")
+        return "done", action_id
+
+    # 打ち切り。ここで再試行しない。効果が現れたかどうかだけを見に行く
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < observe_budget:
+        if act.effects > 0:                   # 実運用では action_id で外部状態を照会する
+            ledger.close(action_id, "done")
+            return "done", action_id
+        await asyncio.sleep(poll)
+
+    # 観測予算を使い切っても判定できないときだけ、人間の判断へ渡す
+    ledger.close(action_id, "unknown")
+    return "unknown", action_id
+```
+
+同じ120回を、この経路で流した結果です。
+
+```
+E3 trials=120 fired=30 観測で解決=30 二重実行=0 観測の追加待ち中央値=67.0ms unknown=0
+```
+
+二重実行は30件から0件へ。代わりに支払ったのは、打ち切りが発火した30回における中央値67.0ミリ秒の追加の待ちだけでした。
+
+30回ぶんを合計しても2秒あまりです。二重にビルドを送信したときの後始末と比べれば、比較にならないほど安い代償でした。
+
+`unknown` が0件だったのは、このハーネスでは効果の観測が確実にできるからです。現実の外部サービスでは、ここが0にならない場面が必ず出ます。その残りをどう扱うかが、次の設計判断になりました。
+
+観測の予算にも注意点があります。私は最初、決着するまで粘るつもりで予算を長めに取りましたが、これは待ちの合計を押し上げるだけでした。
+
+観測は失敗の証拠を掴む作業ではなく、既に起きたはずの効果を確認する作業です。効果の反映が遅れる外部サービスなら、その反映遅延の実測 p95 に少し足した程度を予算にして、超えたものは `unknown` として人へ渡す。この割り切りを推奨します。粘っても、判断材料が増えるわけではありませんでした。
+
+## `unknown` を握りつぶさない
+
+観測しても決着しない `unknown` は、エージェントにとって最も危険な状態です。モデルは判断のつかない状況を嫌い、たいてい「もう一度試します」と言い出します。
+
+そこで、ツール結果としてモデルへ返す文字列を三値に分け、`unknown` のときは次の行動を明示的に禁止することにしました。
+
+```python
+TOOL_RESULT_TEMPLATE = {
+    "done":    "完了しました（action_id={aid}）。次の手順へ進んでください。",
+    "unknown": ("この操作の結果は確認できていません（action_id={aid}）。"
+                "同じ操作を再実行してはいけません。"
+                "利用者に状態の確認を依頼し、確認が取れるまで待ってください。"),
+    "failed":  "失敗が確認されました（action_id={aid}）。再実行して構いません。",
+}
+
+def to_tool_response(state: str, action_id: str) -> dict:
+    return {"status": state, "message": TOOL_RESULT_TEMPLATE[state].format(aid=action_id)}
+```
+
+`failed` を返すのは、外部状態を照会して「効果が生じていない」と確認できたときだけにしました。これが三値に分けた理由です。
+
+二値のままだと、判断できない状態が必ず `failed` 側へ流れ込みます。そして `failed` は、モデルにとって再実行の許可証にほかなりません。
+
+`unknown` を人間の確認へ回す判断は、[Gemini API で「人間が確認するAI」を作る — Human-in-the-Loop の実装設計](/articles/gemini-api/gemini-api-human-in-the-loop-production-guide) で整理した承認ゲートと同じ場所に置いています。承認を挟む理由が「実行前の危険」だけでなく「実行後の不確かさ」にもあると気づけたのは、この計測の副産物でした。
+
+## ツール宣言の側で、あらかじめ区別しておく
+
+最後に、この扱いをツール宣言そのものへ埋め込みました。実行時に思い出す設計は、必ずどこかで忘れられるからです。
+
+```python
+TOOLS = [
+    {
+        "name": "submit_build",
+        "description": "指定バージョンのビルドを送信する。完了まで戻らない。",
+        "parameters": {
+            "type": "object",
+            "properties": {"version": {"type": "string"}},
+            "required": ["version"],
+        },
+        # 以下は自前のメタデータ。API へは渡さず、実行側だけが読む
+        "_blocking": True,
+        "_resource": "appstore:myapp",
+        "_timeout_ms": 200,
+        "_on_timeout": "observe",     # "retry" は選ばせない
+    },
+    {
+        "name": "search_docs",
+        "description": "ドキュメントを検索する。",
+        "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+        "_blocking": False,
+        "_resource": None,
+        "_timeout_ms": 5000,
+        "_on_timeout": "retry",
+    },
+]
+
+def to_api_tools(tools):
+    """アンダースコア始まりの自前キーを落として API へ渡す形にする。"""
+    return [{k: v for k, v in t.items() if not k.startswith("_")} for t in tools]
+```
+
+`_blocking` が `True` のツールを追加するときだけ、資源キーと観測手段を必ず埋める。この二つが空のまま入ってこられなくなったので、危険なツールが静かに紛れ込む経路が一つ塞がりました。
+
+耐障害性の枠組み全体との関係は [Gemini API 本番の耐障害性設計 — Circuit Breaker・Bulkhead・フォールバック](/articles/gemini-api/gemini-api-resilience-circuit-breaker-bulkhead-production-guide) の整理と重なります。ただし今回わかったのは、ブロッキング側のツールに対しては、そこで扱った再試行系の道具立てをそのまま適用してはいけない、ということでした。
+
+## どこから始めるか
+
+手を動かす順番として、私はこうしました。
+
+1. 手持ちのツール一覧に「効果が外にある」「取り消せない」「重ねられない」の3列を足す。二つ以上当てはまるものにだけ印をつける
+2. 印のついたツールの資源キーを決める。同じキーを持つ呼び出しはディスパッチャで直列化する
+3. 印のついたツールから、打ち切り後の自動再試行を外す。まず外すだけでよい
+4. 行動IDの事前登録と、効果を照会する観測手段を用意する。照会先がないツールは、そもそも自動実行の対象から外す
+5. ツール結果を三値にし、`unknown` のときは再実行禁止と利用者への確認依頼を文面で明示する
+
+数値を見る前は、タイムアウトの調整でどうにかなる問題だと思っていました。実際には、閾値をどこへ置いても発火の意味は変わらず、変えられるのは頻度だけでした。
+
+打ち切りは、外の世界の失敗ではなく、こちらの待ち時間の話でしかない。その一点を認めるところから、設計が素直になっていきました。
+
+なお本稿の数値は、Python 3.10.12 のサンドボックス上で実際に走らせて取得したものです。分布のパラメータや動作時間はご自身のワークロードに合わせて置き換えてください。乱数種を固定してありますので、同じコードなら同じ数字が出ます。
+
+読んでくださってありがとうございました。似た構造で困っている方の、遠回りを少しでも減らせたなら嬉しく思います。

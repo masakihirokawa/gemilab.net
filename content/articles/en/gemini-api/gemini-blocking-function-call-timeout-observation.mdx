@@ -1,0 +1,310 @@
+---
+title: "A Timeout Was Never Evidence of Failure — Designing Around Blocking Function Calls"
+slug: "gemini-blocking-function-call-timeout-observation"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-08-08T13:00"
+author: "Gemini Lab"
+description: "When a tool call cannot return until the real-world effect finishes, two habits reverse on you: parallel dispatch and generous timeouts. Measured numbers from a sandbox harness, plus the design that replaces retries with observation."
+tags: ["Gemini API", "Function Calling", "Agent Design", "Timeouts", "Idempotency"]
+highlights:
+  - "Across three timeout thresholds, 97-100% of fired timeouts turned out to be actions that had already succeeded"
+  - "Dispatching four resource-sharing tools in parallel cut wall clock from 1203ms to 301ms — and produced 3 forbidden overlaps"
+  - "Swapping retry for observation took duplicate executions from 30 to 0, at a median cost of 67ms of extra waiting"
+---
+
+I was reading a robotics model card when one sentence stopped me. Function calls, it said, support blocking behavior aligned with physical robot actions.
+
+Nothing to do with me, I thought. I own no robot arms. But the sentence would not let go.
+
+Plenty of my own automation has to wait until the thing is actually done.
+
+Submitting a build to App Store Connect. Batch-converting wallpaper assets. Verifying a purchase receipt. None of them finish at the moment you call them, and while the caller waits, the outside world keeps changing. Structurally, that is the same problem as a moving arm.
+
+So I built a harness and measured it. The short version: the two habits I had trusted most — parallel dispatch and comfortably generous timeouts — both worked against me for this class of tool.
+
+## Tools that cannot return early are everywhere
+
+"Blocking behavior" is robotics vocabulary, but the conditions behind it are ordinary once you abstract them.
+
+<table>
+  <thead>
+    <tr><th>Condition</th><th>What it means</th><th>Example from indie development</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>The effect lives outside</strong></td><td>The point is the external state change, not the return value</td><td>Build submission, email delivery, payment capture</td></tr>
+    <tr><td><strong>It cannot be recalled</strong></td><td>Once started, the caller has no way to stop it</td><td>Asset conversion jobs, push notification fan-out</td></tr>
+    <tr><td><strong>It cannot overlap</strong></td><td>Two of them must never touch the same resource at once</td><td>Writing the same file, reserving the same inventory</td></tr>
+  </tbody>
+</table>
+
+Any tool matching two or more of these, I now tag as a blocking tool and treat separately. Its design assumptions have nothing in common with an ordinary tool — search, summarize, look up.
+
+An ordinary tool that fails can simply be called again. For a blocking tool, calling it again is itself the incident.
+
+## Reproducing it locally with a minimal harness
+
+I wanted this structure isolated, without a robot or a cloud bill. The harness writes to a file instead of moving anything, and counts how often two supposedly exclusive intervals overlap.
+
+```python
+import asyncio, time
+
+class Actuator:
+    """Stands in for a physical action: observably busy from start to finish."""
+    def __init__(self):
+        self.busy = False
+        self.overlaps = 0   # times two exclusive intervals overlapped
+        self.effects = 0    # effects that actually landed in the outside world
+
+    async def move(self, action_id: str, dur: float) -> None:
+        if self.busy:
+            self.overlaps += 1
+        self.busy = True
+        try:
+            await asyncio.sleep(dur)          # the real motion / external job
+            self.effects += 1
+            with open("effects.log", "a") as f:
+                f.write(action_id + "\n")
+        finally:
+            self.busy = False
+
+
+async def blocking_call(act: Actuator, action_id: str, dur: float, timeout: float | None = None) -> str:
+    """A tool call. The timeout only ends our waiting; it does not stop the action."""
+    task = asyncio.create_task(act.move(action_id, dur))
+    if timeout is None:
+        await task
+        return "ok"
+    try:
+        # shield is the whole point. Plain wait_for cancels the task it waits on,
+        # but real physical actions and external jobs cannot be cancelled.
+        await asyncio.wait_for(asyncio.shield(task), timeout)
+        return "ok"
+    except asyncio.TimeoutError:
+        return "timeout"    # the call returns; the action continues
+```
+
+That `asyncio.shield` line matters more than it looks. Written naively, `asyncio.wait_for` cancels the task it is waiting on — which would simulate a world where giving up on the wait also stops the work.
+
+A real arm keeps moving after you stop watching. So does a payment capture, and so does a build upload. Shield is how I made the code honest about that asymmetry.
+
+This was also the trap I fell into first. Measured without `shield`, the harness reports zero duplicate executions across the board — which looks like proof that the design is safe.
+
+All it proves is that the test obeys cancellation. In production, aborting an HTTP request does not stop the server from finishing the work, and giving up on a `subprocess` does not stop the process. Cancellation only ever applied to the local `await`.
+
+So my recommendation, whenever you touch a blocking tool, is to suspect your own abstraction before you trust the result. When the numbers look good from the very first run, the model is usually the thing that is too forgiving.
+
+## How to read a parallel speedup
+
+First, four tool calls against a shared resource, run sequentially and then in parallel. Each action takes 300 milliseconds.
+
+```
+E1 sequential  wall= 1203.3ms  effects=4  overlaps=0
+E1 parallel    wall=  301.3ms  effects=4  overlaps=3
+```
+
+Wall clock fell from 1203.3ms to 301.3ms — exactly the quarter you would predict. Textbook parallelism.
+
+But `overlaps=3` appears alongside it. Three times, two intervals that must never coincide did.
+
+On hardware that is a collision. On a filesystem it is a lost write. In inventory it is a double reservation. And because the effect count is 4 either way, nothing in the log looks wrong.
+
+That was the first trap. As long as I evaluate parallel dispatch by latency, this failure gets recorded as a success forever. **For blocking tools, a shorter wall clock is not a quality signal — it is a warning sign.**
+
+The fix itself is unremarkable. Declare a resource key per tool, and serialize calls that share one.
+
+```python
+class ResourceQueue:
+    """Serialize per resource key. Different keys still run in parallel."""
+    def __init__(self):
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def lock(self, key: str) -> asyncio.Lock:
+        return self._locks.setdefault(key, asyncio.Lock())
+
+RESOURCE_OF = {
+    "submit_build": "appstore:myapp",     # two submissions must not overlap
+    "convert_assets": "fs:wallpapers",    # same directory, same writer
+    "search_docs": None,                  # ordinary tool; no serialization needed
+}
+
+async def dispatch(queues, act, name, action_id, dur, timeout=None):
+    key = RESOURCE_OF.get(name)
+    if key is None:
+        return await blocking_call(act, action_id, dur, timeout)
+    async with queues.lock(key):
+        return await blocking_call(act, action_id, dur, timeout)
+```
+
+The model can still return parallel function calls; the executor collapses them where it must. I never needed to forbid parallel calling itself — only concurrent access to the same resource.
+
+## Measuring what a timeout means, and getting the opposite answer
+
+The second habit was the timeout. I used to set it around 1.5x the observed p99: not too tight, not too loose, a number that felt responsible.
+
+So I swept three thresholds against a tool whose completion time follows a heavy-tailed log-normal distribution with a median near 150 milliseconds, mixing in 5% of actions that genuinely fail.
+
+```
+timeout= 100ms  fired= 34/50 ( 68.0%)  of those, actually succeeded= 33 ( 97.1%)
+timeout= 200ms  fired= 11/50 ( 22.0%)  of those, actually succeeded= 11 (100.0%)
+timeout= 300ms  fired=  5/50 ( 10.0%)  of those, actually succeeded=  5 (100.0%)
+```
+
+Stretching the threshold from 100ms to 300ms drops the firing rate from 68.0% to 10.0%. That much I expected.
+
+The right-hand column is what I did not expect. **The share of fired timeouts that had actually succeeded stayed at 97.1%, 100%, 100% — it never came down, no matter how generous the threshold.**
+
+Which means the event "a timeout fired" says nothing about whether the action failed. It reports one thing only: that I stopped waiting.
+
+Tuning the threshold changes how often the event occurs. It cannot change what the event means. And while that column stays flat, no threshold anywhere makes "timeout equals failure" a valid reading.
+
+Add a naive retry, and the reading turns directly into damage.
+
+```
+E2 trials=120 timeout=200ms fired=30 (25.0%) duplicate executions=30 had already succeeded=30
+```
+
+Thirty timeouts out of 120 trials, and every single one produced a duplicate execution. Retrying is not the flaw here. **Firing a retry with no evidence of failure is.**
+
+## Trading the retry for an observation
+
+The correction was to change the branch after a timeout from "do it again" to "go find out what happened." That requires registering the action before you call it.
+
+```python
+import time, uuid
+
+class IntentLedger:
+    """Record intent before calling; settle timeouts by observation, never re-execution."""
+    def __init__(self):
+        self._rows: dict[str, str] = {}
+
+    def open(self, tool: str, args: dict) -> str:
+        action_id = f"{tool}:{uuid.uuid4().hex[:12]}"
+        self._rows[action_id] = "started"     # in production this belongs in KV or SQLite,
+        return action_id                      # somewhere that survives the process dying
+
+    def close(self, action_id: str, state: str) -> None:
+        self._rows[action_id] = state
+
+
+async def call_with_observation(ledger, act, tool, args, dur,
+                                timeout=0.20, observe_budget=2.0, poll=0.005):
+    action_id = ledger.open(tool, args)
+    result = await blocking_call(act, action_id, dur, timeout=timeout)
+
+    if result == "ok":
+        ledger.close(action_id, "done")
+        return "done", action_id
+
+    # Timed out. Do not retry. Go look for the effect instead.
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < observe_budget:
+        if act.effects > 0:                   # in production, query external state by action_id
+            ledger.close(action_id, "done")
+            return "done", action_id
+        await asyncio.sleep(poll)
+
+    # Only when the observation budget runs out does a human get involved
+    ledger.close(action_id, "unknown")
+    return "unknown", action_id
+```
+
+The same 120 trials, routed through that path:
+
+```
+E3 trials=120 fired=30 settled by observation=30 duplicate executions=0 median extra wait=67.0ms unknown=0
+```
+
+Duplicates went from 30 to 0. What I paid for it was a median of 67.0 milliseconds of extra waiting, on the 30 occasions the timeout fired.
+
+Summed across all thirty, that is a little over two seconds. Set against cleaning up a build submitted twice, it is not a comparison worth having.
+
+`unknown` landed at zero here because this harness can always observe its own effects. Against a real external service it will not stay at zero, and what you do with the remainder is the next design decision.
+
+The observation budget needs care too. My first instinct was to set it generously and keep polling until something resolved, which only inflated total waiting.
+
+Observation is not a hunt for evidence of failure; it is a confirmation of an effect that has probably already landed. For an external service with delayed propagation, I would recommend setting the budget just above the measured p95 propagation delay and handing anything beyond it to a person as `unknown`. Polling longer never produced better information.
+
+## Do not let `unknown` collapse into `failed`
+
+An unresolved `unknown` is the most dangerous state an agent can hold. Models dislike ambiguity, and their instinct is to announce that they will try again.
+
+So I split the tool result string into three values and made `unknown` explicitly forbid the next action.
+
+```python
+TOOL_RESULT_TEMPLATE = {
+    "done":    "Completed (action_id={aid}). Proceed to the next step.",
+    "unknown": ("The outcome of this operation could not be confirmed (action_id={aid}). "
+                "Do NOT re-run the same operation. "
+                "Ask the user to verify the state, and wait until they confirm."),
+    "failed":  "Failure confirmed (action_id={aid}). Re-running is allowed.",
+}
+
+def to_tool_response(state: str, action_id: str) -> dict:
+    return {"status": state, "message": TOOL_RESULT_TEMPLATE[state].format(aid=action_id)}
+```
+
+I return `failed` only after querying external state and confirming that no effect landed. That confirmation is the entire reason for the third value.
+
+With two values, every unresolvable case drains into `failed` — and to a model, `failed` reads as a license to re-execute.
+
+Routing `unknown` to a person sits in the same place as the approval gate I described in [Building Human-in-the-Loop Workflows with Gemini API](/articles/gemini-api/gemini-api-human-in-the-loop-production-guide). Realizing that approval gates exist for post-execution uncertainty, not just pre-execution danger, was a side effect of this measurement.
+
+## Encode the distinction in the tool declaration
+
+Finally I pushed all of this into the tool declarations themselves. Anything you have to remember at call time will eventually be forgotten.
+
+```python
+TOOLS = [
+    {
+        "name": "submit_build",
+        "description": "Submit the specified build version. Does not return until complete.",
+        "parameters": {
+            "type": "object",
+            "properties": {"version": {"type": "string"}},
+            "required": ["version"],
+        },
+        # Local metadata below. Never sent to the API; only the executor reads it.
+        "_blocking": True,
+        "_resource": "appstore:myapp",
+        "_timeout_ms": 200,
+        "_on_timeout": "observe",     # "retry" is not an option here
+    },
+    {
+        "name": "search_docs",
+        "description": "Search the documentation.",
+        "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+        "_blocking": False,
+        "_resource": None,
+        "_timeout_ms": 5000,
+        "_on_timeout": "retry",
+    },
+]
+
+def to_api_tools(tools):
+    """Strip underscore-prefixed local keys before sending to the API."""
+    return [{k: v for k, v in t.items() if not k.startswith("_")} for t in tools]
+```
+
+Adding a tool with `_blocking: True` now forces me to fill in a resource key and an observation path. Neither can be left empty, which closes one quiet route by which a dangerous tool used to slip in.
+
+How this sits inside a broader resilience story overlaps with [Resilient Gemini API Services in Production](/articles/gemini-api/gemini-api-resilience-circuit-breaker-bulkhead-production-guide). What changed for me is knowing that the retry machinery described there must not be applied unmodified to blocking tools.
+
+## Where to start
+
+The order I worked through it:
+
+1. Add three columns to your tool inventory — effect lives outside, cannot be recalled, cannot overlap. Flag anything matching two or more
+2. Assign a resource key to each flagged tool, and serialize calls sharing a key in the dispatcher
+3. Remove automatic post-timeout retry from flagged tools. Removing it is enough as a first move
+4. Add pre-registered action IDs and a way to query whether the effect landed. A tool with no way to query state does not belong in autonomous execution at all
+5. Move tool results to three values, and have `unknown` spell out both the ban on re-execution and the request for user confirmation
+
+Before I saw the numbers, I assumed this was a threshold-tuning problem. It turned out that no threshold changes what a fired timeout means; it only changes how often you see one.
+
+A timeout is a statement about my patience, not about the world. Accepting that one point is what made the rest of the design fall into place.
+
+The figures here came from actually running the harness on Python 3.10.12 in a sandbox. Substitute your own workload's timing distribution for mine — the random seed is fixed, so the same code will reproduce the same numbers.
+
+Thank you for reading. If you are wrestling with a similarly shaped problem, I hope this shortens the detour.
