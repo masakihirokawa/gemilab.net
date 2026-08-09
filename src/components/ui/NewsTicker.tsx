@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MEMORY — Memory Bank の Memory Profiles が GA になりました。静的スキーマの構造化プロファイルにより、セッション中の検索を挟まずに情報へ到達できます",
-    "SCOPE — プロファイルは取り込み時のスコープごとに分離され、スキーマとスコープの組み合わせに対して単一のプロファイルが維持されます",
-    "INGEST — IngestEvents API が GA になり、イベントのストリーミング・メモリのリビジョン管理・メタデータの付与が扱えるようになりました",
-    "AUDIO — gemini-3.1-flash-tts-preview が streamGenerateContent 経由のストリーミングに対応し、読み上げ開始までの待ち時間が縮みました",
-    "CLASSROOM — 8月10日から、既にアクセス権を付与されている K-12 と高等教育の全年齢の学生が Gemini in Classroom を利用できるようになります",
-    "SUNSET — 停止日が迫っています。8月17日に画像生成モデル、20日に Grok 4.1 ファミリー、31日に gemini-robotics-er-1.6-preview です",
+    "CLASSROOM — 本日8月10日から、web で Gemini in Classroom が全年齢の学生へ広がります。モバイルは8月17日からです",
+    "STUDY — 学生は授業のコースマテリアルを選び、その授業に合わせたフラッシュカードや練習クイズを Gemini で作れるようになります",
+    "PROMPT — 従来のスターター プロンプトが授業内容に紐づいた体験へ置き換わり、Classroom と Gemini を行き来する手間が減ります",
+    "SUNSET — 画像生成モデルの停止は8月17日で残り7日です。Grok 4.1 ファミリーは8月20日、gemini-robotics-er-1.6-preview は8月31日です",
+    "FLASH — 7月21日に GA となった gemini-3.6-flash は、トークン効率とコード・エージェント計画が改善し、3.5 Flash より低い価格帯です",
+    "PARAMS — サンプリングパラメータの temperature・top_p・top_k は非推奨になりました。既存の呼び出しを見直す時期です",
   ],
   en: [
-    "MEMORY — Memory Profiles in Memory Bank are now GA. A fixed schema means agents reach evolving information without an expensive search mid-session",
-    "SCOPE — Profiles are isolated by the scope you pass at ingest, and each schema-and-scope pair keeps a single profile as its source of truth",
-    "INGEST — The IngestEvents API reached GA, bringing smoother event streaming, memory revision controls, and metadata support",
-    "AUDIO — gemini-3.1-flash-tts-preview now streams through streamGenerateContent, cutting the wait before the first audio arrives",
-    "CLASSROOM — From August 10, Gemini in Classroom opens to K-12 and higher education students of all ages who already have access",
-    "SUNSET — Shutdown dates are close: image generation models on August 17, the Grok 4.1 family on the 20th, and gemini-robotics-er-1.6-preview on the 31st",
+    "CLASSROOM — Starting today, August 10, Gemini in Classroom opens on the web to students of all ages. Mobile follows on August 17",
+    "STUDY — Students can pick course materials and have Gemini build flashcards or practice quizzes tailored to that specific class",
+    "PROMPT — The old starter prompts become contextualized experiences, so there is less bouncing between Classroom and Gemini to get relevant help",
+    "SUNSET — Image generation models shut down on August 17, seven days out. The Grok 4.1 family follows on the 20th and gemini-robotics-er-1.6-preview on the 31st",
+    "FLASH — gemini-3.6-flash, GA since July 21, improves token efficiency and agentic planning at a lower price point than 3.5 Flash",
+    "PARAMS — The sampling parameters temperature, top_p, and top_k are now deprecated. It is a good moment to revisit existing calls",
   ],
 };
 
