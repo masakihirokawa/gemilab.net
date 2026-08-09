@@ -1,0 +1,543 @@
+---
+title: "The Memory Wasn't Lost — It Was Written to a Different Profile"
+slug: "gemini-memory-profiles-scope-key-drift-tenant-leak-measured"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-08-09T13:00"
+author: "Gemini Lab"
+description: "A Memory Bank profile is identified by the pair of schema and scope. When call sites build that scope slightly differently, extra profiles appear with no error at all. Here are the measured numbers for how badly it fragments, and how three candidate fixes actually performed."
+tags: ["Gemini API", "Memory Bank", "Memory profiles", "Scope design", "Multi-tenancy", "Indie development"]
+highlights:
+  - "Six drift variants across call sites dropped the profile hit rate to 52.1% and produced 4.79 profiles per tenant — with zero errors raised"
+  - "The widely recommended sort_keys canonicalization moved the number by 0.0 points; a key allowlist alone restored 90.0%, exactly the theoretical ceiling — full comparison harness included"
+  - "The read-side fallback scored the best hit rate while returning 1,843 cross-tenant reads over 4,000 turns, plus the ceiling alarm and AST lint that catch it beforehand"
+---
+
+I was looking at the morning rollup when I stopped scrolling.
+
+Two apps share a support pipeline in my setup: a wallpaper app and a companion relaxation app. Both were feeding Memory Bank profiles so that downstream handlers could see a user's preferences and subscription state. That morning, the number of ingestion calls was about 4.8 times the number of distinct users who had actually interacted that day.
+
+Not a single error. Every response was a 200. But one profile per user should have been enough, and the arithmetic said roughly five were being created instead.
+
+It took me a while to see it. **The memory wasn't disappearing. It was being written to a slightly different address every time.**
+
+A Memory Bank profile is held as a single source of truth per combination of schema and scope. That means scope is not a label pointing at "whose data this is" — it is **the composite key that decides where the data lives**. If the key drifts, what sits there is a different profile, and an empty profile comes back as a perfectly valid response. A call site that wrote `{"user_id": 123}` one day and `{"user_id": "123"}` the next was writing to two different places. Until I saw that, I had been trying to solve the wrong problem entirely: "why doesn't the memory stick?"
+
+I didn't want to fix this by intuition, so I built a small harness. It uses no API key. It reproduces only the published semantics — one profile per `(schema, scope)` pair — locally. Every number below comes from actually running that harness; none of it is estimated. And the results very nearly inverted my ranking of the "obviously correct" fixes.
+
+## Scope Isn't an Identifier — It's the Address
+
+First, the model. I'm not guessing at Memory Bank's internals; I'm copying only the contract, which is that a schema-and-scope pair maps to exactly one profile.
+
+```python
+import json
+
+SCHEMA = "user_pref_v1"
+
+class ProfileStore:
+    """A minimal stand-in for Memory profiles.
+    Holds one profile per (schema, scope) pair. No API calls —
+    this reproduces only how the key is derived."""
+
+    def __init__(self, normalizer=None):
+        self.data = {}
+        # Swappable so we can experiment with normalization strategies
+        self.norm = normalizer or (lambda s: json.dumps(s))
+        self.writes = 0
+
+    def key(self, scope):
+        return (SCHEMA, self.norm(scope))
+
+    def get(self, scope):
+        # A miss returns None. That's "nothing here yet", not "you asked wrong"
+        return self.data.get(self.key(scope))
+
+    def put(self, scope, profile):
+        self.writes += 1
+        self.data[self.key(scope)] = profile
+```
+
+The important detail is that `get()` never raises. Query a scope that doesn't exist and you get emptiness, not an error. **There is no built-in signal that you have addressed the wrong place.** That asymmetry is what motivates the alarm I build later in this article.
+
+One structural note about my setup: user IDs are assigned per app. User 42 in the wallpaper app and user 42 in the relaxation app are different people. So `app_id` genuinely belongs in the scope — it isn't decoration, it's correctness. That fact turns out to matter a great deal.
+
+## Six Ways the Call Sites Wrote It, and How Much They Fragmented
+
+Going back through the codebase, scope construction had scattered into six shapes. Every one of them looked reasonable at the moment it was written.
+
+<table>
+<tr><th>Variant</th><th>How it was written</th><th>What the author meant</th></tr>
+<tr><td><code>ok</code></td><td><code>{"app_id": app, "user_id": str(uid)}</code></td><td>The intended form</td></tr>
+<tr><td><code>int</code></td><td><code>{"app_id": app, "user_id": uid}</code></td><td>Passed the integer straight from the DB</td></tr>
+<tr><td><code>extra_tier</code></td><td><code>{"tier": tier, "app_id": app, "user_id": str(uid)}</code></td><td>Wanted to separate by plan</td></tr>
+<tr><td><code>extra_device</code></td><td><code>{"app_id": app, "user_id": str(uid), "device_id": device}</code></td><td><strong>Wanted stricter isolation</strong></td></tr>
+<tr><td><code>extra_locale</code></td><td><code>{"app_id": app, "user_id": str(uid), "locale": locale}</code></td><td>Anticipated language-specific replies</td></tr>
+<tr><td><code>pad</code></td><td><code>{"app_id": app, "user_id": " " + str(uid)}</code></td><td>A concatenation artifact nobody intended</td></tr>
+</table>
+
+I generated 4,000 turns across 200 users and 2 apps using that distribution, then measured hit behavior with a plain `json.dumps` key.
+
+```python
+import random, statistics
+from collections import defaultdict
+
+APPS = ["wallpaper", "relax"]
+
+def gen(users=200, turns=4000, seed=20260809):
+    """Generate traffic that includes realistic call-site drift.
+    Weights match the observed distribution in the real codebase."""
+    rnd = random.Random(seed)
+    out = []
+    for _ in range(turns):
+        app = rnd.choice(APPS)
+        u = rnd.randrange(users)
+        ctx = {
+            "tier": rnd.choice(["free", "pro"]),
+            "device": f"d{rnd.randrange(3)}",
+            "locale": rnd.choice(["ja-JP", "en-US"]),
+        }
+        kind = rnd.choices(
+            ["ok", "int", "extra_tier", "extra_device", "extra_locale", "pad"],
+            [0.46, 0.14, 0.12, 0.12, 0.10, 0.06],
+        )[0]
+        base = {"app_id": app, "user_id": str(u)}
+        s = {
+            "ok": base,
+            "int": {"app_id": app, "user_id": u},
+            "extra_tier": {"tier": ctx["tier"], "app_id": app, "user_id": str(u)},
+            "extra_device": {"app_id": app, "user_id": str(u), "device_id": ctx["device"]},
+            "extra_locale": {"app_id": app, "user_id": str(u), "locale": ctx["locale"]},
+            "pad": {"app_id": app, "user_id": " " + str(u)},
+        }[kind]
+        out.append((app, u, kind, s, ctx["tier"]))
+    return out
+
+
+def run(calls, norm):
+    store = {}
+    hits = miss = 0
+    keys_per_tenant = defaultdict(set)
+    by_kind = defaultdict(lambda: [0, 0])   # kind -> [hit, miss]
+
+    for app, u, kind, s, tier in calls:
+        k = (SCHEMA, norm(s))
+        keys_per_tenant[(app, u)].add(k[1])
+        p = store.get(k)
+        if p is None:
+            miss += 1
+            by_kind[kind][1] += 1
+            store[k] = {"owner": (app, u), "billing_plan": tier}
+        else:
+            hits += 1
+            by_kind[kind][0] += 1
+
+    n = hits + miss
+    return {
+        "hit": 100 * hits / n,
+        "profiles": len(store),
+        "frag": statistics.mean(len(v) for v in keys_per_tenant.values()),
+        "writes": miss,
+        "by_kind": dict(by_kind),
+    }
+```
+
+With a plain `json.dumps` key:
+
+<table>
+<tr><th>Metric</th><th>Value</th></tr>
+<tr><td>Profile hit rate</td><td>52.1%</td></tr>
+<tr><td>Profiles created</td><td>1,915</td></tr>
+<tr><td>Profiles per tenant</td><td>4.79</td></tr>
+<tr><td>Ingestion calls (misses)</td><td>1,915</td></tr>
+</table>
+
+The 4.8x I'd seen in the morning rollup reproduced almost exactly. That's the point where this stopped feeling like wasted spend and started feeling like something worse: **each user's history had been sliced into five disconnected pieces.**
+
+Breaking it down by variant ranks the culprits.
+
+<table>
+<tr><th>Variant</th><th>Hit rate</th><th>hit / miss</th></tr>
+<tr><td><code>ok</code></td><td>79.2%</td><td>1,512 / 397</td></tr>
+<tr><td><code>int</code></td><td>44.3%</td><td>228 / 287</td></tr>
+<tr><td><code>extra_tier</code></td><td>25.3%</td><td>116 / 342</td></tr>
+<tr><td><code>pad</code></td><td>24.8%</td><td>65 / 197</td></tr>
+<tr><td><code>extra_locale</code></td><td>22.8%</td><td>87 / 294</td></tr>
+<tr><td><strong><code>extra_device</code></strong></td><td><strong>16.2%</strong></td><td>77 / 398</td></tr>
+</table>
+
+`extra_device` finishing last stung. That was the key I added because I wanted *stricter* isolation. The single line I wrote to be more careful was doing more damage than the sloppy whitespace bug. The mechanism is obvious in hindsight: `device_id` changes when the same person picks up a different phone. The moment it enters the scope, it becomes **the granularity of separation itself**. Strictness here can only ever reduce who gets to share a memory — including the past version of the same user.
+
+Note also that `ok` only reached 79.2%. Correctly written call sites still miss when something wrote to a different address just before them. **One drifting site drags down the score of every correct site.** Because of that spillover, the reassuring feeling of "well, most of our code does it right" turned out to be worth nothing.
+
+## Adding Normalization One Layer at a Time
+
+The fix seems obvious: normalize the key. But "normalize" covers several distinct operations, so instead of applying all of them at once I added them one layer at a time and measured each delta. I didn't want to misattribute the improvement.
+
+```python
+def naive(s):
+    return json.dumps(s)
+
+def canon(s):
+    # A: the commonly recommended form — stable key order and spacing
+    return json.dumps(s, sort_keys=True, separators=(",", ":"))
+
+def canon_strip(s):
+    # B: A + strip surrounding whitespace from values
+    return json.dumps(
+        {k: (v.strip() if isinstance(v, str) else v) for k, v in s.items()},
+        sort_keys=True, separators=(",", ":"),
+    )
+
+def canon_type(s):
+    # C: B + coerce values to strings
+    return json.dumps(
+        {k: str(v).strip() for k, v in s.items()},
+        sort_keys=True, separators=(",", ":"),
+    )
+
+ALLOW = ("app_id", "user_id")
+
+def canon_allow(s):
+    # D: C + fix which keys are permitted in a scope at all
+    return json.dumps(
+        {k: str(s[k]).strip() for k in ALLOW if k in s},
+        sort_keys=True, separators=(",", ":"),
+    )
+```
+
+Applied in sequence against identical traffic:
+
+<table>
+<tr><th>Stage</th><th>Hit rate</th><th>Profiles</th><th>Per tenant</th></tr>
+<tr><td>Plain <code>json.dumps</code></td><td>52.1%</td><td>1,915</td><td>4.79</td></tr>
+<tr><td>A — <code>sort_keys</code> canonicalization</td><td><strong>52.1%</strong></td><td>1,915</td><td>4.79</td></tr>
+<tr><td>B — A + whitespace trim</td><td>57.0%</td><td>1,719</td><td>4.30</td></tr>
+<tr><td>C — B + string coercion</td><td>64.2%</td><td>1,434</td><td>3.58</td></tr>
+<tr><td>D — C + key allowlist</td><td><strong>90.0%</strong></td><td>400</td><td>1.00</td></tr>
+</table>
+
+Stage A moved the number by **0.0 points**.
+
+I'll admit I suspected my own script first. Canonical dictionary serialization is the standard answer to this class of problem. Printing the keys side by side finally made it click: `sort_keys` fixes exactly one failure mode, which is *identical content in a different order*. What was actually happening was **different content**. `{"user_id": "42"}` and `{"user_id": 42}` are not reorderings of each other, and neither is a dict with one extra key. Sorting only aligns things that were already the same.
+
+Ranked by contribution: string coercion (+7.2 points), whitespace (+4.9 points), and the key allowlist (+25.8 points). **The dominant lever was not how values are written but which keys are allowed to participate.** The first is a coding-style problem; the second is a design decision. I had been attacking only the coding-style side.
+
+The 90.0% figure is also meaningful rather than arbitrary. Across 4,000 turns there are 400 distinct tenants (200 users x 2 apps), and each one must miss on its first touch. So `1 - 400/4000 = 90.0%` is **the ceiling attainable under these conditions**, and stage D lands exactly on it. The remaining 10% isn't a defect; it's cold start.
+
+I measured the cost of normalization too — `{"app_id": "wallpaper", "user_id": " 4211", "device_id": "d2", "locale": "ja-JP"}`, 200,000 iterations, median of 7 runs.
+
+<table>
+<tr><th>Implementation</th><th>Per call</th></tr>
+<tr><td>Plain <code>json.dumps</code></td><td>3.921 µs</td></tr>
+<tr><td><code>canon_allow</code></td><td>5.662 µs</td></tr>
+</table>
+
+A difference of 1.741 µs, against the cost of an avoidable network round trip. There's nothing to deliberate here.
+
+## The Read-Side Fallback Produced the Best Number
+
+Normalization is a write-path change. It leaves open the question of what to do with the 1,915 profiles already scattered around. Wanting to avoid a migration, I briefly reasoned my way into this: on a read miss, just look for an existing profile whose `user_id` matches.
+
+```python
+def run_with_fallback(calls, norm):
+    store = {}
+    hits = miss = leaks = 0
+    for app, u, kind, s, tier in calls:
+        k = (SCHEMA, norm(s))
+        p = store.get(k)
+        if p is None:
+            # On a miss, search for any profile with a matching user_id
+            want = str(s.get("user_id", "")).strip()
+            for (_sch, kk), v in store.items():
+                try:
+                    kd = json.loads(kk)
+                except Exception:
+                    continue
+                if str(kd.get("user_id", "")).strip() == want:
+                    p = v
+                    if v["owner"] != (app, u):
+                        leaks += 1        # returned another tenant's record
+                    break
+        if p is None:
+            miss += 1
+            store[k] = {"owner": (app, u), "billing_plan": tier}
+        else:
+            hits += 1
+    n = hits + miss
+    return {"hit": 100 * hits / n, "profiles": len(store), "leaks": leaks}
+```
+
+Judged on hit rate alone, this was the winner.
+
+<table>
+<tr><th>Approach</th><th>Hit rate</th><th>Profiles</th><th>Cross-tenant reads</th></tr>
+<tr><td>D — write-side normalization + allowlist</td><td>90.0%</td><td>400</td><td><strong>0</strong></td></tr>
+<tr><td>Read-side fallback</td><td><strong>95.0%</strong></td><td>200</td><td><strong>1,843</strong></td></tr>
+</table>
+
+In 1,843 of 4,000 turns it **returned someone else's profile**. User 42 of the wallpaper app was being handed the subscription state of user 42 of the relaxation app.
+
+The numbers explain themselves cleanly. Matching on `user_id` alone erases the `app_id` distinction. Profiles halving from 400 to 200 is precisely the footprint of two apps being merged into one namespace. And the hit rate rising from 90.0% to 95.0% matches `1 - 200/4000 = 95.0%`.
+
+In other words, **what looked like a 5-point improvement was, exactly and entirely, the collapse of the tenant boundary.**
+
+This is the finding that unsettled me most. Optimize for hit rate and you will confidently choose the dangerous option. A permissive read undoes a strict write after the fact. **A boundary is something you defend at the write path, not something you patch on read.** Loosening the read side because a data migration feels tedious is trading safety for convenience — and the receipt arrives much later.
+
+Across five seeds the pattern held (medians):
+
+<table>
+<tr><th>Approach</th><th>Hit rate</th><th>Ingestion calls</th><th>Cross-tenant reads</th></tr>
+<tr><td>Plain <code>json.dumps</code></td><td>52.2%</td><td>1,911</td><td>0</td></tr>
+<tr><td>Normalization + allowlist</td><td>90.0%</td><td>400</td><td>0</td></tr>
+<tr><td>Read-side fallback</td><td>95.0%</td><td>200</td><td>1,913</td></tr>
+</table>
+
+The ingestion call count deserves a mention as well: 1,911 before, 400 after — a **4.8x** difference. Profile generation invokes a model, so that gap lands directly on the invoice. Published pricing for 3.6 Flash is $1.50/1M input and $7.50/1M output, so measuring your own per-call token usage gives you the monthly delta quickly (confirm current figures in the [Gemini API changelog](https://ai.google.dev/gemini-api/docs/changelog)). What actually mattered to me, though, wasn't the money — it was realizing that **the billing data had noticed the bug before I did.** Nobody was watching the hit rate. The call count was in the rollup every single morning.
+
+## Fix the Ceiling First, and Don't Let It Look at Itself
+
+After this, I wanted the next occurrence to announce itself. The relationship from the previous section turns directly into a monitor.
+
+```text
+attainable hit rate = 1 - (distinct scopes / turns)
+```
+
+If the observed rate exceeds that ceiling, scopes are being merged more coarsely than intended. Straightforward enough. The first version I wrote, however, stayed silent in exactly the case it existed for.
+
+```python
+# First attempt — runs fine, misses the anomaly it was built to catch
+ceiling = 100 * (1 - len(store) / turns)
+if observed_hit > ceiling:
+    alert("scopes may be merging")
+```
+
+<table>
+<tr><th>Approach</th><th>Observed hit</th><th>Ceiling from <code>store</code></th><th>Verdict</th></tr>
+<tr><td>Normalization + allowlist</td><td>90.0%</td><td>90.0%</td><td>silent (correct)</td></tr>
+<tr><td>Read-side fallback</td><td>95.0%</td><td>95.0%</td><td><strong>silent (missed)</strong></td></tr>
+</table>
+
+Once written down the reason is plain. The ceiling was computed from the size of `store`, so **when merging shrinks `store`, the ceiling drops right along with it.** I had derived the monitoring threshold from the state being monitored. The broken system was quietly redrawing its own passing grade.
+
+The fix is to source the ceiling from something the store cannot influence. In my case the set of distinct `(app_id, user_id)` pairs seen that day is countable independently, on the auth side.
+
+```python
+def health(observed_hit_pct, turns, distinct_tenants):
+    """Derive the ceiling from an independently counted tenant total,
+    never from store state. A store-derived ceiling drops when merging
+    occurs, which silences the alarm exactly when it should fire
+    (verified by measurement)."""
+    ceiling = 100 * (1 - distinct_tenants / turns)
+    return {
+        "ceiling": ceiling,
+        "merged": observed_hit_pct > ceiling + 1e-9,       # boundary collapsed
+        "fragmented": observed_hit_pct < ceiling - 5.0,    # scopes split apart
+    }
+```
+
+Same data, and now both sides fire correctly:
+
+<table>
+<tr><th>Approach</th><th>Observed hit</th><th>Independent ceiling</th><th>Verdict</th></tr>
+<tr><td>Plain <code>json.dumps</code></td><td>52.1%</td><td>90.0%</td><td><code>fragmented</code> fires</td></tr>
+<tr><td>Normalization + allowlist</td><td>90.0%</td><td>90.0%</td><td>silent (correct)</td></tr>
+<tr><td>Read-side fallback</td><td>95.0%</td><td>90.0%</td><td><strong><code>merged</code> fires</strong></td></tr>
+</table>
+
+The two-sided threshold is what makes this worth keeping. Too low means fragmentation; too high means collapse. **Hit rate is not a metric where higher is always better.** When it pushes past the ceiling, something is usually being trampled.
+
+## Linting Call Sites — Flag Inconsistency, Not Incorrectness
+
+A runtime alarm fires after the damage. I wanted to catch it at authoring time, so I wrote an AST lint over scope dict literals. My first attempt was unusable.
+
+Version one encoded "the correct form" as rules: if the value for `user_id` is a bare variable, `str()` is missing, and so on. Run against a small repository with 7 scope constructions across 4 files, it reported 12 findings. Five were real. The other seven flagged `app_id` receiving a bare variable — but `app` is already a string, so those were noise, not findings. Precision: 41.7%. A linter with that ratio gets muted within a week.
+
+So I changed what the rule is about. **Don't judge absolute correctness — detect inconsistency within the corpus.** When the same scope key is written differently in different places, flag the minority. Drift, after all, is defined by being different from everything else.
+
+```python
+#!/usr/bin/env python3
+"""scope drift lint — flags places where the same scope key is written
+differently from the rest of the corpus. It makes no claim about what is
+"correct"; it only reports the minority spelling."""
+import ast
+import sys
+import pathlib
+from collections import defaultdict
+
+ALLOWED = {"app_id", "user_id"}
+SINKS = {"ingest", "retrieve_profile", "generate_memories"}
+
+
+def shape(v):
+    """Classify how a value is written: str()-wrapped, bare name, constant, ..."""
+    if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "str":
+        return "str()"
+    if isinstance(v, ast.Name):
+        return "bare-name"
+    if isinstance(v, ast.JoinedStr):
+        return "f-string"
+    if isinstance(v, ast.Constant):
+        return f"const:{type(v.value).__name__}"
+    return "other"
+
+
+class Collect(ast.NodeVisitor):
+    """Gather dict literals passed as scope=, following one level of assignment."""
+
+    def __init__(self):
+        self.sites = []
+        self.assigned = {}
+
+    def visit_Assign(self, n):
+        if (isinstance(n.value, ast.Dict) and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)):
+            self.assigned[n.targets[0].id] = n.value
+        self.generic_visit(n)
+
+    def visit_Call(self, n):
+        fname = n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", None)
+        if fname in SINKS:
+            for kw in n.keywords:
+                if kw.arg != "scope":
+                    continue
+                d = kw.value if isinstance(kw.value, ast.Dict) \
+                    else self.assigned.get(getattr(kw.value, "id", None))
+                if isinstance(d, ast.Dict):
+                    self.sites.append(d)
+        self.generic_visit(n)
+
+
+def scan(root):
+    sites = []
+    for p in sorted(pathlib.Path(root).rglob("*.py")):
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        c = Collect()
+        c.visit(tree)
+        sites += [(str(p), d) for d in c.sites]
+
+    # Pass 1: count spellings per key and pick the majority
+    shapes = defaultdict(lambda: defaultdict(int))
+    for _, d in sites:
+        for k, v in zip(d.keys, d.values):
+            if isinstance(k, ast.Constant) and k.value in ALLOWED:
+                shapes[k.value][shape(v)] += 1
+    majority = {k: max(s.items(), key=lambda x: x[1])[0] for k, s in shapes.items()}
+
+    # Pass 2: report minority spellings, disallowed keys, and missing keys
+    out = []
+    for path, d in sites:
+        keys = []
+        for k, v in zip(d.keys, d.values):
+            if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
+                out.append((path, d.lineno, "dynamic-key", "key is not a string literal"))
+                continue
+            keys.append(k.value)
+            if k.value not in ALLOWED:
+                out.append((path, d.lineno, "extra-key",
+                            f"disallowed key {k.value!r} — this fragments the profile"))
+                continue
+            sh = shape(v)
+            if sh != majority[k.value]:
+                out.append((path, d.lineno, "shape-drift",
+                            f"{k.value} written as {sh} (corpus majority is {majority[k.value]})"))
+            if sh.startswith("const:") and sh != "const:str":
+                out.append((path, d.lineno, "type-drift", f"{k.value} is not a string"))
+        for m in sorted(ALLOWED - set(keys)):
+            out.append((path, d.lineno, "missing-key", f"required key {m!r} is absent"))
+    return out
+
+
+if __name__ == "__main__":
+    rows = scan(sys.argv[1] if len(sys.argv) > 1 else ".")
+    for f, l, kind, msg in rows:
+        print(f"{f}:{l}: [{kind}] {msg}")
+    print(f"-- {len(rows)} finding(s)", file=sys.stderr)
+    sys.exit(1 if rows else 0)   # fail CI
+```
+
+Against the same repository:
+
+```text
+repo/a.py:4: [shape-drift] user_id written as bare-name (corpus majority is str())
+repo/b.py:2: [extra-key] disallowed key 'device_id' — this fragments the profile
+repo/c.py:2: [shape-drift] user_id written as f-string (corpus majority is str())
+repo/c.py:3: [extra-key] disallowed key 'tier' — this fragments the profile
+repo/c.py:4: [extra-key] disallowed key 'locale' — this fragments the profile
+-- 5 finding(s)
+```
+
+<table>
+<tr><th>Version</th><th>Reported</th><th>True</th><th>False</th><th>Precision</th><th>Recall</th></tr>
+<tr><td>v1 (absolute correctness)</td><td>12</td><td>5</td><td>7</td><td>41.7%</td><td>100%</td></tr>
+<tr><td>v2 (corpus consistency)</td><td>5</td><td>5</td><td><strong>0</strong></td><td><strong>100%</strong></td><td>100%</td></tr>
+</table>
+
+Relaxing the rule eliminated the false positives because the axis of judgment changed. "Add `str()`" is a claim about the world outside the file; "match the others" is verifiable entirely within the corpus. **Detecting drift doesn't require a definition of correct.**
+
+One limitation worth stating: this lint follows dict literals and a single level of variable assignment, nothing more. Scopes assembled inside helper functions are invisible to it. That's partly laziness and partly a deliberate choice — as the next section argues, scope construction should converge on one place, and in a codebase that has done that, this lint goes quiet. Going quiet is the correct ending.
+
+## Put the Boundary at the Write Path, Not in the Schema
+
+Here's where I landed. Rather than distributing the allowlist across call sites, define exactly one constructor for scopes and close every other route.
+
+```python
+from dataclasses import dataclass
+import json
+
+@dataclass(frozen=True)
+class Tenant:
+    """Values eligible to become a scope, carried as a type.
+    Never accept a raw string dict from a caller."""
+    app_id: str
+    user_id: str
+
+    def __post_init__(self):
+        for name in ("app_id", "user_id"):
+            v = getattr(self, name)
+            if not isinstance(v, str) or v != v.strip() or not v:
+                raise ValueError(f"{name} must be a non-empty string with no surrounding whitespace: {v!r}")
+
+
+def scope_of(t: Tenant) -> dict:
+    """The only place a scope dict is constructed."""
+    return {"app_id": t.app_id, "user_id": t.user_id}
+
+
+def scope_key(t: Tenant) -> str:
+    """Identity of the storage address. Logs and monitors use this same function."""
+    return json.dumps(scope_of(t), sort_keys=True, separators=(",", ":"))
+```
+
+Because malformed values are rejected at `Tenant` construction, nothing downstream needs defensive code. A forgotten `str()` becomes a `ValueError` and dies in tests.
+
+For deciding what belongs in the key, I settled on three questions:
+
+1. **If this value changes, do I want the memory carried over?** If yes, keep it out of the scope
+2. **If this value matches, is sharing the memory acceptable?** If no, put it in the scope
+3. When unsure, leave it out. Adding a key later is easy; removing one orphans every existing profile
+
+Applying that, `device_id`, `locale`, and `tier` all fall out. I want memory to survive a new phone. Switching languages doesn't make someone a different person. A plan change is content to be updated *inside* the profile, not a reason to relocate it. Meanwhile `app_id` stays, because the same number denotes different people across apps.
+
+I had been treating the third question as a minor caveat. Adding a key "to get more granular later" is in practice **an operation that discards the past**. It behaves like a schema change without a migration, and because it raises no error, it breaks far more quietly than a schema change would.
+
+Deciding what updates the *contents* of a profile is a separate axis of judgment. I covered per-field update policies and how quickly values go stale in [Choosing a Memory Profiles Update Policy by Measurement](/articles/gemini-api/gemini-memory-profiles-update-policy-volatility-ttl-measured). Scope decides the address; the update policy decides the freshness of what's at that address. For the broader question of isolating many apps and tenants on shared infrastructure, [Gemini API Multi-Tenant SaaS Architecture](/articles/gemini-api/gemini-api-multi-tenant-saas-architecture-guide) covers the surrounding design.
+
+## Three Things to Check Tomorrow
+
+To close, here's the short version — in the order I actually did it.
+
+1. **Divide today's ingestion call count by today's distinct tenant count.** Close to 1.0 is healthy. Mine was 4.8. That single ratio is the earliest signal available, and it surfaces long before anyone thinks to look at a hit rate
+2. **Grep every scope dict literal and read them side by side.** `grep -rn 'scope=' --include='*.py'` is enough. Two distinct spellings means you are already fragmented
+3. **Compute the hit-rate ceiling from an independent tenant count and compare.** Below it means fragmentation; above it means a boundary has collapsed. Treat "above" as the more alarming direction
+
+And if your profiles have already scattered, I'd encourage you to resist the read-side patch. In my measurements it came back as 1,843 cross-tenant reads over 4,000 turns. Rewriting under correct scopes and discarding the stale profiles takes longer, but it leaves you with a state you can explain later.
+
+Working solo as an indie developer, this class of silent failure never gets reported to you. From the user's side it's just "it doesn't seem to remember me" — not enough friction to file anything. Which is exactly why the alarm has to be something you place yourself, in the spot that stays quiet. Until I saw the numbers, I trusted my own implementation quite a lot.
+
+One caveat on methodology: the measurements here come from a local harness reproducing the one-profile-per-`(schema, scope)` contract, not from live API calls. Fragmentation and merging are fully explained by how the key is derived, so I judged the model sufficient — but if you're making decisions that involve billing or latency, please measure against your own configuration. The harness runs as-is if you concatenate the code blocks above.
+
+If this saves someone half a day of chasing the wrong problem, that would make me glad. Thank you for reading.

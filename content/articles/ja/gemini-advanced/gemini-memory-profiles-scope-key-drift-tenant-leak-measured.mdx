@@ -1,0 +1,540 @@
+---
+title: "記憶が消えたのではなく、別のプロファイルに書かれていました — Memory profiles のスコープキーを実測で正す"
+slug: "gemini-memory-profiles-scope-key-drift-tenant-leak-measured"
+category: "gemini-advanced"
+level: "advanced"
+premium: true
+date: "2026-08-09T13:00"
+author: "Gemini Lab"
+description: "Memory Bank のプロファイルはスキーマとスコープの組で一意になります。呼び出し側でスコープの形がわずかにぶれると、エラーを出さないまま別のプロファイルが増えていきます。分裂の量と、3種類の対処の効き目を同じ条件で測った記録です。"
+tags: ["Gemini API", "Memory Bank", "Memory profiles", "スコープ設計", "マルチテナント", "個人開発"]
+highlights:
+  - "呼び出し側の書き方が6通りに散っただけで、参照が当たる割合が52.1%まで落ち、プロファイルが利用者1人あたり4.79個へ分裂していた計測結果"
+  - "よく勧められる sort_keys による正規化が0.0ポイントしか動かず、キーのallowlistだけで90.0%（理論上限と一致）まで戻るまでの、そのまま走る比較ハーネス全コード"
+  - "参照率がいちばん高く見えた読み出し側フォールバックが、4,000ターンで1,843件の越境読み取りを起こしていた検出と、それを事前に止める天井アラームとlintの実装"
+---
+
+朝の集計を眺めていて、手が止まりました。
+
+壁紙アプリと、その姉妹アプリにあたる癒し系アプリ。両方の問い合わせ窓口に Memory Bank のプロファイルを噛ませて、利用者の設定や購読状態を後段へ渡す仕組みを試していたときのことです。取り込みの呼び出し回数が、その日にやり取りのあった利用者数のおよそ4.8倍ありました。
+
+エラーは1件も出ていません。レスポンスも全部 200 です。ただ、1人につき1つで足りるはずのプロファイルが、5つ近く作られている計算になります。
+
+しばらく眺めて、ようやく合点がいきました。**記憶が消えていたのではなく、毎回わずかに違う住所に書かれていた**のです。
+
+Memory Bank のプロファイルは、スキーマとスコープの組に対して単一のものが保持されます。つまりスコープは「誰のものか」を指す識別子ではなく、**保存先そのものを決める複合キー**です。キーがぶれれば、そこにあるのは別のプロファイルであって、空のプロファイルは正常な応答として返ります。呼び出し側が `{"user_id": 123}` と書いた日と `{"user_id": "123"}` と書いた日で、行き先が変わる。この構造に気づくまで、私はずっと「記憶が定着しない」という誤った問題を解こうとしていました。
+
+勘で直すのが嫌だったので、手元に小さなハーネスを書いて測りました。以下は API キーを使わず、`(schema, scope)` に対して単一プロファイルという意味論だけをローカルに再現したものです。数値はすべてこのハーネスを実際に走らせて得たもので、推定値は含みません。そして結果は、私が用意した「正しそうな対処」の順位を、ほぼ逆さまにしました。
+
+## スコープは識別子ではなく、保存先を決める複合キーでした
+
+まず、模型を用意します。Memory Bank 側の実装を推測するのではなく、公表されている意味論——スキーマとスコープの組ごとに単一のプロファイルが source-of-truth として保たれる——だけをそのまま写します。
+
+```python
+import json
+
+SCHEMA = "user_pref_v1"
+
+class ProfileStore:
+    """Memory profiles を模した最小の store。
+    (schema, scope) の組に対して単一のプロファイルを保持する。
+    実 API を叩かず、キーの決まり方だけを忠実に再現する。"""
+
+    def __init__(self, normalizer=None):
+        self.data = {}
+        # 正規化を差し替えられるようにしておく。ここが本稿の実験点
+        self.norm = normalizer or (lambda s: json.dumps(s))
+        self.writes = 0
+
+    def key(self, scope):
+        return (SCHEMA, self.norm(scope))
+
+    def get(self, scope):
+        # 見つからない場合は None。エラーではなく「まだ何もない」として返る
+        return self.data.get(self.key(scope))
+
+    def put(self, scope, profile):
+        self.writes += 1
+        self.data[self.key(scope)] = profile
+```
+
+ここで大事なのは `get()` が例外を投げないことです。存在しないスコープを引いても、返るのは「空」であって「間違い」ではありません。**取り違えが起きたことを知る手段が、既定では用意されていない**。この非対称さが、後の章でアラームを設計する動機になります。
+
+私の構成では、利用者IDはアプリごとに採番されています。壁紙アプリの利用者42番と、癒し系アプリの利用者42番は別人です。ですからスコープには `app_id` が必要で、これは冗長な飾りではなく正しさの一部でした。この点は後で効いてきます。
+
+## 呼び出し側の書き方を6通り並べて、分裂の量を測る
+
+実際のコードベースを見返すと、スコープを組み立てている箇所は6通りに散っていました。どれも書いた時点では自然です。
+
+<table>
+<tr><th>種別</th><th>実際の書かれ方</th><th>書いたときの意図</th></tr>
+<tr><td><code>ok</code></td><td><code>{"app_id": app, "user_id": str(uid)}</code></td><td>基準の形</td></tr>
+<tr><td><code>int</code></td><td><code>{"app_id": app, "user_id": uid}</code></td><td>DBから来た整数をそのまま渡した</td></tr>
+<tr><td><code>extra_tier</code></td><td><code>{"tier": tier, "app_id": app, "user_id": str(uid)}</code></td><td>プラン別に分けたかった</td></tr>
+<tr><td><code>extra_device</code></td><td><code>{"app_id": app, "user_id": str(uid), "device_id": device}</code></td><td><strong>より厳密に分離したかった</strong></td></tr>
+<tr><td><code>extra_locale</code></td><td><code>{"app_id": app, "user_id": str(uid), "locale": locale}</code></td><td>言語別の応答を想定した</td></tr>
+<tr><td><code>pad</code></td><td><code>{"app_id": app, "user_id": " " + str(uid)}</code></td><td>連結の副産物。誰も意図していない</td></tr>
+</table>
+
+この分布で4,000ターン、200利用者、2アプリのトラフィックを生成し、素の `json.dumps` をキーに使った場合の当たり方を測ります。
+
+```python
+import random, statistics
+from collections import defaultdict
+
+APPS = ["wallpaper", "relax"]
+
+def gen(users=200, turns=4000, seed=20260809):
+    """呼び出し側のばらつきを含むトラフィックを生成する。
+    重みは実コードベースの出現比率に合わせた。"""
+    rnd = random.Random(seed)
+    out = []
+    for _ in range(turns):
+        app = rnd.choice(APPS)
+        u = rnd.randrange(users)
+        ctx = {
+            "tier": rnd.choice(["free", "pro"]),
+            "device": f"d{rnd.randrange(3)}",
+            "locale": rnd.choice(["ja-JP", "en-US"]),
+        }
+        kind = rnd.choices(
+            ["ok", "int", "extra_tier", "extra_device", "extra_locale", "pad"],
+            [0.46, 0.14, 0.12, 0.12, 0.10, 0.06],
+        )[0]
+        base = {"app_id": app, "user_id": str(u)}
+        s = {
+            "ok": base,
+            "int": {"app_id": app, "user_id": u},
+            "extra_tier": {"tier": ctx["tier"], "app_id": app, "user_id": str(u)},
+            "extra_device": {"app_id": app, "user_id": str(u), "device_id": ctx["device"]},
+            "extra_locale": {"app_id": app, "user_id": str(u), "locale": ctx["locale"]},
+            "pad": {"app_id": app, "user_id": " " + str(u)},
+        }[kind]
+        out.append((app, u, kind, s, ctx["tier"]))
+    return out
+
+
+def run(calls, norm):
+    store = {}
+    hits = miss = 0
+    keys_per_tenant = defaultdict(set)
+    by_kind = defaultdict(lambda: [0, 0])   # kind -> [hit, miss]
+
+    for app, u, kind, s, tier in calls:
+        k = (SCHEMA, norm(s))
+        keys_per_tenant[(app, u)].add(k[1])
+        p = store.get(k)
+        if p is None:
+            miss += 1
+            by_kind[kind][1] += 1
+            store[k] = {"owner": (app, u), "billing_plan": tier}
+        else:
+            hits += 1
+            by_kind[kind][0] += 1
+
+    n = hits + miss
+    return {
+        "hit": 100 * hits / n,
+        "profiles": len(store),
+        "frag": statistics.mean(len(v) for v in keys_per_tenant.values()),
+        "writes": miss,
+        "by_kind": dict(by_kind),
+    }
+```
+
+素の `json.dumps` で走らせた結果です。
+
+<table>
+<tr><th>指標</th><th>値</th></tr>
+<tr><td>参照が当たった割合</td><td>52.1%</td></tr>
+<tr><td>作られたプロファイル総数</td><td>1,915個</td></tr>
+<tr><td>テナント1件あたりの分裂数</td><td>4.79個</td></tr>
+<tr><td>取り込み呼び出し（＝miss）</td><td>1,915回</td></tr>
+</table>
+
+朝の集計で見えた「利用者数の4.8倍」が、ほぼそのまま再現しました。ここで胸が少し冷たくなりました。単なる無駄打ちではなく、**利用者の履歴が5つに切り分けられていた**という意味だからです。
+
+種別ごとに分けると、犯人の順位が出ます。
+
+<table>
+<tr><th>種別</th><th>当たった割合</th><th>hit / miss</th></tr>
+<tr><td><code>ok</code></td><td>79.2%</td><td>1,512 / 397</td></tr>
+<tr><td><code>int</code></td><td>44.3%</td><td>228 / 287</td></tr>
+<tr><td><code>extra_tier</code></td><td>25.3%</td><td>116 / 342</td></tr>
+<tr><td><code>pad</code></td><td>24.8%</td><td>65 / 197</td></tr>
+<tr><td><code>extra_locale</code></td><td>22.8%</td><td>87 / 294</td></tr>
+<tr><td><strong><code>extra_device</code></strong></td><td><strong>16.2%</strong></td><td>77 / 398</td></tr>
+</table>
+
+最下位が `extra_device` だったことに、しばらく言葉が出ませんでした。あれは私が「より厳密に分離したい」と思って足したキーです。分離を強めたつもりの一行が、6種類のうちいちばん記憶を壊していました。理屈は単純で、`device_id` は同じ人でも端末を替えれば変わるからです。スコープに入れた瞬間、それは**分離の粒度そのもの**になります。厳密さは、記憶の共有相手を減らす方向にしか働きません。
+
+`ok` ですら 79.2% に留まっている点も見ておきたいところです。正しい形で書いた呼び出しも、直前に別の形で書き込まれていれば当たりません。**1箇所のぶれが、正しい箇所の成績まで引き下げる**。この波及があるので、「うちは9割方ちゃんと書けている」という感触は当てになりませんでした。
+
+## 正規化を一段ずつ足して、どこで効いたのかを分ける
+
+対処はすぐ思いつきます。キーを正規化すればよい。ただ、正規化と一口に言っても中身は何段階もあるので、一度に全部入れず、一段ずつ足して差分を測りました。効いた理由を取り違えたくなかったからです。
+
+```python
+def naive(s):
+    return json.dumps(s)
+
+def canon(s):
+    # A: よく勧められる形。キー順とスペースを揃える
+    return json.dumps(s, sort_keys=True, separators=(",", ":"))
+
+def canon_strip(s):
+    # B: A + 値の前後空白を落とす
+    return json.dumps(
+        {k: (v.strip() if isinstance(v, str) else v) for k, v in s.items()},
+        sort_keys=True, separators=(",", ":"),
+    )
+
+def canon_type(s):
+    # C: B + 型を文字列へ寄せる
+    return json.dumps(
+        {k: str(v).strip() for k, v in s.items()},
+        sort_keys=True, separators=(",", ":"),
+    )
+
+ALLOW = ("app_id", "user_id")
+
+def canon_allow(s):
+    # D: C + スコープに入れてよいキーを固定する
+    return json.dumps(
+        {k: str(s[k]).strip() for k in ALLOW if k in s},
+        sort_keys=True, separators=(",", ":"),
+    )
+```
+
+同じトラフィックに対して順に当てた結果です。
+
+<table>
+<tr><th>段階</th><th>参照が当たった割合</th><th>プロファイル数</th><th>テナントあたり分裂数</th></tr>
+<tr><td>素の <code>json.dumps</code></td><td>52.1%</td><td>1,915</td><td>4.79</td></tr>
+<tr><td>A <code>sort_keys</code> による正規化</td><td><strong>52.1%</strong></td><td>1,915</td><td>4.79</td></tr>
+<tr><td>B A＋前後空白のトリム</td><td>57.0%</td><td>1,719</td><td>4.30</td></tr>
+<tr><td>C B＋型を文字列へ</td><td>64.2%</td><td>1,434</td><td>3.58</td></tr>
+<tr><td>D C＋キーのallowlist</td><td><strong>90.0%</strong></td><td>400</td><td>1.00</td></tr>
+</table>
+
+A が **0.0ポイント**でした。
+
+正直に書くと、私はここで一度スクリプトを疑いました。辞書キーの正規化は、この手の問題への定番の答えです。実際に印字を並べて確かめて、ようやく腑に落ちました。`sort_keys` が直すのは「同じ中身が違う順序で並んだとき」だけです。しかし実際に起きていたのは、**中身そのものが違う**ことでした。`{"user_id": "42"}` と `{"user_id": 42}` は、どう並べ替えても別物です。`device_id` が1つ増えた辞書も同じです。並べ替えは、揃うものしか揃えません。
+
+効いた順に並べると、型（+7.2ポイント）、空白（+4.9ポイント）、そしてキーのallowlist（+25.8ポイント）です。**最大の一手は「値をどう書くか」ではなく「何をキーに含めるか」**でした。前者はコードの書き方の問題ですが、後者は設計の問題です。私は書き方の側ばかり直そうとしていました。
+
+そして 90.0% という数字には意味があります。4,000ターンに対して固有のテナントは 400 件（200利用者 × 2アプリ）ですから、初回だけは必ず miss になります。`1 - 400/4000 = 90.0%` が**この条件で到達しうる上限**です。D は上限に一致しました。残りの10%は不具合ではなく、コールドスタートそのものです。
+
+正規化のコストも測っておきました。`{"app_id": "wallpaper", "user_id": " 4211", "device_id": "d2", "locale": "ja-JP"}` を20万回で7試行、中央値です。
+
+<table>
+<tr><th>実装</th><th>1回あたり</th></tr>
+<tr><td>素の <code>json.dumps</code></td><td>3.921 µs</td></tr>
+<tr><td><code>canon_allow</code></td><td>5.662 µs</td></tr>
+</table>
+
+差は 1.741 µs です。ネットワーク往復を1回減らせる場面と引き比べれば、考慮する必要のない量でした。ここで迷う理由はありません。
+
+## 読み出し側で拾い直す案が、いちばん良い数字を出しました
+
+正規化は書き込み側の話です。ただ、すでに散らばってしまった1,915個のプロファイルをどうするかという問題が残ります。既存データを移す手間を惜しんで、私は一度こう考えました——読み出しで見つからなかったとき、`user_id` が一致する既存のプロファイルを拾えばいいのではないか。
+
+```python
+def run_with_fallback(calls, norm):
+    store = {}
+    hits = miss = leaks = 0
+    for app, u, kind, s, tier in calls:
+        k = (SCHEMA, norm(s))
+        p = store.get(k)
+        if p is None:
+            # 見つからなければ user_id が一致する既存プロファイルを探す
+            want = str(s.get("user_id", "")).strip()
+            for (_sch, kk), v in store.items():
+                try:
+                    kd = json.loads(kk)
+                except Exception:
+                    continue
+                if str(kd.get("user_id", "")).strip() == want:
+                    p = v
+                    if v["owner"] != (app, u):
+                        leaks += 1        # 別テナントの記録を返した
+                    break
+        if p is None:
+            miss += 1
+            store[k] = {"owner": (app, u), "billing_plan": tier}
+        else:
+            hits += 1
+    n = hits + miss
+    return {"hit": 100 * hits / n, "profiles": len(store), "leaks": leaks}
+```
+
+結果です。参照率だけを見れば、これが最良でした。
+
+<table>
+<tr><th>方式</th><th>参照が当たった割合</th><th>プロファイル数</th><th>越境読み取り</th></tr>
+<tr><td>D 書き込み側の正規化＋allowlist</td><td>90.0%</td><td>400</td><td><strong>0件</strong></td></tr>
+<tr><td>読み出し側フォールバック</td><td><strong>95.0%</strong></td><td>200</td><td><strong>1,843件</strong></td></tr>
+</table>
+
+4,000ターンのうち1,843回、**他人のプロファイルを返していました**。壁紙アプリの利用者42番に、癒し系アプリの利用者42番の購読状態が渡っていたということです。
+
+しかも数字は綺麗に説明がつきます。フォールバックは `user_id` だけで一致を取るので、`app_id` の区別が消えます。プロファイルが 400 個から 200 個へ半減しているのが、そのまま2つのアプリを併合した跡です。参照率が 90.0% から 95.0% へ上がったのも同じ理由で、`1 - 200/4000 = 95.0%` に一致します。
+
+つまり、**5ポイントの改善に見えたものは、そっくりそのままテナント境界の消滅でした**。
+
+これが私にとって、この件でいちばん怖かった発見です。参照率という指標だけを見て選べば、迷わず危ない方を選びます。読み出し側の緩い一致は、書き込み側の厳密さを事後的に取り消してしまう。**境界は読み出しで補うものではなく、書き込み口で守るもの**でした。既存データの移行が面倒だという理由で読み出し側を緩めるのは、面倒を安全と交換する取引です。
+
+シードを5つ振っても傾向は動きませんでした（中央値）。
+
+<table>
+<tr><th>方式</th><th>参照率</th><th>取り込み呼び出し</th><th>越境読み取り</th></tr>
+<tr><td>素の <code>json.dumps</code></td><td>52.2%</td><td>1,911回</td><td>0件</td></tr>
+<tr><td>正規化＋allowlist</td><td>90.0%</td><td>400回</td><td>0件</td></tr>
+<tr><td>読み出し側フォールバック</td><td>95.0%</td><td>200回</td><td>1,913件</td></tr>
+</table>
+
+取り込み呼び出しの回数にも触れておきます。素のままでは 1,911 回、正規化後は 400 回で、**4.8倍**の開きがあります。プロファイル生成はモデルを1回呼ぶ処理ですから、この差はそのまま請求に乗ります。公表されている 3.6 Flash の単価は入力 $1.50 / 1M・出力 $7.50 / 1M ですので、1回あたりの消費トークンを自分の構成で測れば月額の差はすぐ出せます（[Gemini API changelog](https://ai.google.dev/gemini-api/docs/changelog) を確認してください）。ただ、私にとって効いたのは金額よりも、**課金明細のほうが先に異常を教えてくれていた**という事実のほうでした。参照率は誰も見ていなかったのに、呼び出し回数は毎朝集計に出ていたのです。
+
+## 参照率の天井を先に決めておく — 自己参照しないアラーム
+
+この一件のあと、同じ壊れ方を次は自動で気づけるようにしたいと考えました。前章で使った関係がそのまま監視式になります。
+
+```text
+到達しうる参照率 = 1 - (固有スコープ数 / ターン数)
+```
+
+観測値がこの天井を超えていたら、スコープが本来より粗く併合されている。素直な発想です。ところが最初に書いた版は、肝心の場面で沈黙しました。
+
+```python
+# 最初に書いた版 — 動くが、探している異常を見逃す
+ceiling = 100 * (1 - len(store) / turns)
+if observed_hit > ceiling:
+    alert("scope が併合されている可能性")
+```
+
+<table>
+<tr><th>方式</th><th>観測参照率</th><th><code>store</code> から出した天井</th><th>判定</th></tr>
+<tr><td>正規化＋allowlist</td><td>90.0%</td><td>90.0%</td><td>沈黙（正常）</td></tr>
+<tr><td>読み出し側フォールバック</td><td>95.0%</td><td>95.0%</td><td><strong>沈黙（見逃し）</strong></td></tr>
+</table>
+
+理由は書いてみれば明白でした。天井を `store` の大きさから計算しているので、**併合が起きて `store` が小さくなると、天井も一緒に下がってくる**。監視対象の状態から監視基準を導いていたのです。壊れた側が自分の合格ラインを引き直していました。
+
+直し方は、天井を store と無関係な情報から出すことです。私の場合、その日にやり取りのあった `(app_id, user_id)` の組は認証側で独立に数えられます。
+
+```python
+def health(observed_hit_pct, turns, distinct_tenants):
+    """天井は store の状態ではなく、独立に数えたテナント数から出す。
+    store 由来で計算すると、併合が起きたときに天井も一緒に下がり
+    アラームが沈黙する（実測で確認済み）。"""
+    ceiling = 100 * (1 - distinct_tenants / turns)
+    return {
+        "ceiling": ceiling,
+        "merged": observed_hit_pct > ceiling + 1e-9,       # 境界が消えている
+        "fragmented": observed_hit_pct < ceiling - 5.0,    # スコープが分裂している
+    }
+```
+
+同じデータで、今度は両側が正しく鳴りました。
+
+<table>
+<tr><th>方式</th><th>観測参照率</th><th>独立に数えた天井</th><th>判定</th></tr>
+<tr><td>素の <code>json.dumps</code></td><td>52.1%</td><td>90.0%</td><td><code>fragmented</code> 発火</td></tr>
+<tr><td>正規化＋allowlist</td><td>90.0%</td><td>90.0%</td><td>沈黙（正常）</td></tr>
+<tr><td>読み出し側フォールバック</td><td>95.0%</td><td>90.0%</td><td><strong><code>merged</code> 発火</strong></td></tr>
+</table>
+
+しきい値が一方向ではない点が、この式の使いどころだと思っています。低すぎれば分裂、高すぎれば併合。**参照率は高ければ高いほど良い指標ではありません**。上に振り切れたときは、たいてい何かの境界を踏み潰しています。
+
+## 呼び出し側を静的に見張る — 不一致だけを指摘する lint
+
+実行時のアラームは、壊れたあとに鳴ります。書いた時点で止めたいので、AST でスコープの辞書リテラルを見る lint を書きました。ただ、最初の版は使い物になりませんでした。
+
+第1版は「正しい形」を規則として持たせました。`user_id` の値が素の変数なら `str()` が抜けている、といった判定です。4ファイル・7箇所のスコープ生成を含む小さなリポジトリに当てると、12件を報告しました。うち本当に問題なのは5件で、残り7件は `app_id` に素の変数が渡っていることへの指摘です。`app` は元から文字列ですから、これは指摘ではなく雑音でした。適合率 41.7%。この比率で鳴る lint は、いずれ誰も読まなくなります。
+
+考え直して、規則の立て方を変えました。**絶対的な正しさではなく、コーパス内の不一致を見る**。同じスコープキーが場所によって違う書かれ方をしているとき、少数派だけを指摘します。ぶれとは、そもそも「他と違うこと」だからです。
+
+```python
+#!/usr/bin/env python3
+"""scope drift lint — 同じ scope キーの書かれ方が場所によってぶれている箇所を指摘する。
+絶対的な正しさは判定しない。多数派と異なる書き方だけを不一致として報告する。"""
+import ast
+import sys
+import pathlib
+from collections import defaultdict
+
+ALLOWED = {"app_id", "user_id"}
+SINKS = {"ingest", "retrieve_profile", "generate_memories"}
+
+
+def shape(v):
+    """値の「書かれ方」を分類する。str() 済みか、素の変数か、定数か。"""
+    if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "str":
+        return "str()"
+    if isinstance(v, ast.Name):
+        return "bare-name"
+    if isinstance(v, ast.JoinedStr):
+        return "f-string"
+    if isinstance(v, ast.Constant):
+        return f"const:{type(v.value).__name__}"
+    return "other"
+
+
+class Collect(ast.NodeVisitor):
+    """scope= に渡される辞書リテラルを集める。変数経由の1段も追う。"""
+
+    def __init__(self):
+        self.sites = []
+        self.assigned = {}
+
+    def visit_Assign(self, n):
+        if (isinstance(n.value, ast.Dict) and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)):
+            self.assigned[n.targets[0].id] = n.value
+        self.generic_visit(n)
+
+    def visit_Call(self, n):
+        fname = n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", None)
+        if fname in SINKS:
+            for kw in n.keywords:
+                if kw.arg != "scope":
+                    continue
+                d = kw.value if isinstance(kw.value, ast.Dict) \
+                    else self.assigned.get(getattr(kw.value, "id", None))
+                if isinstance(d, ast.Dict):
+                    self.sites.append(d)
+        self.generic_visit(n)
+
+
+def scan(root):
+    sites = []
+    for p in sorted(pathlib.Path(root).rglob("*.py")):
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        c = Collect()
+        c.visit(tree)
+        sites += [(str(p), d) for d in c.sites]
+
+    # 第1パス: キーごとに「どの書かれ方が何回出たか」を数え、多数派を決める
+    shapes = defaultdict(lambda: defaultdict(int))
+    for _, d in sites:
+        for k, v in zip(d.keys, d.values):
+            if isinstance(k, ast.Constant) and k.value in ALLOWED:
+                shapes[k.value][shape(v)] += 1
+    majority = {k: max(s.items(), key=lambda x: x[1])[0] for k, s in shapes.items()}
+
+    # 第2パス: 多数派から外れた箇所と、許可外キー・必須キー欠落を報告する
+    out = []
+    for path, d in sites:
+        keys = []
+        for k, v in zip(d.keys, d.values):
+            if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
+                out.append((path, d.lineno, "dynamic-key", "キーが定数文字列でない"))
+                continue
+            keys.append(k.value)
+            if k.value not in ALLOWED:
+                out.append((path, d.lineno, "extra-key",
+                            f"許可外のキー {k.value!r} — プロファイルが分裂します"))
+                continue
+            sh = shape(v)
+            if sh != majority[k.value]:
+                out.append((path, d.lineno, "shape-drift",
+                            f"{k.value} が {sh}（コーパス多数派は {majority[k.value]}）"))
+            if sh.startswith("const:") and sh != "const:str":
+                out.append((path, d.lineno, "type-drift", f"{k.value} が文字列でない"))
+        for m in sorted(ALLOWED - set(keys)):
+            out.append((path, d.lineno, "missing-key", f"必須キー欠落 {m!r}"))
+    return out
+
+
+if __name__ == "__main__":
+    rows = scan(sys.argv[1] if len(sys.argv) > 1 else ".")
+    for f, l, kind, msg in rows:
+        print(f"{f}:{l}: [{kind}] {msg}")
+    print(f"-- {len(rows)} 件", file=sys.stderr)
+    sys.exit(1 if rows else 0)   # CI で落とす
+```
+
+同じリポジトリに当てた出力です。
+
+```text
+repo/a.py:4: [shape-drift] user_id が bare-name（コーパス多数派は str()）
+repo/b.py:2: [extra-key] 許可外のキー 'device_id' — プロファイルが分裂します
+repo/c.py:2: [shape-drift] user_id が f-string（コーパス多数派は str()）
+repo/c.py:3: [extra-key] 許可外のキー 'tier' — プロファイルが分裂します
+repo/c.py:4: [extra-key] 許可外のキー 'locale' — プロファイルが分裂します
+-- 5 件
+```
+
+<table>
+<tr><th>版</th><th>報告数</th><th>真の指摘</th><th>誤検出</th><th>適合率</th><th>再現率</th></tr>
+<tr><td>第1版（絶対的な正しさ）</td><td>12</td><td>5</td><td>7</td><td>41.7%</td><td>100%</td></tr>
+<tr><td>第2版（コーパス内の不一致）</td><td>5</td><td>5</td><td><strong>0</strong></td><td><strong>100%</strong></td><td>100%</td></tr>
+</table>
+
+規則を緩めたのに誤検出だけが消えたのは、判定の軸を変えたからです。「`str()` を付けろ」は環境依存の主張ですが、「他と揃えろ」はコーパスの中だけで検証できます。**ぶれの検出は、正しさの定義を必要としません**。
+
+なお、この lint は辞書リテラルと1段の変数代入しか追いません。関数を経由して組み立てられたスコープは対象外です。これは手抜きでもありますが、割り切りでもあります。次章に書くとおり、スコープの組み立ては最終的に1箇所へ寄せるべきで、そこまで到達したコードベースではこの lint 自体がほとんど鳴らなくなります。鳴らなくなるのが正しい終わり方です。
+
+## 境界はスキーマ側ではなく、書き込み口に置く
+
+ここまでの計測を踏まえて、私が最後に落ち着いた形を書いておきます。allowlist を各所に配るのではなく、スコープを作る関数を1つだけ用意して、他の経路を閉じるという方針です。
+
+```python
+from dataclasses import dataclass
+import json
+
+@dataclass(frozen=True)
+class Tenant:
+    """スコープになりうる値を型として持つ。文字列を直接受け取らない。"""
+    app_id: str
+    user_id: str
+
+    def __post_init__(self):
+        for name in ("app_id", "user_id"):
+            v = getattr(self, name)
+            if not isinstance(v, str) or v != v.strip() or not v:
+                raise ValueError(f"{name} は前後空白のない非空の文字列である必要があります: {v!r}")
+
+
+def scope_of(t: Tenant) -> dict:
+    """スコープを組み立てる唯一の入口。ここ以外で辞書を作らない。"""
+    return {"app_id": t.app_id, "user_id": t.user_id}
+
+
+def scope_key(t: Tenant) -> str:
+    """保存先の同一性を決めるキー。ログや監視でも同じ関数を使う。"""
+    return json.dumps(scope_of(t), sort_keys=True, separators=(",", ":"))
+```
+
+`Tenant` を作った時点で不正な形が弾かれるので、下流のどこにも防御を書かずに済みます。`str()` の付け忘れは `ValueError` になり、テストで落ちます。
+
+キーに含めるかどうかの判断は、次の問いで決めました。
+
+1. **その値が変わったとき、記憶を引き継ぎたいか。** 引き継ぎたいならスコープに入れない
+2. **その値が同じとき、記憶を共有してよいか。** 共有してはいけないならスコープに入れる
+3. 迷ったら入れない。あとから足すのは容易だが、外すと既存プロファイルが全部迷子になる
+
+この基準を当てると、`device_id` も `locale` も `tier` も、すべて外れます。端末を替えても記憶は引き継ぎたい。言語を切り替えても同じ人です。プランが変わったら、それはプロファイルの中身として更新されるべき情報であって、保存先を変える理由ではありません。逆に `app_id` は、同じ番号が別人を指しうるので必須です。
+
+私はこの3つ目を軽く見ていました。「あとで細かくすればいい」と考えてキーを足すのは、実際には**過去の記憶を捨てる操作**です。移行を伴わないスキーマ変更のようなもので、しかもエラーが出ないぶん、スキーマ変更より静かに壊れます。
+
+プロファイルの中身を何で更新するかという話は、スコープとはまた別の判断軸になります。値が古びる速さごとに更新ポリシーを分ける話は[Memory profiles の更新ポリシーを測って選ぶ](/articles/gemini-api/gemini-memory-profiles-update-policy-volatility-ttl-measured)で扱いました。保存先を決めるのがスコープ、中身の鮮度を決めるのが更新ポリシーです。複数アプリ・複数テナントを1つの基盤で扱うときの分離全般については[Gemini API マルチテナントSaaSアーキテクチャ](/articles/gemini-api/gemini-api-multi-tenant-saas-architecture-guide)も合わせてどうぞ。
+
+## 手元で最初に確かめる3つ
+
+長くなったので、明日すぐ確かめられる形にまとめます。私自身がこの順でやりました。
+
+1. **取り込み呼び出しの回数を、その日の固有テナント数で割る。** 1.0 に近ければ健全です。私の場合は 4.8 でした。この1行が最初の兆候で、参照率よりも先に異常を見せてくれます
+2. **スコープの辞書リテラルを全部grepして並べる。** `grep -rn 'scope=' --include='*.py'` で十分です。書かれ方が2種類以上あれば、その時点で分裂しています
+3. **参照率の天井を、認証側の数字から独立に出して比べる。** 天井を下回れば分裂、上回れば境界の消滅です。上回ったときこそ疑ってください
+
+そして、もし既にプロファイルが散らばっていたとしても、読み出し側で拾い直す誘惑には乗らないことをお勧めします。私の計測では、それは 4,000ターンで 1,843 件の越境読み取りという形で返ってきました。手間はかかりますが、正しいスコープで書き直して古いプロファイルを捨てるほうが、あとから説明のつく状態になります。
+
+個人開発だと、この手の静かな壊れ方は誰も報告してくれません。利用者から見れば「なんとなく覚えていない」だけで、問い合わせにすらならないからです。だからこそ、鳴らない場所に自分でアラームを置いておく必要があるのだと、今回あらためて思い知りました。数字を見るまで、私は自分の実装をかなり信用していました。
+
+なお本稿の計測は実 API ではなく、`(schema, scope)` に対して単一プロファイルという意味論をローカルに再現したハーネスによるものです。分裂と併合の起き方はキーの決まり方だけで説明できるため模型で十分だと判断しましたが、課金や遅延を含む判断をされる場合はご自身の構成で測り直してください。ハーネスは本文のコードをそのまま繋げれば動きます。
+
+同じ形の落とし穴に、どなたかが半日でも早く気づけたら嬉しいです。お読みいただきありがとうございました。
