@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SUNSET — 画像生成モデルの停止まで残り6日です。imagen-4.0 系と Gemini 3 Image 系が8月17日に止まります",
-    "MIGRATE — 移行先として gemini-3.1-flash-image が案内されています。generate_images から generate_content への書き換えが必要です",
-    "CHECK — 移行後に同じプロンプトで同じ絵が出る保証はありません。必要な生成物は停止前に確保しておく判断が要ります",
-    "CLASSROOM — 8月17日は Gemini in Classroom のモバイル提供が始まる日でもあります。web は8月10日に全年齢の学生へ広がりました",
-    "DEPRECATION — Grok 4.1 ファミリーの停止は8月20日、gemini-robotics-er-1.6-preview は8月31日で、後継は er-2 系です",
-    "CHANGELOG — Gemini API の changelog は7月30日が最新のままです。直近の大きな変更は Gemini 3.6 Flash と 3.5 Flash-Lite の GA です",
+    "SUNSET — imagen-4.0 系の停止まで残り5日です。8月17日に imagen-4.0-generate-001 ほか3モデルが止まります",
+    "SAMPLING — 7月21日から temperature・top_p・top_k が非推奨になっています。停止日は示されていませんが、実装を点検しておく段階です",
+    "API — Interactions API が GA になり、最新の機能とモデルを使う際はこちらを推奨すると案内されています",
+    "ROBOTICS — gemini-robotics-er-1.6-preview の停止は8月31日です。後継の ER 2 は7月30日から公開プレビューになっています",
+    "ENTERPRISE — サードパーティの ID プロバイダを使う組織向けに、Gemini Enterprise のモバイルアプリが GA になりました",
+    "RENAME — NotebookLM Enterprise は Gemini Notebook Enterprise へ改称されています。資料を探すときの語も変わります",
   ],
   en: [
-    "SUNSET — Six days until the image generation models shut down: the imagen-4.0 family and Gemini 3 Image models stop on August 17",
-    "MIGRATE — gemini-3.1-flash-image is the recommended replacement, and it means rewriting generate_images calls as generate_content",
-    "CHECK — The same prompt will not necessarily produce the same picture after migrating, so secure any images you still need before the cutoff",
-    "CLASSROOM — August 17 is also the day Gemini in Classroom arrives on mobile; the web rollout to students of all ages began on August 10",
-    "DEPRECATION — The Grok 4.1 family shuts down on August 20, and gemini-robotics-er-1.6-preview on August 31, succeeded by the er-2 models",
-    "CHANGELOG — The Gemini API changelog still ends at July 30. The most recent major change remains the GA of Gemini 3.6 Flash and 3.5 Flash-Lite",
+    "SUNSET — Five days until the imagen-4.0 family shuts down: imagen-4.0-generate-001 and two sibling models stop on August 17",
+    "SAMPLING — Since July 21 the temperature, top_p, and top_k parameters are deprecated; no shutdown date yet, but worth auditing your calls",
+    "API — The Interactions API is now generally available and is the recommended path to the latest models and features",
+    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31; its successor, ER 2, has been in public preview since July 30",
+    "ENTERPRISE — The Gemini Enterprise mobile app reached GA for organizations authenticating through third-party identity providers",
+    "RENAME — NotebookLM Enterprise is now Gemini Notebook Enterprise, so the term to search the docs for has changed too",
   ],
 };
 
