@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SUNSET — imagen-4.0 系の停止まで残り5日です。8月17日に imagen-4.0-generate-001 ほか3モデルが止まります",
-    "SAMPLING — 7月21日から temperature・top_p・top_k が非推奨になっています。停止日は示されていませんが、実装を点検しておく段階です",
-    "API — Interactions API が GA になり、最新の機能とモデルを使う際はこちらを推奨すると案内されています",
-    "ROBOTICS — gemini-robotics-er-1.6-preview の停止は8月31日です。後継の ER 2 は7月30日から公開プレビューになっています",
-    "ENTERPRISE — サードパーティの ID プロバイダを使う組織向けに、Gemini Enterprise のモバイルアプリが GA になりました",
-    "RENAME — NotebookLM Enterprise は Gemini Notebook Enterprise へ改称されています。資料を探すときの語も変わります",
+    "SUNSET — 画像生成モデルの停止まで残り4日です。8月17日に Imagen 4 系と Gemini 3 Image 系が止まりますので、切り替え先の確認をおすすめします",
+    "FLASH — Gemini 3.6 Flash が GA になりました。トークン効率とコード・エージェント計画が改善し、3.5 Flash より低い価格帯に置かれています",
+    "LITE — Gemini 3.5 Flash-Lite も GA です。低遅延で費用を抑えたサブエージェント向けとして、大量処理の自動化に向いています",
+    "OMNI — 新しい動画モデル Gemini Omni Flash が、Gemini アプリ・Flow・AI Studio・Gemini API から使えるようになりました",
+    "LOGS — Interactions API の開発者ログに対応しました。対象の呼び出しは AI Studio のダッシュボードから確認できます",
+    "ROBOTICS — gemini-robotics-er-1.6-preview の停止は8月31日です。移行の予定を立てておく時期になりました",
   ],
   en: [
-    "SUNSET — Five days until the imagen-4.0 family shuts down: imagen-4.0-generate-001 and two sibling models stop on August 17",
-    "SAMPLING — Since July 21 the temperature, top_p, and top_k parameters are deprecated; no shutdown date yet, but worth auditing your calls",
-    "API — The Interactions API is now generally available and is the recommended path to the latest models and features",
-    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31; its successor, ER 2, has been in public preview since July 30",
-    "ENTERPRISE — The Gemini Enterprise mobile app reached GA for organizations authenticating through third-party identity providers",
-    "RENAME — NotebookLM Enterprise is now Gemini Notebook Enterprise, so the term to search the docs for has changed too",
+    "SUNSET — Four days until the image models shut down: Imagen 4 and the Gemini 3 Image family stop on August 17, so line up your replacements now",
+    "FLASH — Gemini 3.6 Flash is generally available, with better token efficiency and stronger code and agentic planning at a lower price than 3.5 Flash",
+    "LITE — Gemini 3.5 Flash-Lite also reached GA as a low-latency, cost-conscious subagent option aimed at high-volume automation",
+    "OMNI — Gemini Omni Flash, a new video model, is now reachable from the Gemini app, Flow, AI Studio, and the Gemini API",
+    "LOGS — Developer logs now cover the Interactions API, with supported calls visible in the AI Studio dashboard",
+    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31, so this is the window to plan the migration",
   ],
 };
 
