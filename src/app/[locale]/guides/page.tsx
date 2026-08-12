@@ -10,8 +10,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale } = await params;
   const title = locale === "ja" ? "学習ガイド" : "Learning Guides";
   const description = locale === "ja"
-    ? "目的別に体系化された Gemini の学習ガイド。初心者から上級者まで段階的にスキルアップできます。"
-    : "Structured learning guides for Gemini. Progress from beginner to advanced with step-by-step tracks.";
+    ? "目的別に体系化された Gemini の学習ガイドです。初めての方の入門から API 開発、業務活用まで、読む順番を示したトラックで段階的にスキルアップできます。ご自身の現在地に合わせて、無理なく次の一歩を選べる構成にしています。"
+    : "Structured learning guides for Gemini — curated tracks that take you from your first prompt to API development and workplace automation, step by step.";
   return {
     title,
     description,

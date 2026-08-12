@@ -15,8 +15,8 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
 
   const title = locale === "ja" ? "すべての記事" : "All Articles";
   const description = locale === "ja"
-    ? "Gemini Lab の全記事一覧。Gemini.ai、Gemini Code、Cowork、API / SDK のカテゴリ別に閲覧できます。"
-    : "Browse all Gemini Lab articles by category: Gemini.ai, Gemini Code, Cowork, and API / SDK.";
+    ? "Gemini Lab の全記事一覧です。基本の使い方から開発ツール連携、Gemini API、上級活用、Google Workspace 統合、最新情報まで、カテゴリ別に記事を絞り込みながら、目的のトピックをすばやく探せます。"
+    : "Browse every Gemini Lab article by category — Gemini basics, developer tools, the Gemini API, advanced usage, Google Workspace integration, and updates.";
 
   const canonicalUrl = locale === "ja" ? "https://gemilab.net/articles" : `https://gemilab.net/en/articles`;
 

@@ -30,8 +30,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const title = locale === "ja" ? `「${decoded}」の記事一覧` : `Articles tagged "${decoded}"`;
   const description =
     locale === "ja"
-      ? `Gemini Lab の「${decoded}」タグが付いた記事を一覧で閲覧できます。`
-      : `Browse all Gemini Lab articles tagged with "${decoded}".`;
+      ? `Gemini Lab で「${decoded}」タグが付いた記事をまとめた一覧ページです。関連するチュートリアルや実装例、トラブル対処の記事を横断して読むことで、このテーマへの理解を深めていただけます。`
+      : `Browse all Gemini Lab articles tagged "${decoded}" — related tutorials, implementation examples, and troubleshooting guides gathered in one place.`;
 
   return {
     title,

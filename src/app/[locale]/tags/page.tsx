@@ -10,8 +10,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const title = locale === "ja" ? "タグ一覧" : "All Tags";
   const description =
     locale === "ja"
-      ? "Gemini Lab の全記事をタグで分類。気になるトピックから記事を探せます。"
-      : "Browse all Gemini Lab articles by tag. Find articles on the topics that interest you.";
+      ? "Gemini Lab の全記事をタグで分類した一覧ページです。Function Calling やコスト最適化、トラブルシューティングなど、気になるトピックのタグをたどって、関連する記事をまとめて読み進めていただけます。"
+      : "All Gemini Lab articles organized by tag — jump to topics like Function Calling, cost optimization, or troubleshooting and explore related articles.";
 
   const base = "https://gemilab.net";
   return {

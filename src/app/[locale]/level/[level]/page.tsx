@@ -56,8 +56,8 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
   const title = locale === "ja" ? `${label}の記事一覧` : `${label} Articles`;
   const description =
     locale === "ja"
-      ? `Gemini Lab の${label}向け記事を一覧で閲覧できます。`
-      : `Browse all ${label.toLowerCase()}-level articles on Gemini Lab.`;
+      ? `Gemini Lab の${label}向け記事の一覧ページです。使い方の基礎から API 実装、運用ノウハウまで、${label}の方に合わせた難易度の記事だけを絞り込んで表示しています。関心のあるテーマから次の一本をお選びください。`
+      : `Browse every ${label.toLowerCase()}-level article on Gemini Lab — tutorials, API guides, and hands-on tips filtered by difficulty to match your experience.`;
 
   const base = "https://gemilab.net";
   const canonical = locale === "ja" ? `${base}/level/${level}` : `${base}/en/level/${level}`;

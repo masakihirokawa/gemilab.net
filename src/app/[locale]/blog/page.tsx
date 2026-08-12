@@ -9,8 +9,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale } = await params;
   const title = locale === "ja" ? "ブログ" : "Blog";
   const description = locale === "ja"
-    ? "Gemini Lab の開発ブログ。サイト運営の裏側や技術的なトピックを発信します。"
-    : "Gemini Lab development blog. Behind-the-scenes insights and technical topics.";
+    ? "Gemini Lab の開発ブログです。サイト運営の裏側や記事づくりの工夫、Cloudflare Workers での配信構成といった技術的なトピックを、実際の運用経験に基づいて発信しています。更新の背景を知りたい方はこちらからどうぞ。"
+    : "The Gemini Lab development blog: behind-the-scenes notes on running the site, publishing workflows, and the technical stack that powers it all.";
   return {
     title,
     description,

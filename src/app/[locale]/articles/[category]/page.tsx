@@ -52,28 +52,28 @@ const CATEGORY_NAMES: Record<string, Record<string, string>> = {
 
 const CATEGORY_DESC: Record<string, Record<string, string>> = {
   "gemini-basics": {
-    ja: "Geminiの基本操作と使い方",
-    en: "Getting started with Gemini",
+    ja: "Gemini をこれから使い始める方に向けた基礎カテゴリです。アカウント設定や画面の見方、プロンプトの基本、スマホアプリの活用、有料プランの選び方まで、日常の場面で Gemini を使いこなすための入門記事を幅広く集めています。",
+    en: "A starting point for anyone new to Google Gemini — account setup, basic prompting, the mobile app, plan choices, and everyday use cases.",
   },
   "gemini-dev": {
-    ja: "開発ツール連携・拡張機能",
-    en: "Development tools and extensions",
+    ja: "Gemini CLI や Gemini Code Assist、Google AI Studio といった開発ツールとの連携を扱うカテゴリです。エディタ統合やテスト自動化、開発環境の構築など、Gemini を開発フローに組み込む実践記事をまとめています。",
+    en: "Hands-on articles for building with Gemini developer tools — Gemini CLI, Code Assist, Google AI Studio, editor integrations, and test automation.",
   },
   "gemini-api": {
-    ja: "Gemini APIとSDKの使い方",
-    en: "Gemini API and SDK usage",
+    ja: "Gemini API と SDK の使い方を扱うカテゴリです。クイックスタートから Function Calling、構造化出力、ストリーミング、コスト最適化、本番運用のトラブルシューティングまで、実装コードつきの記事を集めています。",
+    en: "Practical guides to the Gemini API and SDKs — quickstarts, Function Calling, structured output, streaming, cost optimization, and troubleshooting.",
   },
   "gemini-advanced": {
-    ja: "エージェント・高度な活用法",
-    en: "Agents and advanced usage",
+    ja: "エージェント設計やマルチモーダル処理、RAG 構築など、Gemini の高度な活用法を扱うカテゴリです。本番運用のアーキテクチャ設計やコスト最適化まで、一歩踏み込んだ知見を求める開発者の方に向けた上級記事をまとめています。",
+    en: "Advanced Gemini techniques — agent design, multimodal processing, RAG pipelines, production architecture, and cost-aware engineering.",
   },
   "gemini-workspace": {
-    ja: "Google Workspace との統合・自動化",
-    en: "Google Workspace integration and automation",
+    ja: "Gmail や Google ドキュメント、スプレッドシートなど Google Workspace と Gemini の統合を扱うカテゴリです。Apps Script による自動化や業務効率化の実例など、毎日の仕事に効く記事を集めています。",
+    en: "Using Gemini across Google Workspace — Gmail, Docs, Sheets, and Chat — with Apps Script automation recipes and real workflow examples.",
   },
   "gemini-updates": {
-    ja: "Gemini の新機能・アップデート情報",
-    en: "Latest Gemini features and news",
+    ja: "Gemini の新機能リリースやモデルのアップデート、料金変更、提供終了のお知らせなどを継続的に追いかけるカテゴリです。開発や日々の運用にどのような影響があるかという実務の視点を添えて、最新の動きを整理してお届けしています。",
+    en: "News and analysis on Gemini releases — new models, feature launches, pricing changes, and deprecations — always with a practical developer angle.",
   },
 };
 
