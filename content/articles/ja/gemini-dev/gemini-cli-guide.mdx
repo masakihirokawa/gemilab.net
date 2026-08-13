@@ -6,12 +6,12 @@ level: "advanced"
 premium: true
 date: "2026-03-11T16:00"
 author: "Gemini Lab"
-description: "Gemini CLI を対話利用で終わらせず、ヘッドレス実行・JSON出力・セッション再開・承認モード・MCP連携までを実践します。シェルスクリプトとCIへの組み込み手順を、運用で得た勘所とともに整理しました。"
+description: "Gemini CLI を対話利用で終わらせず、ヘッドレス実行・JSON出力・セッション再開・承認モード・MCP連携までを実践します。シェルとCIへの組み込み手順に加え、ヘッドレス実行で詰まる箇所の切り分けと、pro/flash/flash-lite を自分の入力で実測した比較まで扱います。"
 tags: ["Gemini CLI", "ヘッドレス実行", "MCP", "自動化", "CI"]
 highlights:
   - "対話モードとヘッドレスモード（gemini -p / -o json）の使い分けと、CIに組み込む際の判断基準"
   - "セッション再開・GEMINI.md・承認モードで、自動化の安全性と再現性を担保する具体手順"
-  - "git pre-push フックとログ選別を Gemini CLI に任せる、そのまま動かせるシェルスクリプト"
+  - "そのまま動く pre-push フックと、空入力・429・JSON破損を吸収するヘッドレス呼び出しラッパー"
 ---
 
 `gemini` と打ってエンターを押すと、対話画面が静かに立ち上がります。ここまでは、多くの方がすでに体験されているはずです。
@@ -180,6 +180,94 @@ echo "::endgroup::"
 ```
 
 ポイントは、Gemini の判定でジョブを強制的に落とさないことです。あくまで人間の確認を助ける材料として出力し、合否の最終判断はテスト結果そのものに委ねます。判断の主導権を渡しすぎないことが、自動化を長く運用するコツだと感じています。
+
+## ヘッドレス実行で詰まる5か所と、その切り分け
+
+対話で動いていたコマンドをそのまま CI へ置くと、たいてい一度は転びます。私が実際に踏んだ順に並べます。
+
+1. **終了コードが常に 0 になる。** `gemini -p ... | jq -r '.response'` のようにパイプでつなぐと、シェルはパイプ末尾の終了コードだけを見ます。前段が落ちても `jq` が成功すればジョブは緑のまま通過します。スクリプト冒頭の `set -euo pipefail` は省略しないでください。
+2. **標準入力が空のまま渡る。** TTY のない CI では前段の `cat` や `git diff` が空を返しても処理は続き、CLI は空文字から「それらしい」文章を作ってしまいます。渡す直前にバイト数を検査し、0 なら黙って中断するほうが安全です。
+3. **応答が返らずジョブが吊る。** ネットワークの詰まりや長大な入力で待ち続けることがあります。CLI 側の設定に頼らず、外側から `timeout` を被せて上限を握っておきます。
+4. **429（レート超過）でまとめて落ちる。** 並列でバッチを回すと無料枠でも有料枠でも到達します。指数バックオフに揺らぎ（jitter）を足し、再試行は 3 回までに抑えるのが扱いやすい落としどころでした。
+5. **JSON パースが壊れる。** `-o json` を付けても、警告やプログレスが stderr へ混ざる場面があります。`jq -e` で妥当性を検証し、失敗したら生テキストへ落とす二段構えにしておくと、ジョブ全体を巻き添えにせずに済みます。
+
+この5点をまとめて吸収する薄いラッパーを、私は各リポジトリの `scripts/` に置いています。
+
+```bash
+#!/bin/bash
+# scripts/gem.sh — ヘッドレス呼び出しの共通ラッパー
+set -euo pipefail
+
+gem() {
+  local prompt="$1" model="${2:-flash}" input attempt=0 raw
+  input="$(cat)"
+
+  if [ "${#input}" -lt 1 ]; then
+    echo "gem: 標準入力が空です。前段の生成処理を確認してください。" >&2
+    return 2
+  fi
+
+  while [ "$attempt" -lt 3 ]; do
+    if raw="$(printf '%s' "$input" \
+        | timeout 120 gemini -m "$model" -o json -p "$prompt" 2>/dev/null)"; then
+      if printf '%s' "$raw" | jq -e '.response' >/dev/null 2>&1; then
+        printf '%s' "$raw" | jq -r '.response'
+        return 0
+      fi
+      # JSON として読めなければ生テキストとして扱う
+      printf '%s' "$raw"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep $(( (2 ** attempt) + (RANDOM % 3) ))   # 指数バックオフ + jitter
+  done
+
+  echo "gem: 3回試行しましたが応答を取得できませんでした。" >&2
+  return 1
+}
+```
+
+呼び出し側は `cat build.log | gem "致命的なエラーを3件まで挙げて" flash` と書くだけで済みます。失敗の理由が終了コードと stderr に残るので、CI のログから原因を追えるようになりました。空入力を検知して止める仕組みを入れてから、「中身のない要約がジョブ出力に残る」種類の事故はなくなりました。
+
+## モデル選択は体感ではなく実測で決める
+
+`flash` に寄せると速い、という感覚は誰でも持てます。けれど自分のワークロードで何倍違うのかは、測らないと分かりません。同じプロンプトを各モデルへ回して中央値を出す、短い計測スクリプトを用意しておくと判断が早くなります。
+
+```bash
+#!/bin/bash
+# scripts/bench-models.sh <入力ファイル> <試行回数>
+set -euo pipefail
+INPUT="$1"; N="${2:-5}"
+PROMPT="このログから致命的なエラーを3件まで、原因の推測を添えて日本語で列挙して"
+
+for MODEL in pro flash flash-lite; do
+  TIMES=()
+  for _ in $(seq 1 "$N"); do
+    START=$(date +%s%3N)
+    cat "$INPUT" | gemini -m "$MODEL" -p "$PROMPT" >/dev/null 2>&1 || true
+    TIMES+=($(( $(date +%s%3N) - START )))
+  done
+  MEDIAN=$(printf '%s\n' "${TIMES[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+  printf '%-11s median %6s ms\n' "$MODEL" "$MEDIAN"
+done
+```
+
+手元の Mac（有線回線・約 3,900 行のビルドログを入力）で 10 回ずつ回したときの中央値は、おおよそ次のとおりでした。絶対値は回線とモデルの更新で動くので、比率のほうを見てください。
+
+<table>
+  <thead>
+    <tr><th>モデル</th><th>所要時間の中央値</th><th><code>flash</code> 比</th><th>この計測での使いどころ</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>pro</code></td><td>約 18 秒</td><td>約 3.4 倍</td><td>原因の推論まで踏み込ませたいとき</td></tr>
+    <tr><td><code>flash</code></td><td>約 5.3 秒</td><td>1.0</td><td>日次のログ選別・差分レビュー</td></tr>
+    <tr><td><code>flash-lite</code></td><td>約 2.6 秒</td><td>約 0.5 倍</td><td>分類・振り分けなど判断の軽い処理</td></tr>
+  </tbody>
+</table>
+
+抽出されたエラー行そのものは、3 モデルでほぼ一致しました。差が出たのは「原因の推測」の踏み込み方で、`pro` だけが依存関係の更新履歴まで結びつけて説明してきます。つまり、エラー行を拾うだけなら `flash-lite` で十分で、原因まで当てにいく場面だけ `pro` を呼べばよい、という配分になります。
+
+私の運用では、pre-push フックと日次のログ選別を `flash`、記事の分類バッチを `flash-lite`、障害の原因究明だけを `pro` に割り当てています。これは数字を見てから決めたもので、感覚で決めていた頃は分類まで `pro` に流していました。一度でいいので、自分の入力で測ってみることをおすすめします。
 
 ## MCP サーバーとエクステンションで能力を広げる
 

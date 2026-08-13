@@ -6,12 +6,12 @@ level: "advanced"
 premium: true
 date: "2026-03-11T16:00"
 author: "Gemini Lab"
-description: "Move past interactive use of Gemini CLI: headless runs, JSON output, session resume, approval modes, and MCP integration. A practical guide to embedding it in shell scripts and CI, with lessons from real use."
+description: "Move past interactive use of Gemini CLI: headless runs, JSON output, session resume, approval modes, and MCP. Includes the five ways headless runs break and a measured pro/flash comparison."
 tags: ["Gemini CLI", "headless", "MCP", "automation", "CI"]
 highlights:
   - "When to use interactive vs headless mode (gemini -p / -o json), and how to decide before wiring it into CI"
   - "Concrete steps to keep automation safe and reproducible with session resume, GEMINI.md, and approval modes"
-  - "Ready-to-run shell scripts that hand a git pre-push hook and log triage to Gemini CLI"
+  - "A ready-to-run pre-push hook plus a headless wrapper that absorbs empty stdin, 429s, and broken JSON"
 ---
 
 Type `gemini`, press enter, and an interactive screen quietly comes to life. Most of you have probably been here already.
@@ -180,6 +180,94 @@ echo "::endgroup::"
 ```
 
 The point is not to let Gemini's judgment fail the job. It outputs material to help a human decide, while the final pass/fail stays with the test results themselves. Not handing over too much authority is, in my experience, what keeps automation running over the long haul.
+
+## Five places headless runs break, and how to isolate them
+
+A command that worked interactively will usually fall over at least once when you drop it into CI. Here they are, in the order I hit them.
+
+1. **The exit code is always 0.** When you pipe — `gemini -p ... | jq -r '.response'` — the shell only looks at the last command in the pipeline. The first stage can fail and the job still goes green as long as `jq` succeeds. Don't skip `set -euo pipefail` at the top of the script.
+2. **Empty stdin sails right through.** On a CI box with no TTY, an upstream `cat` or `git diff` can return nothing and the run continues; the CLI happily invents plausible prose out of an empty string. Check the byte count right before you hand input over, and abort at zero.
+3. **The job hangs waiting for a response.** A congested network or an oversized input can leave you waiting indefinitely. Rather than trusting a CLI-side setting, wrap the call in `timeout` and hold the ceiling yourself.
+4. **A 429 takes down the whole batch.** Run things in parallel and you'll reach the rate limit on the free and paid tiers alike. Exponential backoff with jitter, capped at three attempts, turned out to be the easiest balance to live with.
+5. **JSON parsing breaks.** Even with `-o json`, warnings and progress output can leak onto stderr. Validate with `jq -e` and fall back to raw text when validation fails, so a malformed response doesn't take the entire job down with it.
+
+I keep a thin wrapper that absorbs all five in each repository's `scripts/` directory.
+
+```bash
+#!/bin/bash
+# scripts/gem.sh — shared wrapper for headless calls
+set -euo pipefail
+
+gem() {
+  local prompt="$1" model="${2:-flash}" input attempt=0 raw
+  input="$(cat)"
+
+  if [ "${#input}" -lt 1 ]; then
+    echo "gem: stdin was empty — check the upstream step." >&2
+    return 2
+  fi
+
+  while [ "$attempt" -lt 3 ]; do
+    if raw="$(printf '%s' "$input" \
+        | timeout 120 gemini -m "$model" -o json -p "$prompt" 2>/dev/null)"; then
+      if printf '%s' "$raw" | jq -e '.response' >/dev/null 2>&1; then
+        printf '%s' "$raw" | jq -r '.response'
+        return 0
+      fi
+      # Not valid JSON — treat it as raw text
+      printf '%s' "$raw"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep $(( (2 ** attempt) + (RANDOM % 3) ))   # exponential backoff + jitter
+  done
+
+  echo "gem: no response after three attempts." >&2
+  return 1
+}
+```
+
+Callers just write `cat build.log | gem "list up to three fatal errors" flash`. Because failures leave a trace in both the exit code and stderr, you can actually trace causes from the CI log afterward. Since adding the empty-input guard, the particular embarrassment of a content-free summary sitting in job output has stopped happening.
+
+## Decide model choice by measurement, not by feel
+
+Anyone can develop the sense that `flash` feels faster. What you can't know without measuring is how much faster it is on *your* workload. A short script that runs the same prompt across models and reports the median makes that call quick.
+
+```bash
+#!/bin/bash
+# scripts/bench-models.sh <input file> <iterations>
+set -euo pipefail
+INPUT="$1"; N="${2:-5}"
+PROMPT="List up to three fatal errors from this log with a guess at the cause"
+
+for MODEL in pro flash flash-lite; do
+  TIMES=()
+  for _ in $(seq 1 "$N"); do
+    START=$(date +%s%3N)
+    cat "$INPUT" | gemini -m "$MODEL" -p "$PROMPT" >/dev/null 2>&1 || true
+    TIMES+=($(( $(date +%s%3N) - START )))
+  done
+  MEDIAN=$(printf '%s\n' "${TIMES[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+  printf '%-11s median %6s ms\n' "$MODEL" "$MEDIAN"
+done
+```
+
+On my own Mac, over a wired connection, feeding a build log of roughly 3,900 lines and running ten iterations each, the medians came out approximately as follows. Absolute numbers move with your connection and with model updates, so read the ratios rather than the values.
+
+<table>
+  <thead>
+    <tr><th>Model</th><th>Median wall time</th><th>vs <code>flash</code></th><th>Where it fit in this run</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>pro</code></td><td>~18 s</td><td>~3.4x</td><td>When you want it to reason about causes</td></tr>
+    <tr><td><code>flash</code></td><td>~5.3 s</td><td>1.0</td><td>Daily log triage, diff review</td></tr>
+    <tr><td><code>flash-lite</code></td><td>~2.6 s</td><td>~0.5x</td><td>Classification and routing — light judgment</td></tr>
+  </tbody>
+</table>
+
+The error lines themselves came back nearly identical across all three models. What differed was how far each went on the guessed cause: only `pro` connected the failure back to recent dependency updates. Which means that if you only need the lines pulled out, `flash-lite` is enough, and `pro` is worth calling only when you're actually betting on the diagnosis.
+
+In my own setup, the pre-push hook and daily log triage run on `flash`, article classification batches on `flash-lite`, and only incident root-cause work goes to `pro`. That split came from looking at numbers; back when I went by feel, classification was flowing through `pro` too. Measure once against your own input — it's worth the ten minutes.
 
 ## Extend its reach with MCP servers and extensions
 
