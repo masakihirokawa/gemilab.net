@@ -4,19 +4,19 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SUNSET — 画像生成モデルの停止まで残り4日です。8月17日に Imagen 4 系と Gemini 3 Image 系が止まりますので、切り替え先の確認をおすすめします",
+    "SUNSET — 画像生成モデルの停止まで残り3日です。8月17日に Imagen 4 系と Gemini 3 Image 系が止まります",
+    "MIGRATE — 移行先は gemini-3.1-flash-image が推奨されています。停止後に generate_images() を呼ぶとエラーで止まるため、猶予はありません",
     "FLASH — Gemini 3.6 Flash が GA になりました。トークン効率とコード・エージェント計画が改善し、3.5 Flash より低い価格帯に置かれています",
     "LITE — Gemini 3.5 Flash-Lite も GA です。低遅延で費用を抑えたサブエージェント向けとして、大量処理の自動化に向いています",
-    "OMNI — 新しい動画モデル Gemini Omni Flash が、Gemini アプリ・Flow・AI Studio・Gemini API から使えるようになりました",
-    "LOGS — Interactions API の開発者ログに対応しました。対象の呼び出しは AI Studio のダッシュボードから確認できます",
+    "PARAMS — サンプリングパラメータ temperature・top_p・top_k が非推奨になりました。既存の呼び出しは見直しておきたいところです",
     "ROBOTICS — gemini-robotics-er-1.6-preview の停止は8月31日です。移行の予定を立てておく時期になりました",
   ],
   en: [
-    "SUNSET — Four days until the image models shut down: Imagen 4 and the Gemini 3 Image family stop on August 17, so line up your replacements now",
+    "SUNSET — Three days until the image models shut down: Imagen 4 and the Gemini 3 Image family stop on August 17",
+    "MIGRATE — gemini-3.1-flash-image is the recommended target; calls to generate_images() fail hard after the cutoff, so there is no grace period",
     "FLASH — Gemini 3.6 Flash is generally available, with better token efficiency and stronger code and agentic planning at a lower price than 3.5 Flash",
     "LITE — Gemini 3.5 Flash-Lite also reached GA as a low-latency, cost-conscious subagent option aimed at high-volume automation",
-    "OMNI — Gemini Omni Flash, a new video model, is now reachable from the Gemini app, Flow, AI Studio, and the Gemini API",
-    "LOGS — Developer logs now cover the Interactions API, with supported calls visible in the AI Studio dashboard",
+    "PARAMS — The sampling parameters temperature, top_p, and top_k are now deprecated, so existing calls are worth revisiting",
     "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31, so this is the window to plan the migration",
   ],
 };
