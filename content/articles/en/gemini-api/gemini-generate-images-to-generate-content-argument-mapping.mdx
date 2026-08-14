@@ -1,0 +1,202 @@
+---
+title: "Rewriting generate_images as generate_content, where the arguments actually go"
+slug: "gemini-generate-images-to-generate-content-argument-mapping"
+category: "gemini-api"
+level: "intermediate"
+premium: false
+date: "2026-08-14T15:45"
+author: "Gemini Lab"
+description: "Ahead of the August 17 Imagen shutdown, I checked the SDK directly: of the 17 arguments in GenerateImagesConfig, only 5 move across unchanged. Here is the mapping, a compatibility layer that keeps callers working, and a way to verify the request shape without an API key."
+tags: ["Gemini API", "Image Generation", "Model Migration", "Python", "google-genai"]
+---
+
+The script that generates base artwork for my wallpaper apps stops working in three days.
+
+Imagen 4 models, including `imagen-4.0-generate-001`, shut down on August 17, 2026, and image generation moves to `gemini-3.1-flash-image`. Most migration notes summarize this as a single sentence: swap `client.models.generate_images` for `client.models.generate_content`. That sentence is accurate. It is also not where the work is.
+
+The work is in the `config` you were passing.
+
+I covered how to find every call site in [preparing for the August 17 Gemini image model shutdown](/articles/gemini-updates/gemini-image-model-817-shutdown-usage-audit-inventory). This article picks up where that one left off: actually rewriting the calls.
+
+## Seventeen arguments, five of which move across unchanged
+
+Rather than guess, I read the installed SDK. The following comes from `google-genai` 2.18.1, comparing the field names on `GenerateImagesConfig` against those on `ImageConfig` and `GenerateContentConfig`.
+
+```python
+from google.genai import types
+
+gi = set(types.GenerateImagesConfig.model_fields) - {"http_options"}
+ic = set(types.ImageConfig.model_fields)
+gc = set(types.GenerateContentConfig.model_fields)
+
+print(len(gi), sorted(gi & ic))      # survive as-is
+print(sorted((gi - ic) & gc))        # move up to the outer config
+print(sorted(gi - ic - gc))          # no destination under the same name
+```
+
+Of the 17 arguments in scope, exactly 5 land on `ImageConfig` under the same name.
+
+<table>
+  <thead>
+    <tr><th>Old <code>GenerateImagesConfig</code> argument</th><th>Destination</th><th>Notes</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>aspect_ratio / image_size / output_mime_type / output_compression_quality / person_generation</td><td><code>ImageConfig</code>, unchanged</td><td>Same name, same meaning</td></tr>
+    <tr><td>seed / labels</td><td>Top level of <code>GenerateContentConfig</code></td><td>No longer image-specific, so they moved one level up</td></tr>
+    <tr><td>number_of_images</td><td>Loop count, or <code>candidate_count</code></td><td>The argument whose behavior changes the most</td></tr>
+    <tr><td>safety_filter_level</td><td><code>safety_settings</code></td><td>A single string becomes a list of <code>SafetySetting</code> objects, so this is a manual rewrite</td></tr>
+    <tr><td>negative_prompt</td><td>The prompt itself</td><td>No longer a separate argument, so it becomes prose</td></tr>
+    <tr><td>add_watermark / enhance_prompt / guidance_scale / language / include_rai_reason / include_safety_attributes / output_gcs_uri</td><td>None</td><td>You have to decide what to do without them</td></tr>
+  </tbody>
+</table>
+
+Finding `person_generation` still present on `ImageConfig` was a pleasant surprise. Anywhere I had been explicit about how people are handled, the code carries over untouched. On the other side, arguments like `guidance_scale` and `negative_prompt` are how many pipelines were steering the look of an image, and both are gone. If your output quality depended on tuning those, this is not an argument swap. It is a prompt rewrite.
+
+Worth noting too: `ImageConfig` has two fields Imagen never had, `prominent_people` and `image_output_options`. Glancing at them while you are already in this code saves a surprise later.
+
+## When the counting changes, so does the meaning of failure
+
+The quietest large change is `number_of_images`.
+
+With Imagen, one call returned several images. `number_of_images=4` meant four images on success and zero on failure. The check was binary.
+
+Doing the same thing through `generate_content` usually becomes four calls returning one image each. `candidate_count` does exist on `GenerateContentConfig`, but whether image models actually return multiple candidates is something you should confirm with your own key rather than take on faith, so I went with the loop.
+
+Three things change the moment you do.
+
+First, failure becomes partial. Three successes and one 503 is now an ordinary outcome. Any caller written to assume "four images arrive" breaks quietly here.
+
+Second, rate limits arrive sooner. One request became four, so per-minute request ceilings show up earlier than they used to. Batch jobs feel this first.
+
+Third, `seed` means something different. Passing a seed to a single four-image call is not the same as fixing a seed and calling four times. The second version can hand you the same image four times over. If you want variation across the set, the seed has to shift per call, or come out entirely.
+
+There is a bookkeeping consequence as well. Any cost estimate or quota alert built around "one request per batch item" now undercounts by whatever `number_of_images` used to be. That was the line I had to fix in my own notes before the numbers stopped disagreeing with the dashboard: the unit of billing moved from the batch item to the image, even though the total number of images did not change. If you track spend per pipeline run, update that arithmetic at the same time you update the call, or the first invoice after the migration will look like a regression that is not one.
+
+I was slow to notice that third point. Realizing it halfway through building the mapping table is what changed my mind about the nature of this migration: it is not a rename, it is a change to how generation is designed.
+
+## A thin compatibility layer keeps callers working
+
+If you have one call site, rewrite it directly. But once you count throwaway verification scripts and the batch job that only runs at month end, rewriting and re-verifying every one of them inside three days gets tight.
+
+So I put a single function in between. It accepts the old arguments and assembles the new request, which lets callers stay as they are while only the inside points at the new API.
+
+```python
+from google.genai import types
+
+IMAGE_CONFIG_KEYS = {"aspect_ratio", "image_size", "output_compression_quality",
+                     "output_mime_type", "person_generation"}
+TOP_LEVEL_KEYS = {"seed"}
+NO_DESTINATION = {"add_watermark", "enhance_prompt", "guidance_scale",
+                  "include_rai_reason", "include_safety_attributes",
+                  "language", "output_gcs_uri", "labels"}
+
+
+class UnportedArgument(RuntimeError):
+    pass
+
+
+def build_request(*, model, prompt, config):
+    """Turn an old GenerateImagesConfig-shaped dict into generate_content kwargs."""
+    cfg = dict(config)
+    notes = []
+
+    for key in sorted(cfg):
+        if key in NO_DESTINATION:
+            raise UnportedArgument(
+                f"{key} has no counterpart in gemini-3.1-flash-image. "
+                f"Decide whether to drop it or replace it.")
+
+    if "negative_prompt" in cfg:
+        prompt = f"{prompt}\n\nAvoid the following: {cfg.pop('negative_prompt')}"
+        notes.append("folded negative_prompt into the prompt text")
+    if "safety_filter_level" in cfg:
+        cfg.pop("safety_filter_level")
+        notes.append("safety_filter_level needs to be rewritten as safety_settings")
+
+    n = cfg.pop("number_of_images", 1)
+    image_config = {k: cfg.pop(k) for k in list(cfg) if k in IMAGE_CONFIG_KEYS}
+    top = {k: cfg.pop(k) for k in list(cfg) if k in TOP_LEVEL_KEYS}
+    if cfg:
+        notes.append(f"ignored unknown keys: {sorted(cfg)}")
+
+    gen_config = types.GenerateContentConfig(
+        response_modalities=["IMAGE"],
+        image_config=types.ImageConfig(**image_config) if image_config else None,
+        **top,
+    )
+    return {"model": model, "contents": prompt, "config": gen_config}, n, notes
+
+
+def generate_images_compat(client, *, model, prompt, config):
+    kwargs, n, notes = build_request(model=model, prompt=prompt, config=config)
+    images, failures = [], []
+    for i in range(n):
+        try:
+            res = client.models.generate_content(**kwargs)
+        except Exception as e:            # one failure should not end the run
+            failures.append((i, repr(e)))
+            continue
+        for part in res.parts:
+            if getattr(part, "inline_data", None):
+                images.append(part.inline_data.data)
+    return images, failures, notes
+```
+
+The deliberate part is raising on arguments with no destination. If you drop them silently, the call site that thought it was passing `guidance_scale` keeps running and quietly returns different images. During a migration, the state I least want is code that looks fine while the output has changed underneath it. So anything requiring a judgment call gets handed back to a human.
+
+Returning images and failures as separate lists is the same instinct. It forces the caller to look at `len(images)`, which makes partial failures hard to miss.
+
+## Verify the shape before you spend a key on it
+
+If you point fresh code at a production key immediately, a failure leaves you unsure whether you assembled the request wrong or the model is having a bad minute. I checked the shape first, using a stub that only records the call.
+
+```python
+class _Part:
+    def __init__(self, data): self.inline_data = type("D", (), {"data": data})()
+class _Res:
+    def __init__(self, data): self.parts = [_Part(data)]
+class _Models:
+    def __init__(self): self.calls = []
+    def generate_content(self, **kw):
+        self.calls.append(kw)
+        if len(self.calls) == 2:
+            raise RuntimeError("503 UNAVAILABLE")   # fail the second call on purpose
+        return _Res(b"\x89PNG-stub")
+class StubClient:
+    def __init__(self): self.models = _Models()
+```
+
+Running the old argument set through it produced this:
+
+```text
+calls made        : 3
+images returned   : 2
+failed attempts   : [(1, "RuntimeError('503 UNAVAILABLE')")]
+note              : folded negative_prompt into the prompt text
+note              : safety_filter_level needs to be rewritten as safety_settings
+contents sent     : 'An abstract view of the sea at dawn, seen from above\n\nAvoid the following: text, watermarks'
+image_config      : aspect_ratio='9:16' person_generation='ALLOW_ADULT' output_mime_type='image/png'
+seed              : 42
+response_modalities: ['IMAGE']
+strict check      : guidance_scale has no counterpart in gemini-3.1-flash-image.
+```
+
+Three calls, two images. Seeing that on screen makes it difficult to move on without deciding how partial failures should be handled. And because the real `types.ImageConfig` and `types.GenerateContentConfig` objects are being constructed, a wrong field name or a type mismatch raises right here. Nothing touched the network.
+
+To be clear about the limits: this verifies that the request is assembled correctly and nothing more. What the images look like, how long they take, and what they cost are all things you can only learn by running it with your own key.
+
+## What to settle before the 17th
+
+With the deadline close, I worked in this order, which is sorted by how hard each step is to undo rather than by difficulty.
+
+1. Find every call site passing one of the seven arguments with no destination. These need product decisions, so they cannot be finished mechanically.
+2. Pull out the sites where `number_of_images` is 2 or more and check whether a seed is set alongside it. If so, decide whether to shift it or drop it.
+3. Add the compatibility layer and get the shape passing against the stub.
+4. Run exactly one request with a real key and look at the output with your own eyes. Only now does this become a conversation about images.
+5. If there is artwork you want to keep that only the old model can produce, download it before the 17th.
+
+That last item sits outside the migration proper, but once a model is gone there is no way to reproduce what it made. Thinking it through early sometimes reorders everything above it. For the broader question of how to structure a pipeline so shutdown dates stop dictating your week, including keeping model IDs in one place, I went into more depth in [what I learned the morning the preview image models stopped](/articles/gemini-api/gemini-image-model-ga-migration-deprecation-resilient-pipeline).
+
+What this migration taught me is that the difficulty of a deprecation is rarely the new API. It is the set of assumptions you had quietly parked in the old one. Discovering that 10 of 17 arguments had no destination under the same name is what made me stop treating this as a rename, and I am glad it happened before the deadline rather than after it.
+
+If you are working toward the same date, I hope this gives you a head start.
