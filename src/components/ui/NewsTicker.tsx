@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SUNSET — 画像生成モデルの停止まで残り2日です。8月17日に imagen-4.0-generate-001・ultra・fast と Gemini 3 Image 系が止まります",
-    "BREAKING — 単なるモデル差し替えでは済みません。generate_images() というメソッド自体が消え、画像生成はテキストと同じ generate_content() を通す形に変わります",
-    "HARD — 停止日は非推奨の警告ではなくハードエラーで止まります。期日をまたいで様子を見る運用は成立しません",
-    "MIGRATE — 非推奨表では移行先として gemini-3.1-flash-image が示されています",
-    "ROBOTICS — Gemini Robotics ER 2 が一般公開されました。動画理解・タスクの統括・複数ロボットの協調・安全性が強化されています",
-    "LOGS — Interactions API の開発者ログが AI Studio のダッシュボードから閲覧できるようになりました",
+    "SUNSET — 画像生成モデルの停止は明日8月17日です。imagen-4.0-generate-001・ultra・fast と Gemini 3 Image 系が止まり、当日はハードエラーになります",
+    "GA — 8月13日に Gemini 3.7 Flash が一般提供となりました。ソフトウェア開発・Web 実装・エージェント用途が強化され、12月31日までは導入価格です",
+    "APPS — 8月12日、Gemini に接続できるアプリが広がりました。Granola・Otter.ai・Wix に加え、OpenTable・Ticketmaster・iHeartRadio・Pandora なども対象です",
+    "SAMPLING — temperature・top_p・top_k のサンプリングパラメータは非推奨になっています。新しいモデルへ移すときは前提から見直してください",
+    "ROBOTICS — Gemini Robotics ER 2 が公開プレビュー中です。旧 gemini-robotics-er-1.6-preview は8月31日に停止します",
+    "NOTEBOOK — NotebookLM Enterprise は Gemini Notebook Enterprise に改称され、Gemini Enterprise のモバイルアプリも一般提供に入りました",
   ],
   en: [
-    "SUNSET — Two days until the image models shut down: imagen-4.0-generate-001, ultra, fast, and the Gemini 3 Image family stop on August 17",
-    "BREAKING — This is not a drop-in swap. The generate_images() method disappears entirely, and image generation moves to generate_content(), the same call used for text",
-    "HARD — On the cutoff date, calls fail with a hard error rather than a deprecation warning, so waiting it out is not an option",
-    "MIGRATE — The deprecations table points to gemini-3.1-flash-image as the recommended replacement",
-    "ROBOTICS — Gemini Robotics ER 2 is now publicly available, with stronger video understanding, task orchestration, multi-robot collaboration, and safety",
-    "LOGS — Developer logs for the Interactions API can now be viewed from the AI Studio dashboard",
+    "SUNSET — The image generation models shut down tomorrow, August 17: imagen-4.0-generate-001, ultra, fast, and the Gemini 3 Image family, and calls will fail with a hard error",
+    "GA — Gemini 3.7 Flash reached general availability on August 13, with substantial gains in software engineering, web development, and agentic work at an introductory price through December 31",
+    "APPS — On August 12 Google widened the set of apps you can connect to Gemini, adding Granola, Otter.ai, and Wix alongside OpenTable, Ticketmaster, iHeartRadio, and Pandora",
+    "SAMPLING — The temperature, top_p, and top_k sampling parameters are now deprecated, so migrating to a newer model means revisiting those assumptions",
+    "ROBOTICS — Gemini Robotics ER 2 is in public preview, and the older gemini-robotics-er-1.6-preview shuts down on August 31",
+    "NOTEBOOK — NotebookLM Enterprise has been renamed Gemini Notebook Enterprise, and the Gemini Enterprise mobile app is now generally available",
   ],
 };
 
