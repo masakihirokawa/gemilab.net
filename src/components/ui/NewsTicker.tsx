@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SUNSET — 画像生成モデルの停止は明日8月17日です。imagen-4.0-generate-001・ultra・fast と Gemini 3 Image 系が止まり、当日はハードエラーになります",
-    "GA — 8月13日に Gemini 3.7 Flash が一般提供となりました。ソフトウェア開発・Web 実装・エージェント用途が強化され、12月31日までは導入価格です",
-    "APPS — 8月12日、Gemini に接続できるアプリが広がりました。Granola・Otter.ai・Wix に加え、OpenTable・Ticketmaster・iHeartRadio・Pandora なども対象です",
-    "SAMPLING — temperature・top_p・top_k のサンプリングパラメータは非推奨になっています。新しいモデルへ移すときは前提から見直してください",
-    "ROBOTICS — Gemini Robotics ER 2 が公開プレビュー中です。旧 gemini-robotics-er-1.6-preview は8月31日に停止します",
-    "NOTEBOOK — NotebookLM Enterprise は Gemini Notebook Enterprise に改称され、Gemini Enterprise のモバイルアプリも一般提供に入りました",
+    "SUNSET — 画像生成モデルの停止は本日8月17日です。imagen-4.0-generate-001・ultra・fast と Gemini 3 Image 系が対象で、以降の呼び出しはハードエラーになります",
+    "SCALE — 8月11日に Gemini の月間アクティブユーザーが10億に到達しました",
+    "ASSISTANT — 9月4日から Android と Wear OS で Google アシスタントが Gemini へ置き換わります。完了まで数週間かかる見込みで、一度切り替わると元には戻せません",
+    "DEVICES — 対象は Android スマートフォン・タブレット、Wear OS、アシスタント対応ヘッドフォン、投影型 Android Auto です。Google ビルトイン搭載車は継続します",
+    "SPARK — 8月13日から Gemini 3.7 Flash が Gemini Spark のエンジンになりました。AI Pro・Ultra 契約者向けに160か国超で提供されています",
+    "PRICE — Gemini 3.7 Flash の導入価格は100万トークンあたり入力 0.75ドル・出力 3.75ドルで、12月31日までです。以後は 1.50ドル・7.50ドル になります",
   ],
   en: [
-    "SUNSET — The image generation models shut down tomorrow, August 17: imagen-4.0-generate-001, ultra, fast, and the Gemini 3 Image family, and calls will fail with a hard error",
-    "GA — Gemini 3.7 Flash reached general availability on August 13, with substantial gains in software engineering, web development, and agentic work at an introductory price through December 31",
-    "APPS — On August 12 Google widened the set of apps you can connect to Gemini, adding Granola, Otter.ai, and Wix alongside OpenTable, Ticketmaster, iHeartRadio, and Pandora",
-    "SAMPLING — The temperature, top_p, and top_k sampling parameters are now deprecated, so migrating to a newer model means revisiting those assumptions",
-    "ROBOTICS — Gemini Robotics ER 2 is in public preview, and the older gemini-robotics-er-1.6-preview shuts down on August 31",
-    "NOTEBOOK — NotebookLM Enterprise has been renamed Gemini Notebook Enterprise, and the Gemini Enterprise mobile app is now generally available",
+    "SUNSET — The image generation models shut down today, August 17: imagen-4.0-generate-001, ultra, fast, and the Gemini 3 Image family, and calls after that fail with a hard error",
+    "SCALE — Gemini crossed one billion monthly active users on August 11",
+    "ASSISTANT — Starting September 4, Gemini replaces Google Assistant on Android and Wear OS, a rollout expected to take several weeks and one you cannot reverse on a device",
+    "DEVICES — The change covers Android phones and tablets, Wear OS watches, Assistant-enabled headphones, and phone-projected Android Auto; cars with Google built-in keep working",
+    "SPARK — Since August 13, Gemini 3.7 Flash has powered Gemini Spark for AI Pro and Ultra subscribers across more than 160 countries",
+    "PRICE — Gemini 3.7 Flash carries introductory pricing of $0.75 per million input tokens and $3.75 output through December 31, moving to $1.50 and $7.50 after that",
   ],
 };
 
