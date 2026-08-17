@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SUNSET — 画像生成モデルの停止は本日8月17日です。imagen-4.0-generate-001・ultra・fast と Gemini 3 Image 系が対象で、以降の呼び出しはハードエラーになります",
-    "SCALE — 8月11日に Gemini の月間アクティブユーザーが10億に到達しました",
-    "ASSISTANT — 9月4日から Android と Wear OS で Google アシスタントが Gemini へ置き換わります。完了まで数週間かかる見込みで、一度切り替わると元には戻せません",
-    "DEVICES — 対象は Android スマートフォン・タブレット、Wear OS、アシスタント対応ヘッドフォン、投影型 Android Auto です。Google ビルトイン搭載車は継続します",
-    "SPARK — 8月13日から Gemini 3.7 Flash が Gemini Spark のエンジンになりました。AI Pro・Ultra 契約者向けに160か国超で提供されています",
-    "PRICE — Gemini 3.7 Flash の導入価格は100万トークンあたり入力 0.75ドル・出力 3.75ドルで、12月31日までです。以後は 1.50ドル・7.50ドル になります",
+    "SUNSET — gemini-robotics-er-1.6-preview は8月31日に停止します。残り13日となり、移行の実作業に取りかかる時期です",
+    "MIGRATION — 移行先は7月30日にパブリックプレビューとなった gemini-robotics-er-2-preview と gemini-robotics-er-2-streaming-preview です。テキスト・画像・動画・音声を入力できます",
+    "PRICING — 8月13日に一般提供となった Gemini 3.7 Flash の導入価格は2026年12月31日までです。年をまたぐワークロードは価格改定を織り込んだ試算が要ります",
+    "DEPRECATION — サンプリングパラメータの temperature・top_p・top_k が非推奨になりました。明示指定しているコードは、指定を外した場合の出力差分を今のうちに測っておくと安全です",
+    "VIDEO — 動画の生成と編集に対応する Gemini Omni Flash が Google AI Studio と Gemini API から利用できます",
+    "LOGS — Interactions API が開発者ログに対応し、対象となる API 呼び出しのログを AI Studio のダッシュボードで確認できるようになりました",
   ],
   en: [
-    "SUNSET — The image generation models shut down today, August 17: imagen-4.0-generate-001, ultra, fast, and the Gemini 3 Image family, and calls after that fail with a hard error",
-    "SCALE — Gemini crossed one billion monthly active users on August 11",
-    "ASSISTANT — Starting September 4, Gemini replaces Google Assistant on Android and Wear OS, a rollout expected to take several weeks and one you cannot reverse on a device",
-    "DEVICES — The change covers Android phones and tablets, Wear OS watches, Assistant-enabled headphones, and phone-projected Android Auto; cars with Google built-in keep working",
-    "SPARK — Since August 13, Gemini 3.7 Flash has powered Gemini Spark for AI Pro and Ultra subscribers across more than 160 countries",
-    "PRICE — Gemini 3.7 Flash carries introductory pricing of $0.75 per million input tokens and $3.75 output through December 31, moving to $1.50 and $7.50 after that",
+    "SUNSET — gemini-robotics-er-1.6-preview shuts down on August 31. Thirteen days out, which makes this the week to actually start the migration",
+    "MIGRATION — The replacements are gemini-robotics-er-2-preview and gemini-robotics-er-2-streaming-preview, both in public preview since July 30 and both accepting text, image, video, and audio input",
+    "PRICING — Gemini 3.7 Flash went GA on August 13 at an introductory price that runs through December 31, 2026, so anything spanning the new year needs a two-stage cost estimate",
+    "DEPRECATION — The temperature, top_p, and top_k sampling parameters are now deprecated. If your code sets them explicitly, measure the output difference without them while there is still time",
+    "VIDEO — Gemini Omni Flash, a model for generating and editing video, is available in Google AI Studio and through the Gemini API",
+    "LOGS — The Interactions API now supports developer logs, viewable for supported calls from the AI Studio dashboard",
   ],
 };
 
