@@ -111,6 +111,52 @@ def thumbnail_from_large_video(video_path: str, brief: str) -> bytes:
 
 Even with IMAGE in `response_modalities`, responses come back in three mixes: text only, image only, or both. Looping over `parts` and treating something as an image only when `inline_data` is present is mandatory in automation. Skip that guard and a text-only response throws.
 
+## Passing the whole video is expensive — narrow it to the seconds that matter
+
+The first wall I hit running video-to-image for real wasn't quality. It was the bill and the wait. Video input accrues tokens by duration, so handing over a three-minute file means paying for the entire clip in order to get the dozen seconds that actually shape the thumbnail.
+
+While producing thumbnails for short videos, I missed this at first and lived with roughly forty seconds of wall-clock per image — a queue that stretched further with every added asset. Once I started trimming to the window around the peak moment before sending, the same quality came back in single-digit seconds, and token consumption dropped by an order of magnitude.
+
+<table>
+<thead>
+<tr><th>How it's sent</th><th>Input duration</th><th>Wall-clock per image</th><th>What I observed</th></tr>
+</thead>
+<tbody>
+<tr><td>Original video, sent inline</td><td>~3 min</td><td>35–45 s</td><td>Large assets force the Files API, adding steps</td></tr>
+<tr><td>Trimmed to the peak window</td><td>12 s</td><td>6–9 s</td><td>Stays inline; roughly a tenth of the tokens</td></tr>
+</tbody>
+</table>
+
+Trimming is one ffmpeg call. Audio is never used for image generation, so drop it — and lower the frame rate and resolution while you're there. A thumbnail needs composition and color, not smooth motion.
+
+```python
+import os
+import subprocess
+import tempfile
+
+def clip_window(video_path: str, start_sec: float, dur_sec: float = 12.0) -> str:
+    """Cut the window around the peak so the video you send is small."""
+    out = os.path.join(tempfile.mkdtemp(), "window.mp4")
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-ss", str(start_sec),   # placed before -i for a fast seek
+            "-t", str(dur_sec),
+            "-i", video_path,
+            "-an",                       # audio is unused for image generation
+            "-vf", "fps=2,scale=-2:720", # lower frame rate and resolution too
+            out,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return out
+```
+
+That leaves the question of which second counts as the peak. I didn't want to watch every file, so I made it two passes. First I send the same video to a text-response model and ask it to answer with nothing but a number: at what second would you freeze this for a thumbnail? Then that second goes into `clip_window()`, and only the short window reaches image generation.
+
+Adding a call to save a call looks like a bad trade until you weigh them. The text response is dramatically cheaper, and cutting the video that reaches image generation to a tenth outweighs it by a wide margin. Ask something cheap to aim, then fire the expensive thing once. That ordering has become my default shape for multimodal automation well beyond images.
+
 ## A lightweight gate that rejects broken images before publishing
 
 The scary part of automation is a broken frame flowing straight to publication. I did exactly this in wallpaper color-variant generation and shipped a flat, single-color image. Before adding heavy quality scoring, stopping obvious accidents with a cheap mechanical check is the realistic move.
@@ -140,6 +186,72 @@ def passes_quality_gate(img_bytes: bytes, target_ratio: float = 16 / 9,
 
 The `150` threshold is just my local empirical value. It needs tuning to your material, but even using it only as a "regenerate an obviously bad frame once" retry condition noticeably dropped my manual rework rate at volume. Rather than aiming for perfect quality judgment from day one, putting a cheap gate that stops only accidents first is the better cost-benefit trade for indie work.
 
+## Make your winners machine-readable — a generation ledger and series consistency
+
+Earlier I said to record the good frame when it appears. But a note written for human eyes doesn't connect to automation. A record becomes an asset only once a program can look it up. I append one line of JSON per generation. No database, and keeping it in the repository means the history shows up in diffs.
+
+```python
+import hashlib
+import json
+import time
+from pathlib import Path
+
+LEDGER = Path("generated/ledger.jsonl")
+
+def record(brief: str, model: str, out_path: Path, adopted: bool) -> str:
+    """Append one generation as one line. `key` identifies identical conditions."""
+    key = hashlib.sha1(f"{model}\n{brief}".encode("utf-8")).hexdigest()[:12]
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with LEDGER.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "key": key,
+            "model": model,
+            "brief": brief,
+            "file": str(out_path),
+            "adopted": adopted,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }, ensure_ascii=False) + "\n")
+    return key
+
+def find_adopted(keyword: str) -> list[dict]:
+    """Look up only adopted generations, by a word in the brief."""
+    if not LEDGER.exists():
+        return []
+    rows = [json.loads(line) for line in LEDGER.read_text(encoding="utf-8").splitlines() if line]
+    return [r for r in rows if r["adopted"] and keyword in r["brief"]]
+```
+
+The `adopted` boolean is what makes this useful. Being able to retrieve the frame you chose, rather than everything you produced, is the whole point. My own ledger sits near a twenty percent adoption rate; the other eighty percent stays recorded too, so I don't pay for the same miss twice.
+
+Records earn their keep again when a series has to hold together. When I want the OGP images across four Lab sites to feel like one set, writing the palette and spacing in words still drifts from run to run. Handing back an already-adopted image as a reference turned out to be far more reliable than describing it.
+
+```python
+def generate_in_series(reference_path: str, brief: str) -> bytes:
+    """Anchor on an adopted frame to produce the next one in the same air."""
+    with open(reference_path, "rb") as f:
+        reference = f.read()
+
+    response = client.models.generate_content(
+        model=IMAGE_MODEL,
+        contents=[
+            types.Part.from_bytes(data=reference, mime_type="image/png"),
+            "Keep this image's palette, texture, and use of negative space. "
+            "Produce one new image with the following content.\n" + brief,
+        ],
+        config=types.GenerateContentConfig(
+            response_modalities=["TEXT", "IMAGE"],
+        ),
+    )
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data
+    raise RuntimeError("No image returned")
+```
+
+Pull the reference with `find_adopted()`, pass it to `generate_in_series()`. Once those two mesh, a vague request like "the way that other one felt" becomes an executable step.
+
+There is a side effect worth watching: anchor too hard and everything starts to look like the same picture. I keep the reference's influence to palette and texture, and vary subject and angle in the brief every time. Consistency isn't about making things match — it's about making them read as one body of work when placed side by side. That framing makes it much easier to decide how much to pin down.
+
 ## Don't get caught by preview shutdowns — keep model IDs in one place
 
 One more thing that always pays off in automation: deprecation handling. Preview models shut down on notice. In fact `gemini-3.1-flash-image-preview` and `gemini-3-pro-image-preview` are scheduled to stop on 6/25, and any code that hard-coded them will fail en masse with `INVALID_ARGUMENT` the moment they go.
@@ -165,4 +277,4 @@ I reuse the same generation base across several Lab sites and the wallpaper apps
 
 ## Your next step
 
-Start by taking one prompt that produced a winner and decomposing it into the four parts — subject, scene, style, detail — as a template. Feed that template as the brief to `thumbnail_from_video()` and you can run the minimal loop for generating assets from a video today. With records and shapes in hand, image generation turns from a gamble into a process you can reproduce. Thank you for reading.
+Start by taking one prompt that produced a winner and decomposing it into the four parts — subject, scene, style, detail — as a template. Feed that template as the brief to `thumbnail_from_video()` and you can run the minimal loop for generating assets from a video today. For the move after that, add one call to `record()` and start the ledger — it costs a line now and pays out three months from now. With records and shapes in hand, image generation turns from a gamble into a process you can reproduce. Thank you for reading.
