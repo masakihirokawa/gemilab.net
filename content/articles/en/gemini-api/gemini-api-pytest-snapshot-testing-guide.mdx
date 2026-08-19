@@ -6,12 +6,14 @@ level: "advanced"
 premium: true
 date: "2026-06-29T15:00"
 author: "Gemini Lab"
-description: "How to defend non-deterministic Gemini API responses with pytest snapshot tests plus embedding-based semantic regression detection — including CI wiring, separating flakiness from real regressions, and snapshot-update governance, all in working code."
-tags: ["Gemini API", "pytest", "snapshot testing", "CI", "regression detection", "Python", "syrupy"]
+description: "Defend non-deterministic Gemini API responses with pytest snapshots plus embedding-based semantic regression detection: record/replay CI, a weekly live smoke that keeps cassettes honest, per-field drift reporting, threshold calibration, and update governance — all in working code."
+tags: ["Gemini API", "pytest", "snapshot testing", "CI", "regression detection", "Python", "syrupy", "vcrpy"]
 highlights:
   - "A two-layer test: structure snapshots plus an embedding score that catches quality regressions the schema hides"
   - "Running CI without hitting the API every time, and threshold design that tells flakiness apart from real regressions"
   - "A snapshot-update workflow that keeps your green builds trustworthy instead of rubber-stamped"
+  - "A weekly live-smoke job that stops stale cassettes from validating an API that no longer exists"
+  - "Per-field drift reporting that turns a red semantic test into a diagnosis in about fifteen seconds"
 ---
 
 Testing code that calls the Gemini API trips you up within minutes. **Generative AI responses change on every run**, so a plain assertion never holds:
@@ -269,6 +271,165 @@ def test_summary_semantic():
 ```
 
 In the Before, a human hard-codes "the correct string," so any change turns it red and you spend effort fixing tests for reasons unrelated to the product. The After splits what you protect into shape and meaning and tells you which one broke. **Only tests whose red has a clear meaning survive long-term maintenance.**
+
+## A Cassette Freezes Yesterday's Reality — Add a Weekly Live Smoke
+
+Record/replay makes CI fast and cheap, but there's a bill attached. A cassette preserves the API as it was at the moment you recorded it, which means **the older your cassettes get, the more your CI is validating a Gemini API that no longer exists**. A build where every offline test is green while the production batch is quietly broken is not a paradox — it's the expected outcome of a stale cassette.
+
+This one caught me. A repository of mine held a green build on cassettes recorded six months earlier, while the actual response had changed a field's type. The replay suite never said a word. The tests didn't lie; I simply had no answer to the question of *which era of reality* I was testing against.
+
+The fix is to split your suite into two jobs with different responsibilities.
+
+<table>
+<thead>
+<tr><th>Job</th><th>Trigger</th><th>Hits the API?</th><th>Scope</th><th>On failure</th></tr>
+</thead>
+<tbody>
+<tr><td>Offline CI</td><td>Every PR and push</td><td>No (replay)</td><td>Structure + semantic</td><td>Blocks merge</td></tr>
+<tr><td>Live smoke</td><td>Weekly schedule</td><td>Yes (a few inputs)</td><td><strong>Structure only</strong></td><td>Files an issue, no block</td></tr>
+</tbody>
+</table>
+
+Leaving the semantic layer out of the live job is deliberate. Real calls vary run to run, so a red semantic test there can't tell you whether the model shifted or the sampler simply wandered. The weekly job answers exactly one question: **is the structure your cassettes encode still the structure reality returns?**
+
+Cassette freshness deserves a check of its own.
+
+```python
+# add to conftest.py — report cassettes that have gone stale
+import time
+from pathlib import Path
+
+CASSETTE_MAX_AGE_DAYS = 45
+
+def pytest_sessionfinish(session, exitstatus):
+    """Warn about aging cassettes without failing the run."""
+    now = time.time()
+    stale = []
+    for c in Path("tests/cassettes").rglob("*.yaml"):
+        age_days = (now - c.stat().st_mtime) / 86400
+        if age_days > CASSETTE_MAX_AGE_DAYS:
+            stale.append((c.name, int(age_days)))
+    if stale:
+        print("\n[cassette] stale recordings:")
+        for name, days in sorted(stale, key=lambda x: -x[1]):
+            print(f"  - {name}: recorded {days}d ago (limit {CASSETTE_MAX_AGE_DAYS}d)")
+```
+
+It warns rather than fails on purpose. Staleness isn't a defect, and making it red trains people to re-record mindlessly just to restore green. All you want here is a nudge that says it's time to go look at reality again.
+
+The weekly job runs only the structure tests, against the live API.
+
+```yaml
+# .github/workflows/live-smoke.yml
+name: live-smoke
+on:
+  schedule:
+    - cron: "0 21 * * 0"   # Mondays, 06:00 JST
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements-dev.txt
+      - name: Structure tests against the real API
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: pytest test_structure.py --record-mode=none --disable-recording -q
+```
+
+`--disable-recording` sends `@pytest.mark.vcr` tests to the real network instead of the cassette, and — critically — doesn't overwrite anything, so your recordings stay clean. That single flag is the difference between a weekly job that *verifies* and one that silently re-records the very thing it was supposed to check.
+
+Three to five representative inputs are plenty. This isn't coverage; it's a fixed observation point that tells you cheaply whether the shape moved. Spending a few tens of yen a month to avoid six months of trusting a lying cassette is a trade I take without hesitating.
+
+## The Thirty Seconds After It Turns Red: Show Which Field Drifted
+
+When a semantic test fails with `cosine=0.83 < 0.88`, that line tells you almost nothing. Folding the whole payload into one vector means **a degraded summary and a mangled tag array collapse into the same number**. You end up reading the raw output side by side anyway, which throws away half the reason you added the second layer.
+
+So keep a separate baseline per JSON field and print the breakdown when things fail.
+
+```python
+# field_drift.py
+import json
+import numpy as np
+from pathlib import Path
+from semantic_snapshot import embed, cosine
+
+BASE_DIR = Path("baseline/fields")
+
+def _to_text(value) -> str:
+    """Flatten lists and dicts into a stable string so they stay comparable."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+def field_drift(payload: dict, name: str) -> dict[str, float]:
+    """Per-field cosine similarity; seeds missing baselines and returns empty."""
+    out: dict[str, float] = {}
+    for key, value in payload.items():
+        path = BASE_DIR / name / f"{key}.npy"
+        vec = embed(_to_text(value))
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(path, vec)
+            continue
+        out[key] = cosine(vec, np.load(path))
+    return out
+
+def format_report(drift: dict[str, float], threshold: float) -> str:
+    rows = sorted(drift.items(), key=lambda kv: kv[1])
+    lines = [f"{'field':<16}{'cosine':>8}  status"]
+    for key, sim in rows:
+        mark = "DRIFT" if sim < threshold else "ok"
+        lines.append(f"{key:<16}{sim:>8.3f}  {mark}")
+    return "\n".join(lines)
+```
+
+The test still gates on the worst field, but a failure now carries its own diagnosis.
+
+```python
+# test_semantic_fields.py
+import json
+import pytest
+from gemini_client import classify_sentiment
+from field_drift import field_drift, format_report
+
+THRESHOLD = 0.88
+
+@pytest.mark.vcr
+def test_sentiment_fields_stable():
+    payload = json.loads(
+        classify_sentiment("Shipping was slow, but support handled it well.")
+    )
+    drift = field_drift(payload, name="sentiment_review")
+    if not drift:
+        pytest.skip("Seeded per-field baselines; comparison starts next run.")
+
+    worst_key = min(drift, key=drift.get)
+    assert drift[worst_key] >= THRESHOLD, (
+        f"\nworst field: {worst_key} (cosine={drift[worst_key]:.3f})\n"
+        + format_report(drift, THRESHOLD)
+    )
+```
+
+A failure reads like this:
+
+```
+worst field: explanation (cosine=0.804)
+field             cosine  status
+explanation        0.804  DRIFT
+confidence         0.981  ok
+sentiment          0.998  ok
+```
+
+`sentiment` and `confidence` are healthy; only `explanation` moved. That narrows the cause immediately — the classification itself is intact, so what shifted is the explanatory generation, pointing at the explanation clause of your prompt or a change in the model's output-length behavior.
+
+Since adding the breakdown, my first-pass triage on a red semantic test went from minutes of comparing prose to about fifteen seconds of reading the failure log. The value of a test isn't that it turns red; it's that **the next move is obvious the moment it does**.
+
+One caution: per-field baselines multiply the contents of `baseline/fields/`. Keep it to one or two representative inputs per use case. Every extra baseline is extra review surface, and review surface is exactly what erodes the governance described next.
 
 ## Governance for Updating Snapshots
 
