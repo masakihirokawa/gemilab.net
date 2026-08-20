@@ -1,0 +1,232 @@
+---
+title: "Never hand Gemini a raw ANR thread dump"
+slug: "gemini-anr-thread-dump-lock-graph-pruning-before-prompt"
+category: "gemini-api"
+level: "advanced"
+premium: true
+date: "2026-08-20T13:00"
+author: "Gemini Lab"
+description: "An ANR dump came in at 96 threads and 33,616 characters. Keeping only main cuts 98 percent, but it also deletes the thread that caused the block. Here is a lock-chain preprocessor, measured three ways."
+tags: ["gemini-api", "android", "anr", "debugging", "prompt-engineering"]
+highlights:
+  - "You will be able to decide what to keep and what to drop from an ANR dump using a single rule: the chain of lock waits"
+  - "You will understand why a main-thread-only preprocessor silently discards the root cause, so you avoid building one and discovering the gap in production"
+  - "You will be able to drop a preprocessor into your own tooling that reduces a 96-thread, 33,616-character dump to 3 threads and 1,898 characters"
+---
+
+The morning after I pushed a staged rollout to 5 percent, Play Console Vitals showed one new ANR.
+
+As an indie developer, that 5 percent window always feels short. You watch for about a day, then decide whether to continue or halt. A crash is manageable — the Crashlytics stack trace usually points somewhere. An ANR turned out to be a different animal.
+
+The dump I opened listed 96 threads.
+
+## The 5 percent window doesn't leave time to read
+
+I ship in stages: 5 percent, then 25, 50, and 100, watching Crash-free users and the ANR rate before each step. On the crash side I already have a preprocessor that de-obfuscates the trace before Gemini ever sees it, and that pipeline has held up well — I wrote about how it came together in [handing Gemini an obfuscated stack trace](/articles/gemini-dev/gemini-crashlytics-r8-retrace-before-prompt-mapping-version-match).
+
+So I tried the same move with the ANR dump: paste the whole thing, ask what happened. It didn't work. Every answer came back as some variation of "the main thread appears to be waiting on I/O" — things you could say without looking at the dump at all.
+
+The problem was in how I was handing it over.
+
+## An ANR dump is a thread inventory, not a stack trace
+
+A crash trace is one call stack. The thing to read is already narrowed down to a single path.
+
+An ANR is different. The event is "the main thread failed to respond in time," so the system dumps the state of every thread in the process. In a real app carrying ad SDKs, an image loader, Firebase, and coroutine dispatchers, that lands somewhere between several dozen and well over a hundred.
+
+What matters is that the dump also encodes **relationships between threads**.
+
+```
+"main" prio=5 tid=1 Blocked
+  - waiting to lock <0x0e3a41c8> (a net.dolice.wallpapers.data.AssetIndex) held by thread 27
+  at net.dolice.wallpapers.data.AssetIndex.lookup(AssetIndex.java:184)
+  at net.dolice.wallpapers.ui.GridAdapter.onBindViewHolder(GridAdapter.java:96)
+```
+
+That single `waiting to lock <address> ... held by thread 27` line is an edge between main and thread 27. If thread 27 is itself waiting on another lock, the edge extends further.
+
+The cause of an ANR lives at the **end** of that chain. Main's own frames only record the fact that it is waiting.
+
+## Keeping only main deletes the thread that was blocking
+
+I built three variants and compared them. The test input is a 96-thread dump assembled to match the Android ANR trace format — not a dump pulled off a device, but a faithful reproduction of the format.
+
+<table>
+<thead>
+<tr><th>Variant</th><th>Threads</th><th>Characters</th><th>Lines</th><th>Reduction</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Send the whole dump</td><td>96</td><td>33,616</td><td>686</td><td>0%</td></tr>
+<tr><td>2. Main thread only</td><td>1</td><td>681</td><td>10</td><td>98%</td></tr>
+<tr><td>3. Lock chain only</td><td>3</td><td>1,898</td><td>30</td><td>95%</td></tr>
+</tbody>
+</table>
+
+The gap between variants 2 and 3 is 1,217 characters — 3.6 percent of the original. Rounding error, more or less.
+
+Here is what lives inside that 3.6 percent:
+
+<table>
+<thead>
+<tr><th>Variant</th><th>First-party frames retained</th></tr>
+</thead>
+<tbody>
+<tr><td>2. Main only</td><td><code>AssetIndex.lookup</code> / <code>GridAdapter.onBindViewHolder</code></td></tr>
+<tr><td>3. Lock chain</td><td>The above, plus <code>AssetIndex.rebuild</code> / <code>CatalogSync.run</code> / <code>ThumbStore.warm</code></td></tr>
+</tbody>
+</table>
+
+Read variant 2 on its own and `AssetIndex.lookup` looks slow. The thread actually holding things up was two hops away in `ThumbStore.warm`, reading thumbnails out of the disk cache. Feed Gemini variant 2 and it will write a plausible, well-reasoned analysis of `lookup`. It will also be wrong.
+
+Cutting 98 percent versus 95 percent is nearly identical as a cost decision. As a question of whether the cause survives the cut, they are not remotely the same.
+
+## Extracting only the wait edges
+
+Split the dump per thread and pull out lock waits and lock ownership. ANR dumps separate threads with a blank line, so the split itself stays simple.
+
+```python
+import re
+
+BLOCK_HEAD = re.compile(r'^"(?P<name>.*)" .*\btid=(?P<tid>\d+)\s+(?P<state>\w+)')
+WAIT_LOCK  = re.compile(r'- waiting to lock <(?P<addr>0x[0-9a-f]+)>.*held by thread (?P<owner>\d+)')
+HELD_LOCK  = re.compile(r'- locked <(?P<addr>0x[0-9a-f]+)>')
+
+
+def parse(text):
+    """Split an ANR dump per thread and extract wait -> owner edges."""
+    threads, order = {}, []
+    for raw in text.split("\n\n"):
+        m = BLOCK_HEAD.match(raw.strip())
+        if not m:
+            # Header and footer lines fall out here
+            continue
+        tid = int(m.group("tid"))
+        w = WAIT_LOCK.search(raw)
+        threads[tid] = {
+            "tid": tid,
+            "name": m.group("name"),
+            "state": m.group("state"),
+            "raw": raw.strip(),
+            # tid this thread is waiting on; None means it is a chain terminus
+            "waits_for": int(w.group("owner")) if w else None,
+            "holds": HELD_LOCK.findall(raw),
+        }
+        order.append(tid)
+    return threads, order
+```
+
+A thread whose `waits_for` is `None` terminates the chain. If that thread sits in `Native` state doing file or network I/O, you are looking at the ANR itself.
+
+Waits without a `held by thread` clause — a plain `Object.wait()` condition wait, for instance — produce no edge here. That is deliberate. A condition wait does not name its counterpart anywhere in the dump, so there is no relationship a parser could follow.
+
+## Walking the chain, and stopping on cycles
+
+Once you have edges, walk them from main. The detail worth planning for is that **a deadlock makes the chain circular**. A naive while loop never returns.
+
+```python
+def lock_closure(threads, root=1, max_hops=8):
+    """Collect only the threads reachable from main by following wait edges.
+    Terminate on already-visited threads so a deadlock cannot loop forever."""
+    seen, chain, cur, hops = set(), [], root, 0
+    while cur is not None and cur not in seen and hops < max_hops:
+        seen.add(cur)
+        chain.append(cur)
+        cur = threads.get(cur, {}).get("waits_for")
+        hops += 1
+    # If we exited while cur was already visited, the chain is circular
+    deadlock = cur is not None and cur in seen
+    return chain, deadlock
+
+
+def render(threads, tids):
+    return "\n\n".join(threads[t]["raw"] for t in tids if t in threads)
+```
+
+The visited set and `max_hops` are not redundant safety nets. The visited set alone stops cycles, but a real dump with a broken tid reference — pointing at a thread that isn't there — makes `threads.get()` return `None` and the walk ends quietly. `max_hops` alone stops runaway walks but cannot distinguish a cycle from a long chain. You need both before the return value can tell you *why* the walk stopped.
+
+That `deadlock` flag matters later, when you build the prompt. If the chain is circular, "which thread is at fault" is the wrong question; the right one is about lock acquisition order.
+
+Feeding a modified dump where thread 27 waits on main's lock, the walk returned `deadlock: True` and terminated at 3 threads.
+
+## What was left after the cut
+
+Running all three variants side by side was the moment the whole approach clicked for me.
+
+```
+1. Full dump      threads= 96  chars= 33616  lines= 686  reduction=  0%
+2. main only      threads=  1  chars=   681  lines=  10  reduction= 98%
+3. lock chain     threads=  3  chars=  1898  lines=  30  reduction= 95%
+
+Wait chain from main: 1(main) -> 27(pool-3-thread-2) -> 41(glide-disk-cache-thread-0)
+Cycle detected: False
+```
+
+The first version I wrote was variant 2. An ANR means the main thread stalled, so send the main thread — that felt like the obvious move.
+
+It was backwards. An ANR means the main thread waited on **something else**, which means the answer is never inside main. It is always on the other side of the edge.
+
+The reduction numbers surprised me too. I had braced for the chain variant to balloon, and instead only 3 of 96 threads carried any meaning. The other 95 percent was idle workers and daemons — effectively boilerplate.
+
+## Tell Gemini the shape of the chain
+
+When I pass the trimmed dump, I state explicitly what I trimmed it to. Without that context, three thread blocks arrive looking like three parallel candidates rather than an ordered chain.
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="YOUR_API_KEY")
+
+PROMPT = """You are diagnosing an Android ANR.
+You are not receiving the full dump. You are receiving only the threads reachable
+from the main thread by following lock-wait edges, ordered along that chain.
+
+- The first block is main; the last block is the terminus of the chain
+- The terminus holds the operation that was actually blocking
+- If deadlock is true, treat this as a lock-ordering problem, not a single culprit
+
+Limit your answer to three points.
+1. What the terminus thread was doing
+2. The path by which main ended up waiting on it
+3. Concrete candidates for work that should move off the main thread
+"""
+
+
+def diagnose(chain_text: str, deadlock: bool) -> str:
+    resp = client.models.generate_content(
+        model="gemini-3.7-flash",
+        contents=[
+            types.Part.from_text(text=PROMPT),
+            types.Part.from_text(text=f"deadlock: {deadlock}"),
+            types.Part.from_text(text=chain_text),
+        ],
+        config=types.GenerateContentConfig(
+            # The input is already narrowed, so keep the thinking budget small
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+            max_output_tokens=1024,
+        ),
+    )
+    return resp.text
+```
+
+I keep `thinking_level` at `low` precisely because the narrowing already happened. With three threads left, there is almost nothing for the model to search. When your own code has identified what to look at, the thinking budget is the cheapest thing to cut.
+
+One related note: the sampling parameters like `temperature` are now deprecated. They still work, but if you set them explicitly it is worth measuring the difference with them removed while you still have room to react — I covered that migration in [the sampling parameter deprecation and where diversity has to come from instead](/articles/gemini-api/gemini-sampling-params-deprecation-diversity-side-migration).
+
+## Fitting the decision inside the rollout window
+
+Since building this, my ANR routine looks like this:
+
+1. Download the ANR cluster dump from Play Console
+2. Run `parse` and `lock_closure`, keeping the chain and the `deadlock` flag
+3. If the chain has length 1 — main isn't waiting on anyone — this is not lock contention, so look elsewhere
+4. If it has 2 or more, hand it to Gemini and let it articulate what the terminus was doing
+5. If the terminus is first-party code, fix it; if it is an SDK, revisit initialization timing
+
+Step 3 exists because plenty of ANRs are not contention at all — they are simply heavy work running on the main thread. In that case the chain never extends, so the preprocessor's return value doubles as the triage signal. It costs nothing: you read `len(chain)`.
+
+What the 5 percent window really lacks isn't compute, it's reading time. I cannot read 33,616 characters before deciding. I can read 1,898 over coffee. The preprocessor turned out to be less about helping the model and more about helping me.
+
+Take one ANR dump you have on hand, run it through `parse`, and just look at the length of `chain`. Whether it comes back as 1 or 3 tells you where to read next.
+
+Thank you for reading. I'm still working out how to live with ANRs, and if I find a better way to trim, I'll come back and add it here.
