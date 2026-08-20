@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SCALE — Gemini アプリの月間利用者が8月11日に10億人を超えました。個人向けアシスタントとしての普及は一段落し、開発者側の関心はどう組み込むかへ移っています",
-    "ASSISTANT — 9月4日から Android の Google アシスタントが Gemini に置き換わります。残り15日で、App Actions や音声ショートカットを実装したアプリは挙動確認が必要です",
-    "AGENTS — Gemini API の Managed Agents がパブリックプレビューになりました。Google 側がホストする実行環境で、状態を持つ自律エージェントを構築できます",
-    "ENTERPRISE — Gemini Enterprise で A2UI エージェントと A2A エージェントの登録・管理が一般提供になり、エージェント同士を接続する枠組みがプレビュー段階を抜けました",
-    "SUNSET — gemini-robotics-er-1.6-preview は8月31日に停止します。残り11日で、移行先は7月30日にパブリックプレビューとなった Gemini Robotics ER 2 です",
-    "PRICING — 8月13日に一般提供となった Gemini 3.7 Flash の導入価格は100万トークンあたり入力0.75ドル・出力3.75ドルで、2026年12月31日までです",
+    "SPARK — 8月13日から Gemini Spark のエンジンが Gemini 3.7 Flash になりました。エージェント用途に推論の深さより往復の速さを選んだ構成で、自作エージェントのモデル選定の参考になります",
+    "AGENT — Spark は権限を与えたうえで複数ステップの作業を自律的に進めます。予約の取得やフォーム入力など、単発の命令に応答する従来型の音声アシスタントとは設計思想が違います",
+    "ASSISTANT — 9月4日の Google アシスタント置き換えまで残り14日です。移行が完了した端末では旧アシスタントへ戻せません。Google ビルトイン搭載車は引き続きアシスタントが動きます",
+    "EDUCATION — 8月10日から Gemini in Classroom が、管理者の許可を受けた K-12 および高等教育の学生であれば年齢を問わず利用できるようになりました",
+    "SCALE — Gemini アプリの画像生成は1日あたり1億5,000万枚に達しています。生成量そのものより、これが常時稼働の負荷としてどう捌かれているかが設計の参考になります",
+    "MODELS — 深い推論は Gemini 3.1 Pro、速度とコストを優先する本番処理は Flash 系という棲み分けが定着しました。同一処理を両者で流して実測すると差が見えます",
   ],
   en: [
-    "SCALE — The Gemini app passed one billion monthly users on August 11. Consumer adoption has settled, and developer attention is shifting to how to build on top of it",
-    "ASSISTANT — Gemini replaces Google Assistant on Android from September 4. Fifteen days out, so apps wired into App Actions or voice shortcuts should be checked now",
-    "AGENTS — Managed Agents in the Gemini API entered public preview, letting you build stateful autonomous agents inside a secure Google-hosted environment",
-    "ENTERPRISE — Gemini Enterprise reached general availability for registering and managing A2UI and A2A agents, moving agent-to-agent wiring out of preview",
-    "SUNSET — gemini-robotics-er-1.6-preview shuts down on August 31, eleven days out. The replacement is Gemini Robotics ER 2, in public preview since July 30",
-    "PRICING — Gemini 3.7 Flash went GA on August 13 at an introductory $0.75 per million input tokens and $3.75 output, holding through December 31, 2026",
+    "SPARK — Gemini 3.7 Flash became the engine behind Gemini Spark on August 13. Choosing round-trip speed over reasoning depth for agent work is a useful signal when picking your own model",
+    "AGENT — Spark carries out multi-step tasks autonomously once granted permission, handling things like booking appointments and filling forms rather than answering one command at a time",
+    "ASSISTANT — Fourteen days until Gemini replaces Google Assistant on September 4. Once a device migrates there is no going back, though cars with Google Built-in keep Assistant for now",
+    "EDUCATION — Since August 10, Gemini in Classroom is available to K-12 and higher-education students of any age, provided their administrator has granted access",
+    "SCALE — The Gemini app now generates 150 million images a day. The interesting part is less the volume than how that sustained load is absorbed in practice",
+    "MODELS — The split has settled: Gemini 3.1 Pro for deep reasoning, the Flash line for production work where speed and cost matter. Running the same job through both makes the gap concrete",
   ],
 };
 
