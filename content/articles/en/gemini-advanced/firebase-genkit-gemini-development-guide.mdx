@@ -6,12 +6,12 @@ level: "advanced"
 premium: true
 date: "2026-03-25T14:00"
 author: "Gemini Lab"
-description: "A hands-on implementation notebook for building serverless AI apps with Firebase Genkit and Gemini. Flows, agents, and RAG on the current Genkit 1.x API, plus Cloud Functions deployment, cost control through model routing, and cold-start tuning from an indie developer's perspective."
+description: "A hands-on implementation notebook for building serverless AI apps with Firebase Genkit and Gemini. Flows, agents, and RAG on the current Genkit 1.x API, plus per-flow usage logging that turns spend into an itemized bill, the gaps between the Dev UI and production, and cold-start tuning."
 tags: ["Firebase Genkit", "Gemini", "Serverless", "AI", "Development"]
 highlights:
   - "Copy-runnable Flow, Tool, and RAG code written against the current Genkit 1.x API (the genkit constructor and zod schemas)"
-  - "Concrete patterns for cutting API cost with model routing and caching, plus how to make per-flow spend visible"
-  - "Cold-start tuning from real operation: when to set minimum instances and how to move heavy init off the request path"
+  - "A usage-logging wrapper and aggregation script that report cost per 1,000 calls, plus how to cut the input-token tail"
+  - "How to isolate the four things that pass in the Dev UI but break in production, and when a minimum instance is worth paying for"
 
 ---
 ## Shipping one Flow, and why the framework's thinness matters
@@ -290,6 +290,143 @@ export const routedFlow = ai.defineFlow(
 
 Alongside that, log call counts and duration per flow. Watching only the grand total hides which flow is driving the bill. On my own setup I was running a simple classification task on Pro for a while; dropping it to Flash roughly halved that flow's model cost. My broader take on staged cost control is in [cost guardrails for indie developers](/articles/gemini-dev/gemini-35-flash-stage-routing-indie-cost-guardrails).
 
+## Stop guessing at cost — record usage per flow and read the itemized bill
+
+The trouble that showed up right after I added routing was that I couldn't tell whether it was working. Billing arrives per project, not per Flow. When the total drops, there's no way to separate "routing paid off" from "that was just a quiet week."
+
+So I started writing out the usage that comes back from `ai.generate()`, one line per call, tagged with the flow name.
+
+```typescript
+// src/usage.ts
+import { appendFileSync } from "node:fs";
+import { ai } from "./genkit";
+
+type GenArgs = Parameters<typeof ai.generate>[0];
+
+// Wrap generate with a flow name and leave usage behind as one JSON line
+export async function generateWithUsage(flow: string, args: GenArgs) {
+  const startedAt = Date.now();
+  const res = await ai.generate(args);
+  const u = res.usage ?? {};
+  const record = {
+    ts: new Date().toISOString(),
+    flow,
+    model:
+      typeof args.model === "string" ? args.model : args.model?.name ?? "default",
+    inputTokens: u.inputTokens ?? 0,
+    outputTokens: u.outputTokens ?? 0,
+    ms: Date.now() - startedAt,
+  };
+
+  if (process.env.USAGE_LOG) {
+    appendFileSync(process.env.USAGE_LOG, JSON.stringify(record) + "\n");
+  } else {
+    // Files don't survive on Cloud Functions, so emit a structured log instead
+    console.log(JSON.stringify({ severity: "INFO", genkitUsage: record }));
+  }
+  return res;
+}
+```
+
+This is where I tripped once: I kept appending to a file the way I did locally. A Cloud Functions instance takes its filesystem with it when it goes away, so those lines are not a log you can trust. In production I switched to emitting JSON through `console.log` and picking it up as a log-based metric in Cloud Logging. Locally I set `USAGE_LOG`, collect the jsonl, and aggregate it with the script below.
+
+```javascript
+// scripts/usage-report.mjs
+import { readFileSync } from "node:fs";
+
+// Prices change — replace these with the numbers on your own billing page (USD per 1M tokens)
+const PRICE = {
+  "gemini-2.5-flash": { in: 0.3, out: 2.5 },
+  "gemini-2.5-pro": { in: 1.25, out: 10.0 },
+};
+
+const rows = readFileSync(process.argv[2], "utf8")
+  .trim()
+  .split("\n")
+  .map((line) => JSON.parse(line));
+
+const agg = new Map();
+for (const r of rows) {
+  const key = `${r.flow}\t${r.model}`;
+  const a = agg.get(key) ?? { calls: 0, in: 0, out: 0, ms: [] };
+  a.calls += 1;
+  a.in += r.inputTokens;
+  a.out += r.outputTokens;
+  a.ms.push(r.ms);
+  agg.set(key, a);
+}
+
+const pct = (xs, p) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length * p)] ?? 0;
+
+for (const [key, a] of agg) {
+  const [flow, model] = key.split("\t");
+  const price = PRICE[model] ?? PRICE["gemini-2.5-flash"];
+  const usd = (a.in / 1e6) * price.in + (a.out / 1e6) * price.out;
+  const per1k = (usd / a.calls) * 1000;
+  console.log(
+    [
+      flow.padEnd(18),
+      `calls=${a.calls}`,
+      `in/call=${Math.round(a.in / a.calls)}`,
+      `out/call=${Math.round(a.out / a.calls)}`,
+      `$${per1k.toFixed(2)} per 1,000 calls`,
+      `p90 ${pct(a.ms, 0.9)}ms`,
+      `p90 input ${pct(rows.filter((r) => r.flow === flow).map((r) => r.inputTokens), 0.9)} tok`,
+    ].join("  "),
+  );
+}
+```
+
+Running my four flows on Flash produced the numbers below, calculated with the prices in that script.
+
+<table>
+  <thead>
+    <tr>
+      <th>Flow</th>
+      <th>Avg input tokens</th>
+      <th>Avg output tokens</th>
+      <th>Per 1,000 calls</th>
+      <th>vs. greeting</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>greeting</td>
+      <td>120</td>
+      <td>90</td>
+      <td>$0.26</td>
+      <td>1.0x</td>
+    </tr>
+    <tr>
+      <td>assistant (with tools)</td>
+      <td>640</td>
+      <td>210</td>
+      <td>$0.72</td>
+      <td>2.7x</td>
+    </tr>
+    <tr>
+      <td>documentAnalysis</td>
+      <td>1,850</td>
+      <td>320</td>
+      <td>$1.36</td>
+      <td>5.2x</td>
+    </tr>
+    <tr>
+      <td>documentRAG</td>
+      <td>2,600</td>
+      <td>280</td>
+      <td>$1.48</td>
+      <td>5.7x</td>
+    </tr>
+  </tbody>
+</table>
+
+What the table finally showed me is that the tail of the input distribution matters more than the average. documentAnalysis averages 1,850 input tokens, but its p90 is roughly 4,900 — about 2.6x the mean. The top ten percent of calls were producing something like thirty percent of that flow's monthly cost.
+
+The 5,000-character truncation should have prevented that, so why did the tail keep growing? Because the cap only applied to the document that was passed in. The boilerplate around the prompt, and the retrieved context injected on the RAG path, were never counted. I now apply the cap to the assembled prompt as a whole and drop from the end of the retrieved context when it overflows.
+
+Keep the price table in code as a constant. Once it lives in a spreadsheet, it stops getting updated, and you end up making decisions on six-month-old rates.
+
 ## Cold starts and operation — the unglamorous tuning that paid off
 
 The first wall in serverless was cold starts. The less often a flow is called, the slower its first invocation, and to a user that reads as a heavy app. Here are my own measurements.
@@ -326,6 +463,59 @@ The first wall in serverless was cold starts. The less often a flow is called, t
 </table>
 
 The fixes are plain. Set `minInstances` to 1 on high-traffic paths to keep them warm, and move heavy initialization off module load and outside the request path. There's nothing flashy here, but perceived speed really does come down to this kind of tuning. Since minimum instances mean continuous billing, the indie compromise is to warm only the paths that genuinely need it.
+
+
+Whether to set a minimum instance comes down to three questions for me.
+
+1. Is this path part of the user's first interaction? If not, four to six seconds on the first call does little real damage
+2. How far apart are the calls? If the logs show gaps of fifteen minutes or more as the norm, warmth won't survive on its own — nothing improves until you pay for a minimum instance
+3. Does the monthly cost of holding one instance warm balance against that flow's model spend?
+
+Question three flipped a decision for me. The lightweight greeting path costs about $0.26 per 1,000 calls. At a few thousand calls a month, the always-on charge for a minimum instance came out larger than the model spend itself. I dropped the minimum instance there and put a single warm instance on documentRAG instead. Warm every path out of a general desire for speed and the model cost you trimmed simply comes back under a different name.
+
+## Four things that passed in the Dev UI and broke in production
+
+The local Dev UI is generous. It reads `.env`, fills schema defaults into the form, and never makes you think about regions. All of that generosity came due at once after deployment. Here are the four I actually hit.
+
+<table>
+  <thead>
+    <tr>
+      <th>Symptom</th>
+      <th>Actual cause</th>
+      <th>First move</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>500 on the first call after deploy, auth-related error in the logs</td>
+      <td>Forgot to pass the secret into <code>onCallGenkit</code>. The Dev UI reads <code>.env</code>, so nothing warns you</td>
+      <td>Confirm the value exists in Secret Manager, then check the <code>secrets</code> array on every exported Flow</td>
+    </tr>
+    <tr>
+      <td>404, or something that looks like a CORS failure, when calling from the client</td>
+      <td>The function's region and the client SDK's default region don't match</td>
+      <td>Name the region on the client too (<code>getFunctions(app, "asia-northeast1")</code>)</td>
+    </tr>
+    <tr>
+      <td>zod rejects the input because a field is undefined</td>
+      <td>The Dev UI form was filling in <code>.default()</code>; the real client omits the field entirely</td>
+      <td>Don't lean on schema defaults — settle them at the top of the Flow body as well</td>
+    </tr>
+    <tr>
+      <td>deadline-exceeded, but only on the very first call</td>
+      <td>Heavy initialization running at module top level</td>
+      <td>Defer init off the request path; set a minimum instance if the path deserves warming</td>
+    </tr>
+  </tbody>
+</table>
+
+Three steps have been enough to isolate every one of these.
+
+1. Pull the logs for that specific function and check whether it fails only on the first call or on every call. That split separates wiring problems from cold-start problems
+2. Failing every time means wiring. Work through secrets, region, and schema in that order — those three explained every case I ran into
+3. Failing only the first time means initialization. Count what runs at module top level and see whether moving it behind the request changes anything
+
+The region mismatch cost me half a day. The error wears a CORS face, so you keep suspecting the frontend. Checking the region in the functions list is a far shorter road.
 
 ## Wrapping up — start small, and grow with the spend breakdown in hand
 

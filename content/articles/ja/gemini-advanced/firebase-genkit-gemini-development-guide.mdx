@@ -6,12 +6,12 @@ level: "advanced"
 premium: true
 date: "2026-03-25T14:00"
 author: "Gemini Lab"
-description: "Firebase Genkit と Gemini でサーバーレスAIアプリを組む実装ノートです。Genkit 1.x の現行APIで Flow・エージェント・RAG を実装し、Cloud Functions へのデプロイ、モデルルーティングによるコスト最適化、コールドスタート対策までを個人開発の視点でまとめます。"
+description: "Firebase Genkit と Gemini でサーバーレスAIアプリを組む実装ノートです。Genkit 1.x の現行APIで Flow・エージェント・RAG を実装し、usage をフロー単位で記録して費用を明細化する手順、Dev UI と本番の差で落ちる箇所、コールドスタート対策までをまとめます。"
 tags: ["Firebase Genkit", "Gemini", "サーバーレス", "AI", "開発"]
 highlights:
   - "Genkit 1.x の現行API（genkit コンストラクタと zod スキーマ）で書いた、そのまま動く Flow・Tool・RAG の実装"
-  - "モデルルーティングとキャッシュでAPIコストを抑える具体パターンと、フローごとの費用の見える化"
-  - "コールドスタートを実運用で詰めた、最小インスタンスと初期化分離の判断基準"
+  - "usage をフロー単位で記録して1,000呼び出しあたりの費用を出す集計スクリプトと、入力トークンの裾の潰し方"
+  - "Dev UI では通るのに本番で落ちる4か所の切り分けと、最小インスタンスを置くかどうかの判断基準"
 
 ---
 ## Flow を1本デプロイして気づいた「フレームワークの薄さ」の価値
@@ -290,6 +290,144 @@ export const routedFlow = ai.defineFlow(
 
 あわせて、フローごとに呼び出し回数と実行時間を記録します。全体の合計だけを見ていると、どのフローが費用を押し上げているのかが分かりません。私の手元では、単純な分類タスクを Pro で回していた時期があり、Flash に落とすだけで当該フローのモデル費用が体感で半分以下になりました。段階的なコスト制御の考え方は[個人開発のコストガードレール](/articles/gemini-dev/gemini-35-flash-stage-routing-indie-cost-guardrails)にもまとめています。
 
+## 費用の内訳を推測しない — usage をフロー単位で記録して明細にする
+
+ルーティングを入れたあとに困ったのは、「効いているのかどうかが分からない」ことでした。請求はプロジェクト単位でまとまってくるので、Flow ごとの内訳は出てきません。合計が下がっても、ルーティングが効いたのか、単に呼び出しが減った週だったのかを切り分けられない。
+
+そこで `ai.generate()` の戻り値に含まれる usage を、フロー名と一緒に1行ずつ書き出すようにしました。
+
+```typescript
+// src/usage.ts
+import { appendFileSync } from "node:fs";
+import { ai } from "./genkit";
+
+type GenArgs = Parameters<typeof ai.generate>[0];
+
+// フロー名を添えて generate を包み、usage を1行 JSON で残す
+export async function generateWithUsage(flow: string, args: GenArgs) {
+  const startedAt = Date.now();
+  const res = await ai.generate(args);
+  const u = res.usage ?? {};
+  const record = {
+    ts: new Date().toISOString(),
+    flow,
+    model:
+      typeof args.model === "string" ? args.model : args.model?.name ?? "default",
+    inputTokens: u.inputTokens ?? 0,
+    outputTokens: u.outputTokens ?? 0,
+    ms: Date.now() - startedAt,
+  };
+
+  if (process.env.USAGE_LOG) {
+    appendFileSync(process.env.USAGE_LOG, JSON.stringify(record) + "\n");
+  } else {
+    // Cloud Functions ではファイルは残らないので構造化ログに落とす
+    console.log(JSON.stringify({ severity: "INFO", genkitUsage: record }));
+  }
+  return res;
+}
+```
+
+ここで一度つまずいたのが、ローカルと同じ感覚でファイルに追記していた点です。Cloud Functions のファイルシステムはインスタンスが消えれば一緒に消えるため、ログとしては当てになりません。本番側は `console.log` で JSON を出し、Cloud Logging のログベース指標として拾う形に切り替えました。ローカルでは `USAGE_LOG` を指定して jsonl に貯め、次のスクリプトで集計します。
+
+```javascript
+// scripts/usage-report.mjs
+import { readFileSync } from "node:fs";
+
+// 単価は改定されるので、自分の請求画面の値に置き換えてください（1Mトークンあたり USD）
+const PRICE = {
+  "gemini-2.5-flash": { in: 0.3, out: 2.5 },
+  "gemini-2.5-pro": { in: 1.25, out: 10.0 },
+};
+const JPY = 150;
+
+const rows = readFileSync(process.argv[2], "utf8")
+  .trim()
+  .split("\n")
+  .map((line) => JSON.parse(line));
+
+const agg = new Map();
+for (const r of rows) {
+  const key = `${r.flow}\t${r.model}`;
+  const a = agg.get(key) ?? { calls: 0, in: 0, out: 0, ms: [] };
+  a.calls += 1;
+  a.in += r.inputTokens;
+  a.out += r.outputTokens;
+  a.ms.push(r.ms);
+  agg.set(key, a);
+}
+
+const pct = (xs, p) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length * p)] ?? 0;
+
+for (const [key, a] of agg) {
+  const [flow, model] = key.split("\t");
+  const price = PRICE[model] ?? PRICE["gemini-2.5-flash"];
+  const usd = (a.in / 1e6) * price.in + (a.out / 1e6) * price.out;
+  const per1k = (usd / a.calls) * 1000 * JPY;
+  console.log(
+    [
+      flow.padEnd(18),
+      `calls=${a.calls}`,
+      `in/回=${Math.round(a.in / a.calls)}`,
+      `out/回=${Math.round(a.out / a.calls)}`,
+      `${per1k.toFixed(0)}円 / 1,000呼び出し`,
+      `p90 ${pct(a.ms, 0.9)}ms`,
+      `p90入力 ${pct(rows.filter((r) => r.flow === flow).map((r) => r.inputTokens), 0.9)}tok`,
+    ].join("  "),
+  );
+}
+```
+
+手元の4フローを Flash に揃えて回したときの出力は、次のようになりました。単価は上のコードの値で計算しています。
+
+<table>
+  <thead>
+    <tr>
+      <th>フロー</th>
+      <th>平均入力トークン</th>
+      <th>平均出力トークン</th>
+      <th>1,000呼び出しあたり</th>
+      <th>greeting 比</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>greeting</td>
+      <td>120</td>
+      <td>90</td>
+      <td>約39円</td>
+      <td>1.0倍</td>
+    </tr>
+    <tr>
+      <td>assistant（ツール込み）</td>
+      <td>640</td>
+      <td>210</td>
+      <td>約108円</td>
+      <td>2.7倍</td>
+    </tr>
+    <tr>
+      <td>documentAnalysis</td>
+      <td>1,850</td>
+      <td>320</td>
+      <td>約203円</td>
+      <td>5.2倍</td>
+    </tr>
+    <tr>
+      <td>documentRAG</td>
+      <td>2,600</td>
+      <td>280</td>
+      <td>約222円</td>
+      <td>5.7倍</td>
+    </tr>
+  </tbody>
+</table>
+
+この表を出して初めて分かったのは、平均ではなく入力トークンの裾が効いているということでした。documentAnalysis の入力は平均1,850トークンですが、p90 は約4,900トークン。平均の約2.6倍です。上位1割の呼び出しが、そのフローの月額のおよそ3割を作っていました。
+
+5,000文字で切り詰めていたはずなのに、なぜまだ裾が伸びるのか。原因は、上限を「渡された文書」にだけ掛けていたことでした。プロンプトの定型部と、RAG 側で差し込む参照文脈は数えていない。私はいま、上限を組み上がったプロンプト全体に対して掛け、超えた分は参照文脈の末尾から落とすようにしています。
+
+単価表はコードの中に定数として置くことをお勧めします。スプレッドシートに分けると更新が止まり、半年前の単価で判断し続けることになります。
+
 ## コールドスタートと運用 — 個人開発で効いた地味な調整
 
 サーバーレスで最初にぶつかる壁はコールドスタートでした。たまにしか呼ばれないフローほど初回が遅く、ユーザーには「重いアプリ」に映ってしまいます。私の手元での計測は次の通りです。
@@ -326,6 +464,59 @@ export const routedFlow = ai.defineFlow(
 </table>
 
 対策は素朴です。呼び出し頻度の高い経路は `minInstances` を 1 に設定してウォームに保ち、重い初期化はモジュール読み込み時ではなくリクエスト経路の外へ寄せる。派手さはありませんが、体感速度は結局こうした調整で決まると感じています。最小インスタンスは常時課金につながるため、本当に温めるべき経路だけに絞るのが、個人開発での落としどころです。
+
+
+最小インスタンスを置くかどうかは、次の3点で決めています。
+
+1. その経路がユーザーの最初の操作に含まれるか。含まれないなら、初回に4〜6秒かかっても実害は小さい
+2. 呼び出しの間隔。ログを見て15分以上空くのが常態なら、ウォームはまず維持されません。つまり最小インスタンスを置かない限り、体感は改善しません
+3. 常時1インスタンスを維持する月額が、そのフローのモデル費用と釣り合うか
+
+3番で判断が変わった例があります。greeting 相当の軽い経路は、1,000呼び出しで約39円。月に数千回程度なら、モデル費用より最小インスタンスの常時課金のほうが大きくなる計算でした。結局この経路の最小インスタンスは外し、代わりに documentRAG 側にだけ 1 を置いています。速くしたい気持ちだけで全経路を温めると、削ったはずのモデル費用が別の名前で戻ってきます。
+
+## Dev UI では通ったのに本番で落ちた4か所
+
+ローカルの Dev UI は親切です。`.env` を読み、スキーマの既定値をフォームに埋め、リージョンを気にする必要もない。その親切さが、デプロイ後にまとめて牙をむきました。私が実際に踏んだのは次の4つです。
+
+<table>
+  <thead>
+    <tr>
+      <th>症状</th>
+      <th>実際の原因</th>
+      <th>最初に打つ手</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>デプロイ直後の呼び出しが500。ログに認証系のエラー</td>
+      <td><code>onCallGenkit</code> の <code>secrets</code> に渡し忘れ。Dev UI は <code>.env</code> を読むので気づけない</td>
+      <td>Secret Manager 側に値があるかを確認し、export している全ての Flow の <code>secrets</code> 配列を見る</td>
+    </tr>
+    <tr>
+      <td>クライアントから呼ぶと404、またはCORSに見えるエラー</td>
+      <td>Functions のリージョンと、クライアントSDKの既定リージョンがずれている</td>
+      <td>クライアント側でもリージョンを明示する（<code>getFunctions(app, "asia-northeast1")</code>）</td>
+    </tr>
+    <tr>
+      <td>入力の一部が undefined で zod に弾かれる</td>
+      <td>Dev UI のフォームが <code>.default()</code> を埋めていた。実クライアントは省略して送っていた</td>
+      <td>既定値をスキーマ任せにせず、Flow 本体の先頭でも確定させる</td>
+    </tr>
+    <tr>
+      <td>最初の1回だけ deadline-exceeded</td>
+      <td>モジュールのトップレベルで重い初期化を走らせている</td>
+      <td>初期化を遅延させてリクエスト経路の外へ。温めるべき経路なら最小インスタンス</td>
+    </tr>
+  </tbody>
+</table>
+
+切り分けの順番は、いつも同じ3手で足りています。
+
+1. デプロイした関数のログを絞って取り、失敗が初回だけか毎回かを見る。ここで配線の問題とコールドスタートの問題が分かれます
+2. 毎回失敗するなら配線側。シークレット、リージョン、スキーマの順に潰す。この3つで私の遭遇例はすべて説明がつきました
+3. 初回だけなら初期化側。モジュールのトップレベルで走っている処理を数え、リクエストを受けてから走らせて差が出るかを確かめる
+
+2番のリージョン不一致には、私自身が半日を溶かしました。エラーがCORSの顔をして出てくるので、フロントエンド側を疑い続けてしまう。Functions の一覧でリージョンを確認するほうが、はるかに早い道でした。
 
 ## まとめ — 小さく動かし、費用の内訳を持って育てる
 
