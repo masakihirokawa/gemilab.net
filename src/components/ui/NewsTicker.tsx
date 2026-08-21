@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SPARK — 8月13日から Gemini Spark のエンジンが Gemini 3.7 Flash になりました。エージェント用途に推論の深さより往復の速さを選んだ構成で、自作エージェントのモデル選定の参考になります",
-    "AGENT — Spark は権限を与えたうえで複数ステップの作業を自律的に進めます。予約の取得やフォーム入力など、単発の命令に応答する従来型の音声アシスタントとは設計思想が違います",
-    "ASSISTANT — 9月4日の Google アシスタント置き換えまで残り14日です。移行が完了した端末では旧アシスタントへ戻せません。Google ビルトイン搭載車は引き続きアシスタントが動きます",
-    "EDUCATION — 8月10日から Gemini in Classroom が、管理者の許可を受けた K-12 および高等教育の学生であれば年齢を問わず利用できるようになりました",
-    "SCALE — Gemini アプリの画像生成は1日あたり1億5,000万枚に達しています。生成量そのものより、これが常時稼働の負荷としてどう捌かれているかが設計の参考になります",
-    "MODELS — 深い推論は Gemini 3.1 Pro、速度とコストを優先する本番処理は Flash 系という棲み分けが定着しました。同一処理を両者で流して実測すると差が見えます",
+    "STUDIO — Android と iOS 向けに予定されていた AI Studio の単体アプリは中止され、アプリ構築機能が Gemini アプリへ直接組み込まれます。画像生成・動画生成・テキスト分析・コード支援も同じ場所に集まります",
+    "BENCH — Gemini 3.7 Flash は長期タスクのコーディング指標 DeepSWE で 49.0 パーセントから 65.3 パーセントへ上がり、同時にトークン単価は半分になりました",
+    "REACH — 3.7 Flash は Gemini API に加え、Android Studio、Google Antigravity、Gemini Enterprise Agent Platform、Gemini アプリの Spark から使えます",
+    "API — サンプリング系の temperature・top_p・top_k が非推奨になりました。これらで出力の揺れを抑えていた実装は、再現性の担保をどこで取るか決め直す時期です",
+    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日に停止します。残り9日です。後継は er-2-preview と er-2-streaming-preview で、テキスト・画像・動画・音声を入力に取ります",
+    "ASSISTANT — Android の Google アシスタントを Gemini へ置き換える作業は9月4日から始まります。残り13日です。App Actions や音声ショートカットを使うアプリは挙動の確認を",
   ],
   en: [
-    "SPARK — Gemini 3.7 Flash became the engine behind Gemini Spark on August 13. Choosing round-trip speed over reasoning depth for agent work is a useful signal when picking your own model",
-    "AGENT — Spark carries out multi-step tasks autonomously once granted permission, handling things like booking appointments and filling forms rather than answering one command at a time",
-    "ASSISTANT — Fourteen days until Gemini replaces Google Assistant on September 4. Once a device migrates there is no going back, though cars with Google Built-in keep Assistant for now",
-    "EDUCATION — Since August 10, Gemini in Classroom is available to K-12 and higher-education students of any age, provided their administrator has granted access",
-    "SCALE — The Gemini app now generates 150 million images a day. The interesting part is less the volume than how that sustained load is absorbed in practice",
-    "MODELS — The split has settled: Gemini 3.1 Pro for deep reasoning, the Flash line for production work where speed and cost matter. Running the same job through both makes the gap concrete",
+    "STUDIO — The planned standalone AI Studio app for Android and iOS has been cancelled, with its app-building tools folded directly into the Gemini app alongside image, video, text and code work",
+    "BENCH — Gemini 3.7 Flash moved from 49.0 to 65.3 percent on DeepSWE, a long-horizon coding benchmark, while costing half as much per token",
+    "REACH — Beyond the Gemini API, 3.7 Flash is available in Android Studio, Google Antigravity, the Gemini Enterprise Agent Platform, and Spark in the Gemini app",
+    "API — The sampling parameters temperature, top_p and top_k are now deprecated. If you relied on them to keep output steady, it is time to decide where reproducibility comes from instead",
+    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31, nine days out. Its successors, er-2-preview and er-2-streaming-preview, accept text, image, video and audio input",
+    "ASSISTANT — Replacing Google Assistant with Gemini on Android begins September 4, thirteen days from now. Worth checking any app that leans on App Actions or voice shortcuts",
   ],
 };
 
