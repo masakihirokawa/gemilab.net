@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "STUDIO — Android と iOS 向けに予定されていた AI Studio の単体アプリは中止され、アプリ構築機能が Gemini アプリへ直接組み込まれます。画像生成・動画生成・テキスト分析・コード支援も同じ場所に集まります",
-    "BENCH — Gemini 3.7 Flash は長期タスクのコーディング指標 DeepSWE で 49.0 パーセントから 65.3 パーセントへ上がり、同時にトークン単価は半分になりました",
-    "REACH — 3.7 Flash は Gemini API に加え、Android Studio、Google Antigravity、Gemini Enterprise Agent Platform、Gemini アプリの Spark から使えます",
-    "API — サンプリング系の temperature・top_p・top_k が非推奨になりました。これらで出力の揺れを抑えていた実装は、再現性の担保をどこで取るか決め直す時期です",
-    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日に停止します。残り9日です。後継は er-2-preview と er-2-streaming-preview で、テキスト・画像・動画・音声を入力に取ります",
-    "ASSISTANT — Android の Google アシスタントを Gemini へ置き換える作業は9月4日から始まります。残り13日です。App Actions や音声ショートカットを使うアプリは挙動の確認を",
+    "CHAT — 8月26日から Google Chat が Gemini のハブになります。検索・下書き・会話の追いつき・タスクとイベントの管理を、Workspace の文脈を持ったまま行えるようになります。残り3日です",
+    "ANDROID — 9月4日から Android の Google アシスタントを Gemini が置き換えます。残り12日です。アシスタント前提で組んだ音声ショートカットは、置き換え後の挙動を確認しておきたいところです",
+    "SCALE — Gemini アプリが8月11日に月間10億ユーザーへ到達しました",
+    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日で停止します。残り8日です。後継は ER 2 系で、空間推論・多段のツール連携・複数ロボットの協調に対応します",
+    "FLASH — Gemini 3.7 Flash は8月13日に GA となり、AI Pro と Ultra 向けの Gemini Spark のエンジンとして160か国以上で動いています。導入価格は12月31日までです",
+    "CLASSROOM — Gemini in Classroom が8月10日から全年齢の学生へ開放されました。フラッシュカード・練習問題・学習ガイド・ガイド付きプロンプトが使えます",
   ],
   en: [
-    "STUDIO — The planned standalone AI Studio app for Android and iOS has been cancelled, with its app-building tools folded directly into the Gemini app alongside image, video, text and code work",
-    "BENCH — Gemini 3.7 Flash moved from 49.0 to 65.3 percent on DeepSWE, a long-horizon coding benchmark, while costing half as much per token",
-    "REACH — Beyond the Gemini API, 3.7 Flash is available in Android Studio, Google Antigravity, the Gemini Enterprise Agent Platform, and Spark in the Gemini app",
-    "API — The sampling parameters temperature, top_p and top_k are now deprecated. If you relied on them to keep output steady, it is time to decide where reproducibility comes from instead",
-    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31, nine days out. Its successors, er-2-preview and er-2-streaming-preview, accept text, image, video and audio input",
-    "ASSISTANT — Replacing Google Assistant with Gemini on Android begins September 4, thirteen days from now. Worth checking any app that leans on App Actions or voice shortcuts",
+    "CHAT — From August 26, Google Chat becomes a Gemini hub for searching, drafting, catching up on threads, and managing tasks and events with full Workspace context. Three days out",
+    "ANDROID — Gemini replaces Google Assistant on Android from September 4, twelve days from now. Worth checking any voice shortcuts you built on Assistant before the switch",
+    "SCALE — The Gemini app crossed one billion monthly users on August 11",
+    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31, eight days out. The ER 2 preview models succeed it, adding spatial reasoning, multi-step tool orchestration, and multi-robot coordination",
+    "FLASH — Gemini 3.7 Flash went GA on August 13 and now powers Gemini Spark for AI Pro and Ultra subscribers in 160-plus countries. Introductory pricing runs through December 31",
+    "CLASSROOM — Gemini in Classroom opened to students of all ages on August 10, with flashcards, practice quizzes, study guides, and guided prompts",
   ],
 };
 
