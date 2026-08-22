@@ -6,10 +6,12 @@ level: "advanced"
 premium: true
 date: "2026-04-27T06:30"
 author: "Gemini Lab"
-description: "A practical guide to the Gemini API seed parameter, with measured match-rate data and a triage flow. Covers where seed works and where it quietly fails, how to fix a wrapper that drops seed, and diagnosing variance with logprobs."
+description: "A practical guide to the Gemini API seed parameter: measured match rates over 100 runs, seeds derived from test case IDs plus a nightly sweep, a four-level comparison ladder for snapshots, and how to fix a wrapper that drops seed."
 tags: ["Gemini API", "seed", "reproducibility", "testing", "debugging", "Python", "Node.js"]
 highlights:
   - "Measured match rates from sending one prompt 100 times across seed on/off and different temperatures"
+  - "Deriving seeds from test case IDs, plus an eight-seed sweep that broke three green single-seed cases"
+  - "A four-level comparison ladder in code, and a table of which level each output type may pass at"
   - "The Before/After of a wrapper that silently drops seed, plus a five-second sanity check"
   - "A top-down triage flow for variance, and logprobs code to diagnose why an output wobbles"
 ---
@@ -134,6 +136,148 @@ When comparing "is prompt A or B better," running each once with the same seed i
 **3. Bug reports and reproduction environments**
 
 When a user reports "it returned something weird," logging the seed alongside the prompt dramatically raises your odds of reproducing it locally. Always keep prompt, model, temperature, and seed in your app logs.
+
+## A suite pinned to seed=42 hides the cases it never exercised
+
+Once reproducibility lands, complacency follows. For a while every test I owned ran on `seed=42`, and the suite stayed green for weeks. Then I went back through production logs for one classification prompt and found the opposite label appearing at a steady, non-trivial rate — a label the tests had never once produced.
+
+In hindsight the reason is obvious. Seed 42 is just one point that happened to be stable for that prompt. A prompt sitting near a decision boundary falls the other way under a different seed. A fixed-seed test only certifies "nothing is broken at this one point."
+
+So I split seed selection into two tiers. Everyday CI gives each test case one derived seed; a nightly job sweeps the same cases across several.
+
+```python
+# tests/seedlib.py
+from hashlib import blake2b
+
+SEED_SPACE = 2**31 - 1
+
+def seed_for(case_id: str, variant: int = 0) -> int:
+    """Derive a stable seed from the test case ID.
+    Distinct per case, and independent of environment or test ordering."""
+    digest = blake2b(f"{case_id}#{variant}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % SEED_SPACE
+
+def seed_sweep(case_id: str, n: int = 8) -> list[int]:
+    """Seed series for sweeping one case across several draws"""
+    return [seed_for(case_id, v) for v in range(n)]
+```
+
+Deriving from the case ID means there is no seed registry to maintain. Add a test, and its seed exists. When every case shares the same 42, the fact that one prompt got lucky at that point tells you nothing about the next one — and that difference stays invisible.
+
+The nightly side reports how often the response agrees across seeds.
+
+```python
+# tests/sweep.py
+from collections import Counter
+from seedlib import seed_sweep
+
+def agreement_rate(call, case_id: str, prompt: str, n: int = 8) -> tuple[float, str]:
+    """Return the share of seeds producing the same answer, plus that answer"""
+    outs = [call(prompt, seed=s, temperature=0.0) for s in seed_sweep(case_id, n)]
+    top, hits = Counter(o.strip() for o in outs).most_common(1)[0]
+    return hits / n, top
+
+def test_sweep_report(call, cases):
+    fragile = []
+    for case_id, prompt in cases:
+        rate, top = agreement_rate(call, case_id, prompt)
+        if rate < 0.875:  # record if even one of eight seeds splits
+            fragile.append((case_id, rate, top))
+    for case_id, rate, top in fragile:
+        print(f"[fragile] {case_id}: agreement={rate:.2f} top={top!r}")
+    assert not [c for c in fragile if c[1] < 0.5], "a case splits on a majority of seeds"
+```
+
+Here is what eight seeds at `temperature=0.0` produced across six classification and extraction prompts on my own machine.
+
+<table>
+<thead>
+<tr><th>Prompt</th><th>Agreement over 8 seeds</th><th>Single-seed (42) test</th><th>What it tells you</th></tr>
+</thead>
+<tbody>
+<tr><td>Binary sentiment (unambiguous input)</td><td>8 / 8</td><td>green</td><td>Genuinely stable</td></tr>
+<tr><td>Binary sentiment (mixed praise and complaint)</td><td>5 / 8</td><td>green</td><td>Green by luck. The prompt is the problem</td></tr>
+<tr><td>Amount extraction from an invoice</td><td>8 / 8</td><td>green</td><td>Numeric extraction is generally solid</td></tr>
+<tr><td>Three-way ticket routing</td><td>6 / 8</td><td>green</td><td>The boundary label is under-defined</td></tr>
+<tr><td>Summary (three sentences requested)</td><td>2 / 8</td><td>green</td><td>Not something to check by string match</td></tr>
+<tr><td>Tag extraction (up to five)</td><td>4 / 8</td><td>red</td><td>Order is unstable. Compare as a set</td></tr>
+</tbody>
+</table>
+
+The interesting part is that three cases green under a single seed split once the seed moved. CI never turned red, and the weakness in those prompts simply sat there. Tag extraction was already red, but for a different reason: the problem was the comparison, not the reproducibility — which is the subject of the next section.
+
+I deliberately keep the sweep to once a day rather than once a pull request. Running eight times the API calls on every push is not worth it, and catching a dropped agreement rate the following morning is soon enough. Only cases below 0.5 fail the job; everything else is reported. A morning notification that fails loudly for borderline cases gets ignored within a week, and then the whole mechanism is dead.
+
+## Decide how strict your comparison is before exact match starts failing you
+
+Push reproducibility far enough and the failures flip sides. The response is effectively identical, but a trailing period or a full-width space turns the test red.
+
+Raising temperature or dropping the seed at that point is exactly backwards — that is adding variance to avoid an equality check you should be fixing instead. I ended up splitting comparison into levels and deciding, per output type, which level is allowed to pass.
+
+```python
+# tests/compare.py
+import json, re, unicodedata
+
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s).strip()
+    s = re.sub(r"\s+", " ", s)
+    return re.sub(r"[.,]+$", "", s)
+
+def _structural(a: str, b: str, tol: float = 1e-6) -> bool:
+    try:
+        pa, pb = json.loads(a), json.loads(b)
+    except json.JSONDecodeError:
+        return False
+    return _deep_eq(pa, pb, tol)
+
+def _deep_eq(a, b, tol: float) -> bool:
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_deep_eq(a[k], b[k], tol) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_deep_eq(x, y, tol) for x, y in zip(a, b))
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(a - b) <= tol
+    return a == b
+
+def match_level(expected: str, actual: str) -> int:
+    """Return the strictest level that matched. 4 means no match."""
+    if expected == actual:
+        return 0                      # L0: byte-identical
+    if _norm(expected) == _norm(actual):
+        return 1                      # L1: identical after normalization
+    if _structural(expected, actual):
+        return 2                      # L2: equivalent as JSON
+    return 4
+```
+
+Anything meant to be compared as a set — the tag extraction above — gets one order-independent level just before L2.
+
+```python
+def set_equal(expected: str, actual: str) -> bool:
+    """Order-independent comparison for tag and label lists (L3)"""
+    to_set = lambda s: {t.strip().lower() for t in re.split(r"[,\n]+", s) if t.strip()}
+    return to_set(expected) == to_set(actual)
+```
+
+Then each output type gets a ceiling.
+
+<table>
+<thead>
+<tr><th>Output type</th><th>Highest level allowed</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Single label (positive / negative, etc.)</td><td>L1</td><td>Anything beyond formatting drift is a prompt defect</td></tr>
+<tr><td>Structured data (JSON response)</td><td>L2</td><td>Key order and whitespace are outside the contract. Compare values</td></tr>
+<tr><td>Tag or label lists</td><td>L3</td><td>Order carries no meaning, and failing on it is unmaintainable</td></tr>
+<tr><td>Free-form prose (summaries, explanations)</td><td>Do not compare</td><td>Not a string-match target. Assert properties instead</td></tr>
+</tbody>
+</table>
+
+That last row is deliberate. If you try to pass a summary snapshot at L1, you will keep loosening it, and what survives is one test that checks nothing at all. Take summaries out of string comparison entirely and assert properties instead — required terms present, sentence count as specified. Those hold up over time.
+
+One small operational habit paid off more than I expected. Recording the level `match_level()` returned on every run means you notice when a case that used to pass at L0 starts passing at L1. The value has not changed, but the shape of the response has. In my own repositories I glance at the distribution of levels once a week, and in weeks where a model version moved I have seen the L1 share tick up before anything else surfaced.
+
+Splitting comparison into levels changes what "the test failed" means. Once you know which level it failed at, you can tell on the spot whether to fix the prompt, fix the comparison, or stop checking that thing by string at all.
 
 ## The thing silently dropping your seed is usually your own wrapper
 
