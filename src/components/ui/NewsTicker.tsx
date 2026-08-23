@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CHAT — 8月26日から Google Chat が Gemini のハブになります。検索・下書き・会話の追いつき・タスクとイベントの管理を、Workspace の文脈を持ったまま行えるようになります。残り3日です",
-    "ANDROID — 9月4日から Android の Google アシスタントを Gemini が置き換えます。残り12日です。アシスタント前提で組んだ音声ショートカットは、置き換え後の挙動を確認しておきたいところです",
-    "SCALE — Gemini アプリが8月11日に月間10億ユーザーへ到達しました",
-    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日で停止します。残り8日です。後継は ER 2 系で、空間推論・多段のツール連携・複数ロボットの協調に対応します",
-    "FLASH — Gemini 3.7 Flash は8月13日に GA となり、AI Pro と Ultra 向けの Gemini Spark のエンジンとして160か国以上で動いています。導入価格は12月31日までです",
-    "CLASSROOM — Gemini in Classroom が8月10日から全年齢の学生へ開放されました。フラッシュカード・練習問題・学習ガイド・ガイド付きプロンプトが使えます",
+    "CHAT — 8月26日から Google Chat が Ask Gemini のハブになります。検索・下書き・会話の追いつき・タスクとイベントの管理を Workspace の文脈のまま扱えます。残り2日です",
+    "ANDROID — 9月4日から Android の Google アシスタントを Gemini が置き換えます。残り11日です。アシスタント前提の音声ショートカットは、いま挙動を確かめておきたいところです",
+    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日で停止します。残り7日です。後継の ER 2 系は空間推論・多段のツール連携・複数ロボットの協調に対応します",
+    "PRICE — Gemini 3.7 Flash の導入価格は100万トークンあたり入力0.75ドル・出力3.75ドルで、12月31日までです。2027年1月1日から入力1.50ドル・出力7.50ドルへ倍になります",
+    "FREE — Google AI Studio には1日あたりのリクエスト上限つきの無料 API ティアがあり、クレジットカードなしで試せます。3.7 Flash の挙動を確かめるだけなら、まずここで足ります",
+    "SCALE — Gemini アプリは8月11日に月間10億ユーザーへ到達しました。深い推論は 3.1 Pro、速度と単価が要る本番処理は Flash 系という住み分けが定着しつつあります",
   ],
   en: [
-    "CHAT — From August 26, Google Chat becomes a Gemini hub for searching, drafting, catching up on threads, and managing tasks and events with full Workspace context. Three days out",
-    "ANDROID — Gemini replaces Google Assistant on Android from September 4, twelve days from now. Worth checking any voice shortcuts you built on Assistant before the switch",
-    "SCALE — The Gemini app crossed one billion monthly users on August 11",
-    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31, eight days out. The ER 2 preview models succeed it, adding spatial reasoning, multi-step tool orchestration, and multi-robot coordination",
-    "FLASH — Gemini 3.7 Flash went GA on August 13 and now powers Gemini Spark for AI Pro and Ultra subscribers in 160-plus countries. Introductory pricing runs through December 31",
-    "CLASSROOM — Gemini in Classroom opened to students of all ages on August 10, with flashcards, practice quizzes, study guides, and guided prompts",
+    "CHAT — From August 26, Google Chat becomes the Ask Gemini hub for searching, drafting, catching up on threads, and managing tasks and events with Workspace context intact. Two days out",
+    "ANDROID — Gemini replaces Google Assistant on Android from September 4, eleven days from now. Now is the time to check any voice shortcuts you built on Assistant",
+    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31, seven days out. The ER 2 line succeeds it with spatial reasoning, multi-step tool orchestration, and multi-robot coordination",
+    "PRICE — Gemini 3.7 Flash introductory pricing is $0.75 input and $3.75 output per million tokens through December 31. From January 1, 2027 it doubles to $1.50 and $7.50",
+    "FREE — Google AI Studio still offers a free API tier with daily request limits and no credit card. If you only want to see how 3.7 Flash behaves, that is enough to start",
+    "SCALE — The Gemini app crossed one billion monthly users on August 11. The split is settling in: 3.1 Pro for deep reasoning, the Flash line for production work where speed and unit cost decide",
   ],
 };
 
