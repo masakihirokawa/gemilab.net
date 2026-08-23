@@ -11,7 +11,7 @@ tags: ["Gemini API", "本番運用", "モデル管理", "個人開発者", "信�
 highlights:
   - "レスポンスの model_version を使って『実際に応答したモデル』を起動時に検証するガードの実装"
   - "エイリアス指定が事故になる仕組みと、固定すべき5項目をコード化する単一の真実の源"
-  - "既定変更を検知してアラートを上げ、移行を7日で安全に完了させる本番プレイブック"
+  - "既定変更を7日で安全に移行するプレイブックと、モデルIDが同じまま挙動が動く『振る舞いドリフト』をMADで捕まえる基準線"
 ---
 
 朝、いつもどおり夜間バッチのログを眺めていて、出力が普段より2割ほど短いことに気づきました。コードは1行も変えていません。料金グラフだけが前日比で少し上振れている。原因を追っていくと、モデルを明示せずエイリアスで呼んでいた経路だけ、応答していたモデルが変わっていました。既定モデルが静かに切り替わったのです。
@@ -142,6 +142,120 @@ if __name__ == "__main__":
 1日目から2日目は、新モデルを本番と同じプロンプトでオフライン評価します。代表的な100件ほどの入力で、出力長・JSON 妥当性・所要時間を旧モデルと並べます。3日目は、ゴールデンデータセットに対する回帰テストを通し、後段の正規表現やスキーマが壊れないかを確認します。4日目から5日目は、トラフィックの5%程度を新モデルに振り分け、`model_version` 別にエラー率とトークン消費を観測します。6日目に問題がなければ、レジストリの `model` と `expected_version_prefix` を新IDへ更新し、CI ゲートを通します。7日目に全面切り替えとし、旧モデルへ即時ロールバックできる状態を24時間維持します。
 
 ここで効いてくるのが、これまで仕込んできた `model_version` のログです。切り替え前後の同一指標を、推測ではなく実データで比較できます。「なんとなく良くなった気がする」ではなく、「出力長の中央値が18%短くなり、JSON 妥当率は99.6%で変化なし」と言えること。これが本番運用の安心につながります。
+
+## model_version が一致していても、挙動は静かに動きます
+
+ここまでのガードが見張っているのは「どのモデルが応答したか」です。捕まえられるのは ID のズレだけ、とも言えます。
+
+同じ `gemini-2.5-pro` が応答していても、サーバー側で thinking の既定配分や安全フィルタの閾値が調整されれば、出力は変わります。私が後から困ったのはこちらでした。ガードは沈黙したまま、後段の JSON パース失敗率だけが週明けに 0.2% から 1.4% へ動いていたのです。
+
+そこで、ID とは別に**振る舞いの基準線**を持つようにしました。内容を固定した数十件の入力を毎日1回だけ流し、出力の統計量を記録します。絶対値そのものではなく、直近の分布からどれだけ外れたかを見る、という考え方です。
+
+```python
+import json, statistics, datetime, pathlib
+
+BASELINE_PATH = pathlib.Path("behavior_baseline.jsonl")
+PROBES = [...]  # 本番の代表入力を20〜50件。内容は凍結して変更しない
+
+def run_probes() -> dict:
+    lengths, valid, thinking_ratio = [], 0, []
+    for p in PROBES:
+        resp = generate_with_guard(p)
+        text = resp.text or ""
+        lengths.append(len(text))
+        try:
+            json.loads(text)
+            valid += 1
+        except json.JSONDecodeError:
+            pass
+        um = resp.usage_metadata
+        think = getattr(um, "thoughts_token_count", 0) or 0
+        out = getattr(um, "candidates_token_count", 0) or 1
+        thinking_ratio.append(think / out)
+    return {
+        "date": datetime.date.today().isoformat(),
+        "model": EXPECTED_MODEL,
+        "len_median": statistics.median(lengths),
+        "json_valid_rate": valid / len(PROBES),
+        "thinking_ratio_median": statistics.median(thinking_ratio),
+    }
+```
+
+プローブの入力を凍結しておくのが前提条件です。ここを都合よく差し替えてしまうと、比較の土台が動いてしまい、基準線としての意味を失います。
+
+判定は平均と標準偏差ではなく、中央値と MAD（中央絶対偏差）で行っています。プローブの結果には時折大きく外れる1件が混ざり、平均だと基準線そのものが引きずられてしまうためです。
+
+```python
+def mad(xs):
+    m = statistics.median(xs)
+    return statistics.median([abs(x - m) for x in xs]) or 1e-9
+
+def check_drift(today: dict, history: list[dict], k: float = 4.0) -> list[str]:
+    alerts = []
+    for key in ("len_median", "json_valid_rate", "thinking_ratio_median"):
+        past = [h[key] for h in history[-14:]]
+        if len(past) < 7:
+            continue          # 履歴が足りないうちは記録のみに徹する
+        base, spread = statistics.median(past), mad(past)
+        if abs(today[key] - base) > k * spread:
+            alerts.append(
+                f"{key}: today={today[key]:.4f} base={base:.4f} mad={spread:.4f}"
+            )
+    return alerts
+```
+
+`k=4.0` は、14日ぶんの履歴で誤検知が週1件を下回るあたりに落ち着いた値です。3.0 では通常のばらつきでも鳴ってしまい、アラートを無視する習慣がついてしまいました。しきい値は環境ごとに違って当然ですので、まず2週間は記録だけを続けて分布を眺めてから決めるほうが確実です。
+
+この基準線があると、`model_version` が変わらないまま起きた変化にも名前がつきます。「なんとなく出力が短い」ではなく「出力長の中央値が14日基準から23%下振れ、thinking 比は横ばい」と言えること。原因の切り分けは、その一文から始まります。
+
+## モデル固定が届かない経路 — キャッシュ、バッチ、そして棚卸し
+
+レジストリで一元管理しても、モデル指定が素通りする経路は残ります。切り替え当日に足をすくわれたのは、まさにここでした。
+
+一つはコンテキストキャッシュです。キャッシュは作成時のモデルIDに紐づくため、レジストリを新IDへ更新した瞬間、既存のキャッシュは新モデルからは参照できなくなります。TTL が残っている間、旧IDのキャッシュを掴む経路と新IDで生成する経路が同居し、同じ機能なのに応答の傾向が二種類になりました。
+
+もう一つはバッチです。投入から完了までに時間が空くため、切り替え作業中に投入されたジョブは旧設定のまま完了します。ジョブのメタデータに投入時点のレジストリ版数を書き込んでおくと、後から結果を仕分けられます。
+
+<table>
+<thead>
+<tr><th>経路</th><th>モデルが決まる時点</th><th>切替時にやること</th></tr>
+</thead>
+<tbody>
+<tr><td>通常の generate_content</td><td>リクエスト時</td><td>レジストリの更新だけで追随します</td></tr>
+<tr><td>コンテキストキャッシュ</td><td>キャッシュ作成時</td><td>新IDでキャッシュを作り直し、旧キャッシュを明示的に削除します</td></tr>
+<tr><td>バッチジョブ</td><td>投入時</td><td>切替の前後で投入を止め、進行中ジョブの完了を待ちます</td></tr>
+<tr><td>チューニング済みモデル</td><td>チューニング実行時</td><td>ベースモデルの提供終了日を別軸で追跡します</td></tr>
+</tbody>
+</table>
+
+そして何より、「どこでモデルを指定しているか」を人間の記憶に置かないことです。次のスクリプトを CI に入れて、レジストリを経由しない直書きを検出しています。
+
+```python
+import re, pathlib, sys
+
+MODEL_LITERAL = re.compile(r"""["'](gemini-[a-z0-9.\-]+)["']""")
+ALLOWED = {"model_registry.json", "model_registry.py"}
+
+def audit(root: str = "src") -> int:
+    hits = []
+    for path in pathlib.Path(root).rglob("*.py"):
+        if path.name in ALLOWED:
+            continue
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            m = MODEL_LITERAL.search(line)
+            if m:
+                hits.append(f"{path}:{i}: {m.group(1)}")
+    for h in hits:
+        print("直書き検出:", h)
+    return 1 if hits else 0
+
+if __name__ == "__main__":
+    sys.exit(audit())
+```
+
+初めて流したとき、想定していなかった場所からモデルIDが出てきました。検証用の小さなスクリプト、ドキュメント生成のツール、それから一度きりのつもりで書いた移行スクリプトです。いずれも本番経路ではありませんが、比較検証の数字を静かに歪めるには十分でした。
+
+棚卸しは記憶ではなく機械にやらせる。この一行を CI に足しただけで、切り替え作業の見通しがずいぶん良くなりました。
 
 ## 落とし穴とその回避
 

@@ -11,7 +11,7 @@ tags: ["Gemini API", "Production", "Model Management", "Indie Developer", "Relia
 highlights:
   - "A startup guard that verifies the model that actually answered using response.model_version"
   - "Why alias references silently break, and the 5 settings to codify in a single source of truth"
-  - "A 7-day production playbook to detect a default change and adopt it safely"
+  - "A 7-day migration playbook, plus a MAD-based behavioral baseline that catches drift even when the model ID never changes"
 ---
 
 One morning I was scanning the nightly batch logs and noticed the output was about 20% shorter than usual. I hadn't changed a single line of code. Only the cost graph had crept up against the previous day. Tracing it back, I found that the path calling the model through an alias — not an explicit ID — had started receiving responses from a different model. The default had quietly shifted.
@@ -142,6 +142,120 @@ Detecting and stopping a default change is defense. When the new default is genu
 Days 1–2: evaluate the new model offline with your real production prompts. On ~100 representative inputs, line up output length, JSON validity, and latency against the old model. Day 3: run a regression test against your golden dataset to confirm downstream regex and schemas don't break. Days 4–5: route about 5% of traffic to the new model and watch error rate and token consumption broken down by `model_version`. Day 6: if clean, update the registry's `model` and `expected_version_prefix` to the new ID and pass the CI gate. Day 7: cut over fully, keeping instant rollback to the old model available for 24 hours.
 
 This is where the `model_version` logs you've been collecting pay off. You compare the same metrics before and after with real data, not guesswork. Not "it feels better" but "median output length dropped 18%, JSON validity unchanged at 99.6%." That precision is what makes a production switch calm.
+
+## The ID can match while the behavior quietly moves
+
+Everything so far watches *which model answered*. Which means it only catches drift in the ID.
+
+The same `gemini-2.5-pro` can keep answering while the server-side default for thinking allocation or a safety threshold gets retuned, and the output changes anyway. That's the failure that caught me later. The guard stayed silent while the JSON parse failure rate downstream went from 0.2% to 1.4% over a weekend.
+
+So alongside the ID check I started keeping a **behavioral baseline**. A few dozen frozen inputs run once a day, with the output statistics recorded. The point isn't the absolute numbers — it's how far today sits from the recent distribution.
+
+```python
+import json, statistics, datetime, pathlib
+
+BASELINE_PATH = pathlib.Path("behavior_baseline.jsonl")
+PROBES = [...]  # 20-50 representative production inputs, frozen verbatim
+
+def run_probes() -> dict:
+    lengths, valid, thinking_ratio = [], 0, []
+    for p in PROBES:
+        resp = generate_with_guard(p)
+        text = resp.text or ""
+        lengths.append(len(text))
+        try:
+            json.loads(text)
+            valid += 1
+        except json.JSONDecodeError:
+            pass
+        um = resp.usage_metadata
+        think = getattr(um, "thoughts_token_count", 0) or 0
+        out = getattr(um, "candidates_token_count", 0) or 1
+        thinking_ratio.append(think / out)
+    return {
+        "date": datetime.date.today().isoformat(),
+        "model": EXPECTED_MODEL,
+        "len_median": statistics.median(lengths),
+        "json_valid_rate": valid / len(PROBES),
+        "thinking_ratio_median": statistics.median(thinking_ratio),
+    }
+```
+
+Freezing the probe inputs is the precondition. Swap them out whenever it's convenient and the ground shifts under the comparison, which strips the baseline of any meaning.
+
+The check uses median and MAD (median absolute deviation) rather than mean and standard deviation. Probe runs occasionally include one wildly off result, and a mean lets that single run drag the baseline with it.
+
+```python
+def mad(xs):
+    m = statistics.median(xs)
+    return statistics.median([abs(x - m) for x in xs]) or 1e-9
+
+def check_drift(today: dict, history: list[dict], k: float = 4.0) -> list[str]:
+    alerts = []
+    for key in ("len_median", "json_valid_rate", "thinking_ratio_median"):
+        past = [h[key] for h in history[-14:]]
+        if len(past) < 7:
+            continue          # while history is thin, record only
+        base, spread = statistics.median(past), mad(past)
+        if abs(today[key] - base) > k * spread:
+            alerts.append(
+                f"{key}: today={today[key]:.4f} base={base:.4f} mad={spread:.4f}"
+            )
+    return alerts
+```
+
+`k=4.0` is where false positives settled below one a week against fourteen days of history. At 3.0 it fired on ordinary variance, and I picked up the habit of ignoring the alert — worse than having no alert at all. Your threshold will differ, so record for two weeks and look at the spread before committing to a number.
+
+With the baseline in place, changes that happen while `model_version` never moves finally get a name. Not "output feels shorter lately" but "median output length is 23% below the 14-day base, thinking ratio flat." Isolating a cause starts from that sentence.
+
+## Where pinning doesn't reach — caches, batches, and taking inventory
+
+Even with the registry as a single source of truth, some paths let the model spec slip past. Cutover day is exactly where that bit me.
+
+Context caching is the first. A cache is bound to the model ID it was created with, so the moment the registry moves to a new ID, existing caches are no longer reachable from the new model. While the TTL lingers, one path grabs an old-ID cache and another generates on the new ID — same feature, two flavors of response.
+
+Batch is the second. Submission and completion are separated in time, so any job submitted mid-cutover completes under the old settings. Writing the registry revision into the job metadata at submission time lets you sort the results out afterward.
+
+<table>
+<thead>
+<tr><th>Path</th><th>When the model is resolved</th><th>What cutover requires</th></tr>
+</thead>
+<tbody>
+<tr><td>Plain generate_content</td><td>At request time</td><td>Updating the registry is enough</td></tr>
+<tr><td>Context cache</td><td>At cache creation</td><td>Rebuild the cache on the new ID and explicitly delete the old one</td></tr>
+<tr><td>Batch job</td><td>At submission</td><td>Pause submissions around cutover and drain in-flight jobs</td></tr>
+<tr><td>Tuned model</td><td>At tuning time</td><td>Track the base model's retirement date separately</td></tr>
+</tbody>
+</table>
+
+Above all, don't keep "where do we specify the model" in human memory. This script runs in CI and flags any literal that bypasses the registry.
+
+```python
+import re, pathlib, sys
+
+MODEL_LITERAL = re.compile(r"""["'](gemini-[a-z0-9.\-]+)["']""")
+ALLOWED = {"model_registry.json", "model_registry.py"}
+
+def audit(root: str = "src") -> int:
+    hits = []
+    for path in pathlib.Path(root).rglob("*.py"):
+        if path.name in ALLOWED:
+            continue
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            m = MODEL_LITERAL.search(line)
+            if m:
+                hits.append(f"{path}:{i}: {m.group(1)}")
+    for h in hits:
+        print("hardcoded model:", h)
+    return 1 if hits else 0
+
+if __name__ == "__main__":
+    sys.exit(audit())
+```
+
+The first run surfaced model IDs in places I'd forgotten about: a small verification script, a docs-generation tool, and a migration script I'd written as a one-off. None of them serve production traffic. All of them were more than capable of quietly skewing the numbers I was comparing against.
+
+Let the machine take inventory instead of your memory. Adding that one job to CI made the whole cutover far easier to see through.
 
 ## Pitfalls and how to avoid them
 
