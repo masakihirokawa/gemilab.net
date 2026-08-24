@@ -10,8 +10,8 @@ description: "Implement the Gemini API in Go with the official Google Gen AI SDK
 tags: ["gemini-api", "go", "golang", "sdk", "multimodal", "streaming", "production"]
 highlights:
   - "A goroutine and semaphore pattern for safely throttling concurrent requests"
-  - "Context timeouts and a measured, production-minded failure design"
-  - "Model selection guided by measured latency and cost trade-offs"
+  - "Separating retryable errors from hopeless ones, with full-jitter backoff"
+  - "A streaming timeout design that measures the first chunk on its own"
 ---
 ## Why Go, and What This Guide Covers
 
@@ -377,6 +377,104 @@ func main() {
 
 For a comprehensive look at error handling strategies with the Gemini API, see our [Gemini API Error Handling & Retry Patterns Guide](/articles/gemini-api/gemini-api-error-handling-retry-patterns).
 
+## Which Errors Deserve a Retry — and Which Never Will
+
+The retry helper above still carries two flaws that bite in production. It retries every error indiscriminately, and every request waits exactly the same amount of time.
+
+When a malformed request is coming back as `400 INVALID_ARGUMENT`, throwing it three more times changes nothing. Worse, you wait one second, then two, then four, only to receive the same error — and your diagnosis is delayed by exactly that much. In one of my own batch jobs, a wrong MIME type kept producing 400s that the helper dutifully retried until the log was wallpapered with the same stack trace. Classifying the error would have surfaced it on the very first attempt.
+
+Start by separating errors worth retrying from errors that will never change.
+
+<table>
+<thead>
+<tr><th>Status</th><th>Meaning</th><th>Retry?</th><th>What to do instead</th></tr>
+</thead>
+<tbody>
+<tr><td>400 INVALID_ARGUMENT</td><td>The request itself is malformed</td><td>No</td><td>Check Part MIME types and input token length</td></tr>
+<tr><td>403 PERMISSION_DENIED</td><td>Key lacks permission or is invalid</td><td>No</td><td>Verify the key and which APIs are enabled</td></tr>
+<tr><td>404 NOT_FOUND</td><td>Wrong or retired model name</td><td>No</td><td>Revisit the model name in your config</td></tr>
+<tr><td>429 RESOURCE_EXHAUSTED</td><td>Rate limit reached</td><td>Yes</td><td>Lower concurrency and wait longer</td></tr>
+<tr><td>500 / 503</td><td>Transient server-side trouble</td><td>Yes</td><td>Back off, then try again</td></tr>
+</tbody>
+</table>
+
+In Go you pull the status code out of `genai.APIError`. While you're there, mix randomness into the wait — full jitter.
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"math/rand"
+	"time"
+
+	"google.golang.org/genai"
+)
+
+// isRetryable decides whether an error is worth another attempt
+func isRetryable(err error) bool {
+	var apiErr genai.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case 429, 500, 502, 503, 504:
+			return true
+		default:
+			return false // 400 / 403 / 404 will return the same thing forever
+		}
+	}
+	// A deadline or cancellation from the caller is not worth retrying
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	return true // an unclassified transport error is worth one gamble
+}
+
+// backoffWithJitter picks a wait using the full jitter strategy
+func backoffWithJitter(attempt int) time.Duration {
+	base := time.Duration(1<<attempt) * time.Second // 1s, 2s, 4s...
+	if base > 30*time.Second {
+		base = 30 * time.Second
+	}
+	return time.Duration(rand.Int63n(int64(base))) // uniform in [0, base)
+}
+
+func generateWithPolicy(ctx context.Context, client *genai.Client,
+	model, prompt string, maxRetries int) (*genai.GenerateContentResponse, error) {
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err := client.Models.GenerateContent(ctx, model, genai.Text(prompt), nil)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+
+		if !isRetryable(err) {
+			return nil, fmt.Errorf("retrying will not fix this: %w", err)
+		}
+
+		wait := backoffWithJitter(attempt)
+		log.Printf("Retry %d/%d (waiting %v): %v", attempt+1, maxRetries, wait, err)
+
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done(): // step down immediately if the deadline arrives mid-wait
+			return nil, ctx.Err()
+		}
+	}
+	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
+}
+```
+
+Two things changed from the earlier version.
+
+First, `time.Sleep` became a `select`. `Sleep` never looks at context cancellation, so even with a 30-second deadline in place, a backoff nap will happily stroll past it. If you want the deadline honored, the waiting side has to watch `ctx.Done()` too.
+
+Second, the randomness. When four concurrent workers take a 429 at the same instant, fixed backoff sends all four back at the same instant, and they get turned away again. In my batch this collision repeated two or three times, inflating the retry count and nothing else. Adding full jitter spread the return times, and with the same input and the same concurrency the second wave of 429s stopped appearing — with a shorter average wait, not a longer one.
+
 ## Throttling Concurrent Requests with Goroutines and a Semaphore
 
 Concurrency is where Go shines, but the Gemini API enforces a requests-per-minute (RPM) ceiling. Spawn goroutines without restraint and you'll hit `429 RESOURCE_EXHAUSTED` almost immediately. The fix is a lightweight semaphore built from a buffered channel: cap the number of in-flight calls while processing a batch of prompts.
@@ -481,6 +579,76 @@ Here are the values worth deciding up front, informed by real measurements.
 
 Think of timeouts and retries as a pair. Make a single deadline too short and you simply add retries, which can lengthen the total time — so work backward so that "one deadline x max retries" stays within what a user is willing to wait.
 
+### Keep One Client per Process
+
+One more thing matters to perceived speed almost as much as deadlines: how long your client lives. My first version called `genai.NewClient` on every request, and responses felt oddly heavy for weeks before I looked into it. The client holds HTTP connections internally, so rebuilding it each time puts the cost of re-establishing those connections straight into your response time.
+
+```go
+type GeminiService struct {
+	client *genai.Client
+	model  string
+}
+
+func NewGeminiService(ctx context.Context, model string) (*GeminiService, error) {
+	client, err := genai.NewClient(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &GeminiService{client: client, model: model}, nil
+}
+
+// Close is called exactly once, when the process shuts down
+func (s *GeminiService) Close() { s.client.Close() }
+```
+
+It is tempting to write `defer client.Close()` inside each handler, but on a shared client that tears the connections out from under every other in-flight request. Decide once that closing happens only at process shutdown, and stick to it.
+
+## Time the First Chunk Separately from the Rest
+
+The table above suggests "10 s to first chunk plus an overall cap" for a reason: an overall timeout alone cannot protect the experience. Cap the whole stream at 90 seconds and a user can still sit for 90 seconds without a single character arriving. From their side that isn't a slow response — it's no response.
+
+The fix is small. Add one watchdog that stands down the moment the first chunk lands.
+
+```go
+// streamWithFirstChunkDeadline watches first-chunk latency apart from the overall cap
+func streamWithFirstChunkDeadline(
+	ctx context.Context,
+	client *genai.Client,
+	model, prompt string,
+	firstChunk, total time.Duration,
+	out func(string),
+) error {
+	ctx, cancel := context.WithTimeout(ctx, total)
+	defer cancel()
+
+	// Collapse the context if the first chunk never shows up
+	watchdog := time.AfterFunc(firstChunk, cancel)
+
+	first := true
+	for chunk, err := range client.Models.GenerateContentStream(
+		ctx, model, genai.Text(prompt), nil) {
+		if err != nil {
+			if first && ctx.Err() != nil {
+				return fmt.Errorf("no first chunk within %v", firstChunk)
+			}
+			return err
+		}
+		if first {
+			watchdog.Stop() // once tokens flow, only the overall cap applies
+			first = false
+		}
+		if t := chunk.Text(); t != "" {
+			out(t)
+		}
+	}
+	return nil
+}
+```
+
+The trick is handing `cancel` itself to `time.AfterFunc`. If the first chunk misses its window the context collapses and the iterator ends; if it arrives in time, `Stop()` releases the watchdog and only the overall cap remains. One flag and one timer — no extra goroutine just to supervise.
+
+On the calling side, treat that first-chunk timeout as a signal to switch rather than a failure. In my own CLI tool, anything past eight seconds means giving up on Pro and reissuing against Flash. Being able to set the ceiling on waiting from the experience side rather than the model's side is, to me, the real payoff of measuring the first chunk on its own.
+
 ## Model Selection and Measured Latency vs. Cost
 
 Which model you name shapes both experience and cost. As of 2026, `gemini-flash-latest` works as an alias pointing at the newest stable Flash, which makes it easy to track model updates. For production paths where you want fixed behavior, a pinned version name is safer.
@@ -501,8 +669,8 @@ The implementation guideline is simple: build with Flash first, then swap in Pro
 
 ## Summary
 
-With the official Go SDK, text generation, multimodal input, streaming, and multi-turn chat come together in remarkably little code. Once you look toward production, three things form the foundation that protects both experience and cost: semaphore-based throttling of concurrent requests, per-call timeouts, and model selection grounded in real measurements.
+With the official Go SDK, text generation, multimodal input, streaming, and multi-turn chat come together in remarkably little code. Once you look toward production, four things form the foundation that protects both experience and cost: separating retryable errors from hopeless ones, spreading waits with full jitter, throttling concurrency with a semaphore, and timing the first streamed chunk apart from the rest.
 
-As a next step, pick one prompt from your own project and run it with Flash and a semaphore (concurrency of 2). Layer timeouts and retries on top of that, and you have the skeleton of a small production service. If you want to go further into architecture, our [Gemini Agent Production System Guide](/articles/gemini-advanced/gemini-agent-production-system) walks through practical patterns in depth.
+As a next step, pick one prompt from your own project and run it with Flash and a semaphore (concurrency of 2). Layer the `isRetryable` classification and jittered backoff on top of that, and you have the skeleton of a small production service. If you want to go further into architecture, our [Gemini Agent Production System Guide](/articles/gemini-advanced/gemini-agent-production-system) walks through practical patterns in depth.
 
 I've focused on the places I stumbled myself while building in the trenches of indie development. If it helps with even one of your design decisions, that would make me happy. Thank you for reading.

@@ -10,8 +10,8 @@ description: "Google 公式 Go SDK（google.golang.org/genai）で Gemini API �
 tags: ["gemini-api", "go", "golang", "sdk", "multimodal", "streaming", "production"]
 highlights:
   - "goroutine とセマフォで並行リクエストを安全に捌く実装パターン"
-  - "context タイムアウトと実測レイテンシにもとづく本番向けの失敗設計"
-  - "モデル別レイテンシ・コストの実測にもとづく選定の指針"
+  - "再試行すべきエラーの切り分けと full jitter を入れたバックオフの実装"
+  - "初回チャンクだけを分けて計るストリーミングのタイムアウト設計"
 ---
 ## Go を選んだ理由と、この記事で扱うこと
 
@@ -377,6 +377,104 @@ func main() {
 
 Gemini API のエラーハンドリングについてさらに詳しく知りたい方は、[Gemini API のエラーハンドリングとリトライ設計](/articles/gemini-api/gemini-api-error-handling-retry-patterns)で網羅的に解説しています。
 
+## リトライしてよいエラー、してはいけないエラー
+
+前節のリトライ関数には、本番で困る欠点が2つ残っています。どんなエラーでも無差別に再試行してしまうこと。そして、待ち時間が全リクエストで完全に一致することです。
+
+プロンプトの組み立てを誤って `400 INVALID_ARGUMENT` が返っているとき、3回投げ直しても結果は変わりません。それどころか1秒・2秒・4秒と待たされた末に同じエラーを受け取るため、原因の切り分けがそのぶん遅れます。私は個人開発のバッチ処理で、MIME タイプの指定ミスによる 400 を延々と再試行し続け、ログが同じスタックトレースで埋まったことがありました。分類さえしていれば、最初の1回で気づけた失敗です。
+
+まず、再試行に意味のあるエラーとそうでないエラーを切り分けます。
+
+<table>
+<thead>
+<tr><th>ステータス</th><th>意味</th><th>再試行</th><th>実務での対処</th></tr>
+</thead>
+<tbody>
+<tr><td>400 INVALID_ARGUMENT</td><td>リクエストの組み立てが不正</td><td>しない</td><td>Part の MIME タイプ・入力トークン長を確認</td></tr>
+<tr><td>403 PERMISSION_DENIED</td><td>キーの権限不足・無効</td><td>しない</td><td>キーと有効化済み API を確認</td></tr>
+<tr><td>404 NOT_FOUND</td><td>モデル名の誤り・提供終了</td><td>しない</td><td>設定側のモデル名を見直す</td></tr>
+<tr><td>429 RESOURCE_EXHAUSTED</td><td>レート制限に到達</td><td>する</td><td>同時実行数を下げ、待ち時間を長めに取る</td></tr>
+<tr><td>500 / 503</td><td>一時的なサーバー側の不調</td><td>する</td><td>バックオフを挟んで再試行</td></tr>
+</tbody>
+</table>
+
+Go では `genai.APIError` からステータスコードを取り出して判定します。あわせて、待ち時間に乱数を混ぜる full jitter も入れておきます。
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"math/rand"
+	"time"
+
+	"google.golang.org/genai"
+)
+
+// isRetryable はエラーが再試行に値するかを判定する
+func isRetryable(err error) bool {
+	var apiErr genai.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case 429, 500, 502, 503, 504:
+			return true
+		default:
+			return false // 400 / 403 / 404 は何度投げても結果が変わらない
+		}
+	}
+	// 呼び出し側の締め切り切れ・キャンセルは再試行しない
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	return true // 素性の分からない通信エラーは一度は賭ける価値がある
+}
+
+// backoffWithJitter は full jitter 方式で待ち時間を決める
+func backoffWithJitter(attempt int) time.Duration {
+	base := time.Duration(1<<attempt) * time.Second // 1s, 2s, 4s...
+	if base > 30*time.Second {
+		base = 30 * time.Second
+	}
+	return time.Duration(rand.Int63n(int64(base))) // 0 〜 base の一様乱数
+}
+
+func generateWithPolicy(ctx context.Context, client *genai.Client,
+	model, prompt string, maxRetries int) (*genai.GenerateContentResponse, error) {
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err := client.Models.GenerateContent(ctx, model, genai.Text(prompt), nil)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+
+		if !isRetryable(err) {
+			return nil, fmt.Errorf("再試行では解決しないエラー: %w", err)
+		}
+
+		wait := backoffWithJitter(attempt)
+		log.Printf("再試行 %d/%d（%v 待機）: %v", attempt+1, maxRetries, wait, err)
+
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done(): // 待機中に締め切りが来たら即座に降りる
+			return nil, ctx.Err()
+		}
+	}
+	return nil, fmt.Errorf("%d 回試して失敗しました: %w", maxRetries, lastErr)
+}
+```
+
+前節の実装から変えた点は2つです。
+
+ひとつは `time.Sleep` を `select` に置き換えたこと。`time.Sleep` は context のキャンセルを一切見ないため、30秒の締め切りを設けていても、バックオフの待機中はそれを平然と踏み越えます。締め切りを守りたいなら、待つ側も `ctx.Done()` を見る必要があります。
+
+もうひとつが乱数です。同時実行 4 本が同じ瞬間に 429 を受け取ると、固定バックオフでは4本とも同じ時刻に戻ってきて、また同じように弾かれます。私のバッチではこの再衝突が二度三度と続き、リトライ回数だけが増えていきました。full jitter を入れて戻る時刻を散らしたところ、同じ入力・同じ同時実行数のまま、二波目の 429 が出なくなりました。待ち時間の平均はむしろ短くなっています。
+
 ## goroutine で並行リクエストを捌く — セマフォによるレート制御
 
 Go の魅力は並行処理にありますが、Gemini API には毎分あたりのリクエスト数（RPM）の上限があります。何も考えずに goroutine を大量に起動すると、すぐに `429 RESOURCE_EXHAUSTED` に阻まれます。ここで効くのが、バッファ付きチャネルを使った軽量なセマフォです。同時実行数を明示的に絞りながら、複数プロンプトをまとめて処理します。
@@ -481,6 +579,76 @@ if err != nil {
 
 タイムアウトとリトライは組で考えます。1回の締め切りを短くしすぎるとリトライ回数が増えて総時間はかえって伸びるため、「1回の締め切り × 最大リトライ回数」が、ユーザーの待てる上限に収まるよう逆算するのが実践的です。
 
+### クライアントはプロセスに1つだけ持つ
+
+もう一点、締め切り設計と同じくらい体感に効くのが、クライアントの寿命です。私は最初、リクエストのたびに `genai.NewClient` を呼ぶ実装を書いてしまい、応答が妙に重い時期がありました。クライアントは内部で HTTP コネクションを保持しているため、毎回作り直すと接続の再確立コストがそのまま応答時間に乗ります。
+
+```go
+type GeminiService struct {
+	client *genai.Client
+	model  string
+}
+
+func NewGeminiService(ctx context.Context, model string) (*GeminiService, error) {
+	client, err := genai.NewClient(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &GeminiService{client: client, model: model}, nil
+}
+
+// Close はプロセスを畳むときに一度だけ呼ぶ
+func (s *GeminiService) Close() { s.client.Close() }
+```
+
+ハンドラごとに `defer client.Close()` と書きたくなりますが、共有クライアントでそれをやると処理中の他のリクエストまで巻き添えで切ることになります。閉じるのはプロセス終了時だけ、と決めておくのが安全です。
+
+## ストリーミングは「最初のチャンクまで」を別に計る
+
+先の表に「初回チャンク 10 秒 ＋ 全体上限」と書いたのは、全体タイムアウトだけでは体験を守れないからです。全体 90 秒で組むと、最初の一文字も届かないまま 90 秒待たされる可能性が残ります。ユーザーから見れば、それは遅い応答ではなく無反応です。
+
+やることは単純で、最初のチャンクが届いた時点で止まる見張りを1本足すだけです。
+
+```go
+// streamWithFirstChunkDeadline は初回チャンクの遅延を全体上限と分けて監視する
+func streamWithFirstChunkDeadline(
+	ctx context.Context,
+	client *genai.Client,
+	model, prompt string,
+	firstChunk, total time.Duration,
+	out func(string),
+) error {
+	ctx, cancel := context.WithTimeout(ctx, total)
+	defer cancel()
+
+	// 初回チャンクが来なければ context を畳む見張り
+	watchdog := time.AfterFunc(firstChunk, cancel)
+
+	first := true
+	for chunk, err := range client.Models.GenerateContentStream(
+		ctx, model, genai.Text(prompt), nil) {
+		if err != nil {
+			if first && ctx.Err() != nil {
+				return fmt.Errorf("初回チャンクが %v 以内に届きませんでした", firstChunk)
+			}
+			return err
+		}
+		if first {
+			watchdog.Stop() // 流れ始めたら見張りを解除、以降は全体上限だけが効く
+			first = false
+		}
+		if t := chunk.Text(); t != "" {
+			out(t)
+		}
+	}
+	return nil
+}
+```
+
+要は `time.AfterFunc` に `cancel` をそのまま渡している点です。初回が間に合わなければ context が畳まれてイテレータが終了し、間に合えば `Stop()` で見張りが解けて全体上限だけが残ります。フラグ1つとタイマー1つで済み、監視のために goroutine を余分に起こす必要もありません。
+
+呼び出し側では、初回タイムアウトを失敗ではなく「切り替えの合図」として使えます。私は手元の CLI ツールで、初回 8 秒を過ぎたら Pro を諦めて Flash で投げ直す運用にしています。待ち時間の上限をモデルの都合ではなく体験の側から決められる。これがストリーミングで初回だけを分けて計る、いちばんの効き目だと感じています。
+
 ## モデル選択とレイテンシ・コストの実測
 
 「どのモデルを指定するか」は、体験とコストを同時に左右します。2026年時点では `gemini-flash-latest` が最新の安定 Flash を指すエイリアスとして使え、モデル更新に追従しやすくなっています。一方で、挙動を固定したい本番系ではバージョン固定名を使うのが安全です。
@@ -501,8 +669,8 @@ if err != nil {
 
 ## まとめ
 
-公式 Go SDK を使えば、テキスト生成からマルチモーダル、ストリーミング、マルチターン会話までは驚くほど短いコードで書けます。そのうえで本番を見据えるなら、並行リクエストのセマフォ制御・呼び出し単位のタイムアウト・実測にもとづくモデル選定という3点が、体験とコストを守る土台になります。
+公式 Go SDK を使えば、テキスト生成からマルチモーダル、ストリーミング、マルチターン会話までは驚くほど短いコードで書けます。そのうえで本番を見据えるなら、再試行すべきエラーの切り分け、待ち時間を散らす full jitter、並行リクエストのセマフォ制御、そして初回チャンクを分けて計るストリーミングの締め切り。この4つが、体験とコストを同時に守る土台になります。
 
-次の一歩として、手元のプロンプトを1つ選び、まず Flash とセマフォ（同時実行 2）で動かしてみてください。そこにタイムアウトとリトライを重ねていけば、そのまま小さな本番サービスの骨格になります。より高度なアーキテクチャに踏み込みたい方は、[Gemini エージェントシステム本番構築ガイド](/articles/gemini-advanced/gemini-agent-production-system)もあわせてご覧ください。
+次の一歩として、手元のプロンプトを1つ選び、まず Flash とセマフォ（同時実行 2）で動かしてみてください。そこに `isRetryable` の分類とジッタ付きバックオフを重ねれば、そのまま小さな本番サービスの骨格になります。より高度なアーキテクチャに踏み込みたい方は、[Gemini エージェントシステム本番構築ガイド](/articles/gemini-advanced/gemini-agent-production-system)もあわせてご覧ください。
 
 個人開発の現場で私自身がつまずいた箇所を中心にまとめました。実装の設計判断に少しでも役立てば嬉しいです。お読みいただきありがとうございました。
