@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CHAT — 8月26日から Google Chat が Ask Gemini のハブになります。検索・下書き・会話の追いつき・タスクとイベントの管理を Workspace の文脈のまま扱えます。残り2日です",
-    "ANDROID — 9月4日から Android の Google アシスタントを Gemini が置き換えます。残り11日です。アシスタント前提の音声ショートカットは、いま挙動を確かめておきたいところです",
-    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日で停止します。残り7日です。後継の ER 2 系は空間推論・多段のツール連携・複数ロボットの協調に対応します",
-    "PRICE — Gemini 3.7 Flash の導入価格は100万トークンあたり入力0.75ドル・出力3.75ドルで、12月31日までです。2027年1月1日から入力1.50ドル・出力7.50ドルへ倍になります",
-    "FREE — Google AI Studio には1日あたりのリクエスト上限つきの無料 API ティアがあり、クレジットカードなしで試せます。3.7 Flash の挙動を確かめるだけなら、まずここで足ります",
-    "SCALE — Gemini アプリは8月11日に月間10億ユーザーへ到達しました。深い推論は 3.1 Pro、速度と単価が要る本番処理は Flash 系という住み分けが定着しつつあります",
+    "CHAT — 明日8月26日から Google Chat が Ask Gemini のハブになります。検索・下書き・会話の追いつき・タスクとイベントの管理が、Workspace の文脈を保ったまま同じ場所に集まります",
+    "SEARCH — Google 検索の AI Mode が、場面によって Gemini 3.7 Flash で動くようになりました。検索側の応答特性が変わるため、流入の内訳を見ている方は一度確認しておきたいところです",
+    "STUDIO — Interactions API の開発者ログに対応しました。対象の呼び出しは AI Studio のダッシュボードからログを追えます。手元にログ基盤を持たない段階の切り分けが楽になります",
+    "TTS — gemini-3.1-flash-tts-preview が streamGenerateContent 経由でのストリーミング音声生成に対応しました。生成が終わるまで待たずに再生を始められます",
+    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日で停止します。残り6日です。後継の ER 2 系は空間推論・多段のツール連携・複数ロボットの協調に対応しています",
+    "STUDENT — 学生向けのハブ・スタディノートブック・対話的な可視化・Gemini Live での Deep Research が追加され、対象の学生は Google AI プランを1年間無料で使えます",
   ],
   en: [
-    "CHAT — From August 26, Google Chat becomes the Ask Gemini hub for searching, drafting, catching up on threads, and managing tasks and events with Workspace context intact. Two days out",
-    "ANDROID — Gemini replaces Google Assistant on Android from September 4, eleven days from now. Now is the time to check any voice shortcuts you built on Assistant",
-    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31, seven days out. The ER 2 line succeeds it with spatial reasoning, multi-step tool orchestration, and multi-robot coordination",
-    "PRICE — Gemini 3.7 Flash introductory pricing is $0.75 input and $3.75 output per million tokens through December 31. From January 1, 2027 it doubles to $1.50 and $7.50",
-    "FREE — Google AI Studio still offers a free API tier with daily request limits and no credit card. If you only want to see how 3.7 Flash behaves, that is enough to start",
-    "SCALE — The Gemini app crossed one billion monthly users on August 11. The split is settling in: 3.1 Pro for deep reasoning, the Flash line for production work where speed and unit cost decide",
+    "CHAT — Tomorrow, August 26, Google Chat becomes the Ask Gemini hub: searching, drafting, catching up on threads, and managing tasks and events all land in one place with Workspace context intact",
+    "SEARCH — AI Mode in Google Search is now sometimes served by Gemini 3.7 Flash. Response characteristics on the search side shift with it, which is worth checking if you watch your traffic mix",
+    "STUDIO — Developer logs now cover the Interactions API. Supported calls can be traced from the AI Studio dashboard, which makes triage easier before you have logging of your own",
+    "TTS — gemini-3.1-flash-tts-preview now supports streaming speech generation through streamGenerateContent, so playback can start before generation finishes",
+    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31, six days out. The ER 2 line succeeds it with spatial reasoning, multi-step tool orchestration, and multi-robot coordination",
+    "STUDENT — Gemini added a student hub, study notebooks, interactive visualizations, and Deep Research in Gemini Live, with a free year of Google AI plans for eligible students",
   ],
 };
 
