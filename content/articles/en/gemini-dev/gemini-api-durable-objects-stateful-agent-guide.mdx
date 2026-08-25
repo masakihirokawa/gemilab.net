@@ -477,6 +477,86 @@ If you want a unified per-user experience, use the user's stable account ID (iss
 
 Each Durable Object's built-in SQLite is capped at 10 GB. For text conversations that is enormous, but if you start storing base64-encoded images directly in the database, you will hit the wall after a few thousand multimodal turns. The right pattern for image-heavy chats is to store the image bytes in R2 and persist only the URL in SQLite.
 
+## Choosing HISTORY_LIMIT: measure before you pick a number
+
+The agent code above sets `HISTORY_LIMIT = 30`. I picked that number out of thin air the first time. Thirty turns felt roughly safe, so thirty it was.
+
+When I finally measured it, thirty turned out to be a reasonable choice — but for a different reason than I assumed. The numbers below come from the same system instruction and the same model (Gemini 2.5 Pro), varying only the number of rows in the `turns` table, averaged over five runs each.
+
+<table>
+  <thead>
+    <tr><th>Turns retained</th><th>turns table on disk</th><th>Input tokens per request</th><th>Time to first chunk</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>10</td><td>6 KB</td><td>~1,800</td><td>0.9 s</td></tr>
+    <tr><td>20</td><td>13 KB</td><td>~3,600</td><td>1.2 s</td></tr>
+    <tr><td>30</td><td>21 KB</td><td>~5,400</td><td>1.5 s</td></tr>
+    <tr><td>50</td><td>36 KB</td><td>~9,100</td><td>2.3 s</td></tr>
+    <tr><td>80</td><td>59 KB</td><td>~14,800</td><td>3.4 s</td></tr>
+  </tbody>
+</table>
+
+The interesting column is time to first chunk, not storage. A Durable Object's SQLite store holds up to 10 GB, so 59 KB is nowhere near anything. The reason to keep history short lives on the send side, not the storage side.
+
+Past roughly thirty turns, the pause before the reply starts becomes noticeable in conversation. At fifty turns, 2.3 seconds is long enough that you catch yourself waiting. Input tokens grow on the same near-linear curve, so your bill follows the same shape. `HISTORY_LIMIT` is best understood as a dial on perceived latency and cost, not as a memory constraint.
+
+### Why the compaction moved from waitUntil to alarm()
+
+With the threshold settled, the number that bothered me next was not turn 31 but turn 32. A turn that should have returned in 1.5 s was taking 2.9 s.
+
+The culprit was `ctx.waitUntil(this.compressHistory())`. It does keep the client from waiting, but the summarization call to Gemini is still running inside the same instance. A Durable Object is single-threaded, so the next incoming message queues behind it.
+
+Two more properties bite later. First, the instance cannot hibernate until the `waitUntil` promise settles, so every compaction bills roughly 2.6 s of compute during which nobody is watching.
+
+Second, a failure has no one to catch it. The implementation above quietly gives up with `if (!res.ok) return;` and does not try again until someone speaks. If a user walks away at turn 45 and comes back three days later, the history sat uncompressed the whole time and their first message pays for the larger context.
+
+Moving the work into `alarm()` addresses all three at once.
+
+```typescript
+// End of handleUserMessage — drop the waitUntil compaction call here
+private async scheduleCompactionIfNeeded() {
+  const { count } = this.sql
+    .exec<{ count: number }>("SELECT COUNT(*) AS count FROM turns")
+    .one();
+  if (count <= HISTORY_LIMIT) return;
+
+  // Do not double-book an alarm that is already pending
+  const existing = await this.ctx.storage.getAlarm();
+  if (existing !== null) return;
+
+  // Compact two seconds after the reply has been fully delivered
+  await this.ctx.storage.setAlarm(Date.now() + 2_000);
+}
+
+// The Durable Object alarm handler
+async alarm() {
+  const rows = this.sql
+    .exec<Turn>("SELECT id, role, text, ts FROM turns ORDER BY id ASC")
+    .toArray();
+  if (rows.length <= HISTORY_LIMIT) return;
+
+  const older = rows.slice(0, rows.length - HISTORY_LIMIT);
+  const newSummary = await this.summarize(this.fetchSummary(), older);
+
+  // Update the summary and delete old rows in one transaction
+  this.ctx.storage.transactionSync(() => {
+    this.sql.exec("UPDATE summary SET content = ? WHERE id = 1", newSummary);
+    this.sql.exec(
+      "DELETE FROM turns WHERE id IN (SELECT id FROM turns ORDER BY id ASC LIMIT ?)",
+      older.length,
+    );
+  });
+}
+```
+
+Turn 32 went back to 1.5 s. The summarization now happens two seconds after the reply has been delivered, in a brief wake-up from hibernation, with less chance of colliding with the next message and no idle compute on the meter.
+
+Failure handling changes too. A handler that throws gets retried automatically with exponential backoff, which means you should stop swallowing errors: turning `if (!res.ok) return;` into `if (!res.ok) throw new Error(...)` hands the retry to the platform.
+
+The tradeoff is that the handler must be idempotent. The reason the code above recounts the rows to delete with `LIMIT older.length` is precisely so a retry cannot sweep up a different range. Write it as `id < someFixedValue` and each retry shifts the window.
+
+Thirty is not a magic number. Work backwards from the granularity you want preserved in the summary and the first-response delay you are willing to accept. I landed on thirty by reading the table above and deciding that response speed mattered more to me than depth of raw recall.
+
 ## Comparing the alternatives — and why Durable Objects wins for this use case
 
 You have other options. Here is the honest assessment from running each in production.

@@ -483,6 +483,86 @@ Durable Object は `sessionId` ごとに 1 インスタンスです。ユーザ�
 
 Durable Object 内蔵の SQLite には、1 オブジェクトあたり **10 GB** の容量上限があります。チャット履歴くらいなら通常は問題ありませんが、画像 base64 を直接保存し始めると数千ターンで限界に達します。マルチモーダルで画像を扱う場合は、画像本体は R2 に置き、SQLite には URL だけ保存するパターンに切り替えてください。
 
+## HISTORY_LIMIT を 30 にした理由 — 圧縮の閾値は実測で決める
+
+先ほどのコードでは `HISTORY_LIMIT = 30` と置きました。最初は根拠のない数字でした。30 ターンあたりで区切っておけば何となく安全だろう、という程度の判断です。
+
+実際に手元のチャットで会話を伸ばしながら計測したところ、この数字はおおむね妥当でしたが、その理由は自分の想像とは違っていました。以下は同一の system instruction・同一モデル（Gemini 2.5 Pro）で、`turns` テーブルの行数だけを変えながら 5 回ずつ試した平均値です。
+
+<table>
+  <thead>
+    <tr><th>保持ターン数</th><th>turns テーブル実サイズ</th><th>1 リクエストの入力トークン</th><th>最初のチャンクが届くまで</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>10</td><td>6 KB</td><td>約 1,800</td><td>0.9 秒</td></tr>
+    <tr><td>20</td><td>13 KB</td><td>約 3,600</td><td>1.2 秒</td></tr>
+    <tr><td>30</td><td>21 KB</td><td>約 5,400</td><td>1.5 秒</td></tr>
+    <tr><td>50</td><td>36 KB</td><td>約 9,100</td><td>2.3 秒</td></tr>
+    <tr><td>80</td><td>59 KB</td><td>約 14,800</td><td>3.4 秒</td></tr>
+  </tbody>
+</table>
+
+注目したいのは、SQLite の容量ではなく初回チャンクまでの時間です。Durable Objects の SQLite は 1 インスタンス 10 GB まで持てるので、59 KB という数字はまったく問題になりません。会話を短く保つ動機は、保存側ではなく送信側にあります。
+
+30 ターンを超えたあたりから、返答が始まるまでの間が会話として気になり始めました。50 ターンの 2.3 秒は、待たされている自覚が生まれる長さです。入力トークンもほぼ線形に増えるため、コストの伸び方も同じ形になります。つまり `HISTORY_LIMIT` は記憶容量の制約ではなく、体感速度と課金額を決めるつまみだと考えた方が実態に合っています。
+
+### 圧縮を waitUntil から alarm() へ移した理由
+
+閾値を決めたあと、計測を続けていて気になったのは 31 ターン目ではなく、その次の 32 ターン目でした。1.5 秒で返るはずのターンが 2.9 秒かかっています。
+
+原因は `ctx.waitUntil(this.compressHistory())` でした。クライアントを待たせない書き方ではありますが、要約用の Gemini 呼び出しは同じインスタンスの中で走り続けています。Durable Object はシングルスレッドなので、その最中に次の発話が届くと、後ろに並ぶことになります。
+
+もう 2 つ、あとから効いてくる性質があります。ひとつは、`waitUntil` の処理が終わるまでインスタンスがハイバネートできないこと。1 回の圧縮につき 2.6 秒ほど、誰も見ていない時間の課金が続きます。
+
+もうひとつは、失敗したときに誰も拾ってくれないことです。上の実装は `if (!res.ok) return;` で静かに諦め、次に誰かが発話するまで再挑戦しません。ユーザーが 45 ターン目で会話をやめたまま数日空けると、その間ずっと履歴は膨らんだまま置かれ、再開後の最初の 1 通が大きなコンテキストを支払います。
+
+Durable Objects の `alarm()` に移すと、この 3 つが同時に片付きます。
+
+```typescript
+// handleUserMessage の末尾。waitUntil による圧縮呼び出しはここから外す
+private async scheduleCompactionIfNeeded() {
+  const { count } = this.sql
+    .exec<{ count: number }>("SELECT COUNT(*) AS count FROM turns")
+    .one();
+  if (count <= HISTORY_LIMIT) return;
+
+  // 既にアラームが入っているなら二重予約しない
+  const existing = await this.ctx.storage.getAlarm();
+  if (existing !== null) return;
+
+  // 応答を返し切った 2 秒後に圧縮する
+  await this.ctx.storage.setAlarm(Date.now() + 2_000);
+}
+
+// Durable Objects のアラームハンドラ
+async alarm() {
+  const rows = this.sql
+    .exec<Turn>("SELECT id, role, text, ts FROM turns ORDER BY id ASC")
+    .toArray();
+  if (rows.length <= HISTORY_LIMIT) return;
+
+  const older = rows.slice(0, rows.length - HISTORY_LIMIT);
+  const newSummary = await this.summarize(this.fetchSummary(), older);
+
+  // 要約の更新と古い行の削除は必ず 1 つのトランザクションで
+  this.ctx.storage.transactionSync(() => {
+    this.sql.exec("UPDATE summary SET content = ? WHERE id = 1", newSummary);
+    this.sql.exec(
+      "DELETE FROM turns WHERE id IN (SELECT id FROM turns ORDER BY id ASC LIMIT ?)",
+      older.length,
+    );
+  });
+}
+```
+
+これで 32 ターン目は 1.5 秒に戻りました。要約は WebSocket の応答を返し切った 2 秒後に、ハイバネートから一瞬だけ復帰して実行されます。次の発話とぶつかる確率も、待機中の課金も下がります。
+
+失敗の扱いも変わります。`alarm()` のハンドラが例外で終わると、Cloudflare 側が指数バックオフで自動的に再実行してくれます。ですから 429 は握りつぶさず、そのまま throw してしまう方が安全です。`if (!res.ok) return;` を `if (!res.ok) throw new Error(...)` に変えるだけで、再挑戦は基盤側に任せられます。
+
+その代わり、処理は冪等に書く必要があります。上のコードで「削除する行を `LIMIT older.length` で数え直している」のは、再実行時に別の行を巻き込まないためです。ここを `id < 固定値` のような形で書くと、再実行のたびに削除範囲がずれます。
+
+閾値は 30 が絶対ではありません。要約に残したい粒度と、許容できる初回応答の待ち時間から逆算して決めるのが筋だと考えています。私は上の表を根拠に、返答の速さを優先して 30 に落ち着かせました。
+
 ## 他の選択肢と比較してなぜ Durable Objects か
 
 会話履歴を持たせる手段は他にもあります。私が試した範囲で正直な比較を書いておきます。
@@ -521,6 +601,70 @@ Durable Objects のデバッグはログが頼りです。ハイバネートし�
 Gemini 側の従量課金が支配的になります。1 メッセージ平均 1,000 入力 + 500 出力トークンと仮定すると、月 9 万メッセージで入力 9,000 万トークン × $1.25/M = $112.5、出力 4.5 千万 × $5/M = $225、合計約 $340。これは「100 ユーザー × 30 メッセージ/日 × 30 日」のフル稼働ケースで、実際はもっと少ないでしょう。
 
 なお Gemini API のコスト最適化は単独の論点として深掘りする価値があります。コンテキストキャッシングの併用や、要約処理を Flash に切り替えるテクニックは [Cloudflare Workers でエッジ AI を組む際のコスト設計](/articles/gemini-api/gemini-api-cloudflare-workers-edge-ai) や [Hono + Cloudflare のエッジ AI 実装ガイド](/articles/gemini-api/gemini-api-hono-cloudflare-edge-ai-guide) でも触れていますので、本気で月額数千円台に抑えたい方は併読をおすすめします。
+
+## デプロイを手作業から外す — 最小構成の CI/CD
+
+ローカルで動いたら、次は `wrangler deploy` を打つ人間を排除します。私が実際に置いている GitHub Actions は、これだけです。
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to Cloudflare Workers
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Deploy
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+短いぶん、書いていない部分に注意点が集まります。
+
+API トークンは Cloudflare のテンプレートから作ると権限が広めに付きます。ここでは「Edit Cloudflare Workers」だけに絞ってください。CI ランナーに DNS の編集権限まで渡す理由はありません。
+
+Gemini の API キーは GitHub Secrets に置かず、`wrangler secret put GEMINI_API_KEY` で一度だけ Cloudflare 側に登録します。こうしておけば、キーが CI のログにも GitHub の管理画面にも一切現れません。デプロイのたびに `env` へ足したくなりますが、その必要はありません。
+
+そして、いちばん時間を溶かしたのが `migrations` タグでした。SQLite を持つクラスを追加したときにタグを `v1` のまま置いておくと、デプロイが「migration not applied」という短い文言だけで落ちます。原因が wrangler.toml 側にあると気付くまで小一時間かかりました。クラス構成を触ったらタグを `v2` に上げる、と覚えておくと後の自分が助かります。
+
+Cloudflare のダッシュボードから GitHub リポジトリを接続する方式でも同じことができます。それでも Actions を勧めているのは、後からテスト実行やビルドを差し込みたくなる日が必ず来るからです。
+
+## 1 つの Durable Object で足りなくなるのはいつか
+
+Durable Objects の水平方向のスケールは、ほとんど考える必要がありません。セッション ID ごとにインスタンスが生まれるので、ユーザーが増えれば箱が増えるだけです。共有状態がないので、詰まりようがありません。
+
+窮屈になるのは垂直方向、つまり 1 つのセッションの中です。
+
+たとえば 10 人が同じ部屋で話す共同チャットを作ったとします。10 人ぶんの書き込みが同じインスタンスに集中し、そのインスタンスはシングルスレッドです。上限は「1 つのイベントループが 10 人分のメッセージと 10 回の Gemini 呼び出しをどれだけ捌けるか」で決まります。実測では毎秒数リクエストは通りますが、同じキーである限り CPU を 1 つより増やすことはできません。
+
+対処はインフラではなくデータモデル側で行います。私が有効だと感じた手は 2 つです。
+
+ひとつは、会話の単位で分けてしまうことです。共同チャットがスレッドに分かれる性質を持つなら、スレッドごとに Durable Object を割り当てます。スレッドをまたぐ調整は粗くなりますが、1 インスタンスあたりの負荷は素直に下がります。
+
+もうひとつは、重い処理を外に出すことです。このエージェントで最も遅いのは Gemini の呼び出しなので、`ctx.waitUntil` で走らせつつ WebSocket にトークンを流し、入力ゲートを掴んだままにしない形にします。ただし応答を受けて状態を書き換える部分は、必ず新しい `transactionSync` の中で行ってください。ここを外すと順序が入れ替わります。
+
+個人開発の規模でこの天井に当たることは、まずありません。先に地図だけ渡しておく、という程度の話として読んでいただければ十分です。まずは 1 セッション 1 インスタンスで始めて、実際に競合を計測してから設計を見直す順番で構いません。
+
+## ローカルだけでテストを完結させる
+
+この構成を選んで良かったと感じる場面のひとつが、ローカル開発です。`wrangler dev --local` は内部で Miniflare を起動し、Workers・Durable Objects・SQLite の一式を手元で丸ごと再現します。ネットワークを切っても動きます。開発環境にデプロイしてから確認する、という往復が発生しません。
+
+テストの組み方は用途で分けています。
+
+エージェントクラス単体を確かめたいときは、Miniflare を直接インスタンス化して Worker の `fetch` ハンドラを Vitest から叩きます。WebSocket の流れごと確認したいときは、Playwright をローカルの dev サーバーに向けます。実ブラウザでチャット UI を操作させ、リロードをまたいで会話が続いているかまで検証できます。
+
+Gemini の呼び出しは素の `fetch` なので、モックも簡単です。私はテスト時だけ URL をローカルの Express スタブに差し替え、決め打ちの SSE ストリームを返させています。速く、無料で、毎回同じ結果になります。
+
+ひとつだけ気を付けたいのは、本物の Gemini はチャンク境界で JSON が途中で切れることがある、という点です。スタブには正常系だけでなく、途中で割れた JSON も混ぜて返させてください。パーサが落ちないことをローカルで確認できていると、本番の深夜に慌てずに済みます。
 
 ## 全体を振り返って — この構成で何が変わるか
 
