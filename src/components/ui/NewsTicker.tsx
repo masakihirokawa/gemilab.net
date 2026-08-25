@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CHAT — 明日8月26日から Google Chat が Ask Gemini のハブになります。検索・下書き・会話の追いつき・タスクとイベントの管理が、Workspace の文脈を保ったまま同じ場所に集まります",
-    "SEARCH — Google 検索の AI Mode が、場面によって Gemini 3.7 Flash で動くようになりました。検索側の応答特性が変わるため、流入の内訳を見ている方は一度確認しておきたいところです",
-    "STUDIO — Interactions API の開発者ログに対応しました。対象の呼び出しは AI Studio のダッシュボードからログを追えます。手元にログ基盤を持たない段階の切り分けが楽になります",
-    "TTS — gemini-3.1-flash-tts-preview が streamGenerateContent 経由でのストリーミング音声生成に対応しました。生成が終わるまで待たずに再生を始められます",
-    "ROBOTICS — gemini-robotics-er-1.6-preview は8月31日で停止します。残り6日です。後継の ER 2 系は空間推論・多段のツール連携・複数ロボットの協調に対応しています",
-    "STUDENT — 学生向けのハブ・スタディノートブック・対話的な可視化・Gemini Live での Deep Research が追加され、対象の学生は Google AI プランを1年間無料で使えます",
+    "CHAT — Ask Gemini in Chat が本日8月26日から使えるようになりました。検索・下書き・会話の追いつき・タスク管理が Google Chat の中で完結します",
+    "LIMITS — Ask Gemini in Chat は10月1日まで上限が優遇されています。それ以降は通常の使用量上限が適用されます",
+    "SHEETS — Sheets canvas が公開されました。自然言語のプロンプトから、スプレッドシートを読み書き可能な対話型アプリケーションへ変換できます",
+    "MEET — Google Meet のメモ機能をホーム画面から直接開始できるようになりました。対面の会議でも要約・アクションアイテム・全文書き起こしが Google ドキュメントにまとまります",
+    "MODELS — Gemini 3.7 Flash が8月13日に一般提供となりました。導入価格は2026年12月31日までです",
+    "DEPRECATION — gemini-robotics-er-1.6-preview が8月31日に停止します。残り5日で、移行先は7月30日から公開プレビューの ER 2 系です",
   ],
   en: [
-    "CHAT — Tomorrow, August 26, Google Chat becomes the Ask Gemini hub: searching, drafting, catching up on threads, and managing tasks and events all land in one place with Workspace context intact",
-    "SEARCH — AI Mode in Google Search is now sometimes served by Gemini 3.7 Flash. Response characteristics on the search side shift with it, which is worth checking if you watch your traffic mix",
-    "STUDIO — Developer logs now cover the Interactions API. Supported calls can be traced from the AI Studio dashboard, which makes triage easier before you have logging of your own",
-    "TTS — gemini-3.1-flash-tts-preview now supports streaming speech generation through streamGenerateContent, so playback can start before generation finishes",
-    "ROBOTICS — gemini-robotics-er-1.6-preview shuts down on August 31, six days out. The ER 2 line succeeds it with spatial reasoning, multi-step tool orchestration, and multi-robot coordination",
-    "STUDENT — Gemini added a student hub, study notebooks, interactive visualizations, and Deep Research in Gemini Live, with a free year of Google AI plans for eligible students",
+    "CHAT — Ask Gemini in Chat goes live today, August 26, turning Google Chat into a single command line for search, drafting, catching up, and task management",
+    "LIMITS — Ask Gemini in Chat comes with promotional higher limits through October 1, after which standard usage limits apply",
+    "SHEETS — Sheets canvas turns a spreadsheet into an interactive, read-write application from a plain-language prompt",
+    "MEET — You can now start a Gemini note-taking session straight from the Google Meet home screen, including for in-person meetings, with the summary, action items, and full transcript saved to a Google Doc",
+    "MODELS — Gemini 3.7 Flash reached general availability on August 13, with introductory pricing running through December 31, 2026",
+    "DEPRECATION — gemini-robotics-er-1.6-preview shuts down on August 31, five days from now. The ER 2 endpoints have been in public preview since July 30",
   ],
 };
 
