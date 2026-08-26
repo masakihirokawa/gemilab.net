@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CHAT — Ask Gemini in Chat が本日8月26日から使えるようになりました。検索・下書き・会話の追いつき・タスク管理が Google Chat の中で完結します",
-    "LIMITS — Ask Gemini in Chat は10月1日まで上限が優遇されています。それ以降は通常の使用量上限が適用されます",
-    "SHEETS — Sheets canvas が公開されました。自然言語のプロンプトから、スプレッドシートを読み書き可能な対話型アプリケーションへ変換できます",
-    "MEET — Google Meet のメモ機能をホーム画面から直接開始できるようになりました。対面の会議でも要約・アクションアイテム・全文書き起こしが Google ドキュメントにまとまります",
-    "MODELS — Gemini 3.7 Flash が8月13日に一般提供となりました。導入価格は2026年12月31日までです",
-    "DEPRECATION — gemini-robotics-er-1.6-preview が8月31日に停止します。残り5日で、移行先は7月30日から公開プレビューの ER 2 系です",
+    "API — temperature・top_p・top_k の非推奨は、エラーではなく無言の no-op です。リクエストは 200 で通り、値だけが受け取られたうえで無視されます",
+    "AUDIT — 実行時に検知する手段がないため、コードベースを静的に検索して指定を洗い出すしかありません。監査の方法が開発者フォーラムで議論になっています",
+    "CHECK — 同じプロンプトを temperature 0 と 1 で複数回投げ、出力の分散が変わらないことを実測すれば、効いていないことを自分の目で確認できます",
+    "MODELS — Gemini 3.7 Flash は DeepSWE v1.1 で 65.3%、FrontierCode 1.1 Main で 43.6% を記録しています。導入価格は2026年12月31日までです",
+    "SEARCH — File Search が gemini-embedding-2 によるマルチモーダル検索に対応しました。画像を書き起こさずに、そのまま埋め込んで検索できます",
+    "DEPRECATION — gemini-robotics-er-1.6-preview が8月31日に停止します。残り4日で、移行先は7月30日から公開プレビューの ER 2 系です",
   ],
   en: [
-    "CHAT — Ask Gemini in Chat goes live today, August 26, turning Google Chat into a single command line for search, drafting, catching up, and task management",
-    "LIMITS — Ask Gemini in Chat comes with promotional higher limits through October 1, after which standard usage limits apply",
-    "SHEETS — Sheets canvas turns a spreadsheet into an interactive, read-write application from a plain-language prompt",
-    "MEET — You can now start a Gemini note-taking session straight from the Google Meet home screen, including for in-person meetings, with the summary, action items, and full transcript saved to a Google Doc",
-    "MODELS — Gemini 3.7 Flash reached general availability on August 13, with introductory pricing running through December 31, 2026",
-    "DEPRECATION — gemini-robotics-er-1.6-preview shuts down on August 31, five days from now. The ER 2 endpoints have been in public preview since July 30",
+    "API — The deprecation of temperature, top_p, and top_k is a silent no-op rather than an error: requests still return 200 and the values are simply ignored",
+    "AUDIT — There is no runtime signal to catch it, so auditing means searching your codebase statically for the parameters, a gap developers are actively discussing",
+    "CHECK — Send the same prompt several times at temperature 0 and again at 1, then compare the spread of the outputs, and you can confirm for yourself that nothing changes",
+    "MODELS — Gemini 3.7 Flash scores 65.3% on DeepSWE v1.1 and 43.6% on FrontierCode 1.1 Main, with introductory pricing available through December 31, 2026",
+    "SEARCH — File Search now supports multimodal search through gemini-embedding-2, so images can be embedded and searched directly without a transcription step",
+    "DEPRECATION — gemini-robotics-er-1.6-preview shuts down on August 31, four days from now, with the ER 2 line in public preview since July 30 as the migration path",
   ],
 };
 
