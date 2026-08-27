@@ -6,7 +6,7 @@ level: "advanced"
 premium: true
 date: "2026-04-29T12:30"
 author: "Gemini Lab"
-description: "Practical patterns for testing TypeScript code that calls the Gemini API, using Vitest. Covers SDK mocking, Function Calling verification, and streaming response tests, drawn from a setup I run in personal projects."
+description: "Vitest patterns for TypeScript code that calls Gemini — SDK mocks, Function Calling and streaming tests, dropping to MSW, and a one-call nightly smoke test."
 tags:
   - "gemini-api"
   - "vitest"
@@ -16,8 +16,8 @@ tags:
   - "function-calling"
 highlights:
   - "Test designs that fire 429/503 on purpose to pin retry ceilings and fail-fast paths"
-  - "Skipping exponential backoff with vi.useFakeTimers for zero real-time waits"
-  - "A measured setup running 41 cases in 0.9s with zero live API calls, saving 10k+ calls a month"
+  - "MSW handlers that survive an SDK response-shape change without rewriting every test"
+  - "A single nightly live call that catches model deprecation and auth expiry, nothing else"
 ---
 ## I changed one line of a prompt and production responses quietly broke
 
@@ -213,6 +213,82 @@ Snapshot tests on prompts I run as warnings only for the first few weeks. Updati
 
 The same gradual approach applies to the mock layer. Module-level mocking via `vi.mock` (the setup in this article) is the right starting point. As production traffic gets serious, MSW at the HTTP layer becomes more durable across SDK upgrades. Don't pay for that complexity until the project is around to benefit.
 
+## The day vi.mock stops being enough — dropping to MSW at the HTTP layer
+
+I said above that MSW becomes the better option as a project matures, so here is what that transition actually feels like.
+
+`vi.mock` imitates the SDK's class structure. Which means your tests are coupled to the SDK's internal shape. When I upgraded to a version where the return value moved from `result.response.text()` to `result.text`, a dozen tests went red at once — while the application behaviour hadn't changed at all. What broke was the mock, not the code.
+
+MSW sits one layer lower and replaces the HTTP request and response. Whatever the SDK does internally, the POST it eventually sends to `generativelanguage.googleapis.com` keeps the same shape. Pin that, and an SDK upgrade stops dragging your suite down with it.
+
+```ts
+// tests/msw/handlers.ts
+import { http, HttpResponse } from "msw";
+
+const ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/:model";
+
+export const handlers = [
+  http.post(`${ENDPOINT}\\:generateContent`, async ({ request }) => {
+    const body = (await request.json()) as { contents?: unknown[] };
+    if (!Array.isArray(body.contents) || body.contents.length === 0) {
+      return HttpResponse.json(
+        { error: { code: 400, status: "INVALID_ARGUMENT" } },
+        { status: 400 },
+      );
+    }
+    return HttpResponse.json({
+      candidates: [
+        {
+          content: { role: "model", parts: [{ text: "1. Fast delivery" }] },
+          finishReason: "STOP",
+        },
+      ],
+      usageMetadata: { promptTokenCount: 32, candidatesTokenCount: 12 },
+    });
+  }),
+];
+```
+
+Streaming adds `?alt=sse` and returns a sequence of `data:` lines. Build the `ReadableStream` yourself and you get to test your SSE-folding logic too.
+
+```ts
+http.post(`${ENDPOINT}\\:streamGenerateContent`, () => {
+  const chunks = ["Hel", "lo, ", "world"];
+  const stream = new ReadableStream({
+    start(controller) {
+      const enc = new TextEncoder();
+      for (const c of chunks) {
+        const payload = { candidates: [{ content: { parts: [{ text: c }] } }] };
+        controller.enqueue(enc.encode(`data: ${JSON.stringify(payload)}\n\n`));
+      }
+      controller.close();
+    },
+  });
+  return new HttpResponse(stream, {
+    headers: { "Content-Type": "text/event-stream" },
+  });
+});
+```
+
+One trap worth flagging. Gemini endpoints use a colon separator — `models/gemini-2.5-flash:generateContent`. In MSW path patterns a colon introduces a path variable, so unless you escape it as `\\:generateContent`, the handler never matches. Worse, an unmatched request passes through by default, meaning your tests quietly hit the live API. I nearly ran up a bill this way. Once your handlers are written, always start the server with `onUnhandledRequest: "error"` so a pass-through registers as a failure rather than a green run.
+
+The two approaches protect against different things.
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>vi.mock (whole SDK)</th><th>MSW (HTTP layer)</th></tr>
+</thead>
+<tbody>
+<tr><td>What makes tests break</td><td>The SDK changes its return shape</td><td>Gemini changes its wire format</td></tr>
+<tr><td>Cost to get started</td><td>A few lines, written inline</td><td>An upfront set of handlers</td></tr>
+<tr><td>What you can assert</td><td>Call arguments and branching</td><td>Request body, status codes, SSE framing</td></tr>
+<tr><td>When you swap SDKs</td><td>Near-total rewrite</td><td>Usually passes untouched</td></tr>
+<tr><td>Best suited to</td><td>Branch-heavy logic tests</td><td>The few tests that encode a contract</td></tr>
+</tbody>
+</table>
+
+You don't need to move everything to MSW. What I settle on is a two-layer split: branch-heavy tests like retry predicates and tool-loop control stay on `vi.mock`, and only the three or four tests that guard "what goes into the request body" and "how SSE gets folded" drop down to MSW. Move everything down and the suite slows; leave everything up and you've staked your test suite's lifespan on the SDK's minor versions.
+
 ## A note on test data — keep fixtures small and named
 
 One small habit that's paid off for me: store test inputs as named fixtures, not inline strings. After the second or third test that involves "a Japanese review with a typo" or "a review that mentions a delivery problem," it gets hard to remember which one you're looking at when a snapshot diffs.
@@ -295,6 +371,46 @@ Speed isn't the only win. Because nothing hits the real API, CI never spends tok
 
 On gathering the numbers: Vitest prints per-file timing by default, but `vitest run --reporter=verbose` is easier to read for the whole picture. When I find a slow test, it's almost always one of two things — a backoff wait I forgot to fake, or an oversized fixture. The former goes away with `vi.useFakeTimers()` as above; the latter, by trimming the fixture to the minimum, and most cases drop back under a second.
 
+## The one thing mocks can't see — a single nightly live call
+
+A mock is a well-constructed lie. Because it's internally consistent, it never tells you the outside world moved. What slipped past me was a model ID going deprecated: the suite stayed green while production quietly failed.
+
+So I keep exactly one test that hits the real API. It doesn't run in PR CI — only on a nightly schedule.
+
+```ts
+// tests/live.smoke.test.ts
+import { describe, it, expect } from "vitest";
+import { callGeminiRaw } from "../src/raw";
+
+const live = process.env.RUN_LIVE_SMOKE === "1";
+
+describe.skipIf(!live)("live smoke", () => {
+  it("the configured model still answers", async () => {
+    const res = await callGeminiRaw("ping");
+    expect(res.candidates?.[0]?.finishReason).toBe("STOP");
+    expect(res.candidates?.[0]?.content?.parts?.[0]?.text ?? "").not.toBe("");
+    expect(res.usageMetadata?.promptTokenCount).toBeGreaterThan(0);
+  }, 30_000);
+});
+```
+
+Keeping the assertions deliberately thin is the whole point. It never looks at the content. It checks three things: the model ID is alive, auth still works, and the response skeleton hasn't shifted. Add an expectation about wording and you've built a test that fails most nights on model variance — and one nobody looks at anymore.
+
+If `setupFiles` overwrites your API key with a dummy, this one test needs the real one. Add a condition to the overwrite:
+
+```ts
+// tests/setup.ts
+if (process.env.RUN_LIVE_SMOKE !== "1") {
+  process.env.GOOGLE_GENERATIVE_AI_API_KEY = "test-key-not-real";
+}
+```
+
+Cost is one call a day, roughly thirty a month. That fits inside the free tier comfortably, and a few tokens to `gemini-2.5-flash` never becomes a line item you notice.
+
+Decide up front how you'll treat a failure, too. A red here means "the ground moved," not "my code broke." I route it to a notification I check the next morning rather than something that blocks merges — it makes little sense for an unrelated change to be stuck because the platform shifted overnight. It's the same line I drew earlier when I kept prompt snapshots at warning level.
+
 ## Start by pinning the call shape, nothing more
 
 Thanks for reading this far. Tests can grow without limit, so the version I keep recommending for solo projects is small: write one test that fixes "what arguments does my code pass to `generateContent`," and stop there for now. With that pinned, when you iterate on prompts, you can always tell whether a regression is in your code or in the prompt itself — and that single split saves more time than any other test you'll add.
+
+When you have room for the next step, it's one of two things. If an SDK migration is anywhere on the horizon, drop a handful of tests down to MSW. If your code runs on a nightly batch or any schedule, add the one live smoke test. Either takes an afternoon, and both start paying off the following morning.
