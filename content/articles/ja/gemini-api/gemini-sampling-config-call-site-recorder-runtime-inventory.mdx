@@ -1,0 +1,369 @@
+---
+title: "temperature が効いているかを測るより渡した値を記録する方が先です"
+slug: "gemini-sampling-config-call-site-recorder-runtime-inventory"
+category: "gemini-api"
+level: "intermediate"
+premium: true
+date: "2026-08-27T13:00"
+author: "Gemini Lab"
+description: "非推奨になったサンプリングパラメータは 200 が返るまま無視されます。grep と AST が取りこぼした箇所を実行時に拾い、設定の組み立て元まで記録して CI の合否に変えるまでを、実際に動かした結果とともにまとめます。"
+tags: ["Gemini API", "temperature", "非推奨", "静的解析", "CI", "個人開発"]
+highlights:
+  - "grep では 3 箇所にしか見えない設定が実際には 5 箇所から送られている、という取りこぼしの構造を自分のコードで確かめられるようになります"
+  - "外部プロファイルや共通ヘルパを経由する設定を、移行の途中で取りこぼす前に監査の穴を塞げるようになります"
+  - "非推奨パラメータの棚卸しが終わったことを、人の記憶ではなく CI の合否として示せるようになります"
+---
+
+更新履歴の一行を読んで、手元のコードを grep したのが最初でした。temperature・top_p・top_k が非推奨になった、という記載です。
+
+3 箇所。思ったより少ない、と安心しかけました。
+
+その安心が間違いだったと気づいたのは、実際に送られているリクエストを覗いたときです。5 箇所ありました。
+
+厄介なのは、この種の変更がエラーとして現れないことです。非推奨のパラメータを付けたリクエストは 200 で返ってきます。値は受け取られたうえで、無視されます。温度を 0 に固定したつもりのコードが、何も固定しないまま動き続けます。例外もログも出ません。
+
+個人開発で使っているツールチェーンを一通り調べたとき、誤った設定キーへの反応がきれいに三層に分かれたことがあります。TypeScript のコンパイラと ESLint は落ちます。wrangler は警告だけ出して先へ進みます。npm と vitest は完全に黙ります。原因にたどり着くまでの時間が一番長くなるのは、いつも三層目でした。
+
+Gemini のサンプリングパラメータ非推奨は、この三層目に当たります。
+
+## 「効いているか」を測る道は、監査には使えません
+
+公式のフォーラムでも、棚卸しの手段が話題になっています。実行時に検知する方法がないためです。
+
+素直に思いつくのは、同じプロンプトを temperature 0 と 1 で複数回投げ、出力の散らばりが変わらないことを確かめる方法です。効いていないことを自分の目で確認する手段としては、これで足ります。
+
+ただ、監査の道具にはなりません。私が回している分類系のジョブは、そもそも temperature 1 でも出力がほとんど揺れません。選択肢が閉じた課題では、値を上げても同じ答えが返ります。この場合、分散が変わらないことは「無視されている」証拠にも「効いている」証拠にもなりません。判定が原理的に成り立たない領域が残ります。
+
+そして、測定が成功したところで分かるのは「このジョブでは効いていない」という一点だけです。移行のときに要るのは、そこではありません。**どこで何を渡しているかの、漏れのない一覧**です。
+
+順番を入れ替えました。効き目を測るのは後回しにして、まず渡した値を記録することにしました。
+
+## grep が見つけた 3 箇所
+
+検証のために、設定の作り方が違う 5 つのジョブを用意しました。実際のコードベースで見かける形をひととおり並べたものです。
+
+```python
+# app/jobs/a_direct.py — 型付き config に直接渡す
+from google.genai import types
+
+def build():
+    return types.GenerateContentConfig(temperature=0.2, top_k=40)
+```
+
+```python
+# app/jobs/b_dict_literal.py — 辞書リテラル
+def build():
+    return {"temperature": 0.9, "response_mime_type": "application/json"}
+```
+
+```python
+# app/jobs/c_assigned.py — 後から代入
+def build(t: float):
+    cfg = {"max_output_tokens": 512}
+    cfg["temperature"] = t
+    return cfg
+```
+
+```python
+# app/jobs/d_profile.py — 外部 JSON プロファイル由来
+from app.common.config import load_profile
+
+def build():
+    return load_profile("caption")   # caption.json に {"temperature": 0.9, "top_p": 0.95}
+```
+
+```python
+# app/jobs/e_merged.py — 共通ヘルパでマージ
+from app.common.config import merged
+
+def build():
+    return merged("extract", candidate_count=1)   # extract.json に {"temperature": 0.0}
+```
+
+この 5 本に対して grep を当てます。
+
+```bash
+$ grep -rn --include='*.py' 'temperature\|top_p\|top_k' app | wc -l
+3
+```
+
+d と e は Python ファイルに文字列が存在しないため、出てきません。
+
+対象を JSON まで広げると 5 行ヒットします。ただし増えた 2 行はプロファイル定義そのものであって、**どのジョブがそれを読むか**は分かりません。1 つのプロファイルを 3 本のジョブが共有していれば 1 行に見えますし、誰も読んでいない残骸でも 1 行に見えます。箇所の数え上げには使えない情報です。
+
+## AST に替えても、増えたのは件数であって箇所ではありません
+
+grep が弱いのだと考えて、構文木で数え直しました。
+
+```python
+# audit_static.py — 非推奨キーの静的検出
+import ast, pathlib, sys
+
+DEPRECATED = {"temperature", "top_p", "top_k"}
+
+class Finder(ast.NodeVisitor):
+    def __init__(self, path):
+        self.path, self.hits = path, []
+
+    def _hit(self, node, how, key):
+        self.hits.append((self.path, node.lineno, how, key))
+
+    def visit_Call(self, node):          # f(temperature=...)
+        for kw in node.keywords:
+            if kw.arg in DEPRECATED:
+                self._hit(node, "keyword-arg", kw.arg)
+        self.generic_visit(node)
+
+    def visit_Dict(self, node):          # {"temperature": ...}
+        for k in node.keys:
+            if isinstance(k, ast.Constant) and k.value in DEPRECATED:
+                self._hit(node, "dict-literal", k.value)
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node):     # cfg["temperature"] = ...
+        s = node.slice
+        if isinstance(s, ast.Constant) and s.value in DEPRECATED:
+            self._hit(node, "subscript-assign", s.value)
+        self.generic_visit(node)
+
+hits = []
+for p in sorted(pathlib.Path(sys.argv[1]).rglob("*.py")):
+    f = Finder(str(p))
+    f.visit(ast.parse(p.read_text(encoding="utf-8")))
+    hits += f.hits
+
+for h in hits:
+    print(f"{h[0]}:{h[1]}  {h[2]:<16} {h[3]}")
+print(f"--- AST 検出: {len(hits)} 件 / ファイル {len({h[0] for h in hits})} 本")
+```
+
+実行結果です。
+
+```
+app/jobs/a_direct.py:4  keyword-arg      temperature
+app/jobs/a_direct.py:4  keyword-arg      top_k
+app/jobs/b_dict_literal.py:2  dict-literal     temperature
+app/jobs/c_assigned.py:3  subscript-assign temperature
+--- AST 検出: 4 件 / ファイル 3 本
+```
+
+件数は 3 から 4 に増えました。増えたのは a_direct.py の `top_k` です。同じ行の 2 つ目のキーを別件として数え直しただけで、**見えるジョブは 3 本のまま**でした。
+
+静的解析を強くしても、値がコードの外から来る経路には届きません。ここで方向を変えました。
+
+## 実行時に捕まえたら、原点が全部同じ行に集まりました
+
+送信されるものを直接見るのが確実です。SDK のメソッドを包んで、渡された config を書き出すようにしました。
+
+```python
+# recorder.py（第1版）
+import functools, inspect, json, os, time
+
+DEPRECATED = ("temperature", "top_p", "top_k")
+LEDGER = os.environ.get("GENAI_CONFIG_LEDGER", "config_ledger.jsonl")
+
+def _as_dict(config):
+    if config is None:
+        return {}
+    if isinstance(config, dict):
+        return dict(config)
+    if hasattr(config, "to_dict"):
+        return config.to_dict()
+    return {k: v for k, v in vars(config).items() if not k.startswith("_")}
+
+def record_configs(models):
+    original = models.generate_content
+
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):
+        cfg = _as_dict(kwargs.get("config"))
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "model": kwargs.get("model"),
+            "origin": f"{inspect.stack()[1].filename}:{inspect.stack()[1].lineno}",
+            "deprecated": [k for k in DEPRECATED if k in cfg],
+        }
+        with open(LEDGER, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return original(*args, **kwargs)
+
+    models.generate_content = wrapped
+    return models
+```
+
+5 本のジョブを一巡させました。件数は狙いどおり 5 件です。ところが記録された原点が、こうなりました。
+
+```
+run_batch.py:13   temperature,top_k
+run_batch.py:13   temperature
+run_batch.py:13   temperature
+run_batch.py:13   temperature,top_p
+run_batch.py:13   temperature
+```
+
+全部同じ行です。
+
+考えてみれば当然でした。`generate_content` を呼んでいるのはジョブを回すディスパッチのループで、設定を組み立てた場所ではありません。ジョブ側の `build()` は値を返した時点でスタックから消えています。**呼び出し元をたどっても、設定の出どころには戻れません。**
+
+数え上げの完全性は手に入ったのに、修正すべき場所が分からない。取りこぼしを潰したつもりが、別の意味で使えない台帳になっていました。
+
+## 設定そのものに出自を持たせる
+
+呼び出し時点で分からないなら、組み立てた時点で覚えておくしかありません。
+
+辞書として振る舞い、生成された場所を属性として持つ型を用意しました。`__slots__` を使い、辞書のキーには一切影響を与えない形にしています。
+
+```python
+# tracked.py
+import inspect, os
+
+_SKIP = {os.path.abspath(__file__)}
+
+def register_factory(path: str) -> None:
+    """設定を組み立てる共通ヘルパを、原点探索の対象から外す。"""
+    _SKIP.add(os.path.abspath(path))
+
+class TrackedConfig(dict):
+    __slots__ = ("origin", "chain")
+
+    def __init__(self, mapping=None, /, **kw):
+        super().__init__(mapping or {}, **kw)
+        self.chain = _origin_chain(depth=2)
+        self.origin = self.chain[0] if self.chain else "unknown"
+
+    def plain(self) -> dict:
+        """送信直前に、素の dict へ戻す。"""
+        return dict(self)
+
+def _origin_chain(depth: int = 2):
+    out = []
+    for fr in inspect.stack()[1:]:
+        if os.path.abspath(fr.filename) in _SKIP:
+            continue
+        out.append(f"{os.path.relpath(fr.filename)}:{fr.lineno}")
+        if len(out) >= depth:
+            break
+    return out
+```
+
+各ジョブの `build()` が `TrackedConfig` を返すように書き換えて、もう一度回しました。今度は組み立て元が記録されます。ただし、d と e はこうなりました。
+
+```
+app/common/config.py:9    temperature,top_p
+app/common/config.py:12   temperature
+```
+
+共通ヘルパの行です。プロファイルを読んでいるのは確かにこの 2 行なのですが、**修正の判断が要るのはプロファイルを指定したジョブの側**です。同じ `load_profile` を 10 本のジョブが呼んでいたら、10 件が同じ 1 行に潰れます。第1版で起きたことが、一段内側で再発した形でした。
+
+## 共通ヘルパを原点探索から外す一手
+
+そのために `register_factory` を用意しました。設定を作る側のファイルを登録しておくと、原点の探索がそのファイルを飛び越えます。
+
+```python
+# app/common/config.py
+import json, os
+from tracked import TrackedConfig, register_factory
+
+BASE = {"max_output_tokens": 1024}
+
+def load_profile(name: str) -> dict:
+    path = os.path.join(os.path.dirname(__file__), "profiles", f"{name}.json")
+    with open(path, encoding="utf-8") as f:
+        return TrackedConfig(json.load(f))
+
+def merged(profile_name: str, **override) -> dict:
+    return TrackedConfig({**BASE, **load_profile(profile_name), **override})
+
+register_factory(__file__)   # このファイルを原点にしない
+```
+
+同じバッチの結果です。
+
+```
+app/jobs/a_direct.py:4        <- run_batch2.py:12   temperature,top_k
+app/jobs/b_dict_literal.py:4  <- run_batch2.py:12   temperature
+app/jobs/c_assigned.py:4      <- run_batch2.py:12   temperature
+app/jobs/d_profile.py:4       <- run_batch2.py:12   temperature,top_p
+app/jobs/e_merged.py:4        <- run_batch2.py:12   temperature
+```
+
+5 箇所すべてが、それを要求したジョブの行に解決されました。左が組み立て元、右がその呼び出し元です。2 段持っておくと、共通化が一段深いときにも手がかりが残ります。
+
+3 つの手段を並べます。
+
+<table>
+<thead>
+<tr><th>手段</th><th>見つかった箇所</th><th>組み立て元の特定</th></tr>
+</thead>
+<tbody>
+<tr><td>grep（*.py）</td><td>5 箇所中 3</td><td>可</td></tr>
+<tr><td>grep（JSON 込み）</td><td>5 行ヒット</td><td>不可（どのジョブが読むか不明）</td></tr>
+<tr><td>AST 静的解析</td><td>5 箇所中 3（4 件）</td><td>可</td></tr>
+<tr><td>実行時レコーダ（第1版）</td><td>5 箇所中 5</td><td>不可（全件がディスパッチ行）</td></tr>
+<tr><td>TrackedConfig ＋ ヘルパ除外</td><td>5 箇所中 5</td><td>可</td></tr>
+</tbody>
+</table>
+
+## 台帳を CI の合否に変える
+
+一覧が出るだけでは、次に見るのを忘れます。移行が終わったことを判定に変えました。
+
+```python
+# ci_gate.py
+import json, sys, collections
+
+rows = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+untracked = [r for r in rows if r["origin"] == "untracked"]
+by_origin = collections.Counter(r["origin"] for r in rows if r["deprecated"])
+
+print(f"記録された呼び出し: {len(rows)} 件 / 追跡できなかった呼び出し: {len(untracked)} 件")
+for origin, n in sorted(by_origin.items()):
+    keys = sorted({k for r in rows if r["origin"] == origin for k in r["deprecated"]})
+    print(f"  {origin:<30} {n:>3} 回  {', '.join(keys)}")
+
+if untracked:
+    print("❌ TrackedConfig を経由していない呼び出しがあります（棚卸しが不完全です）")
+    sys.exit(1)
+if by_origin:
+    print(f"❌ 非推奨キーを渡している箇所が {len(by_origin)} 件残っています")
+    sys.exit(1)
+print("✅ 非推奨キーの送出はありません")
+```
+
+移行前は 5 箇所を挙げて `exit 1`。プロファイルとジョブから非推奨キーを外した後は `exit 0`。ここまでは期待どおりです。
+
+効いたのは 3 つ目のケースでした。あとから素の dict を 1 件だけ混ぜてみます。
+
+```python
+client.models.generate_content(
+    model="gemini-3.7-flash", contents="ping", config={"temperature": 0.7}
+)
+```
+
+```
+記録された呼び出し: 6 件 / 追跡できなかった呼び出し: 1 件
+  untracked                        1 回  temperature
+❌ TrackedConfig を経由していない呼び出しがあります（棚卸しが不完全です）
+```
+
+`untracked` として立ちます。**非推奨キーの有無より、経路を通っていない呼び出しがあること自体を落とす**方が、監査としては強くなります。新しく書かれたコードが黙って抜けていく余地を、ここで閉じられます。
+
+移行の初期は前者だけで十分に見えます。ただ、キーを外す作業が一巡した後に効いてくるのは後者です。この場合は経路の欠落を落とす判定を先に入れておくことをお勧めします。順番を逆にすると、掃除が終わった直後に入った新しいコードだけが監視の外に残ります。
+
+なお、`plain()` で素の dict に戻してから送るため、追跡用の情報が API へ渡ることはありません。手元では送信直前の型が `dict`、キーは元の 2 つだけになることを確認しています。型付きの `types.GenerateContentConfig` を使っている箇所は辞書のサブクラスにできないので、そこだけは薄いファクトリ関数を挟んで同じ台帳に載せる形にしました。
+
+## この仕組みで見えないこと
+
+正直に線を引いておきます。
+
+記録できるのは**渡した値**であって、**効いたかどうか**ではありません。台帳が空になっても、それは非推奨キーを送らなくなったという意味であり、出力が望んだとおりに揃うという意味ではありません。品質の確認は回帰テストの仕事です。この点は [Pytest で組むプロンプト回帰テスト](/articles/gemini-api/gemini-api-prompt-regression-testing-pytest-guide) の側で受け持たせています。
+
+もうひとつ、実行時の記録は**通った経路しか埋まりません**。月に一度しか動かないジョブは、その月が来るまで台帳に現れません。ですから静的解析を捨てるのではなく、両方を残しています。静的側は書き方の分かっている箇所を早く落とし、実行時側は書き方の分からない箇所を後から埋める。役割が違います。私はこの二本立てを、どちらかに寄せない方が結局は手数が少なくなると考えています。個人開発で回している程度の規模でも、片方だけにするとどこかで必ず穴が開きました。モデル ID の期限を扱う仕組みと合わせた運用は [モデル非推奨を CI で先回りして止める仕組み](/articles/gemini-api/gemini-model-deprecation-ci-scanner-deadline-guard) に書いています。
+
+サンプリングパラメータの非推奨そのものについては、影響が出たのが決定性の側ではなく多様性の側だった経緯を [temperature 非推奨で先に困ったのは多様性の側でした](/articles/gemini-api/gemini-sampling-params-deprecation-diversity-side-migration) にまとめてあります。
+
+## 今日いちばん回数の多いジョブから
+
+まず 1 本で構いません。呼び出し回数がいちばん多いジョブの `build()` を `TrackedConfig` に通し、1 日分の台帳を眺めてみてください。自分が思っていた箇所と、実際に送られている箇所がずれているかどうかは、それだけで分かります。
+
+私自身、3 箇所だと思っていたものが 5 箇所でした。ずれていた 2 箇所は、どちらも「共通化して見えなくした」ところにありました。読んでいただきありがとうございました。
