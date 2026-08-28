@@ -1,0 +1,303 @@
+---
+title: "A twice-daily batch that only ran once — reconstructing run counts from artifacts"
+slug: "gemini-batch-missing-run-slot-reconstruction-from-artifacts"
+category: "gemini-dev"
+level: "intermediate"
+premium: true
+date: "2026-08-28T13:00"
+author: "Gemini Lab"
+description: "One half of a scheduled job silently never fired, and throughput sat at half of plan for over a week without a single error in the logs. Here is how I reconstructed actual run counts from artifacts and backlog, with working code."
+tags: ["Gemini API", "batch processing", "scheduled jobs", "operations", "observability"]
+highlights:
+  - "You will be able to check, before it costs you anything, whether one slot of your own scheduled job is quietly failing to fire"
+  - "You will be able to port a run-count reconstruction built on artifacts and backlog, rather than success logs, straight into your own pipeline"
+  - "You will be able to compute a plan ratio like 0.5 from backlog movement yourself, and know to suspect missing runs instead of slow ones"
+---
+
+The queue folder was not shrinking as fast as it should have been.
+
+I hand wallpaper category classification off to Gemini, and the pile of unprocessed images is supposed to come down every day. But the gap between what I saw on Monday and what I saw on Friday did not match the arithmetic in my head.
+
+So I opened the logs. No errors. Not a single failed run. Every classification result file I opened was correctly filled in.
+
+My first suspicion was that the work itself had gotten slower — fewer items per run, for some reason. That was wrong. **Items per run were exactly as designed. The number of runs was half of what I thought.**
+
+## The signal was the drain rate, not a failure
+
+I had quietly assumed that trouble always announces itself through a broken artifact. A corrupt file, a dead job, a red alert. This time everything that came out was clean.
+
+Clean, and simply not enough of it.
+
+That shape of failure is structurally hard to see, because a log is a record of things that happened. A run that never started has no row. You cannot grep for a row that does not exist.
+
+I have been running scheduled jobs as an indie developer for over a decade, and I had never built the habit of suspecting this. "If it breaks, I'll hear about it" was baked in deep enough that I stopped questioning it.
+
+## Success-only logs cannot show you a run that never happened
+
+The first thing I did was inventory what I could actually observe.
+
+<table>
+<thead>
+<tr><th>Signal</th><th>What it tells you</th><th>Can it catch a missed run?</th></tr>
+</thead>
+<tbody>
+<tr><td>Run logs (success and failure)</td><td>Breakdown of runs that happened</td><td>No — there is no row to inspect</td></tr>
+<tr><td>Gemini API error rate</td><td>Health of the calls you made</td><td>No — the calls were never made</td></tr>
+<tr><td>Output artifacts</td><td>What was processed, and when</td><td>Yes, once you aggregate timestamps</td></tr>
+<tr><td>Unprocessed backlog</td><td>Effective throughput</td><td>Yes — it shows up as a gap against plan</td></tr>
+</tbody>
+</table>
+
+No amount of precision on the first two would have helped, because **both of them observe the inside of a call**. To see a run that did not happen, you have to stand outside the processing system — on the artifacts, or on the backlog.
+
+That distinction ended up dictating the whole design that follows.
+
+## Deriving effective throughput from backlog
+
+I started with the crudest calculation available, because it is also the fastest one to answer. Just the daily backlog numbers.
+
+If you are in an inventory window with no new material arriving, the drop in backlog *is* your throughput.
+
+```python
+"""Decide whether effective throughput is falling short of plan, using backlog alone."""
+
+def drain_rate(backlog: list[int]) -> float:
+    """Average decrease per day. Positive means draining, negative means piling up."""
+    deltas = [backlog[i] - backlog[i + 1] for i in range(len(backlog) - 1)]
+    return sum(deltas) / len(deltas)
+
+
+def days_to_empty(backlog: list[int]) -> float | None:
+    rate = drain_rate(backlog)
+    return None if rate <= 0 else backlog[-1] / rate
+
+
+def plan_ratio(planned_per_run: int, runs_per_day: int, backlog: list[int]) -> dict:
+    """Observed throughput over planned. A value near 0.5 points at missing runs."""
+    planned = planned_per_run * runs_per_day
+    observed = drain_rate(backlog)
+    return {
+        "planned_per_day": planned,
+        "observed_per_day": round(observed, 1),
+        "ratio": round(observed / planned, 2) if planned else None,
+    }
+
+
+if __name__ == "__main__":
+    # Eight days of backlog, sampled every morning at the same time, no new inflow
+    backlog = [1180, 1108, 1036, 962, 890, 818, 744, 672]
+    print("drain per day:", round(drain_rate(backlog), 1))
+    print("days to empty:", round(days_to_empty(backlog), 1))
+    print(plan_ratio(planned_per_run=72, runs_per_day=2, backlog=backlog))
+```
+
+Here is what it printed on my machine:
+
+```text
+drain per day: 72.6
+days to empty: 9.3
+{'planned_per_day': 144, 'observed_per_day': 72.6, 'ratio': 0.5}
+```
+
+The ratio landed on 0.5 and stayed there.
+
+That is the tell. **If you are merely slow, the ratio wanders** — 0.83 one day, 0.71 the next, 0.94 after that, depending on load and image size. A clean fraction that holds steady is not a performance profile. It is a counting problem.
+
+When the ratio snaps to a tidy fraction, stop looking at speed and start looking at how many times the thing ran. That single heuristic collapsed the search space immediately.
+
+## Matching expected slots against artifacts to name the gap
+
+Once the ratio told me *what kind* of problem it was, the next job was identifying *which* slot was missing.
+
+The method is plain. List the scheduled times, give each one a grace window, then assign the completion timestamps found in your artifacts to those windows. Any window left unclaimed is a run that did not happen.
+
+```python
+"""Detect missing run slots by working backwards from artifacts."""
+from __future__ import annotations
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+JST = ZoneInfo("Asia/Tokyo")
+
+
+@dataclass(frozen=True)
+class Slot:
+    day: str        # "2026-08-26"
+    label: str      # "04:30"
+    start: datetime
+    end: datetime   # deadline including grace
+
+
+def expected_slots(days: list[str], times: list[str], grace_min: int = 90) -> list[Slot]:
+    """Turn a schedule into acceptance windows with grace."""
+    out = []
+    for d in days:
+        y, m, dd = map(int, d.split("-"))
+        for t in times:
+            hh, mm = map(int, t.split(":"))
+            start = datetime(y, m, dd, hh, mm, tzinfo=JST)
+            out.append(Slot(d, t, start, start + timedelta(minutes=grace_min)))
+    return sorted(out, key=lambda s: s.start)
+
+
+def observed_runs(records: list[dict]):
+    """Pull run_id and completion time out of artifacts as evidence a run occurred."""
+    seen = set()
+    for r in records:
+        rid = r.get("run_id")
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        yield datetime.fromisoformat(r["finished_at"]).astimezone(JST)
+
+
+def reconcile(slots: list[Slot], runs: list[datetime]) -> dict:
+    """Assign evidence to windows, keeping leftovers on both sides separate."""
+    remaining = sorted(runs)
+    missed, matched = [], []
+    for s in slots:
+        hit = next((r for r in remaining if s.start <= r <= s.end), None)
+        if hit is None:
+            missed.append(s)
+        else:
+            matched.append((s, hit))
+            remaining.remove(hit)
+    return {"missed": missed, "matched": matched, "orphans": remaining}
+
+
+if __name__ == "__main__":
+    days = [f"2026-08-{d:02d}" for d in range(20, 28)]
+    slots = expected_slots(days, ["04:30", "16:30"])
+
+    # Completion times recovered from artifacts — only the 04:30 slot was represented
+    records = [
+        {"run_id": f"r{i}", "finished_at": f"{d}T04:52:00+09:00"}
+        for i, d in enumerate(days)
+    ]
+
+    res = reconcile(slots, list(observed_runs(records)))
+    print(f"expected: {len(slots)}  observed: {len(res['matched'])}  missed: {len(res['missed'])}")
+
+    by_label: dict[str, int] = {}
+    for s in res["missed"]:
+        by_label[s.label] = by_label.get(s.label, 0) + 1
+    for label, n in sorted(by_label.items()):
+        print(f"  missing slot {label}: {n}/{len(days)} days")
+```
+
+The output:
+
+```text
+expected: 16  observed: 8  missed: 8
+  missing slot 16:30: 8/8 days
+```
+
+Not "occasionally flaky." **One specific slot had not fired once in eight days.** At that point the culprit is not the processing code, it is whatever is supposed to start it.
+
+The `orphans` bucket exists for a reason. Evidence landing outside every window means either a manual run or a grace window that is too tight. Dump missed slots and orphaned evidence into the same bag and you lose that distinction entirely.
+
+## Leave a trace even when a run finishes with zero items
+
+Working backwards from artifacts has one hole: **a run that had nothing to process produces no artifact.**
+
+An empty queue and a job that never started both show up as silence. That gives you a detector that cries wolf, and a detector that cries wolf eventually gets ignored.
+
+So I started writing one row before calling Gemini at all. Even when the item count is zero.
+
+```python
+"""Record the fact that a run started, decoupled from what it processed."""
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+
+DDL = """
+CREATE TABLE IF NOT EXISTS run_heartbeat (
+    run_id      TEXT PRIMARY KEY,
+    slot_label  TEXT NOT NULL,     -- "04:30", matching the schedule
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    item_count  INTEGER            -- zero is a legitimate recorded value
+);
+"""
+
+
+def open_ledger(path: str = "runs.db") -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.execute(DDL)
+    conn.commit()
+    return conn
+
+
+def begin_run(conn: sqlite3.Connection, slot_label: str) -> str:
+    """Call this before the Gemini request. Write it later and the blind spot returns."""
+    run_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO run_heartbeat (run_id, slot_label, started_at) VALUES (?, ?, ?)",
+        (run_id, slot_label, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    return run_id
+
+
+def end_run(conn: sqlite3.Connection, run_id: str, item_count: int) -> None:
+    conn.execute(
+        "UPDATE run_heartbeat SET finished_at = ?, item_count = ? WHERE run_id = ?",
+        (datetime.now(timezone.utc).isoformat(), item_count, run_id),
+    )
+    conn.commit()
+
+
+def missing_slots(conn: sqlite3.Connection, day: str, expected: list[str]) -> list[str]:
+    rows = conn.execute(
+        "SELECT slot_label FROM run_heartbeat WHERE started_at LIKE ? || '%'", (day,)
+    ).fetchall()
+    seen = {r[0] for r in rows}
+    return [s for s in expected if s not in seen]
+```
+
+Placing `begin_run` ahead of the Gemini call is the whole point. Put it after, and any run that dies inside the call leaves no trace, which rebuilds the exact blind spot you were trying to close.
+
+Allowing `item_count` to be zero is deliberate too. Zero is an observation, not a missing measurement. Collapse it into `NULL` and "the day it was empty" starts wearing the same face as "the day it never ran."
+
+Where I got stuck on the classification work itself is written up separately in [three places Gemini API embedding broke on me](/articles/gemini-api/gemini-api-embedding-errors-practical-fix). This piece sits one layer earlier: did the thing run at all.
+
+## The counterintuitive part was how I had written the schedule
+
+The root cause turned out to be in how the schedule itself was declared.
+
+I wanted the job twice a day, so I registered a single entry listing both times. I had assumed, without ever testing it, that both would fire. Only one did.
+
+Reading the schedule back does not reveal this. **Correct as a declaration, half-executed in practice** is a state you will never catch by re-reading configuration. Counting from the artifact side was the only way in.
+
+The fix was mundane: split the slots into separate entries, one for 04:30 and one for 16:30. Bundling is easier to maintain, but a bundle fails as a bundle.
+
+<table>
+<thead>
+<tr><th>How it is declared</th><th>Maintenance overhead</th><th>Detecting one half failing</th></tr>
+</thead>
+<tbody>
+<tr><td>Several times folded into one entry</td><td>Low</td><td>Invisible until you count artifacts</td></tr>
+<tr><td>One entry per slot</td><td>Slightly higher</td><td>Obvious from the run history</td></tr>
+</tbody>
+</table>
+
+I suspect this generalizes past any particular scheduler. Fold things that are supposed to run independently into a single declaration, and gaps inside the fold stop being visible from outside. I had walked into a similar shape before, when I folded a send-interval constraint into one place while [automating App Store and Google Play review replies](/articles/gemini-api/gemini-api-app-store-review-response-automation-multilingual).
+
+## Three numbers I kept for the morning check
+
+Splitting the schedule fixed the incident. To avoid rebuilding the same blind spot, I kept exactly three numbers on the morning check.
+
+1. **Yesterday's run count versus planned.** The return value of `missing_slots`, printed as is. A non-empty list gets investigated on the spot.
+2. **Seven-day plan ratio.** The `ratio` from `plan_ratio`. Below 0.9, separate slowness from absence.
+3. **Runs that ended with `item_count` of zero.** A rising count means the supply side of the queue has stalled.
+
+None of the three has anything to do with Gemini's output quality. I had a dashboard for accuracy long before this. **I had nowhere at all that measured whether the job ran.** Quality measurement quietly assumed execution measurement, and I had never built the second one.
+
+My notes from running two models side by side live in [three weeks of Gemini 3 Pro and 2.5 Pro on wallpaper classification](/articles/gemini-advanced/gemini-3-pro-25-pro-wallpaper-classification-3week-parallel-memo). Even there, everything I compared was output quality. Counting runs never entered the picture.
+
+## Closing
+
+Pick one scheduled job you own that folds several times into a single entry, and count the completion timestamps in its artifacts over the last seven days. If the count matches the plan, you can stop worrying about it. If it does not, you can split it today.
+
+I have not finished recounting my other automated jobs yet. I have a feeling the same hole is sitting somewhere else.
