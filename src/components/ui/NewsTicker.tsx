@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEPRECATION — temperature・top_p・top_k の非推奨は「静かな no-op」として効いています。gemini-3.7-flash・3.6-flash・3.5-flash-lite は受理したうえで無視し、リクエストは 200 で返ります",
-    "AUDIT — エラーが出ないため気づけません。temperature: 0 を前提に決定性を組んだ処理は、同じプロンプトを複数回投げて出力の揺れを実測するのが確実な確認方法です",
-    "SHUTDOWN — gemini-robotics-er-1.6-preview は明日8月31日で停止します。残り1日です。gemini-omni-flash-preview の廃止は9月30日で、GA 版への差し替えが必要になります",
-    "CHAT — Ask Gemini in Google Chat が8月26日に開始しました。会話から離れずに Workspace のデータを横断して検索し、下書き・タスク・イベントの管理まで行えます",
-    "SECURITY — Gemini DLP により、内容条件とラベルにもとづいて Gemini が Google Drive のデータへアクセスできる範囲を制限できます。導入判断そのものを左右する部分です",
-    "NOTEBOOK — Gemini Notebook へのソース追加を定期ワークフロー化できます。テキスト・Drive ファイルへのリンク・Web の URL を自動で取り込み、調査ノートを継続的に育てられます",
+    "SHUTDOWN — gemini-robotics-er-1.6-preview は本日8月31日で停止します。preview 接尾辞のモデルに依存したコードは、今日を境に動かなくなります",
+    "DEPRECATION — 次の期限は9月30日です。gemini-omni-flash-preview エンドポイントが廃止され、8月27日に GA となった gemini-omni-1.1-flash への差し替えが必要になります",
+    "VIDEO — Omni 1.1 Flash の GA には extend タスクによる動画の延長と、image_to_video に画像を2枚渡して間を補間する生成が入りました。始点と終点を先に決められます",
+    "VIDEO — video_config の resolution が 360p・720p（既定）・1080p・4k に対応しました。1080p と 4K はアップスケールによる出力だと明記されています",
+    "SPEECH — gemini-3.5-transcribe が8月26日に GA。85言語以上の発話単位の言語検出、話者ダイアライゼーション、単語レベルのタイムスタンプ、最大1,000語のカスタム語彙に対応します",
+    "SPEECH — gemini-3.5-transcribe-live は Live API 上の WebSocket 双方向ストリーミングです。暫定と確定の文字起こしイベント、Smart transcription、複数の VAD 設定を持ちます",
   ],
   en: [
-    "DEPRECATION — The temperature, top_p, and top_k deprecation behaves as a silent no-op: gemini-3.7-flash, 3.6-flash, and 3.5-flash-lite accept the values, ignore them, and still return 200",
-    "AUDIT — Because nothing errors, nothing warns you. If your code relies on temperature: 0 for determinism, send the same prompt several times and measure the spread in the output",
-    "SHUTDOWN — gemini-robotics-er-1.6-preview retires tomorrow, August 31, leaving one day. gemini-omni-flash-preview follows on September 30 and needs swapping for the GA endpoint",
-    "CHAT — Ask Gemini in Google Chat opened on August 26, letting you search across Workspace data, draft, and manage tasks and events without stepping out of the conversation",
-    "SECURITY — Gemini DLP restricts what Drive data Gemini can reach, based on content conditions and labels. Where that line falls often decides whether a rollout happens at all",
-    "NOTEBOOK — Adding sources to a Gemini Notebook can now run as a recurring workflow, pulling in text, Drive file links, and web URLs so a research note keeps growing on its own",
+    "SHUTDOWN — gemini-robotics-er-1.6-preview retires today, August 31. Any code still pointing at that preview model stops working from here on",
+    "DEPRECATION — September 30 is the next date to watch: the gemini-omni-flash-preview endpoint goes away and needs swapping for gemini-omni-1.1-flash, which reached GA on August 27",
+    "VIDEO — The Omni 1.1 Flash GA adds video extension through the extend task, and interpolation by passing two images to image_to_video so you can fix the first and last frame up front",
+    "VIDEO — A resolution parameter in video_config now accepts 360p, 720p as the default, 1080p, and 4k, with the note that 1080p and 4K outputs are produced by upscaling",
+    "SPEECH — gemini-3.5-transcribe reached GA on August 26 with utterance-level language detection across 85+ languages, speaker diarization, word-level timestamps, and up to 1,000 custom vocabulary terms",
+    "SPEECH — gemini-3.5-transcribe-live streams both ways over WebSockets on the Live API, with interim and finalized transcription events, a Smart transcription mode, and several VAD settings",
   ],
 };
 
