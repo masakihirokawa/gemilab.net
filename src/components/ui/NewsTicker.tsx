@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SHUTDOWN — gemini-robotics-er-1.6-preview は本日8月31日で停止します。preview 接尾辞のモデルに依存したコードは、今日を境に動かなくなります",
-    "DEPRECATION — 次の期限は9月30日です。gemini-omni-flash-preview エンドポイントが廃止され、8月27日に GA となった gemini-omni-1.1-flash への差し替えが必要になります",
-    "VIDEO — Omni 1.1 Flash の GA には extend タスクによる動画の延長と、image_to_video に画像を2枚渡して間を補間する生成が入りました。始点と終点を先に決められます",
-    "VIDEO — video_config の resolution が 360p・720p（既定）・1080p・4k に対応しました。1080p と 4K はアップスケールによる出力だと明記されています",
-    "SPEECH — gemini-3.5-transcribe が8月26日に GA。85言語以上の発話単位の言語検出、話者ダイアライゼーション、単語レベルのタイムスタンプ、最大1,000語のカスタム語彙に対応します",
-    "SPEECH — gemini-3.5-transcribe-live は Live API 上の WebSocket 双方向ストリーミングです。暫定と確定の文字起こしイベント、Smart transcription、複数の VAD 設定を持ちます",
+    "DEADLINE — gemini-robotics-er-1.6-preview は昨日8月31日でシャットダウンされました。今日からエラーが出るコードがあれば、原因はまずこの停止を疑ってください",
+    "NEXT — 次の期限は9月30日です。gemini-omni-flash-preview エンドポイントが廃止され、移行先は8月27日に GA になった gemini-omni-1.1-flash になります",
+    "APIKEY — Gemini API は9月中に標準 API キーからのリクエストを拒否し始めます。auth キーへの移行がまだの場合、今月が実質の移行期限です",
+    "SHEETS — Gemini を組み込んだ Sheets canvas が8月31日から Scheduled Release ドメインへ段階展開されています。表示まで最大15日の時間差があります",
+    "MEET — Google Meet ハードウェアのタッチコントローラから「Take notes for me」の開始・停止・管理ができる展開が8月31日に始まりました",
+    "PARAMS — temperature・top_p・top_k は受理されたまま無視される「静かな非推奨」が続いています。決定性を前提にしたコードは実測での確認が必要です",
   ],
   en: [
-    "SHUTDOWN — gemini-robotics-er-1.6-preview retires today, August 31. Any code still pointing at that preview model stops working from here on",
-    "DEPRECATION — September 30 is the next date to watch: the gemini-omni-flash-preview endpoint goes away and needs swapping for gemini-omni-1.1-flash, which reached GA on August 27",
-    "VIDEO — The Omni 1.1 Flash GA adds video extension through the extend task, and interpolation by passing two images to image_to_video so you can fix the first and last frame up front",
-    "VIDEO — A resolution parameter in video_config now accepts 360p, 720p as the default, 1080p, and 4k, with the note that 1080p and 4K outputs are produced by upscaling",
-    "SPEECH — gemini-3.5-transcribe reached GA on August 26 with utterance-level language detection across 85+ languages, speaker diarization, word-level timestamps, and up to 1,000 custom vocabulary terms",
-    "SPEECH — gemini-3.5-transcribe-live streams both ways over WebSockets on the Live API, with interim and finalized transcription events, a Smart transcription mode, and several VAD settings",
+    "DEADLINE — gemini-robotics-er-1.6-preview shut down yesterday, August 31. If code started erroring today, this retirement is the first thing to check",
+    "NEXT — The next deadline is September 30, when the gemini-omni-flash-preview endpoint is retired. The migration target is gemini-omni-1.1-flash, GA since August 27",
+    "APIKEY — The Gemini API begins rejecting requests from standard API keys during September. If you have not moved to auth keys yet, this month is the real deadline",
+    "SHEETS — Sheets canvas, a Gemini-powered feature, began a gradual rollout to Scheduled Release domains on August 31, with up to 15 days before it becomes visible",
+    "MEET — Starting August 31, Google Meet hardware touch controllers can start, stop, and manage the Take notes for me feature directly from the in-room screen",
+    "PARAMS — temperature, top_p, and top_k remain silently deprecated: requests are accepted and the values ignored. Code that assumes determinism needs to be verified by measurement",
   ],
 };
 
