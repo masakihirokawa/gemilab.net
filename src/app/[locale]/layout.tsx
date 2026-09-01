@@ -8,7 +8,11 @@ import { NewsTicker } from "@/components/ui/NewsTicker";
 import { ScrollToTop } from "@/components/ui/ScrollToTop";
 
 // Blocking script to prevent FOUC (Flash of Unstyled Content) on theme change
-const themeScript = `(function(){try{var t=localStorage.getItem('gemilab-theme');document.documentElement.setAttribute('data-theme',t||'dark')}catch(e){}})()`;
+// Turbopack/esbuild keepNames helper: next-themes stringifies its init function into an inline
+// <script>, and the compiled body calls __name(). Without a global __name the theme script throws
+// "ReferenceError: __name is not defined" on every page (see STUMBLING_POINTS #122).
+const nameShim = `if(typeof __name==="undefined"){window.__name=function(f,n){try{Object.defineProperty(f,"name",{value:n,configurable:true})}catch(e){}return f}};`;
+const themeScript = `${nameShim}(function(){try{var t=localStorage.getItem('gemilab-theme');document.documentElement.setAttribute('data-theme',t||'dark')}catch(e){}})()`;
 
 // Non-blocking Google Fonts loader
 const fontUrl = "https://fonts.googleapis.com/css2?family=DM+Mono:wght@400&family=DM+Sans:wght@300;400;500&family=Noto+Sans+JP:wght@300;400;500;700&display=swap";
