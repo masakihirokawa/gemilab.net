@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEADLINE — gemini-robotics-er-1.6-preview は昨日8月31日でシャットダウンされました。今日からエラーが出るコードがあれば、原因はまずこの停止を疑ってください",
-    "NEXT — 次の期限は9月30日です。gemini-omni-flash-preview エンドポイントが廃止され、移行先は8月27日に GA になった gemini-omni-1.1-flash になります",
-    "APIKEY — Gemini API は9月中に標準 API キーからのリクエストを拒否し始めます。auth キーへの移行がまだの場合、今月が実質の移行期限です",
-    "SHEETS — Gemini を組み込んだ Sheets canvas が8月31日から Scheduled Release ドメインへ段階展開されています。表示まで最大15日の時間差があります",
-    "MEET — Google Meet ハードウェアのタッチコントローラから「Take notes for me」の開始・停止・管理ができる展開が8月31日に始まりました",
-    "PARAMS — temperature・top_p・top_k は受理されたまま無視される「静かな非推奨」が続いています。決定性を前提にしたコードは実測での確認が必要です",
+    "ROBOTICS — 8月31日に停止した ER 1.6 preview には後継があります。Gemini Robotics ER 2 が公開プレビュー中で、通常版とストリーミング版の2種類が提供されています",
+    "VIDEO — ER 2 の成功・失敗判定は静止画ではなく生の映像フィード上で動きます。こぼれ・滑り・位置ずれのような、実行の途中で起きる失敗を捉えられる設計です",
+    "DEADLINE — 次の期限は9月30日、gemini-omni-flash-preview の廃止です。移行先は8月27日に GA になった gemini-omni-1.1-flash で、残り4週間を切りました",
+    "APIKEY — 残りの標準 API キーは、制限付きのものも含めて9月中に全面停止します。移行先は Google Cloud サービスアカウントに紐付く auth キー形式です",
+    "PRICE — Gemini 3.7 Flash の導入価格 $0.75/$3.75 per 1M は12月31日までです。2027年1月1日から $1.50/$7.50 になるため、年を跨ぐ見積もりは2本立てが要ります",
+    "AUDIO — Gemini 3.5 Transcribe は85言語以上の言語検出、話者ダイアライゼーション、単語単位タイムスタンプ、最大1,000語のカスタム語彙バイアスに対応しています",
   ],
   en: [
-    "DEADLINE — gemini-robotics-er-1.6-preview shut down yesterday, August 31. If code started erroring today, this retirement is the first thing to check",
-    "NEXT — The next deadline is September 30, when the gemini-omni-flash-preview endpoint is retired. The migration target is gemini-omni-1.1-flash, GA since August 27",
-    "APIKEY — The Gemini API begins rejecting requests from standard API keys during September. If you have not moved to auth keys yet, this month is the real deadline",
-    "SHEETS — Sheets canvas, a Gemini-powered feature, began a gradual rollout to Scheduled Release domains on August 31, with up to 15 days before it becomes visible",
-    "MEET — Starting August 31, Google Meet hardware touch controllers can start, stop, and manage the Take notes for me feature directly from the in-room screen",
-    "PARAMS — temperature, top_p, and top_k remain silently deprecated: requests are accepted and the values ignored. Code that assumes determinism needs to be verified by measurement",
+    "ROBOTICS — The ER 1.6 preview that shut down on August 31 does have a successor. Gemini Robotics ER 2 is in public preview, in both standard and streaming variants",
+    "VIDEO — ER 2 judges success and failure from live video rather than still snapshots, which is what lets it catch spills, slips, and misalignments while a task is still running",
+    "DEADLINE — Next up is September 30, when gemini-omni-flash-preview is retired. The target is gemini-omni-1.1-flash, GA since August 27, and there are now under four weeks left",
+    "APIKEY — Every remaining standard API key, restricted ones included, stops working during September. The replacement is an auth key bound to a Google Cloud service account",
+    "PRICE — Gemini 3.7 Flash keeps its introductory $0.75/$3.75 per 1M through December 31, then moves to $1.50/$7.50 on January 1, 2027. Any estimate crossing the year needs both figures",
+    "AUDIO — Gemini 3.5 Transcribe handles language detection across 85+ languages, speaker diarization, word-level timestamps, and custom vocabulary biasing of up to 1,000 terms",
   ],
 };
 
