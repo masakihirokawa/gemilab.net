@@ -18,7 +18,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       description: post.meta.description,
       type: "article",
       publishedTime: post.meta.date,
-      images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 630, alt: post.meta.title, type: "image/png" }],
+      images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 1200, alt: post.meta.title, type: "image/png" }],
     },
     twitter: {
       card: "summary_large_image",

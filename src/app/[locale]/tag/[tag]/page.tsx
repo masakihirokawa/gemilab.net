@@ -36,7 +36,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   return {
     title,
     description,
-    openGraph: { title, description, images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 630, alt: "Gemini Lab", type: "image/png" }] },
+    openGraph: { title, description, images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 1200, alt: "Gemini Lab", type: "image/png" }] },
     robots: { index: false, follow: true },
   };
 }

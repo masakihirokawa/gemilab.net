@@ -440,7 +440,6 @@ export const GONE_ARTICLE_SLUGS: string[] = [
   "gemini-rsfc-structured-prompt-complete-guide",
   "gemini-structured-output-advanced",
   "gemini-troubleshooting-common-errors-2026",
-  "gemma-4-complete-guide",
   "google-document-ai-gemini-intelligent-document-processing-guide",
   "google-workspace-gemini-practical-daily-workflow",
   "premium-showcase-multimodal-app-development",
