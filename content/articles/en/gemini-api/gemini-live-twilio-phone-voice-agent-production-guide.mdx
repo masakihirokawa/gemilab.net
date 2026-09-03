@@ -292,7 +292,94 @@ Rough numbers as of April 2026 per minute of conversation:
 
 That puts a typical minute around **6–9 US cents**. Compared to staffing a human receptionist for an hour, the ROI is obvious. A shop fielding 100 calls a month at three minutes each pays roughly USD 25/month for the AI side.
 
-If you need to tighten the budget, three knobs help: keep **System Instructions short** (they're sent every session), **cap response length**, and **auto-disconnect on long silence**. Silence detection is a few dozen lines on top of the VAD events you already get.
+If you need to tighten the budget, three knobs help: keep **System Instructions short** (they're sent every session), **cap response length**, and **auto-disconnect on long silence**. The third one is the easiest to postpone, so the next section ships it with the code.
+
+## A Silence and Timeout Watchdog — Forty Lines That Cap the Bill
+
+The "hang up on silence" item from the cost section is the kind of thing you postpone until an invoice reminds you. Early on I assumed callers would end their own calls. In practice a surprising share of them don't: phones placed on hold and forgotten, conversations that finished but never got hung up, and people who dial, hear a voice, and walk away.
+
+Here's the part that cost me an afternoon: **silence on Twilio is not "no frames arriving."** Media Streams keeps sending a `media` frame every 20 ms whether anyone is talking or not — the payload is simply μ-law encoded silence. So the naive "disconnect if no frame arrives for N seconds" never fires. What had stalled wasn't the call; it was my expectation of it.
+
+What you actually watch is amplitude. `audioop.rms` gives you the RMS of a buffer in one line, so decode to 8kHz PCM and compare against a threshold.
+
+```python
+# server/watchdog.py
+# Role: watch for sustained silence and runaway call length, then end the call
+import audioop
+import time
+from typing import Optional
+
+SILENCE_RMS = 500         # below this RMS we treat the frame as silence (tune per line)
+SILENCE_LIMIT_SEC = 12.0  # disconnect after this much continuous silence
+MAX_CALL_SEC = 300.0      # hard ceiling per call — the last line of defence
+
+class CallWatchdog:
+    """Per-call state: when we last heard a voice, and when the call began."""
+
+    def __init__(self) -> None:
+        now = time.monotonic()
+        self.started_at = now
+        self.last_voice_at = now
+
+    def note_caller_frame(self, mulaw_bytes: bytes) -> None:
+        """Call once per inbound frame. Silent frames deliberately do not refresh the clock."""
+        pcm8k = audioop.ulaw2lin(mulaw_bytes, 2)
+        if audioop.rms(pcm8k, 2) >= SILENCE_RMS:
+            self.last_voice_at = time.monotonic()
+
+    def note_agent_audio(self) -> None:
+        """The agent talking counts as activity, so long answers never trip the timer."""
+        self.last_voice_at = time.monotonic()
+
+    def verdict(self) -> Optional[str]:
+        now = time.monotonic()
+        if now - self.started_at > MAX_CALL_SEC:
+            return "max_duration"
+        if now - self.last_voice_at > SILENCE_LIMIT_SEC:
+            return "silence"
+        return None
+```
+
+Wiring it into the bridge touches four places: call `watchdog.note_caller_frame(mulaw)` on each `media` event, call `watchdog.note_agent_audio()` where Gemini audio arrives, and add a one-second polling task to `asyncio.gather`.
+
+```python
+# server/media_bridge.py (continued)
+import asyncio
+from twilio.rest import Client as TwilioClient
+
+async def watch_call(twilio_ws, watchdog: CallWatchdog, call_sid: Optional[str]) -> None:
+    """Poll once a second; end the call itself when a condition trips."""
+    while True:
+        await asyncio.sleep(1.0)
+        reason = watchdog.verdict()
+        if reason is None:
+            continue
+        logger.info("ending call: reason=%s call_sid=%s", reason, call_sid)
+        if call_sid:
+            TwilioClient(
+                os.environ["TWILIO_ACCOUNT_SID"],
+                os.environ["TWILIO_AUTH_TOKEN"],
+            ).calls(call_sid).update(status="completed")
+        await twilio_ws.close(code=1000)
+        return
+```
+
+`call_sid` comes from `msg["start"]["callSid"]` on the `start` event. Closing the WebSocket alone does terminate a `<Connect><Stream>`, but marking the call `completed` over REST leaves no room for a half-alive call. I'd rather close it from both ends.
+
+One caveat worth stating: `<Connect>` is a terminal verb, so the call ends the moment the stream closes. If you want a spoken goodbye, prompt Gemini for a short closing line and let that audio drain before you call `close`. A line that simply vanishes mid-air reads colder on the phone than it does anywhere else.
+
+Thresholds move with the room. Across my own trials, `SILENCE_RMS` behaved very differently between 300 and 800. Too low and an air conditioner or background chatter registers as speech, so the call never ends; too high and a soft-spoken caller's acknowledgements count as silence and you cut them off mid-sentence. Before this goes near production, place a few calls from your own phone, log the raw `audioop.rms` values, and look at the gap between talking and not talking. **Put the threshold between two numbers you measured on your own line, not between two you guessed.** That's the step I don't skip.
+
+Resist shortening `SILENCE_LIMIT_SEC` too far. The fifteen seconds a caller spends hunting for a date in their notes is silent, but it is very much part of the conversation. I start around twelve seconds and adjust by reading the logs of calls that got cut.
+
+<table>
+  <tr><th>Setting</th><th>Too low</th><th>Too high</th><th>Starting point</th></tr>
+  <tr><td><strong>SILENCE_RMS</strong></td><td>Soft speech read as silence</td><td>Room noise keeps the call alive</td><td>300–800 (measure your line)</td></tr>
+  <tr><td><strong>SILENCE_LIMIT_SEC</strong></td><td>Cuts off callers who are thinking</td><td>Forgotten calls keep billing</td><td>10–15 seconds</td></tr>
+  <tr><td><strong>MAX_CALL_SEC</strong></td><td>Long enquiries end abruptly</td><td>No real ceiling on runaways</td><td>300 seconds, use-case dependent</td></tr>
+</table>
+
+What these forty lines protect isn't only the invoice. Zombie Gemini sessions eat into the Live API concurrency quota, and once that ceiling is hit, real callers get nothing at all.
 
 ## Observability — Make Failures Legible
 
