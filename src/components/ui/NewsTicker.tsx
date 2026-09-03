@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "ASSISTANT — 9月4日から Google アシスタントの提供終了が始まります。Android のスマートフォンとタブレット、Wear OS、Android Auto で Gemini が後継になります",
-    "MIGRATION — 段階的なロールアウトで、全ユーザーに届くまで数週間かかります。切り替わったあとはアシスタントが動かなくなり、戻す手段は用意されていません",
-    "SURFACES — 見落とされがちなのが Wear OS と Android Auto です。画面を見られない場面での音声操作は、机の前でスマートフォンに話しかけるのとは要求が違います",
-    "DROP — 9月の Android Drop では、トラッカータグのない持ち物も記録できる Find Hub の Remembered リストが入りました。Motion Assist と Google メッセージの Keep 連携も同時です",
-    "CODE — Gemini Advanced で複数のコードファイルをまとめてアップロードできるようになりました。単一ファイルを貼り付ける運用から、リポジトリの一部を渡す運用へ移れます",
-    "ROLE — Gemini の説明のされ方が、チャットツールから監督付きのデジタルワーカーへ寄ってきています。ファイル・画面・ドキュメント・コードを扱う存在として語られる文脈です",
+    "MODEL — Gemini 3.8 Flash が9月2日に一般提供へ移りました。API のモデル ID は gemini-3.8-flash です。3.7 Flash の一般提供が8月13日でしたから、わずか3週間での更新になります",
+    "PRICE — 価格は $0.75 入力 / $3.75 出力 per MTok で 3.7 Flash から据え置きです。速度と価格はそのままに、推論とコーディングだけを上げた世代交代という位置づけになっています",
+    "BENCH — コーディング系で差が出ています。Terminal-Bench 2.1 が 3.7 Flash の 81.6% に対して 90.8%。金融や法務のエージェント評価でも上回ったと説明されています",
+    "REACH — 提供範囲が広いのが今回の特徴です。AI Studio と Gemini API に加え、Antigravity では既定モデルになり、Android Studio・Stitch・AI Mode・スプレッドシートでも使えます",
+    "ASSISTANT — 本日9月4日から Android の Google アシスタント撤去が始まります。数週間かけて順次適用され、届いた端末では元に戻せません。通訳モードなど未実装の機能が残っている点は先に知っておきたいところです",
+    "CODE — Gemini Advanced でコードリポジトリを端末から丸ごとアップロードできるようになりました。1会話につき1フォルダ、最大1,000ファイル・100MB という上限です",
   ],
   en: [
-    "ASSISTANT — Google Assistant begins shutting down on September 4, with Gemini taking over on Android phones and tablets, Wear OS, and Android Auto",
-    "MIGRATION — The rollout is staged and may take several weeks to reach everyone. Once it lands, Assistant stops working and there is no way to switch back",
-    "SURFACES — Wear OS and Android Auto are easy to overlook here. Voice control when you cannot look at a screen asks something rather different from talking to a phone at your desk",
-    "DROP — The September Android Drop adds a Remembered list in Find Hub for items without a tracker tag, along with Motion Assist and Keep inside Google Messages",
-    "CODE — Gemini Advanced now accepts multiple code files in one upload, so you can hand over part of a repository instead of pasting a single file at a time",
-    "ROLE — The framing around Gemini keeps shifting from chat tool toward a supervised digital worker that handles files, screens, documents, and code",
+    "MODEL — Gemini 3.8 Flash reached general availability on September 2 under the API model ID gemini-3.8-flash. With 3.7 Flash having gone GA on August 13, that is a three-week turnaround",
+    "PRICE — Pricing holds at $0.75 input and $3.75 output per MTok, unchanged from 3.7 Flash. Speed and cost stay put; reasoning and coding are what moved",
+    "BENCH — The gap shows up in coding. Terminal-Bench 2.1 goes from 81.6% on 3.7 Flash to 90.8%, and Google reports gains on finance and legal agent benchmarks as well",
+    "REACH — Distribution is unusually broad. Beyond AI Studio and the Gemini API, it is now the default model in Antigravity, and it ships in Android Studio, Stitch, AI Mode, and Sheets",
+    "ASSISTANT — Google begins removing Assistant from Android today, September 4. The rollout takes a few weeks and cannot be undone once it reaches a device; Interpreter mode is among the pieces Gemini still lacks",
+    "CODE — Gemini Advanced can now take a whole code repository uploaded from your device, capped at one folder per conversation with up to 1,000 files or 100MB",
   ],
 };
 
