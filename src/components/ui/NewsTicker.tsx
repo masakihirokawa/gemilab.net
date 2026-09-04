@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MODEL — Gemini 3.8 Flash が9月2日に一般提供へ移りました。API のモデル ID は gemini-3.8-flash です。3.7 Flash の一般提供が8月13日でしたから、わずか3週間での更新になります",
-    "PRICE — 価格は $0.75 入力 / $3.75 出力 per MTok で 3.7 Flash から据え置きです。速度と価格はそのままに、推論とコーディングだけを上げた世代交代という位置づけになっています",
-    "BENCH — コーディング系で差が出ています。Terminal-Bench 2.1 が 3.7 Flash の 81.6% に対して 90.8%。金融や法務のエージェント評価でも上回ったと説明されています",
-    "REACH — 提供範囲が広いのが今回の特徴です。AI Studio と Gemini API に加え、Antigravity では既定モデルになり、Android Studio・Stitch・AI Mode・スプレッドシートでも使えます",
-    "ASSISTANT — 本日9月4日から Android の Google アシスタント撤去が始まります。数週間かけて順次適用され、届いた端末では元に戻せません。通訳モードなど未実装の機能が残っている点は先に知っておきたいところです",
-    "CODE — Gemini Advanced でコードリポジトリを端末から丸ごとアップロードできるようになりました。1会話につき1フォルダ、最大1,000ファイル・100MB という上限です",
+    "MODEL — Gemini 3.8 Flash が9月2日に一般提供へ移りました。6週間で3本目の Flash になります。価格は 3.7 Flash と同じ $0.75 入力 / $3.75 出力 per MTok に据え置きです",
+    "PRICE — この導入価格は12月31日までです。2027年1月1日からは $1.50 / $7.50 per MTok に変わりますので、来期の見積もりを立てる方は先に織り込んでおきたいところです",
+    "BENCH — HLE-Verified で 54.9%、DeepSWE v1.1 では自分より大きなモデルを上回ったと説明されています。金融の Vals Finance Agent V2、法務の Harvey Legal Agent Benchmark でも改善しています",
+    "EFFORT — 3.8 Flash は難しい課題ほど手数をかけます。推論の段階を増やしツールを繰り返し呼ぶため、トークンが伸びることがあります。効率を優先する用途には 3.7 Flash が引き続き使えます",
+    "CYBER — 同時に Gemini 3.8 Flash Cyber が公開されました。脆弱性の発見と修正に振った変種で、Fairwind Program を通じて信頼できる防御側にのみ提供されます",
+    "AUDIO — 9月3日には Lyria 3.5 が公開プレビューに入りました。テキストと画像を入力に、44.1kHz ステレオでフルレングスの楽曲を生成できます",
   ],
   en: [
-    "MODEL — Gemini 3.8 Flash reached general availability on September 2 under the API model ID gemini-3.8-flash. With 3.7 Flash having gone GA on August 13, that is a three-week turnaround",
-    "PRICE — Pricing holds at $0.75 input and $3.75 output per MTok, unchanged from 3.7 Flash. Speed and cost stay put; reasoning and coding are what moved",
-    "BENCH — The gap shows up in coding. Terminal-Bench 2.1 goes from 81.6% on 3.7 Flash to 90.8%, and Google reports gains on finance and legal agent benchmarks as well",
-    "REACH — Distribution is unusually broad. Beyond AI Studio and the Gemini API, it is now the default model in Antigravity, and it ships in Android Studio, Stitch, AI Mode, and Sheets",
-    "ASSISTANT — Google begins removing Assistant from Android today, September 4. The rollout takes a few weeks and cannot be undone once it reaches a device; Interpreter mode is among the pieces Gemini still lacks",
-    "CODE — Gemini Advanced can now take a whole code repository uploaded from your device, capped at one folder per conversation with up to 1,000 files or 100MB",
+    "MODEL — Gemini 3.8 Flash reached general availability on September 2, the third Flash release in six weeks. Pricing holds at 3.7 Flash levels: $0.75 input and $3.75 output per MTok",
+    "PRICE — That introductory rate runs through December 31. From January 1, 2027 it becomes $1.50 and $7.50 per MTok, which is worth folding into next year's estimates now",
+    "BENCH — Google reports 54.9% on HLE-Verified and, on DeepSWE v1.1, results ahead of most larger frontier models, along with gains on the Vals Finance Agent V2 and Harvey Legal Agent benchmarks",
+    "EFFORT — 3.8 Flash works harder on hard problems, taking extra reasoning steps and calling tools iteratively, so token counts can rise. Where efficiency comes first, 3.7 Flash remains fully supported",
+    "CYBER — Gemini 3.8 Flash Cyber launched alongside it, tuned for vulnerability discovery and automated patching, and offered only to trusted defenders through the Fairwind Program",
+    "AUDIO — Lyria 3.5 entered public preview on September 3. It takes text and images as input and generates full-length tracks in 44.1 kHz stereo",
   ],
 };
 
