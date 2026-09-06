@@ -2,6 +2,12 @@
 // 2026-06-10: GSC「クロール済み-インデックス未登録」∩ 検索実績ゼロ(28日) の死蔵記事
 // 機構: src/middleware.ts が /articles/{category}/{slug} 一致時に 410 を返す
 export const GONE_ARTICLE_SLUGS: string[] = [
+  // 2026-09-07: GSC「見つかりませんでした(404)」実測で残っていた削除済み記事を 410 に統一（#124）
+  "recommended-books",
+  "toyama-darkness-uozu-tax-office-kura-ai-reform",
+  "why-ai-should-replace-tax-officials",
+  "gemini-workspace-tax-records-legal-documents",
+  "local-llm-selection-guide",
   "ai-easy-life-gemini-intro",
   "ai-side-business-gemini-multi-ai-guide",
   "ai-studio-works-gemini-api-fails-troubleshooting",
