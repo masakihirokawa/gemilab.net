@@ -9,8 +9,8 @@ author: "Gemini Lab"
 description: "The Interactions API developer log in AI Studio is a great triage lens, but it is not a system of record. Here is a two-layer observability design with self-hosted structured logging, reconciliation code, measured sink sizing across 100,000 records, and per-feature cost attribution from an indie operator’s point of view."
 tags: ["Gemini", "Interactions API", "AI Studio", "Observability", "Production"]
 highlights:
-  - "Reconciliation code that joins the dashboard and your own log on interaction_id to catch missing records"
-  - "Measured storage and write latency for JSON Lines, SQLite, and a gzipped projection across 100,000 records"
+  - "Reconciliation on interaction_id plus a runtime guard that catches calls bypassing your logging wrapper"
+  - "Measured storage and write latency for JSON Lines, SQLite, and a gzipped projection across 100,000 records, with the demotion code that produces the cold tier"
   - "A situational table plus rollup SQL for retention tiers, PII masking, and per-feature cost attribution"
 ---
 
@@ -210,6 +210,48 @@ class SqliteSink:
 
 The `feature` column earns its place because it lets the cost attribution below fall out of a single query. One extra string at call time buys back information you cannot reconstruct later. Cheap insurance, the way I see it.
 
+## Demoting to the cold tier: project, then let gzip sit on it
+
+The smallest row in that table — the cold projection — is not the ledger compressed whole. It is the set of columns I know I will still want, pulled out of rows older than 90 days and rewritten. Id, fingerprint, feature, tokens, status, timestamp: with those six, audits, cost attribution, and reproduction work all still hold. `prev_interaction_id` and the model string, on the other hand, almost never got read on old rows.
+
+```python
+import gzip
+import json
+import sqlite3
+import time
+
+COLD_COLS = ("interaction_id", "prompt_fingerprint", "feature",
+             "input_tokens", "output_tokens", "status", "created_at")
+HOT_DAYS = 90
+
+
+def demote_to_cold(db_path: str, cold_path: str, now: float | None = None) -> int:
+    """Project rows older than HOT_DAYS into gzip, then drop them from the hot tier."""
+    now = now or time.time()
+    cutoff = now - HOT_DAYS * 86400
+    con = sqlite3.connect(db_path)
+    rows = con.execute(
+        f"SELECT {','.join(COLD_COLS)} FROM interactions WHERE created_at < ?",
+        (cutoff,),
+    ).fetchall()
+    if not rows:
+        con.close()
+        return 0
+    # append mode: never rewrite the existing cold file
+    with gzip.open(cold_path, "at", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(dict(zip(COLD_COLS, r))) + "\n")
+    con.execute("DELETE FROM interactions WHERE created_at < ?", (cutoff,))
+    con.commit()
+    con.execute("VACUUM")   # DELETE alone does not shrink the file
+    con.close()
+    return len(rows)
+```
+
+The `VACUUM` at the end is there for a reason. SQLite keeps the freed pages internally after a `DELETE` and does not hand the space back to the filesystem. I ran without it for a while and only later noticed that the hot tier I thought I was pruning had grown well past what I expected. A demotion is finished when the file size says it is finished.
+
+Opening the gzip in append mode (`"at"`) causes fewer accidents than rewriting the archive monthly. Concatenated gzip streams decompress correctly, so the read side needs no changes no matter how many times you append.
+
 ## Catching gaps with reconciliation
 
 Splitting into two layers raises the next question: is my ledger actually missing anything? Here the fast lens helps in the reverse direction. Join the runs visible on the dashboard against the `interaction_id`s in your own log, and surface any id that exists on only one side.
@@ -232,6 +274,43 @@ def reconcile(dashboard_ids: set[str], sink_ids: set[str]) -> dict:
 If `missing_in_sink` appears, it is a strong signal that some call path is not going through your wrapper. Closing that path is the work of keeping the ledger complete. Conversely, `missing_in_dashboard` is often just the dashboard's retention expiring, and it is actually evidence that your ledger is doing its job. Understanding this asymmetry keeps you from pointing your alerts in the wrong direction.
 
 I run this reconciliation as a daily batch and only notify when `sink_coverage` drops. Rather than a human reading every log, someone acts only when skew appears. For an indie developer, this "stay quiet when things are quiet" property is what decides whether a practice is sustainable.
+
+## Close the bypass first: finding calls that skip the wrapper
+
+That reconciliation has a soft spot worth naming. If there is no machine-readable way to export `interaction_id`s from the dashboard, `dashboard_ids` is something a person assembles by hand. I only pull the window I am actually investigating; I do not diff every call, every day.
+
+So I added a way to attack the cause of `missing_in_sink` directly, without waiting for the batch: catch raw client calls that never went through the wrapper, at runtime.
+
+```python
+import contextvars
+import functools
+import logging
+
+log = logging.getLogger("interactions.guard")
+_inside_wrapper = contextvars.ContextVar("inside_wrapper", default=False)
+
+
+def install_bypass_guard(client, *, strict: bool = False) -> None:
+    """Detect direct calls on the raw client. Calls from ObservedClient pass through."""
+    raw = client.interactions.create
+
+    @functools.wraps(raw)
+    def guarded(*args, **kwargs):
+        if not _inside_wrapper.get():
+            msg = "Interactions call did not go through ObservedClient"
+            if strict:
+                raise RuntimeError(msg)
+            log.warning("%s (model=%s)", msg, kwargs.get("model"))
+        return raw(*args, **kwargs)
+
+    client.interactions.create = guarded
+```
+
+Inside `ObservedClient.run()`, set `token = _inside_wrapper.set(True)` right after entering the `try`, and call `_inside_wrapper.reset(token)` in the `finally`. The flag lives in a `ContextVar` rather than a module global so concurrent calls cannot bleed into each other. My first version used a plain global, and the warning appeared and disappeared depending on how the coroutines interleaved — that cost me an afternoon.
+
+I run `strict=True` in staging and warning-only in production. Bypasses almost always come from an admin script added later, or a small verification snippet someone wrote to check something once. Staging is as far as failing loudly gets you, if I am honest about it.
+
+Since this went in, the only skew my daily reconciliation reports is the dashboard's own retention expiring. Preventing a gap turns out to help future-me more than finding one does.
 
 ## The question only a ledger can answer: cost by feature
 
@@ -280,8 +359,8 @@ The one that paid off most was separating `empty` from `error`. At first I lumpe
 
 ## Where to start
 
-If you already run the Interactions API in production, the first step can be small. Wrap a single model call with the wrapper above and append just the `interaction_id` and `status`. That alone means that the next time someone asks about "that one call three weeks ago," you have a line you can trace.
+If you already run the Interactions API in production, the first step can be small. Wrap a single model call with the wrapper above and append just the `interaction_id` and `status`. Then install the bypass guard in warning mode and watch it for a week before you build any batch job — the paths it names are the ones that would have shown up as gaps months later. That much alone means that the next time someone asks about "that one call three weeks ago," you have a line you can trace.
 
-The fast lens will keep getting more convenient. That is exactly why you keep the source of truth on your own side. I have come to see that small extra step as a quiet kind of reassurance.
+The fast lens will keep getting more convenient. That is exactly why you keep the source of truth on your own side. I have come to see that small extra step as something that pays back later rather than today.
 
 I am still tuning my reconciliation threshold as I operate this. If it gives anyone else who supports a service on their own a reason to revisit their design, I would be glad. Thank you for reading.
