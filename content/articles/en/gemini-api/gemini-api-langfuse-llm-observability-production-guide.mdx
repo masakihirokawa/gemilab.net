@@ -239,17 +239,111 @@ if __name__ == "__main__":
 
 The underrated move is populating `update_current_trace()` with `user_id` and `session_id`. In the Langfuse UI you can then filter "all traces for this user in the past week" or "all LLM calls within this session." In my experience, the single biggest operational payoff is support tickets: "I got a weird answer around 5 PM yesterday" goes from a multi-hour archaeology trip to a thirty-second `user_id` + time filter.
 
-## Cost attribution — registering model prices and slicing by feature
+## Cost attribution — assume the price table drifts
 
-Langfuse ships a table of known model prices, but Gemini's newest models (especially those released in the last few weeks) often aren't in it yet. When a model isn't registered, USD cost renders as `—`. Use the "Models" page in the settings UI to register each Gemini SKU with its input and output price. Approximate 2026-Q2 numbers (always confirm against the [current pricing page](https://ai.google.dev/pricing)):
+Langfuse ships default prices for the popular models, Gemini included, and those defaults are maintained in the open-source repo with a **daily automated audit** that checks official provider sources for changed prices, tiers, and newly released models. So the old advice — "register every new model yourself" — is no longer accurate.
 
-- **gemini-2.5-flash**: $0.075 / 1M input tokens, $0.30 / 1M output tokens
-- **gemini-2.5-pro**: $1.25 / 1M input (≤200K), $10.00 / 1M output
-- **Context Caching hit**: roughly 25% of normal input cost (varies by model)
+Two properties downstream of that are what actually bite.
 
-Registering prices retroactively recomputes cost across historical traces. Once that's in place, **feature-level cost slicing** becomes the feature you'll come back to daily. If you've been tagging `metadata.feature`, you'll immediately see "article_summary accounts for 38% of spend" or "code_review is 17%" — decisions that were guesses a week ago are now reports.
+**Cost is computed at ingestion time.** Langfuse looks up the price the moment it receives the trace, calculates the number, and stores it. Editing a model definition afterwards does **not** recompute traces that are already stored. I had this backwards for a long stretch: I assumed registering a new model's price would backfill last month. It doesn't. I only reread the docs after counting the rows that stayed empty.
+
+**Price changes have effective dates.** A price table gets replaced on each revision, but a bill has a "starting when." A pipeline sized around a promotional rate comes back at double the cost the month after the cutover — and the more you trust the table, the less likely you are to notice. When I write a price into a design doc now, I write down how long that price is good for, right beside it.
+
+**A price table is a copy of the truth, not the truth.** Once a month I put the Langfuse total next to the provider's invoice and look at the gap. If the gap grows past a threshold, the suspect is either the model definition or the token accounting covered in the next section.
+
+### Models that change price above 200K need pricing tiers
+
+A model like Gemini 2.5 Pro, whose rate depends on input size, can't be expressed with a single price. Langfuse supports **pricing tiers**: one model definition can carry several price points, each with a name, a priority, conditions, and prices. Tiers are evaluated in priority order and the first one whose conditions match wins; if none match, the default tier applies.
+
+Conditions can draw on three sources:
+
+<table>
+<thead>
+<tr><th>Source</th><th>How it matches</th><th>Where it helps with Gemini</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Usage details</strong></td><td>Match usage keys with a regex, sum the values, compare with <code>gt</code> / <code>gte</code> / <code>lt</code> / <code>lte</code> / <code>eq</code> / <code>neq</code></td><td>Switch to long-context pricing above 200,000 input tokens</td></tr>
+<tr><td><strong>Model parameters</strong></td><td>Match a top-level model-parameter key against exact values</td><td>Request attributes that carry a different rate</td></tr>
+<tr><td><strong>Metadata</strong></td><td>Match a top-level metadata key against exact values</td><td>Split rates by <code>region</code> or your own billing bucket</td></tr>
+</tbody>
+</table>
+
+Nested paths aren't supported, and when a tier carries several conditions, all of them have to match. Spending one careful hour here is what keeps a long-document feature and a short-chat feature from smearing into each other on the same dashboard.
+
+With that in place, **feature-level cost slicing** becomes the view you return to daily. If you've been tagging `metadata.feature`, you'll see "article_summary accounts for 38% of spend" or "code_review is 17%" — decisions that were guesses a week ago are now reports.
 
 One implementation rule: **keep metadata flat and low-cardinality.** `{"feature": "article_summary"}` groups cleanly. Slipping `{"article_id": "12345"}` directly into metadata blows up cardinality and destroys dashboard grouping. High-cardinality IDs belong in `input`/`output` payloads or in `session_id` links.
+
+## Translating Gemini's token counts into Langfuse's exclusive buckets
+
+When your cost comes out higher than the provider's invoice, suspect the **token accounting** before the prices. This is where Langfuse and Gemini quietly disagree, and I walked into it myself.
+
+Langfuse treats every key in `usage_details` as a **non-overlapping bucket**. `input` excludes any `input_*` value such as `input_cached_tokens`; `output` excludes any `output_*` value; `total` is the sum of the buckets rather than a bucket itself. Hand it overlapping numbers and both usage and inferred cost get counted twice.
+
+Gemini's `usage_metadata` is **inclusive**. `prompt_token_count` is the whole input, cache reads included. `cached_content_token_count` tells you how much of that came from cache. Thinking tokens arrive separately as `thoughts_token_count`.
+
+Put `prompt_token_count` straight into `input` and every cache-heavy call reads higher than your bill: the cached portion is charged at a discount, but you've counted it at full input rate and then added it a second time. In my case, only the batch job that attaches a long document on every call looked strangely expensive, and I spent half a day blaming the price table. The price table was fine. I had skipped a subtraction.
+
+So I convert inclusive counts to exclusive ones before anything reaches Langfuse, and I keep that in a single function so no caller touches `usage_metadata` directly.
+
+```python
+# app/observability/usage.py
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+def to_langfuse_usage(um: Any) -> dict[str, int]:
+    """Convert Gemini's inclusive usage_metadata into Langfuse's exclusive buckets.
+
+    prompt_token_count includes cache reads, so always subtract them.
+    """
+    def n(name: str) -> int:
+        return int(getattr(um, name, 0) or 0)
+
+    prompt = n("prompt_token_count")
+    cached = n("cached_content_token_count")
+    total = n("total_token_count")
+
+    usage = {
+        "input": max(prompt - cached, 0),          # fresh input only
+        "input_cached_tokens": cached,             # cache reads
+        "output": n("candidates_token_count"),
+        "output_reasoning_tokens": n("thoughts_token_count"),
+    }
+
+    # The day this drifts is the day the provider's breakdown changed
+    drift = total - sum(usage.values()) if total else 0
+    if drift > 0:
+        usage["untracked"] = drift             # unaccounted tokens: a new field appeared
+    elif drift < 0:
+        logger.warning("usage buckets overlap: drift=%d", drift)  # double counting
+    return usage
+```
+
+Those last few lines do the most work. Providers add breakdown fields, and when they do, the numbers shift without saying anything. Parking the difference in a bucket named `untracked` means the day that bucket appears on your dashboard is the day the contract changed. A negative drift points the other way — overlapping buckets — so that one goes to a warning log instead of into the cost.
+
+Callers just pass the dict through:
+
+```python
+with langfuse.start_as_current_observation(
+    as_type="generation",
+    name="gemini-generate",
+    model="gemini-2.5-flash",
+    input=prompt_text,
+) as gen:
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash", contents=prompt_text
+    )
+    gen.update(
+        output=resp.text,
+        usage_details=to_langfuse_usage(resp.usage_metadata),
+    )
+```
+
+Usage keys have to match the price keys on the model definition **exactly**. If there's no price on `input_cached_tokens`, that bucket bills at zero — and a zero can mean "free" or "you forgot," which are very different things. Whenever I add a bucket, I open the model definition in the same sitting.
+
+One more: for models that return thinking tokens, Langfuse can't infer cost unless you ingest the counts. The docs say as much for reasoning models. Passing `usage_details` explicitly, rather than leaning on auto-instrumentation, is what saves you at month end.
 
 ## LLM-as-Judge for continuous production evaluation
 
@@ -361,7 +455,7 @@ def ask():
 
 **Pitfall 2 — high-cardinality keys in metadata.** `article_id` or `order_id` in `metadata` destroys grouping. Either embed them in `input`/`output` payloads or promote them to `session_id`.
 
-**Pitfall 3 — new Gemini models showing $0 cost.** When a fresh Gemini SKU appears, register it in the Langfuse Models page immediately. Skipping this puts "`$0` this month" on your report — a dangerous kind of misleading.
+**Pitfall 3 — traces that ship before a price exists never get fixed.** If a brand-new Gemini model reaches production before it lands in the default price table, those traces keep a `—` forever: registering the price later does **not** recompute them. Your monthly report quietly understates spend. On any day you promote a new model ID, either land the model definition first or switch that path to ingesting `cost_details` explicitly.
 
 **Pitfall 4 — `@observe` hiding exceptions that inner code swallowed.** The decorator passes exceptions through correctly, but `try / except` blocks inside your function can mask errors and make the Langfuse error-rate dashboard lie. Audit for these during code review.
 
@@ -427,11 +521,14 @@ export async function summarize(
 
   const out = response.text ?? "";
   const usage = response.usageMetadata;
+  const cached = usage?.cachedContentTokenCount ?? 0;
   generation.end({
     output: out,
     usage: {
-      input: usage?.promptTokenCount,
-      output: usage?.candidatesTokenCount,
+      // promptTokenCount includes cache reads — subtract before sending
+      input: Math.max((usage?.promptTokenCount ?? 0) - cached, 0),
+      input_cached_tokens: cached,
+      output: usage?.candidatesTokenCount ?? 0,
     },
   });
 
@@ -439,6 +536,8 @@ export async function summarize(
   return out;
 }
 ```
+
+The snippet above is the v3-era JS SDK. In v4 this moved to `startObservation` from `@langfuse/tracing`, and the usage key changed from `usage` to `usageDetails`. Miss the rename during an upgrade and traces keep arriving while the cost column silently empties out. On any release where I bump the SDK, I check that column the next day.
 
 Two caveats worth knowing about the Node SDK. First, on serverless platforms (Vercel, Cloudflare Workers, AWS Lambda) you must call `langfuse.shutdownAsync()` — or `flushAsync()` — before the handler resolves, otherwise traces are lost. Second, at the time of writing, the Node SDK does not have a direct equivalent of Python's `@observe` decorator; you build the trace/generation hierarchy manually. I find that slightly more verbose but also more explicit, which has its own merits in code review.
 
@@ -474,13 +573,13 @@ Switching on everything at once will stall your team. The order I recommend to c
 
 **Week 1 — instrument the skeleton.** Add `@observe` to three to five core endpoints. Populate `user_id` and `feature` metadata. This alone transforms support response time.
 
-**Week 2 — cost visibility.** Register model prices and build the feature-level cost dashboard. Expect to find at least one feature that's spending far more than you assumed.
+**Week 2 — cost visibility.** Settle the model definitions and pricing tiers, then build the feature-level cost dashboard. Expect to find at least one feature that's spending far more than you assumed.
 
 **Week 3 — evaluation.** Turn on `answer_relevance` and `tone_compliance` LLM-as-Judge at 5% sampling. This pays back the next time you ship a prompt change.
 
 **Week 4 — PII and sampling.** Now that traffic patterns are visible, wire up the masking hook and the sampling rules. Installing sampling too early blinds you to the patterns you'd want to sample intelligently later.
 
-This cadence extracts Langfuse's value while minimizing surprise in existing systems. It pairs well with the upstream and downstream pieces — our guides on [context caching](/en/articles/gemini-api/context-caching-guide) and [rate-limit and quota management in production](/en/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) slot in on either side of this observability layer.
+This cadence extracts Langfuse's value while minimizing surprise in existing systems. It pairs well with the upstream and downstream pieces — the [caching strategy field notes](/en/articles/gemini-api/gemini-api-caching-strategy-masterclass-production) and [rate limits and 429 handling in production](/en/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) slot in on either side of this observability layer.
 
 ## Your first move today
 
