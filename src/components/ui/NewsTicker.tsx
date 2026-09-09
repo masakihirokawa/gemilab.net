@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "LYRIA — 9月3日に Lyria 3.5 がパブリックプレビューになりました。ループ素材ではなくフルレングスの楽曲を、長さと構成を指定しながら生成できます",
-    "INPUT — モデルID は lyria-3.5。テキストだけでなく画像も入力に取れます。「この写真の雰囲気で」という指定ができるということで、設計の考え方が変わります",
-    "SPEC — 出力は 44.1kHz ステレオ、入力の上限は 131,072 トークン、歌詞の生成にも対応します。数値を引くときはこの単位を添えてください",
-    "VIDEO — 9月1日のエージェント型動画理解は、モデルが動画のタイムラインを自分で辿り、必要に応じて文字起こしやフレームを要求します。長尺で最大88%のトークン削減です",
-    "QUIET — API のリリースノートは9月3日以降、新しい項目が載っていません。動きがなかったことも記録に値すると考えています",
-    "DICTATION — アプリ側では Fn キーを押しているあいだだけ話しかけると、カーソル位置に整形済みのテキストが差し込まれる入力が届いています",
+    "API — Gemini API のリリースノートは9月3日の Lyria 3.5 が最新のままです。9月10日時点で新しい項目はありませんでした",
+    "CLI — Gemini CLI の v0.47.0 nightly に、Antigravity CLI への移行コマンドとドキュメントが入りました。nightly である点は忘れずに",
+    "GARDEN — Gemini Enterprise Agent Platform の Model Garden に Claude Fable 5.1 が加わりました。埋め込み SKU とエージェント計測の価格も更新されています",
+    "DEPRECATION — gemini-omni-flash-preview の廃止は9月30日、あと20日です。移行先は8月27日に GA となった gemini-omni-1.1-flash になります",
+    "SIRI — iOS 27 が9月14日に配信されます。刷新された Siri は Google の Gemini モデルの協力で開発されたと報じられていますが、詳細は未確認です",
+    "PRICE — Gemini 3.8 Flash と 3.7 Flash の 0.75 ドル / 3.75 ドルは導入価格です。2027年1月1日から 1.50 ドル / 7.50 ドルへ変わります",
   ],
   en: [
-    "LYRIA — Lyria 3.5 entered public preview on September 3. It generates full-length songs rather than loops, with fine-grained control over duration and structure",
-    "INPUT — The model ID is lyria-3.5, and it accepts images alongside text. Being able to say make it feel like this photo changes how you approach the prompt",
-    "SPEC — Output is 44.1kHz stereo, the input ceiling is 131,072 tokens, and it can write lyrics. Worth carrying those units whenever you quote the numbers",
-    "VIDEO — The agentic video understanding released September 1 lets the model walk a timeline itself, pulling transcripts or frames on demand. Up to 88% fewer tokens on long content",
-    "QUIET — Nothing new has landed in the API release notes since September 3. A quiet stretch is still worth recording rather than passing over in silence",
-    "DICTATION — On the app side, holding the Fn key now dictates into your active window, dropping cleaned-up text straight at the cursor",
+    "API — The Gemini API release notes still end at Lyria 3.5 on September 3. Nothing new had appeared as of September 10",
+    "CLI — Gemini CLI v0.47.0 nightly adds documentation and migration commands for the Antigravity CLI. Worth remembering that this is a nightly build",
+    "GARDEN — Claude Fable 5.1 has joined Model Garden on the Gemini Enterprise Agent Platform, alongside updated embedding SKUs and agent metering prices",
+    "DEPRECATION — gemini-omni-flash-preview retires on September 30, twenty days out. The path forward is gemini-omni-1.1-flash, which reached GA on August 27",
+    "SIRI — iOS 27 ships on September 14. Its rebuilt Siri was reportedly developed with help from Google's Gemini models, though the specifics remain unconfirmed",
+    "PRICE — The $0.75 / $3.75 per MTok on Gemini 3.8 Flash and 3.7 Flash is introductory. From January 1, 2027 it becomes $1.50 / $7.50",
   ],
 };
 
