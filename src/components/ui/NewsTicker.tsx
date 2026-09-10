@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "API — Gemini API のリリースノートは9月3日の Lyria 3.5 が最新のままです。9月10日時点で新しい項目はありませんでした",
-    "CLI — Gemini CLI の v0.47.0 nightly に、Antigravity CLI への移行コマンドとドキュメントが入りました。nightly である点は忘れずに",
-    "GARDEN — Gemini Enterprise Agent Platform の Model Garden に Claude Fable 5.1 が加わりました。埋め込み SKU とエージェント計測の価格も更新されています",
-    "DEPRECATION — gemini-omni-flash-preview の廃止は9月30日、あと20日です。移行先は8月27日に GA となった gemini-omni-1.1-flash になります",
-    "SIRI — iOS 27 が9月14日に配信されます。刷新された Siri は Google の Gemini モデルの協力で開発されたと報じられていますが、詳細は未確認です",
-    "PRICE — Gemini 3.8 Flash と 3.7 Flash の 0.75 ドル / 3.75 ドルは導入価格です。2027年1月1日から 1.50 ドル / 7.50 ドルへ変わります",
+    "OMNI — gemini-omni-flash-preview は9月30日で廃止されます。残り19日です。移行を扱う記事を書くなら、実質これが最後の機会になります",
+    "MIGRATE — 移行先は8月27日に GA となった gemini-omni-1.1-flash。extend で末尾を延長でき、2枚の画像を渡せばそのあいだを補間します",
+    "RESOLUTION — video_config の resolution は 360p / 720p / 1080p / 4k から選べます。1080p と 4K はアップスケーリングによる生成です",
+    "SAMPLING — temperature と top_p、top_k は非推奨として整理されました。揺れを抑えたいなら、プロンプトと構造化出力の側で決めることになります",
+    "TRANSCRIBE — gemini-3.5-transcribe は85言語以上の発話単位の言語判定、話者分離、単語単位のタイムスタンプ。カスタム語彙は最大1,000語までです",
+    "FLASH — Gemini 3.8 Flash は9月2日に GA。9月3日には Lyria 3.5 がパブリックプレビューとなり、テキストと画像から楽曲を生成します",
   ],
   en: [
-    "API — The Gemini API release notes still end at Lyria 3.5 on September 3. Nothing new had appeared as of September 10",
-    "CLI — Gemini CLI v0.47.0 nightly adds documentation and migration commands for the Antigravity CLI. Worth remembering that this is a nightly build",
-    "GARDEN — Claude Fable 5.1 has joined Model Garden on the Gemini Enterprise Agent Platform, alongside updated embedding SKUs and agent metering prices",
-    "DEPRECATION — gemini-omni-flash-preview retires on September 30, twenty days out. The path forward is gemini-omni-1.1-flash, which reached GA on August 27",
-    "SIRI — iOS 27 ships on September 14. Its rebuilt Siri was reportedly developed with help from Google's Gemini models, though the specifics remain unconfirmed",
-    "PRICE — The $0.75 / $3.75 per MTok on Gemini 3.8 Flash and 3.7 Flash is introductory. From January 1, 2027 it becomes $1.50 / $7.50",
+    "OMNI — The gemini-omni-flash-preview endpoint retires on September 30. Nineteen days left, which makes this the last realistic window for a migration piece",
+    "MIGRATE — Its replacement, gemini-omni-1.1-flash, went GA on August 27. An extend task continues a clip, and two images let the model interpolate between them",
+    "RESOLUTION — video_config now takes a resolution of 360p, 720p, 1080p or 4k. Worth stating plainly that 1080p and 4K are produced by upscaling",
+    "SAMPLING — temperature, top_p and top_k have been folded into the deprecated list. If you want less variance, the lever is now your prompt and structured output",
+    "TRANSCRIBE — gemini-3.5-transcribe covers utterance-level language detection across 85+ languages, speaker diarization, word-level timestamps, and up to 1,000 custom terms",
+    "FLASH — Gemini 3.8 Flash reached GA on September 2, and Lyria 3.5 opened in public preview a day later, generating full songs from text and image input",
   ],
 };
 
