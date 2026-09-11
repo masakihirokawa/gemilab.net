@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "OMNI — gemini-omni-flash-preview は9月30日で廃止されます。残り19日です。移行を扱う記事を書くなら、実質これが最後の機会になります",
-    "MIGRATE — 移行先は8月27日に GA となった gemini-omni-1.1-flash。extend で末尾を延長でき、2枚の画像を渡せばそのあいだを補間します",
-    "RESOLUTION — video_config の resolution は 360p / 720p / 1080p / 4k から選べます。1080p と 4K はアップスケーリングによる生成です",
-    "SAMPLING — temperature と top_p、top_k は非推奨として整理されました。揺れを抑えたいなら、プロンプトと構造化出力の側で決めることになります",
-    "TRANSCRIBE — gemini-3.5-transcribe は85言語以上の発話単位の言語判定、話者分離、単語単位のタイムスタンプ。カスタム語彙は最大1,000語までです",
-    "FLASH — Gemini 3.8 Flash は9月2日に GA。9月3日には Lyria 3.5 がパブリックプレビューとなり、テキストと画像から楽曲を生成します",
+    "10/2 — gemini-2.5-flash-image の停止予定日は10月2日です。世に Nano Banana として広まった初代で、記事やサンプルに最も多く残っています",
+    "注意 — 公式の表が推奨移行先に挙げる gemini-3.1-flash-image-preview は、すでに6月25日に停止済みです。実際の移行先は GA の gemini-3.1-flash-image です",
+    "9/30 — gemini-omni-flash-preview の停止は9月30日。移行先は8月27日に GA となった gemini-omni-1.1-flash です",
+    "RESOLUTION — gemini-omni-1.1-flash では video_config に resolution が入りました。360p / 720p / 1080p / 4k から選べます",
+    "最早日 — 停止日は確定日ではなく「最も早い可能性のある日付」だと公式が明記しています。慌てず、しかし先延ばしにもしないことです",
+    "SAMPLING — temperature / top_p / top_k は7月21日付で非推奨です。手癖で温度を下げる書き方は、世代が変わると効かなくなります",
   ],
   en: [
-    "OMNI — The gemini-omni-flash-preview endpoint retires on September 30. Nineteen days left, which makes this the last realistic window for a migration piece",
-    "MIGRATE — Its replacement, gemini-omni-1.1-flash, went GA on August 27. An extend task continues a clip, and two images let the model interpolate between them",
-    "RESOLUTION — video_config now takes a resolution of 360p, 720p, 1080p or 4k. Worth stating plainly that 1080p and 4K are produced by upscaling",
-    "SAMPLING — temperature, top_p and top_k have been folded into the deprecated list. If you want less variance, the lever is now your prompt and structured output",
-    "TRANSCRIBE — gemini-3.5-transcribe covers utterance-level language detection across 85+ languages, speaker diarization, word-level timestamps, and up to 1,000 custom terms",
-    "FLASH — Gemini 3.8 Flash reached GA on September 2, and Lyria 3.5 opened in public preview a day later, generating full songs from text and image input",
+    "OCT 2 — gemini-2.5-flash-image is scheduled to shut down on October 2. It is the original model the world came to know as Nano Banana",
+    "CAREFUL — The replacement named in the official table, gemini-3.1-flash-image-preview, was itself retired on June 25. The live path is the GA gemini-3.1-flash-image",
+    "SEP 30 — gemini-omni-flash-preview shuts down on September 30. Move to gemini-omni-1.1-flash, which went GA on August 27",
+    "RESOLUTION — gemini-omni-1.1-flash adds a resolution field to video_config, with 360p, 720p, 1080p and 4k to choose from",
+    "EARLIEST — Google notes that a shutdown date is the earliest possible date, not a fixed one. No need to panic, but no excuse to wait either",
+    "SAMPLING — temperature, top_p and top_k were deprecated back on July 21. Turning the temperature down is a habit that stops working across generations",
   ],
 };
 
