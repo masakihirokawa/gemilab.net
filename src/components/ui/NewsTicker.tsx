@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "10/2 — gemini-2.5-flash-image の停止予定日は10月2日です。世に Nano Banana として広まった初代で、記事やサンプルに最も多く残っています",
-    "注意 — 公式の表が推奨移行先に挙げる gemini-3.1-flash-image-preview は、すでに6月25日に停止済みです。実際の移行先は GA の gemini-3.1-flash-image です",
-    "9/30 — gemini-omni-flash-preview の停止は9月30日。移行先は8月27日に GA となった gemini-omni-1.1-flash です",
-    "RESOLUTION — gemini-omni-1.1-flash では video_config に resolution が入りました。360p / 720p / 1080p / 4k から選べます",
-    "最早日 — 停止日は確定日ではなく「最も早い可能性のある日付」だと公式が明記しています。慌てず、しかし先延ばしにもしないことです",
-    "SAMPLING — temperature / top_p / top_k は7月21日付で非推奨です。手癖で温度を下げる書き方は、世代が変わると効かなくなります",
+    "CLI — Gemini API のリリースノートが9月3日から止まっている間に、Gemini CLI 側は v0.59.0 が stable になりました。中身はセキュリティ寄りです",
+    "SSRF — MCP の OAuth メタデータ探索における SSRF が塞がれました。第三者の MCP を繋いでいる方には、探索段階の穴が閉じたという話です",
+    "RESTRICTED — restricted mode で workspace trust が fail-closed になり、MCP サーバーがフィルタされます。無人運用に MCP を繋いでいる方は挙動が変わります",
+    "版の固定 — 明示的にバージョン指定した Flash のモデル ID が保持されない不具合が直りました。再現性のために版を固定していた方ほど影響を受けていた箇所です",
+    "9/30 — gemini-omni-flash-preview の停止まであと17日です。10/2 には gemini-2.5-flash-image も止まります",
+    "移行先 — 公式の表が挙げる gemini-3.1-flash-image-preview は6月25日に停止済みです。実際の移行先は GA の gemini-3.1-flash-image をご確認ください",
   ],
   en: [
-    "OCT 2 — gemini-2.5-flash-image is scheduled to shut down on October 2. It is the original model the world came to know as Nano Banana",
-    "CAREFUL — The replacement named in the official table, gemini-3.1-flash-image-preview, was itself retired on June 25. The live path is the GA gemini-3.1-flash-image",
-    "SEP 30 — gemini-omni-flash-preview shuts down on September 30. Move to gemini-omni-1.1-flash, which went GA on August 27",
-    "RESOLUTION — gemini-omni-1.1-flash adds a resolution field to video_config, with 360p, 720p, 1080p and 4k to choose from",
-    "EARLIEST — Google notes that a shutdown date is the earliest possible date, not a fixed one. No need to panic, but no excuse to wait either",
-    "SAMPLING — temperature, top_p and top_k were deprecated back on July 21. Turning the temperature down is a habit that stops working across generations",
+    "CLI — While the Gemini API release notes have sat still since September 3, the CLI moved: v0.59.0 is now stable, and the changes are mostly about security",
+    "SSRF — Server-side request forgery in MCP OAuth metadata discovery has been closed off. If you connect third-party MCP servers, this one is for you",
+    "RESTRICTED — Restricted mode now enforces fail-closed workspace trust and filters MCP servers. Expect different behaviour if you run unattended with MCP attached",
+    "PINNING — Explicitly versioned Flash model IDs were not being preserved. If you pin versions for reproducibility, this quietly affected you",
+    "SEP 30 — Seventeen days until gemini-omni-flash-preview is retired, and gemini-2.5-flash-image follows on October 2",
+    "MIGRATION — The official table still points to gemini-3.1-flash-image-preview, which was retired on June 25. The real destination is the GA gemini-3.1-flash-image",
   ],
 };
 
