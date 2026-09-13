@@ -138,7 +138,7 @@ export function Header() {
         {/* Logo */}
         <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 7 : 11, flexShrink: 1, minWidth: 0, overflow: "hidden" }}>
           <a href={prefix || "/"} style={{ display: "flex", alignItems: "center", gap: isMobile ? 7 : 11, textDecoration: "none", minWidth: 0 }}>
-            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: isMobile ? 16 : 18, color: "var(--accent-coral)", fontWeight: 400, position: "relative" as const, top: isMobile ? 0 : 2, flexShrink: 0 }}>
+            <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: isMobile ? 16 : 18, color: "var(--accent-coral)", fontWeight: 400, position: "relative" as const, top: isMobile ? 0 : 2, flexShrink: 0 }}>
               ◉
             </span>
             <span style={{ fontSize: isMobile ? 13 : 15, fontWeight: 500, letterSpacing: isMobile ? "0.04em" : "0.1em", color: "var(--text-primary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
@@ -252,7 +252,7 @@ export function Header() {
                 color: "var(--text-muted)",
                 fontSize: 12,
                 cursor: "pointer",
-                fontFamily: "'DM Mono', monospace",
+                fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                 letterSpacing: "0.04em",
                 whiteSpace: "nowrap",
               }}
@@ -349,7 +349,7 @@ export function Header() {
           </button>
           {/* Level links in mobile — top position */}
           <div style={{ width: "100%", maxWidth: 280, margin: "0 auto", paddingBottom: 4 }}>
-            <span style={{ display: "block", textAlign: "center", fontSize: 9, fontFamily: "'DM Mono', monospace", color: "var(--text-dim)", letterSpacing: "0.15em", marginBottom: 8 }}>
+            <span style={{ display: "block", textAlign: "center", fontSize: 9, fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", color: "var(--text-dim)", letterSpacing: "0.15em", marginBottom: 8 }}>
               LEVEL
             </span>
             <div style={{ display: "flex", justifyContent: "center", gap: 10 }}>

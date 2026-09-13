@@ -38,7 +38,7 @@ export default async function BlogPage({ params }: Props) {
       <div style={{ marginBottom: 48 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
           <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+          <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
             BLOG
           </span>
         </div>
@@ -112,7 +112,7 @@ export default async function BlogPage({ params }: Props) {
                 <time
                   dateTime={post.date.split("T")[0]}
                   style={{
-                    fontFamily: "'DM Mono', monospace",
+                    fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                     fontSize: 12,
                     color: "var(--text-faint)",
                     letterSpacing: "0.04em",
@@ -131,7 +131,7 @@ export default async function BlogPage({ params }: Props) {
                       key={tag}
                       style={{
                         fontSize: 10,
-                        fontFamily: "'DM Mono', monospace",
+                        fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                         color: "var(--text-dim)",
                         background: "var(--bg-surface)",
                         border: "1px solid var(--border-subtle)",
