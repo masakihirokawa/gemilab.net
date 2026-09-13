@@ -38,6 +38,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     description,
     openGraph: { title, description, images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 1200, alt: "Gemini Lab", type: "image/png" }] },
     robots: { index: false, follow: true },
+    // 自己 canonical。無指定だとルート layout の canonical（トップ）を継承していた（2026-09-13）
+    alternates: { canonical: `https://gemilab.net${locale === "ja" ? "" : `/${locale}`}/tag/${encodeURIComponent(decoded)}` },
   };
 }
 

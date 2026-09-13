@@ -33,14 +33,9 @@ export const metadata: Metadata = {
     site: "@dolice",
     creator: "@dolice",
   },
-  alternates: {
-    canonical: "https://gemilab.net",
-    languages: {
-      "ja": "https://gemilab.net",
-      "en": "https://gemilab.net/en",
-      "x-default": "https://gemilab.net/en",
-    },
-  },
+  // alternates（canonical / hreflang）はここに置かない。ルートに置くと alternates を持たないページ
+  //（タグページ・404 等）が「canonical=トップ」を継承し、noindex と canonical の矛盾シグナルを
+  // 数千ページ分トップへ向けてしまう（2026-09-13 構造監査）。各 page.tsx が自分の canonical を宣言する。
   icons: {
     icon: [
       { url: "/favicon-48.png", sizes: "48x48", type: "image/png" },

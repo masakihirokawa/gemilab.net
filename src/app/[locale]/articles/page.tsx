@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { notFound } from "next/navigation";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { ArticlePagination } from "@/components/ui/ArticlePagination";
@@ -34,7 +35,19 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
     },
   };
 
-  // Pagination: rely on canonical (to page 1) instead of noindex for GSC compatibility
+  // page>=2 は自己 canonical + noindex,follow（page1 への canonical は Google 非推奨）。
+  // ?category=X（page1）は本物のカテゴリページ /articles/X の重複なのでそちらへ canonical（2026-09-13）。
+  const filterCat = CATEGORIES.some((c) => c.id === sp.category) ? (sp.category || "") : "";
+  const listBase = locale === "ja" ? "https://gemilab.net/articles" : "https://gemilab.net/en/articles";
+  if (currentPage > 1) {
+    const qs = new URLSearchParams();
+    if (filterCat) qs.set("category", filterCat);
+    qs.set("page", String(currentPage));
+    metadata.alternates = { canonical: `${listBase}?${qs.toString()}` };
+    metadata.robots = { index: false, follow: true };
+  } else if (filterCat) {
+    metadata.alternates = { canonical: `${listBase}/${filterCat}` };
+  }
   return metadata;
 }
 
@@ -65,6 +78,7 @@ export default async function ArticlesPage({ params, searchParams }: Props) {
 
   const totalArticles = articles.length;
   const totalPages = Math.ceil(totalArticles / ARTICLES_PER_PAGE);
+  if (currentPage > Math.max(1, totalPages)) notFound(); // 範囲外の ?page= は 200 で page1 を返さず 404
   const safePage = Math.min(currentPage, Math.max(1, totalPages));
   const startIdx = (safePage - 1) * ARTICLES_PER_PAGE;
   const paginatedArticles = articles.slice(startIdx, startIdx + ARTICLES_PER_PAGE);

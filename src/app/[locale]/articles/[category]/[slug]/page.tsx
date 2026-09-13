@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound, permanentRedirect } from "next/navigation";
-import { getArticle, getArticles, getAllArticleSlugs, CATEGORIES, getArticleContent, getTagCounts } from "@/lib/content";
+import { getArticle, getArticles, getAllArticleSlugs, CATEGORIES, getArticleContent, getTagCounts, toIsoJst } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { BookRecommendation } from "@/components/ui/BookRecommendation";
 import { ShareButtons } from "@/components/ui/ShareButtons";
@@ -38,8 +38,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       url,
       type: "article",
       siteName: "Gemini Lab",
-      publishedTime: article.meta.date,
-      modifiedTime: article.meta.updated || article.meta.date,
+      publishedTime: toIsoJst(article.meta.date),
+      modifiedTime: toIsoJst(article.meta.updated || article.meta.date),
       authors: [article.meta.author],
       tags: article.meta.tags,
       images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 1200, alt: article.meta.title, type: "image/png" }],
@@ -121,7 +121,7 @@ export default async function ArticlePage({ params }: Props) {
 
   if (!article) {
     // カテゴリ違いの URL（旧カテゴリ・Google の推測 URL）は正しいカテゴリへ恒久移転（2026-09-07・#124）
-    const moved = getArticles(locale).find((a) => a.slug === slug);
+    const moved = getArticles(locale, true).find((a) => a.slug === slug);
     if (moved && moved.category !== category) {
       permanentRedirect(`${locale === "ja" ? "" : `/${locale}`}/articles/${moved.category}/${slug}`);
     }
@@ -158,11 +158,13 @@ export default async function ArticlePage({ params }: Props) {
     "@type": "Article",
     headline: article.meta.title,
     description: article.meta.description,
-    author: { "@type": "Person", name: article.meta.author },
-    datePublished: article.meta.date,
-    dateModified: article.meta.updated || article.meta.date,
-    publisher: { "@type": "Organization", name: "Gemini Lab", url: "https://gemilab.net" },
+    author: { "@type": "Person", name: "Masaki Hirokawa", url: `https://gemilab.net${prefix}/about`, sameAs: ["https://dolice.net"] },
+    datePublished: toIsoJst(article.meta.date),
+    dateModified: toIsoJst(article.meta.updated || article.meta.date),
+    publisher: { "@type": "Organization", name: "Gemini Lab", url: "https://gemilab.net", logo: { "@type": "ImageObject", url: "https://gemilab.net/icon-512.png" } },
     url: articleUrl,
+    mainEntityOfPage: { "@type": "WebPage", "@id": articleUrl },
+    image: ["https://gemilab.net/og/default.png"],
     inLanguage: locale === "ja" ? "ja" : "en",
     keywords: article.meta.tags.join(", "),
     speakable: {
@@ -293,6 +295,14 @@ export default async function ArticlePage({ params }: Props) {
           <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
             {article.meta.tags.map((tag) => {
               const count = tagCounts.get(tag) || 0;
+              // keep 記事が 2 本未満のタグは一覧にならないのでリンクしない（薄い noindex タグページへの内部リンクを断つ）
+              if (count < 2) {
+                return (
+                  <span key={tag} style={{ fontSize: 11, padding: "2px 10px", borderRadius: 3, border: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
+                    {tag}
+                  </span>
+                );
+              }
               return (
                 <a
                   key={tag}
