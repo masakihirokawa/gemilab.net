@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLI — Gemini API のリリースノートが9月3日から止まっている間に、Gemini CLI 側は v0.59.0 が stable になりました。中身はセキュリティ寄りです",
-    "SSRF — MCP の OAuth メタデータ探索における SSRF が塞がれました。第三者の MCP を繋いでいる方には、探索段階の穴が閉じたという話です",
-    "RESTRICTED — restricted mode で workspace trust が fail-closed になり、MCP サーバーがフィルタされます。無人運用に MCP を繋いでいる方は挙動が変わります",
-    "版の固定 — 明示的にバージョン指定した Flash のモデル ID が保持されない不具合が直りました。再現性のために版を固定していた方ほど影響を受けていた箇所です",
-    "9/30 — gemini-omni-flash-preview の停止まであと17日です。10/2 には gemini-2.5-flash-image も止まります",
-    "移行先 — 公式の表が挙げる gemini-3.1-flash-image-preview は6月25日に停止済みです。実際の移行先は GA の gemini-3.1-flash-image をご確認ください",
+    "DESKTOP — Gemini の Windows デスクトップ版が出ました。Windows 10 以降に対応し、Alt + Space でどの画面からでも呼び出せます",
+    "0.59.0 — Gemini CLI の現在の安定版はこれです。v0.60 と v0.61 は nightly と preview だけで、安定版タグはまだ出ていません",
+    "9/30 — gemini-omni-flash-preview の停止まで残り16日です。後継の gemini-omni-1.1-flash は video_config に resolution が加わっており、ID を差し替えるだけでは済まない場合があります",
+    "429 — fileData に外部 URL の画像や PDF を渡すと、クォータを 0.03% しか使っていなくても 429 が返る報告が続いています。テキストだけなら通ります",
+    "NEW — Drive の原稿を直して聞き直したら、Gemini が直す前の文を返してきました。取り込みの癖と、再添付を決める基準を書きました",
+    "SAFETY — 小説の翻訳で PROHIBITED_CONTENT が続くとき、閾値を下げれば通る話と、下げても通らない話があります。その境目を先に見分けたいところです",
   ],
   en: [
-    "CLI — While the Gemini API release notes have sat still since September 3, the CLI moved: v0.59.0 is now stable, and the changes are mostly about security",
-    "SSRF — Server-side request forgery in MCP OAuth metadata discovery has been closed off. If you connect third-party MCP servers, this one is for you",
-    "RESTRICTED — Restricted mode now enforces fail-closed workspace trust and filters MCP servers. Expect different behaviour if you run unattended with MCP attached",
-    "PINNING — Explicitly versioned Flash model IDs were not being preserved. If you pin versions for reproducibility, this quietly affected you",
-    "SEP 30 — Seventeen days until gemini-omni-flash-preview is retired, and gemini-2.5-flash-image follows on October 2",
-    "MIGRATION — The official table still points to gemini-3.1-flash-image-preview, which was retired on June 25. The real destination is the GA gemini-3.1-flash-image",
+    "DESKTOP — Gemini now has a Windows desktop app. It runs on Windows 10 and later, and Alt + Space brings it up from anywhere",
+    "0.59.0 — This is the current stable Gemini CLI. Versions 0.60 and 0.61 exist only as nightly and preview builds, with no stable tag yet",
+    "SEPT 30 — Sixteen days left before gemini-omni-flash-preview shuts down. Its successor adds a resolution field to video_config, so swapping the model ID may not be enough",
+    "429 — Passing an external image or PDF URL through fileData keeps returning 429 for some users at 0.03% of quota. The same request succeeds with text alone",
+    "NEW — We edited a draft in Drive, asked again, and Gemini answered from the version before the edit. Here is how its file intake behaves and when to re-attach",
+    "SAFETY — When translating fiction keeps hitting PROHIBITED_CONTENT, some cases clear with a lower threshold and some never will. Telling the two apart first saves the afternoon",
   ],
 };
 
