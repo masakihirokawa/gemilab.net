@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "3.8FLASH — gemini-3.8-flash が9月2日に一般提供となりました。長く続く開発作業、自律エージェント、企業のワークフロー向けという位置づけです",
-    "LYRIA3.5 — 音楽生成の lyria-3.5 がパブリックプレビューに入りました。フル尺の楽曲を 44.1 kHz ステレオで生成でき、テキストと画像の両方を入力に取れます",
-    "9/30 — gemini-omni-flash-preview の停止まで残り15日です。後継は gemini-omni-1.1-flash で、8月27日に一般提供が始まっています",
-    "CACHE — 暗黙キャッシュの最小トークン数は公式には 4,096 ですが、12k を超えるまで発火しないという実測報告が出ています。効いているかどうかは自分で測るほかありません",
-    "NEW — BLOCK_NONE を入れても結果が変わらないとき。閾値で通る話と、下げても通らない話の境目を書きました",
-    "403 — models の一覧は 200 で返るのに generateContent だけ 403 で拒まれる、という質問が毎週のように再発しています。課金を有効にした直後でも起こります",
+    "3.8LIVE — gemini-3.8-live と extended-thinking 版が GA になりました。低遅延の音声エージェント向けで、非同期の function calling が既定です",
+    "2.5FLASH — 二次情報で広まっている「2.5 系は10月16日に停止」は、公式の廃止予定表に記載がありません。3モデルとも停止日は未告知のままです",
+    "09/30 — gemini-omni-flash-preview の停止まで残り14日です。GA 版は延長やフレーム補間、解像度指定が増えているため、モデル ID の置換だけでは済みません",
+    "BATCH — バッチジョブは成功で終わるのに、中のレスポンスだけが権限エラーで返る報告が出ています。同期呼び出しと同じファイルでも起きるところが厄介です",
+    "NEW — 3.8 Flash と 3.7 Flash のどちらに寄せるか。手元の20問を毎回通して決めている方法を書きました",
+    "SHEETS — スプレッドシートの AI 関数が反応しないとき、24時間の回数上限なのか、ファイルの置き場所と開き方なのかを先に切り分けます",
   ],
   en: [
-    "3.8 FLASH — gemini-3.8-flash reached general availability on September 2, aimed at long-horizon software work, autonomous agents and complex enterprise workflows",
-    "LYRIA 3.5 — The lyria-3.5 music model is in public preview. It generates full-length songs in 44.1 kHz stereo and accepts both text and image input",
-    "SEPT 30 — Fifteen days until gemini-omni-flash-preview shuts down. Its successor, gemini-omni-1.1-flash, has been generally available since August 27",
-    "CACHE — The documented minimum for implicit caching is 4,096 tokens, but developers report nothing firing until past 12k. Whether it is working is something you have to measure yourself",
-    "NEW — When BLOCK_NONE changes nothing. Telling apart the cases a lower threshold clears from the ones it never will",
-    "403 — Listing models returns 200 while generateContent alone returns 403. The same question resurfaces weekly, including on projects that have just enabled billing",
+    "3.8LIVE — gemini-3.8-live and its extended-thinking variant are now generally available. Both target low-latency voice agents, with async function calling on by default",
+    "2.5FLASH — The widely repeated claim that the 2.5 models shut down on October 16 does not appear in the official deprecation table. All three still show no announced date",
+    "09/30 — Fourteen days left before gemini-omni-flash-preview shuts down. The GA model adds extension, frame interpolation and resolution options, so this is more than an ID swap",
+    "BATCH — Batch jobs are completing successfully while the responses inside come back as permission errors. The same file works fine through a synchronous call",
+    "NEW — Choosing between 3.8 Flash and 3.7 Flash by running the same twenty questions every time, and what that set is made of",
+    "SHEETS — When an AI function in Sheets stops responding, separate the daily usage cap from where the file lives and how it was opened before changing anything else",
   ],
 };
 
