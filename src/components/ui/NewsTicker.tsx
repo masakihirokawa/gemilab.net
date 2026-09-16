@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-ja: [
-    "3.8LIVE — gemini-3.8-live と extended-thinking 版が GA になりました。低遅延の音声エージェント向けで、非同期の function calling が既定です",
-    "2.5FLASH — 二次情報で広まっている「2.5 系は10月16日に停止」は、公式の廃止予定表に記載がありません。3モデルとも停止日は未告知のままです",
-    "09/30 — gemini-omni-flash-preview の停止まで残り14日です。GA 版は延長やフレーム補間、解像度指定が増えているため、モデル ID の置換だけでは済みません",
-    "BATCH — バッチジョブは成功で終わるのに、中のレスポンスだけが権限エラーで返る報告が出ています。同期呼び出しと同じファイルでも起きるところが厄介です",
-    "NEW — 3.8 Flash と 3.7 Flash のどちらに寄せるか。手元の20問を毎回通して決めている方法を書きました",
-    "SHEETS — スプレッドシートの AI 関数が反応しないとき、24時間の回数上限なのか、ファイルの置き場所と開き方なのかを先に切り分けます",
+  ja: [
+    "3.8LIVE — Live API 向けの audio-to-audio が 2 種 GA になりました。低遅延の既定が gemini-3.8-live、ライブ音声中の背景推論が -extended-thinking です",
+    "09/30 — gemini-omni-flash-preview のシャットダウンまで残り 13 日です。後継は gemini-omni-1.1-flash で、差し替え前に呼び出し箇所を数え直しておきます",
+    "MCP — 拡張側に 10 分と書いたタイムアウトが 1 分で切れる、という報告が出ています。長い処理を MCP に任せている場合はそのまま踏みます",
+    "NEW — Sheets の AI 関数が生成できないときは、24 時間の上限より先にファイルの置き場所を疑います",
+    "GEM — 社内で作った Gem が共有できないときは、管理者設定と Drive の共有設定を決まった順で確認していきます",
+    "10/16 — Gemini 2.5 の Pro / Flash / Flash-Lite が揃って停止するまで残り 29 日です。移行先は 3.5 Flash 系になります",
   ],
   en: [
-    "3.8LIVE — gemini-3.8-live and its extended-thinking variant are now generally available. Both target low-latency voice agents, with async function calling on by default",
-    "2.5FLASH — The widely repeated claim that the 2.5 models shut down on October 16 does not appear in the official deprecation table. All three still show no announced date",
-    "09/30 — Fourteen days left before gemini-omni-flash-preview shuts down. The GA model adds extension, frame interpolation and resolution options, so this is more than an ID swap",
-    "BATCH — Batch jobs are completing successfully while the responses inside come back as permission errors. The same file works fine through a synchronous call",
-    "NEW — Choosing between 3.8 Flash and 3.7 Flash by running the same twenty questions every time, and what that set is made of",
-    "SHEETS — When an AI function in Sheets stops responding, separate the daily usage cap from where the file lives and how it was opened before changing anything else",
+    "3.8LIVE — Two audio-to-audio models reached GA for the Live API: gemini-3.8-live as the low-latency default, and -extended-thinking for background reasoning mid-conversation",
+    "09/30 — Thirteen days until gemini-omni-flash-preview shuts down. The replacement is gemini-omni-1.1-flash, so count your call sites before you swap",
+    "MCP — A timeout written as ten minutes on the extension side is reportedly cutting out at one. Anyone handing long work to an MCP server runs straight into it",
+    "NEW — When an AI function in Sheets refuses to generate, suspect where the file lives before you blame the 24-hour cap",
+    "GEM — When a Gem built for your team will not share, walk the admin settings and the Drive sharing settings in a set order",
+    "10/16 — Twenty-nine days until Gemini 2.5 Pro, Flash and Flash-Lite shut down together. The path forward is the 3.5 Flash line",
   ],
 };
 
