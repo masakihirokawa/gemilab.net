@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-  ja: [
-    "3.8LIVE — Live API 向けの audio-to-audio が 2 種 GA になりました。低遅延の既定が gemini-3.8-live、ライブ音声中の背景推論が -extended-thinking です",
-    "09/30 — gemini-omni-flash-preview のシャットダウンまで残り 13 日です。後継は gemini-omni-1.1-flash で、差し替え前に呼び出し箇所を数え直しておきます",
-    "MCP — 拡張側に 10 分と書いたタイムアウトが 1 分で切れる、という報告が出ています。長い処理を MCP に任せている場合はそのまま踏みます",
-    "NEW — Sheets の AI 関数が生成できないときは、24 時間の上限より先にファイルの置き場所を疑います",
-    "GEM — 社内で作った Gem が共有できないときは、管理者設定と Drive の共有設定を決まった順で確認していきます",
-    "10/16 — Gemini 2.5 の Pro / Flash / Flash-Lite が揃って停止するまで残り 29 日です。移行先は 3.5 Flash 系になります",
+ja: [
+    "0.60.0 — Gemini CLI の今回の更新は、ほぼ全件が拡張と MCP の境界の締め直しです。環境変数を変える拡張には同意を求めるようになりました",
+    "09/30 — gemini-omni-flash-preview の停止まで残り12日です。後継は gemini-omni-1.1-flash で、呼び出し箇所の棚卸しから始めます",
+    "LICENSE — 手順どおりに設定していたのに、ある日から「有効なライセンスがありません」で起動できない、という報告が二つのスレッドで続いています",
+    "NEW — Gem が相手の一覧に出ないとき、止まっている場所は三つあります。見る順番を決めておきます",
+    "PDF — 大きすぎると言われた資料は、分ける前に何を削るかを決めるほうが早く済みます",
+    "ADC — Antigravity の Enterprise では ADC 経由で Gemini 3.8 Flash を選べます。同じモデルでも入口によって扱いが変わります",
   ],
   en: [
-    "3.8LIVE — Two audio-to-audio models reached GA for the Live API: gemini-3.8-live as the low-latency default, and -extended-thinking for background reasoning mid-conversation",
-    "09/30 — Thirteen days until gemini-omni-flash-preview shuts down. The replacement is gemini-omni-1.1-flash, so count your call sites before you swap",
-    "MCP — A timeout written as ten minutes on the extension side is reportedly cutting out at one. Anyone handing long work to an MCP server runs straight into it",
-    "NEW — When an AI function in Sheets refuses to generate, suspect where the file lives before you blame the 24-hour cap",
-    "GEM — When a Gem built for your team will not share, walk the admin settings and the Drive sharing settings in a set order",
-    "10/16 — Twenty-nine days until Gemini 2.5 Pro, Flash and Flash-Lite shut down together. The path forward is the 3.5 Flash line",
+    "0.60.0 — Nearly every line of this Gemini CLI release tightens a boundary around extensions and MCP. An extension that changes your environment now has to ask first",
+    "09/30 — Twelve days until gemini-omni-flash-preview shuts down. The successor is gemini-omni-1.1-flash, and the work starts with an inventory of your call sites",
+    "LICENSE — Two threads are still collecting reports of accounts set up exactly as documented being turned away one day with \"you do not have a valid license of this product\"",
+    "NEW — When a Gem never appears in someone else's list, there are three places it can be stuck. Decide the order you check them in",
+    "PDF — When a document is refused for being too large, deciding what to cut usually beats deciding where to split",
+    "ADC — Antigravity's enterprise accounts can now pick Gemini 3.8 Flash through ADC. The same model is governed differently depending on the door you come in by",
   ],
 };
 
