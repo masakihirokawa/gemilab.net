@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "V0.60.0 — gemini-cli の安定版は v0.60.0 のままです。中身は web fetch の宛先検証や MCP OAuth の issuer 検証など、ほとんどがセキュリティ修正でした",
-    "9/30 — gemini-omni-flash-preview が9月30日に止まります。残り9日。置き換え先は gemini-omni-1.1-flash です",
-    "CODE13 — 同じ動画を続けて上げると、成功と code 13 の失敗が交互に返るという報告が出ています。再現条件が見えないため、再試行の設計を決めておきたいところです",
-    "NEW — Gemini アプリの画像機能を分ける、13歳・18歳・管理者という三本の線",
-    "2.5GA — Gemini 2.5 の Pro・Flash・Flash-Lite は、いまも shutdown date が公表されていません。廃止表の表記は No shutdown date announced のままです",
-    "3.8FLASH — Gemini 3.8 Flash の価格は導入価格です。2026年12月31日までで、2027年1月1日から入力も出力も倍になります",
+    "MCPCONN — Gemini in Google Workspace が Asana・Atlassian Rovo・HubSpot・Mailchimp・QuickBooks・Monday・Salesforce と MCP で接続されました。既定は ON で、管理コンソール側で切り替えます",
+    "GLOBAL — Gmail 検索の AI Overviews の「グローバル提供」には条件が付いています。表示言語が英語であることと、個人アカウントでは日本が除外されていることが原文に書かれています",
+    "10/02 — gemini-2.5-flash-image が10月2日に止まります。残り10日。置き換え先は gemini-3.1-flash-image-preview です",
+    "402 — プリペイド残高が尽きたときの応答が 429 から HTTP 402 に変わりました。status は RESOURCE_EXHAUSTED のままですので、status で分岐している再試行は止まりません",
+    "NEW — つないだ MCP を初めて外した日 — 常時有効にするツールを選ぶ基準",
+    "SKILLS — Gems の終了と Skills への移行がアプリ内で案内されています。仕事や学校のアカウントでは Skills を使えないとされており、日付はまだ公式に確認できていません",
   ],
   en: [
-    "V0.60.0 — The gemini-cli stable release is still v0.60.0. Almost all of it is security work: web fetch destination checks, MCP OAuth issuer validation, sandbox isolation",
-    "9/30 — gemini-omni-flash-preview shuts down on September 30, nine days from now. The replacement is gemini-omni-1.1-flash",
-    "CODE13 — Uploading the same video repeatedly returns success and a code 13 failure in turn. With no visible trigger, it is worth deciding your retry policy up front",
-    "NEW — Three lines that decide image features in the Gemini app: thirteen, eighteen, and your administrator",
-    "2.5GA — Gemini 2.5 Pro, Flash and Flash-Lite still have no announced shutdown date. The deprecation table reads No shutdown date announced",
-    "3.8FLASH — Gemini 3.8 Flash pricing is introductory. It holds until December 31, 2026, and both input and output double on January 1, 2027",
+    "MCPCONN — Gemini in Google Workspace now connects to Asana, Atlassian Rovo, HubSpot, Mailchimp, QuickBooks, Monday and Salesforce over MCP. It is on by default and managed from the admin console",
+    "GLOBAL — The Gmail Search AI Overviews rollout described as global comes with conditions. The announcement itself requires English as the display language and excludes personal accounts in Japan",
+    "10/02 — gemini-2.5-flash-image shuts down on October 2, ten days away. The replacement is gemini-3.1-flash-image-preview",
+    "402 — Depleted prepay credits now return HTTP 402 instead of 429. The status field still reads RESOURCE_EXHAUSTED, so retry logic that branches on status will never stop",
+    "NEW — The day I first disconnected an MCP server: how I choose which tools stay enabled",
+    "SKILLS — In-app notices point from Gems to Skills, but Skills is described as unavailable on work and school accounts, and the dates have not been confirmed officially",
   ],
 };
 
