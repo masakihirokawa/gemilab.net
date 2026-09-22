@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "MCPCONN — Gemini in Google Workspace が Asana・Atlassian Rovo・HubSpot・Mailchimp・QuickBooks・Monday・Salesforce と MCP で接続されました。既定は ON で、管理コンソール側で切り替えます",
-    "GLOBAL — Gmail 検索の AI Overviews の「グローバル提供」には条件が付いています。表示言語が英語であることと、個人アカウントでは日本が除外されていることが原文に書かれています",
-    "10/02 — gemini-2.5-flash-image が10月2日に止まります。残り10日。置き換え先は gemini-3.1-flash-image-preview です",
-    "402 — プリペイド残高が尽きたときの応答が 429 から HTTP 402 に変わりました。status は RESOURCE_EXHAUSTED のままですので、status で分岐している再試行は止まりません",
-    "NEW — つないだ MCP を初めて外した日 — 常時有効にするツールを選ぶ基準",
-    "SKILLS — Gems の終了と Skills への移行がアプリ内で案内されています。仕事や学校のアカウントでは Skills を使えないとされており、日付はまだ公式に確認できていません",
+    "2.5ONLY — 9月18日の公式更新です。2.5 系モデルへのアクセスは、過去に実際に使ってきた利用者に限られます。非推奨ではなく API では提供が続き、新規プロジェクトは 3.5 Flash-Lite か 3.8 Flash が案内されています",
+    "3.8LIVE — 9月15日に Gemini 3.8 Live と 3.8 Live Extended Thinking が GA になりました。Live API 向けの音声対音声モデルで、後者は応答の裏で推論を続けます",
+    "09/30 — gemini-omni-flash-preview が9月30日に止まります。残り7日で、後継は8月27日に GA した gemini-omni-1.1-flash です",
+    "ONCE — 「このセッションでは許可」がパスを含むコマンドでは1回しか効かない、という報告にコメントが159件付いています。承認の設計そのものが問われている形です",
+    "NEW — 関数呼び出しが平文に化けるとき、疑うのはツール宣言のプロパティ名",
+    "HISTORY — モデルが選べなくなっても過去のやり取りを失わないよう、決めたこと・使った指示・やり直した理由の3つだけでも外に書き出しておくと安心です",
   ],
   en: [
-    "MCPCONN — Gemini in Google Workspace now connects to Asana, Atlassian Rovo, HubSpot, Mailchimp, QuickBooks, Monday and Salesforce over MCP. It is on by default and managed from the admin console",
-    "GLOBAL — The Gmail Search AI Overviews rollout described as global comes with conditions. The announcement itself requires English as the display language and excludes personal accounts in Japan",
-    "10/02 — gemini-2.5-flash-image shuts down on October 2, ten days away. The replacement is gemini-3.1-flash-image-preview",
-    "402 — Depleted prepay credits now return HTTP 402 instead of 429. The status field still reads RESOURCE_EXHAUSTED, so retry logic that branches on status will never stop",
-    "NEW — The day I first disconnected an MCP server: how I choose which tools stay enabled",
-    "SKILLS — In-app notices point from Gems to Skills, but Skills is described as unavailable on work and school accounts, and the dates have not been confirmed officially",
+    "2.5ONLY — From the September 18 changelog: access to the 2.5 models is now limited to people who have actively used them. They are not deprecated and the API keeps serving them, while new projects are pointed at 3.5 Flash-Lite or 3.8 Flash",
+    "3.8LIVE — Gemini 3.8 Live and 3.8 Live Extended Thinking went GA on September 15. Both are audio-to-audio models for the Live API, and the second keeps reasoning in the background during the call",
+    "09/30 — gemini-omni-flash-preview shuts down on September 30, seven days away. Its successor, gemini-omni-1.1-flash, went GA on August 27",
+    "ONCE — A report that \"allow for this session\" only lasts one call when the command contains a path has drawn 159 comments. The question underneath is how approvals should be scoped at all",
+    "NEW — When a function call comes back as plain text, suspect the property names in your tool declaration first",
+    "HISTORY — Writing just three things outside the tool — what you settled on, the instructions you used, and why you redid something — keeps past work from disappearing with a model",
   ],
 };
 
