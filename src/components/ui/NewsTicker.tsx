@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-ja: [
-    "2.5ONLY — 9月18日の公式更新です。2.5 系モデルへのアクセスは、過去に実際に使ってきた利用者に限られます。非推奨ではなく API では提供が続き、新規プロジェクトは 3.5 Flash-Lite か 3.8 Flash が案内されています",
-    "3.8LIVE — 9月15日に Gemini 3.8 Live と 3.8 Live Extended Thinking が GA になりました。Live API 向けの音声対音声モデルで、後者は応答の裏で推論を続けます",
-    "09/30 — gemini-omni-flash-preview が9月30日に止まります。残り7日で、後継は8月27日に GA した gemini-omni-1.1-flash です",
-    "ONCE — 「このセッションでは許可」がパスを含むコマンドでは1回しか効かない、という報告にコメントが159件付いています。承認の設計そのものが問われている形です",
-    "NEW — 関数呼び出しが平文に化けるとき、疑うのはツール宣言のプロパティ名",
-    "HISTORY — モデルが選べなくなっても過去のやり取りを失わないよう、決めたこと・使った指示・やり直した理由の3つだけでも外に書き出しておくと安心です",
+  ja: [
+    "0918 — Gemini API の changelog は9月18日以降の新規なしです。新規プロジェクトの推奨は引き続き 3.5 Flash-Lite か 3.8 Flash です",
+    "09/30 — gemini-omni-flash-preview は9月30日に止まります。残り6日で、後継は gemini-omni-1.1-flash です",
+    "ENTCLI — Enterprise の Gemini CLI に 3.5 / 3.6 Flash が来ない、という問いが立っています。個人アカウントとの差がまだ説明されていません",
+    "NEW — つないだ MCP を初めて外した日、常時有効にするツールを選ぶ基準",
+    "CONFIG — Antigravity 2.17.0 からリポジトリ設定は .gemini/config.json で読まれます。Gemini CLI と同じ .gemini/ を共有する形です",
+    "PICKER — 見慣れたモデルが使えないときは、まず自分の画面のピッカーに何が並んでいるかを確かめると、限定措置と故障を取り違えずに済みます",
   ],
   en: [
-    "2.5ONLY — From the September 18 changelog: access to the 2.5 models is now limited to people who have actively used them. They are not deprecated and the API keeps serving them, while new projects are pointed at 3.5 Flash-Lite or 3.8 Flash",
-    "3.8LIVE — Gemini 3.8 Live and 3.8 Live Extended Thinking went GA on September 15. Both are audio-to-audio models for the Live API, and the second keeps reasoning in the background during the call",
-    "09/30 — gemini-omni-flash-preview shuts down on September 30, seven days away. Its successor, gemini-omni-1.1-flash, went GA on August 27",
-    "ONCE — A report that \"allow for this session\" only lasts one call when the command contains a path has drawn 159 comments. The question underneath is how approvals should be scoped at all",
-    "NEW — When a function call comes back as plain text, suspect the property names in your tool declaration first",
-    "HISTORY — Writing just three things outside the tool — what you settled on, the instructions you used, and why you redid something — keeps past work from disappearing with a model",
+    "0918 — The Gemini API changelog has no entries after September 18. For new projects the recommendation is still 3.5 Flash-Lite or 3.8 Flash",
+    "09/30 — gemini-omni-flash-preview shuts down on September 30, six days away. Its successor is gemini-omni-1.1-flash",
+    "ENTCLI — An open question asks why Gemini 3.5 and 3.6 Flash have not reached Gemini CLI on Enterprise accounts, and the gap with personal accounts is still unexplained",
+    "NEW — The day I first removed a connected MCP server, and how I now pick the tools that stay on",
+    "CONFIG — Since Antigravity 2.17.0, repository settings load from .gemini/config.json, the same .gemini/ folder Gemini CLI already uses",
+    "PICKER — When a familiar model disappears, check what your own model picker actually lists first. It keeps an access limit from being mistaken for an outage",
   ],
 };
 
