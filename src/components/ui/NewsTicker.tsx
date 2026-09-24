@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "0918 — Gemini API の changelog は9月18日以降の新規なしです。新規プロジェクトの推奨は引き続き 3.5 Flash-Lite か 3.8 Flash です",
-    "09/30 — gemini-omni-flash-preview は9月30日に止まります。残り6日で、後継は gemini-omni-1.1-flash です",
-    "ENTCLI — Enterprise の Gemini CLI に 3.5 / 3.6 Flash が来ない、という問いが立っています。個人アカウントとの差がまだ説明されていません",
-    "NEW — つないだ MCP を初めて外した日、常時有効にするツールを選ぶ基準",
-    "CONFIG — Antigravity 2.17.0 からリポジトリ設定は .gemini/config.json で読まれます。Gemini CLI と同じ .gemini/ を共有する形です",
-    "PICKER — 見慣れたモデルが使えないときは、まず自分の画面のピッカーに何が並んでいるかを確かめると、限定措置と故障を取り違えずに済みます",
+    "TTS — Gemini 3.8 Flash TTS と 3.8 Flash-Lite TTS が9月22日に一般提供になりました。Flash-Lite TTS は 3.1 Flash TTS preview の置き換えです",
+    "GEMINI2.5 — 2.5 系モデルは過去に使っていた利用者に限られるようになりました。非推奨ではなく、新しい開発には 3.5 Flash-Lite か 3.8 Flash が案内されています",
+    "9/30 — gemini-omni-flash-preview は9月30日に非推奨になります。残り5日です",
+    "SANDBOX — サンドボックスで動かす Gemini CLI が v0.60.0 以降は毎回ログインを求め、過去のセッションも再開できない、という報告が出ています",
+    "NEW — Gemini の下書きを送る前に、オレンジの文だけ見直す",
+    "CONFIG — Antigravity 2.17.0 はリポジトリ設定を .gemini/config.json から読むようになり、Gemini CLI と置き場所を共有する形になりました",
   ],
   en: [
-    "0918 — The Gemini API changelog has no entries after September 18. For new projects the recommendation is still 3.5 Flash-Lite or 3.8 Flash",
-    "09/30 — gemini-omni-flash-preview shuts down on September 30, six days away. Its successor is gemini-omni-1.1-flash",
-    "ENTCLI — An open question asks why Gemini 3.5 and 3.6 Flash have not reached Gemini CLI on Enterprise accounts, and the gap with personal accounts is still unexplained",
-    "NEW — The day I first removed a connected MCP server, and how I now pick the tools that stay on",
-    "CONFIG — Since Antigravity 2.17.0, repository settings load from .gemini/config.json, the same .gemini/ folder Gemini CLI already uses",
-    "PICKER — When a familiar model disappears, check what your own model picker actually lists first. It keeps an access limit from being mistaken for an outage",
+    "TTS — Gemini 3.8 Flash TTS and 3.8 Flash-Lite TTS became generally available on September 22. Flash-Lite TTS replaces the 3.1 Flash TTS preview",
+    "GEMINI2.5 — Access to the 2.5 models is now limited to people who already used them. They are not deprecated; new projects are pointed to 3.5 Flash-Lite or 3.8 Flash",
+    "9/30 — gemini-omni-flash-preview is deprecated on September 30, five days from now",
+    "SANDBOX — Users report that since v0.60.0, a sandboxed Gemini CLI asks for sign-in every time and can no longer resume past sessions",
+    "NEW — Review only the orange sentences before sending a Gemini draft",
+    "CONFIG — Antigravity 2.17.0 now reads repository settings from .gemini/config.json, the same place Gemini CLI looks",
   ],
 };
 
