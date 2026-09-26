@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-  ja: [
-    "TTS — Gemini 3.8 Flash TTS と 3.8 Flash-Lite TTS が9月22日に一般提供になりました。Flash-Lite TTS は 3.1 Flash TTS preview の置き換えです",
-    "GEMINI2.5 — 2.5 系モデルは過去に使っていた利用者に限られるようになりました。非推奨ではなく、新しい開発には 3.5 Flash-Lite か 3.8 Flash が案内されています",
-    "9/30 — gemini-omni-flash-preview は9月30日に非推奨になります。残り5日です",
-    "SANDBOX — サンドボックスで動かす Gemini CLI が v0.60.0 以降は毎回ログインを求め、過去のセッションも再開できない、という報告が出ています",
-    "NEW — Gemini の下書きを送る前に、オレンジの文だけ見直す",
-    "CONFIG — Antigravity 2.17.0 はリポジトリ設定を .gemini/config.json から読むようになり、Gemini CLI と置き場所を共有する形になりました",
+ja: [
+    "9/30 — gemini-omni-flash-preview は9月30日に提供終了です。残り3日です。後継は gemini-omni-1.1-flash です",
+    "IMAGE — 10月2日に止まる gemini-2.5-flash-image の推奨先は、廃止表では6月に終了した preview のままです。実際の差し替え先は gemini-3.1-flash-image です",
+    "FLASHLITE — gemini-3.1-flash-lite の提供終了日は 2027年5月7日と公示され、後継は gemini-3.5-flash-lite です",
+    "MEMORY — Gemini CLI の Auto Memory が、意味の薄いセッションを何度も読み直し続ける、という報告が出ています",
+    "NEW — 3.8 Flash-Lite TTS へ置き換え、案内音声の声を選び直すまで",
+    "JA — Claude Code の日本語まわりの処理だけを Gemini 3.8 に任せる、という併用の記録が共有されています",
   ],
   en: [
-    "TTS — Gemini 3.8 Flash TTS and 3.8 Flash-Lite TTS became generally available on September 22. Flash-Lite TTS replaces the 3.1 Flash TTS preview",
-    "GEMINI2.5 — Access to the 2.5 models is now limited to people who already used them. They are not deprecated; new projects are pointed to 3.5 Flash-Lite or 3.8 Flash",
-    "9/30 — gemini-omni-flash-preview is deprecated on September 30, five days from now",
-    "SANDBOX — Users report that since v0.60.0, a sandboxed Gemini CLI asks for sign-in every time and can no longer resume past sessions",
-    "NEW — Review only the orange sentences before sending a Gemini draft",
-    "CONFIG — Antigravity 2.17.0 now reads repository settings from .gemini/config.json, the same place Gemini CLI looks",
+    "9/30 — gemini-omni-flash-preview shuts down on September 30, three days from now. Its successor is gemini-omni-1.1-flash",
+    "IMAGE — The deprecations table still points gemini-2.5-flash-image, which ends on October 2, to a preview that itself shut down in June. The working replacement is gemini-3.1-flash-image",
+    "FLASHLITE — gemini-3.1-flash-lite now has a published shutdown date of May 7, 2027, with gemini-3.5-flash-lite as its successor",
+    "MEMORY — Users report that Gemini CLI's Auto Memory keeps re-reading low-signal sessions over and over",
+    "NEW — Switching to 3.8 Flash-Lite TTS and choosing a new voice for app guidance",
+    "JA — One developer shares how they hand only the Japanese-language work in Claude Code to Gemini 3.8",
   ],
 };
 
