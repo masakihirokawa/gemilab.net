@@ -14,6 +14,9 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { path: "/articles/gemini-dev", priority: 0.8, freq: "daily" as const },
     { path: "/articles/gemini-api", priority: 0.8, freq: "daily" as const },
     { path: "/articles/gemini-advanced", priority: 0.8, freq: "daily" as const },
+    { path: "/articles/gemini-workspace", priority: 0.8, freq: "daily" as const }, // 2026-10-02 漏れを追加
+    { path: "/articles/gemini-updates", priority: 0.8, freq: "daily" as const }, // 2026-10-02 漏れを追加
+    { path: "/about", priority: 0.5, freq: "monthly" as const }, // 著者ページ（2026-10-02 追加）
     { path: "/privacy", priority: 0.3, freq: "monthly" as const },
     { path: "/terms", priority: 0.3, freq: "monthly" as const },
     { path: "/tokusho", priority: 0.3, freq: "monthly" as const },
