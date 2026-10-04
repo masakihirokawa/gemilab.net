@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLI — Gemini CLI の nightly（10月3日）で、選択リストの Enter と Space が確実に効く修正が入りました（prerelease）",
-    "12/31 — 導入価格の終了まで残り88日。3.8 / 3.7 / 3.6 Flash は入力 $0.75→$1.50、出力 $3.75→$7.50 になります",
+    "CLI — Gemini CLI の安定版は v0.62.0（9月29日）。nightly は v0.64.0（10月3日・prerelease）まで進んでいます",
+    "10/22 — veo-3.1 の preview 3種の停止まで残り17日。後継は gemini-omni-1.1-flash です",
+    "AUTH — 企業の Workspace アカウントで Gemini CLI の認証が通らないという報告（#29101）にコメント55件。切り分けの手順が求められています",
     "NEW — Sheets から呼ぶ Gemini の月額を、年末の値上げ日をまたいで見積もる",
-    "AGENT — サブエージェントが回数上限で止まったのに「成功」と表示されるという報告（#22323）。完了の見分け方が論点です",
-    "LITE — gemini-3.1-flash-lite は2027年5月7日に停止予定です。後継は gemini-3.5-flash-lite。急ぎではありませんが、移行表の題材です",
-    "SAFE — nightly（10月2日）で、状態の原子的な保存と破損時のバックアップ復旧が入りました。長い作業中の落ち方に備える修正です",
+    "TTS — gemini-3.8-flash-tts と gemini-3.8-flash-lite-tts が GA になりました（9月22日）。Voices エンドポイントも加わっています",
+    "12/31 — 導入価格の終了まで残り87日。3.8 / 3.7 / 3.6 Flash は入力 $0.75→$1.50、出力 $3.75→$7.50 になります",
   ],
   en: [
-    "CLI — Gemini CLI's nightly (Oct 3) fixes Enter and Space so they reliably confirm options in selection lists (prerelease)",
-    "12/31 — 88 days left until the introductory pricing ends. 3.8 / 3.7 / 3.6 Flash move to $1.50 input and $7.50 output, from $0.75 and $3.75",
+    "CLI — Gemini CLI's stable release is v0.62.0 (Sep 29). The nightly has reached v0.64.0 (Oct 3, prerelease)",
+    "10/22 — 17 days left until the three veo-3.1 preview models shut down. The successor is gemini-omni-1.1-flash",
+    "AUTH — A report (#29101) of Gemini CLI auth failing for enterprise Workspace accounts has 55 comments. People want a way to isolate the cause",
     "NEW — Estimating a Sheets-Driven Gemini Bill Across the Year-End Price Switch with Apps Script",
-    "AGENT — A report (#22323) says a subagent that stopped at its turn limit is shown as a success. How to tell real completion is the open question",
-    "LITE — gemini-3.1-flash-lite is scheduled to shut down on May 7, 2027, with gemini-3.5-flash-lite as the successor. No rush, but a good topic for a migration table",
-    "SAFE — The Oct 2 nightly saves state atomically and recovers from a backup if it gets corrupted. A fix for how long sessions fail",
+    "TTS — gemini-3.8-flash-tts and gemini-3.8-flash-lite-tts are generally available (Sep 22), along with a Voices endpoint",
+    "12/31 — 87 days left until the introductory pricing ends. 3.8 / 3.7 / 3.6 Flash move to $1.50 input and $7.50 output, from $0.75 and $3.75",
   ]
 };
 
