@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-  ja: [
-    "CLI — Gemini CLI の安定版は v0.62.0（9月29日）。nightly は v0.64.0（10月3日・prerelease）まで進んでいます",
-    "10/22 — veo-3.1 の preview 3種の停止まで残り17日。後継は gemini-omni-1.1-flash です",
-    "AUTH — 企業の Workspace アカウントで Gemini CLI の認証が通らないという報告（#29101）にコメント55件。切り分けの手順が求められています",
-    "NEW — Sheets から呼ぶ Gemini の月額を、年末の値上げ日をまたいで見積もる",
-    "TTS — gemini-3.8-flash-tts と gemini-3.8-flash-lite-tts が GA になりました（9月22日）。Voices エンドポイントも加わっています",
-    "12/31 — 導入価格の終了まで残り87日。3.8 / 3.7 / 3.6 Flash は入力 $0.75→$1.50、出力 $3.75→$7.50 になります",
+ja: [
+    "API — Gemini 3.8 Flash TTS と Flash-Lite TTS が一般提供になりました（9月22日）。Voices エンドポイントで 150 以上の音声を引けます",
+    "10/22 — Veo 3.1 の3モデルの提供終了まで残り16日。移行先は gemini-omni-1.1-flash です",
+    "TMP — Gemini CLI が一時スクリプトを思わぬ場所に作る、という Issue が上がっています。置き場所の決め方が論点です",
+    "NEW — 年末の価格切り替えに備え、Sheets に Gemini 呼び出しの台帳を作って月額を見積もりました",
+    "CLAUDE — Claude Code から Gemini 3.8 へ日本語処理を振る併用が Zenn で読まれています。振る仕事と振らない仕事の線引きが論点です",
+    "2.5 — Gemini 2.5 系は新規プロジェクトでは使わない方針です（9月18日）。API では引き続き提供されますが、過去に使った利用者に限られます",
   ],
   en: [
-    "CLI — Gemini CLI's stable release is v0.62.0 (Sep 29). The nightly has reached v0.64.0 (Oct 3, prerelease)",
-    "10/22 — 17 days left until the three veo-3.1 preview models shut down. The successor is gemini-omni-1.1-flash",
-    "AUTH — A report (#29101) of Gemini CLI auth failing for enterprise Workspace accounts has 55 comments. People want a way to isolate the cause",
-    "NEW — Estimating a Sheets-Driven Gemini Bill Across the Year-End Price Switch with Apps Script",
-    "TTS — gemini-3.8-flash-tts and gemini-3.8-flash-lite-tts are generally available (Sep 22), along with a Voices endpoint",
-    "12/31 — 87 days left until the introductory pricing ends. 3.8 / 3.7 / 3.6 Flash move to $1.50 input and $7.50 output, from $0.75 and $3.75",
+    "API — Gemini 3.8 Flash TTS and Flash-Lite TTS are generally available (Sep 22). The Voices endpoint lets you query over 150 voices",
+    "10/22 — 16 days until the three Veo 3.1 models shut down. The place to move is gemini-omni-1.1-flash",
+    "TMP — An issue reports Gemini CLI creating temporary scripts in unexpected places. Where to put them is the real question",
+    "NEW — To prepare for the year-end price switch, I built a Gemini call ledger in Sheets and estimated the monthly cost",
+    "CLAUDE — Handing Claude Code's Japanese-text work to Gemini 3.8 is a pairing getting read on Zenn. The real question is which jobs to hand over and which to keep",
+    "2.5 — Skip the Gemini 2.5 family for new projects (Sep 18). The API still serves it, but access is limited to past users",
   ]
 };
 
