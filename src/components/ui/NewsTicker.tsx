@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "API — Gemini 3.8 Flash TTS と Flash-Lite TTS が一般提供になりました（9月22日）。Voices エンドポイントで 150 以上の音声を引けます",
-    "10/22 — Veo 3.1 の3モデルの提供終了まで残り16日。移行先は gemini-omni-1.1-flash です",
-    "TMP — Gemini CLI が一時スクリプトを思わぬ場所に作る、という Issue が上がっています。置き場所の決め方が論点です",
-    "NEW — 年末の価格切り替えに備え、Sheets に Gemini 呼び出しの台帳を作って月額を見積もりました",
-    "CLAUDE — Claude Code から Gemini 3.8 へ日本語処理を振る併用が Zenn で読まれています。振る仕事と振らない仕事の線引きが論点です",
-    "2.5 — Gemini 2.5 系は新規プロジェクトでは使わない方針です（9月18日）。API では引き続き提供されますが、過去に使った利用者に限られます",
+    "CLI 0.63.0 — Gemini CLI 0.63.0（10月6日）。接続回復時の再試行表示、MCP 設定の欠落と JSON 破損の見分け、長いエージェントループでのツール出力の上限を直しました",
+    "10/29 — 画像モデル gemini-3.1-flash-image のシャットダウンまで残り22日。10月6日に加わった gemini-nano-banana-2.1 へ移します",
+    "10/22 — Veo 3.1 の3モデルの提供終了まで残り15日。移行先は gemini-omni-1.1-flash です",
+    "NOTICE — AI のモデルが提供終了しても、プラグインの管理画面は何も言わなかった、という報告が Zenn に出ています。見落とさない仕組みが論点です",
+    "NEW — Veo 3.1 の preview 3種が 10/22 に止まります。差し替えの前に、呼び出し箇所を棚卸しする手順をまとめました",
+    "CLAUDE — Codex や Claude Code の文章を Gemini に任せる仕組みが Zenn で続けて出ています。振る仕事と振らない仕事の線引きが論点です",
   ],
   en: [
-    "API — Gemini 3.8 Flash TTS and Flash-Lite TTS are generally available (Sep 22). The Voices endpoint lets you query over 150 voices",
-    "10/22 — 16 days until the three Veo 3.1 models shut down. The place to move is gemini-omni-1.1-flash",
-    "TMP — An issue reports Gemini CLI creating temporary scripts in unexpected places. Where to put them is the real question",
-    "NEW — To prepare for the year-end price switch, I built a Gemini call ledger in Sheets and estimated the monthly cost",
-    "CLAUDE — Handing Claude Code's Japanese-text work to Gemini 3.8 is a pairing getting read on Zenn. The real question is which jobs to hand over and which to keep",
-    "2.5 — Skip the Gemini 2.5 family for new projects (Sep 18). The API still serves it, but access is limited to past users",
+    "CLI 0.63.0 — Gemini CLI 0.63.0 (Oct 6) shows retry progress on reconnect, tells a missing MCP config from broken JSON, and caps tool output in long agent loops",
+    "10/29 — 22 days until the image model gemini-3.1-flash-image shuts down. Move to gemini-nano-banana-2.1, added on Oct 6",
+    "10/22 — 15 days until the three Veo 3.1 models shut down. The place to move is gemini-omni-1.1-flash",
+    "NOTICE — A Zenn post reports that a plugin's admin screen said nothing when an AI model was retired. How to avoid missing such notices is the real question",
+    "NEW — Three Veo 3.1 previews stop on 10/22. Before swapping them, here is how to inventory every place that calls them",
+    "CLAUDE — Zenn keeps getting posts on handing Codex or Claude Code writing to Gemini. The real question is which jobs to hand over and which to keep",
   ]
 };
 
