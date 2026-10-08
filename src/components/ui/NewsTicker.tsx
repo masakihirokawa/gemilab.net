@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "VEO 3.1 — veo-3.1 の preview 3モデルは 10/22 に停止、残り14日。移行先は gemini-omni-1.1-flash",
-    "OMNI — gemini-omni-flash-preview の停止も 10/22。9/30 ではなく表の日付に合わせて確認を",
-    "NANO 2.1 — 画像モデル gemini-nano-banana-2.1 が GA。gemini-3.1-flash-image は非推奨で停止日は未発表",
-    "CLI 0.63 — Gemini CLI 安定版 v0.63.0。接続回復時のリトライ表示などを改善",
-    "TTS/LIVE — 2.5 系の音声・TTS 系プレビューは 11/17 に停止、残り40日",
-    "NEW — Veo 3.1 preview の 10/22 停止、差し替え前の棚卸し手順",
+    "VEO 3.1 — veo-3.1 の preview 3モデルは 10/22 に停止、残り13日。移行先は gemini-omni-1.1-flash",
+    "OMNI — gemini-omni-flash-preview の停止も 10/22。表の日付に合わせて確認を",
+    "NANO 2.1 — gemini-nano-banana-2.1 が GA。gemini-3.1-flash-image は非推奨で停止日は未発表",
+    "Q&A — Gemini CLI でツールを 128 個超えて載せると 400 になる、という報告が出ています",
+    "TTS/LIVE — 2.5 系の音声・TTS 系プレビューは 11/17 に停止、残り39日",
+    "NEW — Free tier 表示なのに 429「limit: 0」になるとき、最初の1時間で見る点",
   ],
   en: [
-    "VEO 3.1 — The three veo-3.1 preview models shut down Oct 22, 14 days left. Move to gemini-omni-1.1-flash",
-    "OMNI — gemini-omni-flash-preview also shuts down Oct 22, not Sep 30. Check the deprecations table",
+    "VEO 3.1 — The three veo-3.1 preview models shut down Oct 22, 13 days left. Move to gemini-omni-1.1-flash",
+    "OMNI — gemini-omni-flash-preview also shuts down Oct 22. Check the deprecations table",
     "NANO 2.1 — gemini-nano-banana-2.1 is GA. gemini-3.1-flash-image is deprecated with no shutdown date yet",
-    "CLI 0.63 — Gemini CLI stable is v0.63.0, with clearer retry progress on reconnect",
-    "TTS/LIVE — 2.5-era audio and TTS previews shut down Nov 17, 40 days left",
-    "NEW — Veo 3.1 previews stop Oct 22: take inventory before you swap",
+    "Q&A — Users report Gemini CLI returns a 400 error once more than 128 tools are loaded",
+    "TTS/LIVE — 2.5-era audio and TTS previews shut down Nov 17, 39 days left",
+    "NEW — Free tier shown but 429 \"limit: 0\"? What to check in the first hour",
   ]
 };
 
