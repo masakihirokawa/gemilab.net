@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "VEO 3.1 — veo-3.1 の preview 3モデルは 10/22 に停止、残り13日。移行先は gemini-omni-1.1-flash",
-    "OMNI — gemini-omni-flash-preview の停止も 10/22。表の日付に合わせて確認を",
+    "3.8 FLASH — 3.7 Flash は 10/08 に非推奨に。旧モデルへの要求は 3.8 Flash へ自動で回されます",
     "NANO 2.1 — gemini-nano-banana-2.1 が GA。gemini-3.1-flash-image は非推奨で停止日は未発表",
-    "Q&A — Gemini CLI でツールを 128 個超えて載せると 400 になる、という報告が出ています",
-    "TTS/LIVE — 2.5 系の音声・TTS 系プレビューは 11/17 に停止、残り39日",
-    "NEW — Free tier 表示なのに 429「limit: 0」になるとき、最初の1時間で見る点",
+    "DEADLINE — veo-3.1 の preview と gemini-omni-flash-preview は 10/22、Deep Research エージェントは 10/23 に停止（残り12〜13日）",
+    "Q&A — Gemini CLI でサブエージェントが MAX_TURNS で止まっても成功と報告される、という報告が出ています",
+    "TTS/LIVE — 2.5 系の音声・TTS 系プレビューは 11/17 に停止、残り38日",
+    "NEW — 停止日のない非推奨をどう扱うか。画像モデルの移行先を3つの条件で選び直す",
   ],
   en: [
-    "VEO 3.1 — The three veo-3.1 preview models shut down Oct 22, 13 days left. Move to gemini-omni-1.1-flash",
-    "OMNI — gemini-omni-flash-preview also shuts down Oct 22. Check the deprecations table",
+    "3.8 FLASH — 3.7 Flash was deprecated on Oct 8. Requests to the old model are routed to 3.8 Flash automatically",
     "NANO 2.1 — gemini-nano-banana-2.1 is GA. gemini-3.1-flash-image is deprecated with no shutdown date yet",
-    "Q&A — Users report Gemini CLI returns a 400 error once more than 128 tools are loaded",
-    "TTS/LIVE — 2.5-era audio and TTS previews shut down Nov 17, 39 days left",
-    "NEW — Free tier shown but 429 \"limit: 0\"? What to check in the first hour",
+    "DEADLINE — veo-3.1 previews and gemini-omni-flash-preview shut down Oct 22; the Deep Research agent follows Oct 23 (12-13 days left)",
+    "Q&A — Users report Gemini CLI marks a subagent run as a success even after it stops at MAX_TURNS",
+    "TTS/LIVE — 2.5-era audio and TTS previews shut down Nov 17, 38 days left",
+    "NEW — Deprecated with no shutdown date? Re-pick your image-model target with three conditions",
   ]
 };
 
