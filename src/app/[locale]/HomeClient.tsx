@@ -7,10 +7,10 @@ import { LevelBadge } from "@/components/ui/LevelBadge";
 import type { ArticleMeta } from "@/lib/content";
 
 const CATEGORIES = [
-  { id: "gemini-basics", icon: "✦", color: "#5B9BF4" },
-  { id: "gemini-dev", icon: "⚡", color: "#34D399" },
-  { id: "gemini-api", icon: "◆", color: "#4A8AE5" },
-  { id: "gemini-advanced", icon: "◈", color: "#FBBF24" },
+  { id: "gemini-basics", icon: "✦", color: "var(--accent-coral)" },
+  { id: "gemini-dev", icon: "⚡", color: "var(--accent-green)" },
+  { id: "gemini-api", icon: "◆", color: "var(--accent-blue)" },
+  { id: "gemini-advanced", icon: "◈", color: "var(--accent-gold)" },
 ];
 
 const GUIDES_DARK = {
