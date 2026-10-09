@@ -5,6 +5,7 @@ import { useTranslations, useLocale } from "next-intl";
 import { ThemeToggle } from "./ThemeToggle";
 import { LocaleSwitcher } from "./LocaleSwitcher";
 import { SearchModal } from "@/components/ui/SearchModal";
+import { Icon } from "@/components/ui/Icons";
 import { localePrefix } from "@/lib/locale";
 
 interface SearchItem {
@@ -82,6 +83,16 @@ export function Header() {
     };
   }, [mobileOpen]);
 
+  // Escape でモバイルメニューを閉じる（2026-10-09）
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMobileOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mobileOpen]);
+
   // Cmd/Ctrl+K shortcut
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -129,7 +140,7 @@ export function Header() {
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          background: scrolled ? "color-mix(in srgb, var(--bg-primary) 85%, transparent)" : "transparent",
+          background: scrolled ? "color-mix(in srgb, var(--bg-primary) 94%, transparent)" : "transparent",
           backdropFilter: scrolled ? "blur(20px)" : "none",
           borderBottom: scrolled ? "1px solid var(--border-subtle)" : "1px solid transparent",
           transition: "all 0.4s",
@@ -183,7 +194,7 @@ export function Header() {
               </button>
               {levelOpen && (
                 <div style={{ position: "absolute", top: "100%", left: "50%", transform: "translateX(-50%)", paddingTop: 8, zIndex: 200 }}>
-                  <div style={{ background: "var(--bg-surface)", border: "1px solid var(--border-subtle)", borderRadius: 8, padding: "6px 0", minWidth: 160, boxShadow: "0 8px 32px rgba(0,0,0,0.12)" }}>
+                  <div style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-subtle)", borderRadius: 8, padding: "6px 0", minWidth: 160, boxShadow: "0 8px 32px rgba(0,0,0,0.12)" }}>
                     {levelItems.map(({ key, label, href, icon, color }) => (
                       <a key={key} href={href} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", textDecoration: "none", fontSize: 13, color: "var(--text-secondary)", transition: "background 0.15s", letterSpacing: "0.03em" }}
                         onMouseEnter={(e) => (e.currentTarget.style.background = "color-mix(in srgb, var(--text-primary) 5%, transparent)")}
@@ -235,7 +246,7 @@ export function Header() {
                 e.currentTarget.style.transform = "scale(1)";
               }}
             >
-              ♥
+              <Icon name="heart" size={15} />
             </a>
             <button
               onClick={() => setSearchOpen(true)}
@@ -277,7 +288,7 @@ export function Header() {
                 color: "var(--text-dim)",
               }}
             >
-              ♥
+              <Icon name="heart" size={15} />
             </a>
             <button
               onClick={() => setSearchOpen(true)}
@@ -287,7 +298,7 @@ export function Header() {
                 color: "var(--text-muted)",
               }}
             >
-              ⌕
+              <Icon name="search" size={15} />
             </button>
             <LocaleSwitcher mobile />
             <ThemeToggle />
@@ -297,13 +308,10 @@ export function Header() {
               style={{
                 ...MOBILE_ICON_BTN,
                 color: "var(--text-secondary)",
-                fontSize: 18,
-                lineHeight: 1,
-                paddingBottom: 4,
                 margin: "0 1px",
               }}
             >
-              ☰
+              <Icon name="menu" size={18} />
             </button>
           </div>
         )}
@@ -345,7 +353,7 @@ export function Header() {
               cursor: "pointer",
             }}
           >
-            ×
+            <Icon name="close" size={24} strokeWidth={1.4} />
           </button>
           {/* Level links in mobile — top position */}
           <div style={{ width: "100%", maxWidth: 280, margin: "0 auto", paddingBottom: 4 }}>
@@ -384,6 +392,7 @@ export function Header() {
           <a
             href={`${prefix}/support`}
             onClick={() => setMobileOpen(false)}
+            aria-label="Support us"
             style={{
               color: "var(--text-dim)",
               textDecoration: "none",
@@ -393,7 +402,7 @@ export function Header() {
               transition: "color 0.3s",
             }}
           >
-            ♥
+            <Icon name="heart" size={15} />
           </a>
         </div>
       )}
