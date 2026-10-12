@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-  ja: [
+ja: [
     "FLASH — 3.7 Flash と 3.5 Flash が非推奨に。旧名への要求は 3.8／3.6 Flash へ自動で回されます",
     "NANO 2.1 — gemini-nano-banana-2.1 が GA。gemini-3.1-flash-image は非推奨で停止日は未発表",
-    "DEADLINE — veo-3.1 の preview と gemini-omni-flash-preview は 10/22、Deep Research の旧エージェントは 10/23 に停止（残り10〜11日）。agent 名の差し替えが必要です",
-    "Q&A — Gemini CLI でツールを 128 個超で渡すと 400 エラーになる、という報告が出ています",
-    "TTS 3.8 — Gemini 3.8 Flash TTS と Flash-Lite TTS が GA。Voices エンドポイントも追加されました",
+    "DEADLINE — Deep Research の旧エージェント deep-research-pro-preview-12-2025 は 10/23 に停止、残り10日。移行先は 04-2026 版",
+    "Q&A — GAS と Gemini で3,000行を整形したとき、詰まった3点を共有した記事が出ています",
+    "ADK — MCP の結果が 8.5 万トークンになる場面を、FunctionTool で包んで 310 トークンにした実測が共有されています",
     "NEW — 家計や健康の相談を履歴に残さない。一時チャットと設定の確認",
   ],
   en: [
-    "FLASH — 3.7 Flash and 3.5 Flash are deprecated. Requests to the old names are routed to 3.8 / 3.6 Flash automatically",
+    "FLASH — 3.7 Flash and 3.5 Flash are deprecated; requests to the old names are routed to 3.8 / 3.6 Flash",
     "NANO 2.1 — gemini-nano-banana-2.1 is GA. gemini-3.1-flash-image is deprecated with no shutdown date yet",
-    "DEADLINE — veo-3.1 previews and gemini-omni-flash-preview shut down Oct 22; the old Deep Research agent follows Oct 23 (10-11 days left). Swap the agent name",
-    "Q&A — Users report Gemini CLI returns a 400 error when you pass more than 128 tools",
-    "TTS 3.8 — Gemini 3.8 Flash TTS and Flash-Lite TTS are GA, with a new Voices endpoint",
-    "NEW — Keep money and health talk off your history: check temporary chat and settings",
+    "DEADLINE — The old Deep Research agent deep-research-pro-preview-12-2025 shuts down Oct 23, 10 days left. Move to the 04-2026 versions",
+    "Q&A — A write-up lists the three snags hit while formatting 3,000 rows with GAS and Gemini",
+    "ADK — One write-up wraps an 85k-token MCP result in a FunctionTool and gets it down to 310 tokens",
+    "NEW — Keep money and health questions out of your history: temporary chat and the setting to check",
   ]
 };
 
