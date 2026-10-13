@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "FLASH — 3.7 Flash と 3.5 Flash が非推奨に。旧名への要求は 3.8／3.6 Flash へ自動で回されます",
+    "ARGON — gemini-4-argon が 10/13 に GA。複雑なコーディング、エージェント、数学・科学の用途向けです",
     "NANO 2.1 — gemini-nano-banana-2.1 が GA。gemini-3.1-flash-image は非推奨で停止日は未発表",
-    "DEADLINE — Deep Research の旧エージェント deep-research-pro-preview-12-2025 は 10/23 に停止、残り10日。移行先は 04-2026 版",
-    "Q&A — GAS と Gemini で3,000行を整形したとき、詰まった3点を共有した記事が出ています",
-    "ADK — MCP の結果が 8.5 万トークンになる場面を、FunctionTool で包んで 310 トークンにした実測が共有されています",
-    "NEW — 家計や健康の相談を履歴に残さない。一時チャットと設定の確認",
+    "DEADLINE — Deep Research の旧エージェント deep-research-pro-preview-12-2025 は 10/23 に停止、残り9日。移行先は 04-2026 版",
+    "Q&A — MCP の設定を診断するエージェントを Gemini と ADK で作った記録が共有されています",
+    "EXPORT — 会話の PDF 保存が3サービスとも無い。資料化の実装差を比べた記事が出ています",
+    "NEW — 仕事用アカウントでアクティビティが切り替えられないとき、先に確かめる三つの画面",
   ],
   en: [
-    "FLASH — 3.7 Flash and 3.5 Flash are deprecated; requests to the old names are routed to 3.8 / 3.6 Flash",
-    "NANO 2.1 — gemini-nano-banana-2.1 is GA. gemini-3.1-flash-image is deprecated with no shutdown date yet",
-    "DEADLINE — The old Deep Research agent deep-research-pro-preview-12-2025 shuts down Oct 23, 10 days left. Move to the 04-2026 versions",
-    "Q&A — A write-up lists the three snags hit while formatting 3,000 rows with GAS and Gemini",
-    "ADK — One write-up wraps an 85k-token MCP result in a FunctionTool and gets it down to 310 tokens",
-    "NEW — Keep money and health questions out of your history: temporary chat and the setting to check",
+    "ARGON — gemini-4-argon reached GA on Oct 13, aimed at complex coding, agentic work, math and science",
+    "NANO 2.1 — gemini-nano-banana-2.1 is GA. gemini-3.1-flash-image is deprecated, with no shutdown date announced",
+    "DEADLINE — The old Deep Research agent deep-research-pro-preview-12-2025 stops on 10/23, 9 days left. Move to the 04-2026 version",
+    "Q&A — A write-up builds an agent that reviews MCP settings, using Gemini and ADK",
+    "EXPORT — None of the three services saves a chat as a PDF. A write-up compares how each handles it",
+    "NEW — When the activity setting is locked on a work account: three screens to check first"
   ]
 };
 
