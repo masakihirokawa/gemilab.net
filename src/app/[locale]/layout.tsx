@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { routing } from "@/i18n/routing";
 import { ThemeProvider } from "@/components/layout/ThemeProvider";
 import { Header } from "@/components/layout/Header";
+import { Motion } from "@/components/ui/Motion";
 import { Footer } from "@/components/layout/Footer";
 import { NewsTicker } from "@/components/ui/NewsTicker";
 import { ScrollToTop } from "@/components/ui/ScrollToTop";
@@ -71,6 +72,7 @@ export default async function LocaleLayout({
             <main style={{ paddingTop: 99 }}>{children}</main>
             <Footer />
             <ScrollToTop />
+            <Motion />
           </NextIntlClientProvider>
         </ThemeProvider>
       </body>
