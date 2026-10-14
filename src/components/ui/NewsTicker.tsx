@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "ARGON — gemini-4-argon が 10/13 に GA。複雑なコーディング、エージェント、数学・科学の用途向けです",
-    "NANO 2.1 — gemini-nano-banana-2.1 が GA。gemini-3.1-flash-image は非推奨で停止日は未発表",
-    "DEADLINE — Deep Research の旧エージェント deep-research-pro-preview-12-2025 は 10/23 に停止、残り9日。移行先は 04-2026 版",
-    "Q&A — MCP の設定を診断するエージェントを Gemini と ADK で作った記録が共有されています",
-    "EXPORT — 会話の PDF 保存が3サービスとも無い。資料化の実装差を比べた記事が出ています",
-    "NEW — 仕事用アカウントでアクティビティが切り替えられないとき、先に確かめる三つの画面",
+    "ARGON — gemini-4-argon が 10/13 に GA。複雑なコーディング・エージェント・数学・科学向けです",
+    "DEEP RES — deep-research-pro-preview-12-2025 は 10/23 に停止、残り8日。移行先は deep-research-preview-04-2026",
+    "NANO — gemini-nano-banana-2.1 が GA（10/06）。gemini-3.1-flash-image は非推奨で停止日は未発表です",
+    "MCP — ツール結果が 8.5万トークンに膨らんだ事例を、ADK で 310 トークンに包んで抑えた報告が出ています",
+    "FLASH — gemini-3.7-flash と 3.5-flash は新しい Flash モデルに自動で回されます（10/08）",
+    "NEW — クラッシュ報告を毎回ゼロから読ませない — 既知バグ早見表を先に grep し…",
   ],
   en: [
-    "ARGON — gemini-4-argon reached GA on Oct 13, aimed at complex coding, agentic work, math and science",
-    "NANO 2.1 — gemini-nano-banana-2.1 is GA. gemini-3.1-flash-image is deprecated, with no shutdown date announced",
-    "DEADLINE — The old Deep Research agent deep-research-pro-preview-12-2025 stops on 10/23, 9 days left. Move to the 04-2026 version",
-    "Q&A — A write-up builds an agent that reviews MCP settings, using Gemini and ADK",
-    "EXPORT — None of the three services saves a chat as a PDF. A write-up compares how each handles it",
-    "NEW — When the activity setting is locked on a work account: three screens to check first"
+    "ARGON — gemini-4-argon is generally available as of 10/13, aimed at complex coding, agents, math and science",
+    "DEEP RES — deep-research-pro-preview-12-2025 shuts down 10/23, 8 days left. Move to deep-research-preview-04-2026",
+    "NANO — gemini-nano-banana-2.1 is GA (10/06). gemini-3.1-flash-image is deprecated with no shutdown date yet",
+    "MCP — One write-up cut an 85,000-token tool result to 310 tokens by wrapping it in an ADK FunctionTool",
+    "FLASH — gemini-3.7-flash and 3.5-flash now route automatically to newer Flash models (10/08)",
+    "NEW — Stop Re-Reading Every Crash Report: Gre…"
   ]
 };
 
