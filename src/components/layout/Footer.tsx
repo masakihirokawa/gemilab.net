@@ -2,6 +2,7 @@
 
 import { useTranslations, useLocale } from "next-intl";
 import { localePrefix } from "@/lib/locale";
+import { SocialIcon } from "@/components/ui/SocialIcons";
 
 const SNS_LINKS = [
   { label: "X", href: "https://x.com/dolice" },
@@ -181,24 +182,20 @@ export function Footer() {
       >
         <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" }}>
           {SNS_LINKS.map((sns) => (
-            <a
-              key={sns.label}
-              href={sns.href}
-              target="_blank"
-              rel="noopener noreferrer"
-              title={sns.label}
-              style={FOOTER_LINK}
-              onMouseEnter={hoverFaint}
-              onMouseLeave={unhoverFaint}
-            >
-              {sns.label}
-            </a>
-          ))}
+              <a
+                key={sns.label}
+                href={sns.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={sns.label}
+                aria-label={sns.label}
+                className="sns-icon"
+              >
+                <SocialIcon name={sns.label} />
+              </a>
+            ))}
         </div>
         <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.1em" }}>
-            DOLICE LABS
-          </span>
           {SISTER_SITES.map((site) => (
             <a
               key={site.label}
