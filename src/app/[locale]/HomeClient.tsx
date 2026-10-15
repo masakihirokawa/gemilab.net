@@ -37,11 +37,12 @@ function SectionLabel({ text }: { text: string }) {
 }
 
 interface HomeClientProps {
-  articles: ArticleMeta[];
+  articles: ArticleMeta[]; // 最新 10 本
+  counts: { total: number; byCategory: Record<string, number> };
   locale: string;
 }
 
-export default function HomeClient({ articles, locale }: HomeClientProps) {
+export default function HomeClient({ articles, counts, locale }: HomeClientProps) {
   const t = useTranslations();
   const [mounted, setMounted] = useState(false);
   const [skipAnim, setSkipAnim] = useState(false);
@@ -202,7 +203,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
             onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
             onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
           >
-            {t("sections.allArticles").replace(" →", "")} ({articles.length}) →
+            {t("sections.allArticles").replace(" →", "")} ({counts.total}) →
           </a>
         </div>
 
@@ -212,7 +213,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               {locale === "ja" ? "記事を準備中です..." : "Articles coming soon..."}
             </p>
           ) : (
-            articles.slice(0, 10).map((article, i) => (
+            articles.map((article, i) => (
               <a
                 key={`${article.category}/${article.slug}`}
                 href={articleUrl(article)}
@@ -242,7 +243,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               </a>
             ))
           )}
-          {articles.length > 10 && (
+          {counts.total > 10 && (
             <a
               href={`${locale === "ja" ? "" : `/${locale}`}/articles`}
               style={{
@@ -267,7 +268,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
                 e.currentTarget.style.transform = "translateY(0)";
               }}
             >
-              {locale === "ja" ? `すべての記事を見る (${articles.length}) →` : `View All Articles (${articles.length}) →`}
+              {locale === "ja" ? `すべての記事を見る (${counts.total}) →` : `View All Articles (${counts.total}) →`}
             </a>
           )}
         </div>
@@ -282,8 +283,8 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16 }}>
           {(GUIDES[locale] || GUIDES.ja).map((guide, i) => {
             const count = guide.categories.length > 0
-              ? articles.filter((a) => guide.categories.includes(a.category)).length
-              : articles.length;
+              ? guide.categories.reduce((n, c) => n + (counts.byCategory[c] || 0), 0)
+              : counts.total;
             return (
               <a
                 key={i}
