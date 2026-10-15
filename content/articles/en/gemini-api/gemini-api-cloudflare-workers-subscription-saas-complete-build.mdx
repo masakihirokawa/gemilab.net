@@ -5,43 +5,58 @@ category: "gemini-api"
 level: "advanced"
 premium: false
 date: "2026-05-03T12:30"
+updated: "2026-10-15T12:10"
 author: "Gemini Lab"
-description: "An end-to-end implementation guide for shipping a subscription SaaS on Gemini API, Stripe, and Cloudflare Workers — including model tier switching, KV-based access control, rate limiting, and the production edge cases that always show up."
+description: "How I wire Gemini API, Stripe, and Cloudflare Workers into a subscription SaaS — with code, and with the places that actually bite: signature checks on Workers, webhook idempotency, KV access control, and the limits of a KV rate limiter."
 tags: ["Gemini API", "Stripe", "Cloudflare Workers", "SaaS", "Implementation"]
 
 ---
+The first time I pointed a Stripe test webhook at my Workers deployment, the dashboard filled with red 400s. I re-pasted the signing secret three times, suspected a stray newline, even generated a fresh endpoint — and got the same result every time. The secret was never the problem. The function I was verifying with was.
 
-In the [companion roadmap](/articles/gemini-api/gemini-api-paid-service-launch-roadmap-2026) I argued that Gemini API's pricing edge becomes a strategic moat only if you avoid the trap of underpricing your service. This article is the implementation half: the actual code for shipping a subscription SaaS on Gemini API + Stripe + Cloudflare Workers.
+This is the implementation companion to my [Gemini API paid-service launch roadmap](/articles/gemini-api/gemini-api-paid-service-launch-roadmap-2026). It walks through wiring Stripe and the Gemini API together on Cloudflare Workers as a subscription SaaS, following the setup I use on my own site.
 
-I run four AI publications on this same stack — Gemini Lab, Claude Lab, Antigravity Lab, Rork Lab — so the patterns below have all been beat-tested in production through webhook failures, cancellation edge cases, and KV rate limit incidents. The structure mirrors my [Claude × Stripe implementation guide](/articles/api-sdk/claude-stripe-subscription-saas-complete-implementation), but with Gemini-specific decisions (model tier switching, Vertex AI compatibility, larger usage caps) at the right places.
+The first thing I'd like to say is that the heart of this build isn't model selection — it's deciding, in exactly one place, who counts as a paying member. The Gemini call itself is a few dozen lines. The time went into webhooks, cancellations, and caching.
 
-The code targets Next.js 16 App Router on Cloudflare Workers via OpenNext, with Stripe v15 and `@google/generative-ai`.
+The code assumes Next.js (App Router) on Cloudflare Workers via OpenNext, the Stripe Node SDK, and `@google/genai`. Versions move quickly, so please compare against your own `package.json` and the official docs as you read. I also cover the webhook side from another angle in [the Stripe billing webhook production guide](/articles/gemini-api/gemini-api-stripe-saas-billing-webhook-production-guide).
 
 ## Reference Architecture
 
-The end goal:
-
 - **Auth**: NextAuth.js (email + OAuth)
-- **Billing**: Stripe Checkout (subscription + one-shot)
-- **Authorization**: Stripe Webhook → Cloudflare KV
-- **Inference layer**: Cloudflare Workers + `@google/generative-ai`
-- **Tier switching**: Flash by default, Pro fallback on quota exhaustion (optional)
+- **Payments**: Stripe Checkout (subscription and one-time purchase)
+- **Access control**: Stripe webhook → Cloudflare KV (a permission flag per user)
+- **API layer**: Cloudflare Workers + `@google/genai`
+- **Model switching**: Flash by default, Pro only where it earns its cost
 
-KV as the single source of truth for authorization is non-negotiable for indie scale. Don't query Stripe on every request — it's wrong on rate limits and wrong on latency.
+KV is the single source of truth for access. Asking the Stripe API on every request costs you in both rate limits and latency. I think of Stripe as the record of money and KV as the badge that says whether someone can walk in right now; splitting the roles that way also makes failures easier to localize.
 
 ## Step 1: Stripe Product Design
 
-The Gemini-specific move here is that "¥1,500/month unlimited" is actually viable, and you should brand around that.
+Create products and prices in the Stripe dashboard, then put the resulting price IDs in environment variables. Separate Prices per currency keep the amount shown at Checkout matched to the locale.
 
-- **Pro Monthly (JPY)**: "Pro Unlimited," ¥1,500/month
-- **Pro Monthly (USD)**: "Pro Unlimited," $10/month
-- **Single Purchase (JPY/USD)**: ¥350 / $3, one-shot
+- **Pro monthly (JPY / USD)**: recurring subscription
+- **Single purchase (JPY / USD)**: a 24-hour pass
 
-Split products by currency so that Stripe Checkout shows the right localized name and description (project STUMBLING_POINTS #79). "Unlimited" as a marketing term is hard for Claude- or GPT-based competitors to advertise without bleeding margin, so we lean into it.
+I deliberately don't fix amounts here. I believe the monthly price should come from your own invoices — work out per-user monthly cost first. I did it backwards the first time, settling on the phrase "unlimited" before checking margins, and repricing afterwards was more work than it should have been.
 
-Store price IDs in `wrangler.toml`; put real secrets behind `wrangler secret put`.
+```toml
+# wrangler.toml
+[vars]
+STRIPE_PRICE_PRO_JPY = "price_..."
+STRIPE_PRICE_PRO_USD = "price_..."
+STRIPE_PRICE_SINGLE_JPY = "price_..."
+STRIPE_PRICE_SINGLE_USD = "price_..."
+SITE_URL = "https://example.com"
 
-## Step 2: Checkout Endpoint
+# Secrets are managed separately with `wrangler secret put`
+# - STRIPE_SECRET_KEY
+# - STRIPE_WEBHOOK_SECRET
+# - GEMINI_API_KEY
+# - NEXTAUTH_SECRET
+```
+
+## Step 2: Checkout Session Endpoint
+
+Don't trust `plan` and `locale` from the client as-is. Decide the allowed values up front and return 400 for anything else.
 
 ```typescript
 // app/api/checkout/route.ts
@@ -50,7 +65,8 @@ import Stripe from 'stripe';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 
-export const runtime = 'edge';
+const PLANS = ['pro', 'single'] as const;
+const LOCALES = ['ja', 'en'] as const;
 
 export async function POST(req: NextRequest) {
   const session = await getServerSession(authOptions);
@@ -59,49 +75,40 @@ export async function POST(req: NextRequest) {
   }
 
   const { plan, locale } = await req.json();
+  if (!PLANS.includes(plan) || !LOCALES.includes(locale)) {
+    return NextResponse.json({ error: 'bad_request' }, { status: 400 });
+  }
+
   const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-    apiVersion: '2025-10-31',
+    httpClient: Stripe.createFetchHttpClient(), // use the fetch-based client on Workers
   });
 
-  const isJa = locale === 'ja';
+  const suffix = locale === 'ja' ? 'JPY' : 'USD';
+  const priceId = process.env[`STRIPE_PRICE_${plan.toUpperCase()}_${suffix}`]!;
   const isPro = plan === 'pro';
 
-  const params: Stripe.Checkout.SessionCreateParams = {
+  const checkout = await stripe.checkout.sessions.create({
     mode: isPro ? 'subscription' : 'payment',
+    line_items: [{ price: priceId, quantity: 1 }],
+    customer_email: session.user.email,
     success_url: `${process.env.SITE_URL}/${locale}/thanks?session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${process.env.SITE_URL}/${locale}/membership`,
-    customer_email: session.user.email,
-    line_items: [{
-      price_data: {
-        currency: isJa ? 'jpy' : 'usd',
-        recurring: isPro ? { interval: 'month' } : undefined,
-        unit_amount: isPro ? (isJa ? 1500 : 1000) : (isJa ? 350 : 300),
-        product_data: {
-          name: isPro
-            ? (isJa ? 'Pro Unlimited（月額）' : 'Pro Unlimited (Monthly)')
-            : (isJa ? '単発購入' : 'Single Purchase'),
-          description: isPro
-            ? 'Unlimited monthly access to all Gemini features'
-            : '24-hour single-use access',
-          images: [`${process.env.SITE_URL}/images/stripe-product.png`],
-        },
-      },
-      quantity: 1,
-    }],
-    metadata: {
-      plan_type: plan,
-      user_email: session.user.email,
-    },
-  };
+    metadata: { plan_type: plan, user_email: session.user.email },
+  });
 
-  const checkoutSession = await stripe.checkout.sessions.create(params);
-  return NextResponse.json({ url: checkoutSession.url });
+  return NextResponse.json({ url: checkout.url });
 }
 ```
 
-`metadata.plan_type` is mandatory. The webhook needs it to distinguish a subscription from a one-shot purchase, and confusing the two is the most common indie billing bug (project STUMBLING_POINTS #14.5).
+Always set `metadata.plan_type`. In the webhook it's the only clue you'll have for telling a subscription from a one-time purchase.
+
+One more note: with OpenNext on Workers, leaving `export const runtime = 'edge'` in a route can make the build complain. In my setup, removing that line and staying on the Node.js runtime (`nodejs_compat`) was the stable choice. Please check the docs for your OpenNext version once.
 
 ## Step 3: Stripe Webhook
+
+The opening 400s were born here. The synchronous `constructEvent` that appears in most Node samples doesn't get along with the Workers crypto API (SubtleCrypto is asynchronous), so verification fails even when the signature is valid. On Workers, use **`constructEventAsync`**.
+
+My first version also had an idempotency trap: it recorded the event ID in KV *before* processing. If processing crashed midway, Stripe's retry arrived and was discarded as "already handled." **Record after the work is done.** That's the order I use now.
 
 ```typescript
 // app/api/stripe/webhook/route.ts
@@ -109,73 +116,70 @@ import { NextRequest, NextResponse } from 'next/server';
 import Stripe from 'stripe';
 import { getCloudflareContext } from '@opennextjs/cloudflare';
 
-export const runtime = 'edge';
-
 export async function POST(req: NextRequest) {
   const sig = req.headers.get('stripe-signature');
-  const body = await req.text();
+  const body = await req.text(); // verification needs the raw, untouched text
   const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-    apiVersion: '2025-10-31',
+    httpClient: Stripe.createFetchHttpClient(),
   });
 
   let event: Stripe.Event;
   try {
-    event = stripe.webhooks.constructEvent(
+    event = await stripe.webhooks.constructEventAsync(
       body, sig!, process.env.STRIPE_WEBHOOK_SECRET!
     );
-  } catch (e) {
+  } catch {
     return NextResponse.json({ error: 'invalid signature' }, { status: 400 });
   }
 
   const { env } = getCloudflareContext();
   const kv = env.MEMBERSHIP_KV;
 
-  // Idempotency
-  const eventKey = `site:gemilab:webhook:${event.id}`;
-  const seen = await kv.get(eventKey);
-  if (seen) {
+  // Skip events we've already handled (we record at the very end)
+  const eventKey = `site:example:webhook:${event.id}`;
+  if (await kv.get(eventKey)) {
     return NextResponse.json({ received: true, duplicate: true });
   }
-  await kv.put(eventKey, '1', { expirationTtl: 86400 * 7 });
 
   switch (event.type) {
     case 'checkout.session.completed': {
       const s = event.data.object as Stripe.Checkout.Session;
-      const planType = s.metadata?.plan_type;
       const email = s.customer_email ?? s.metadata?.user_email;
       if (!email) break;
 
-      if (planType === 'pro') {
-        const subscription = await stripe.subscriptions.retrieve(s.subscription as string);
+      if (s.metadata?.plan_type === 'pro') {
+        const sub = await stripe.subscriptions.retrieve(s.subscription as string);
+        // Where the period end lives depends on your Stripe API version
+        const periodEnd =
+          sub.items?.data?.[0]?.current_period_end ??
+          (sub as unknown as { current_period_end: number }).current_period_end;
+        const ttl = periodEnd - Math.floor(Date.now() / 1000) + 86400 * 3;
         await kv.put(
-          `site:gemilab:member:${email}`,
-          JSON.stringify({
-            plan: 'pro',
-            current_period_end: subscription.current_period_end,
-            subscription_id: subscription.id,
-          }),
-          { expirationTtl: subscription.current_period_end - Math.floor(Date.now() / 1000) + 86400 * 3 }
+          `site:example:member:${email}`,
+          JSON.stringify({ plan: 'pro', current_period_end: periodEnd, subscription_id: sub.id }),
+          { expirationTtl: Math.max(ttl, 60) } // KV's minimum TTL is 60 seconds
         );
-      } else if (planType === 'single') {
-        // Single purchase grants 24-hour access
-        await kv.put(`site:gemilab:single:${email}`, '1', { expirationTtl: 86400 });
+      } else if (s.metadata?.plan_type === 'single') {
+        await kv.put(`site:example:single:${email}`, '1', { expirationTtl: 86400 });
       }
       break;
     }
     case 'customer.subscription.deleted': {
       const sub = event.data.object as Stripe.Subscription;
       const customer = await stripe.customers.retrieve(sub.customer as string);
-      if ('email' in customer && customer.email) {
-        await kv.delete(`site:gemilab:member:${customer.email}`);
+      if (!('deleted' in customer) && customer.email) {
+        await kv.delete(`site:example:member:${customer.email}`);
       }
       break;
     }
   }
+
+  await kv.put(eventKey, '1', { expirationTtl: 86400 * 7 });
   return NextResponse.json({ received: true });
 }
 ```
 
-The TTL design matters: monthly subscriptions get "current_period_end + 3 days" — automatic safety expiration if a webhook is ever lost. Single purchases get exactly 24 hours, which is what makes that ¥350 product viable: Gemini's per-request cost is so low that a day's worth of access fits comfortably under that price.
+I set the TTL to "next renewal date + 3 days," so even if a renewal webhook never arrives, the badge expires on its own instead of granting access forever. The flip side is that you also need to extend the TTL on each renewal (for example from `invoice.paid`). The code here is a minimal skeleton, so please add renewal handling before production.
 
 ## Step 4: Authorization Helper
 
@@ -190,66 +194,53 @@ export async function canViewPremium(): Promise<boolean> {
   if (!session?.user?.email) return false;
   try {
     const { env } = getCloudflareContext();
-    const raw = await env.MEMBERSHIP_KV.get(`site:gemilab:member:${session.user.email}`);
-    if (raw) {
-      const data = JSON.parse(raw);
-      if (data.plan === 'pro') return true;
-    }
-    const single = await env.MEMBERSHIP_KV.get(`site:gemilab:single:${session.user.email}`);
-    return single === '1';
-  } catch (e) {
-    return false; // deny by default
+    const raw = await env.MEMBERSHIP_KV.get(`site:example:member:${session.user.email}`);
+    if (raw && JSON.parse(raw).plan === 'pro') return true;
+    return (await env.MEMBERSHIP_KV.get(`site:example:single:${session.user.email}`)) === '1';
+  } catch {
+    return false; // if KV can't be read, stay closed
   }
 }
 ```
 
-Returning `false` on KV error is non-negotiable. Anyone "fixing" this to `return true` for resilience is opening every premium feature on a KV outage. Deny by default isn't a style choice (project STUMBLING_POINTS #89).
+Please never change the `return false` in the `catch`, however rushed you are. Flip it to `true` and every KV outage turns into free access for everyone.
 
-## Step 5: Gemini API Calls With Tier Switching
+**Keep the truth about access in one place, and when in doubt, lean toward closed.** I hold to that line even the night before a deadline.
 
-This is the Gemini-specific piece. Make Flash/Pro/Ultra a runtime decision:
+## Step 5: Calling the Gemini API
+
+This is the Gemini-specific part. I use `@google/genai`; the older `@google/generative-ai` has moved on to its successor, so for a new build it's simplest to start with the new one. Two tiers, Flash and Pro, with model names kept in a single table. Model IDs turn over quickly, so check the [official model list](https://ai.google.dev/gemini-api/docs/models) for current names before shipping.
 
 ```typescript
 // lib/gemini.ts
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenAI } from '@google/genai';
 
-type ModelTier = 'flash' | 'pro' | 'ultra';
+export type ModelTier = 'flash' | 'pro';
 
 const MODEL_NAMES: Record<ModelTier, string> = {
   flash: 'gemini-3.2-flash',
   pro: 'gemini-3.2-pro',
-  ultra: 'gemini-3.2-ultra',
 };
 
 export async function generateWithGemini(
   prompt: string,
   tier: ModelTier = 'flash'
 ): Promise<string> {
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-  const model = genAI.getGenerativeModel({
+  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+  const res = await ai.models.generateContent({
     model: MODEL_NAMES[tier],
-    generationConfig: {
-      maxOutputTokens: 2000,
-      temperature: 0.7,
-    },
+    contents: prompt,
+    config: { maxOutputTokens: 2000, temperature: 0.7 },
   });
-
-  const result = await model.generateContent(prompt);
-  return result.response.text();
-}
-
-export async function smartGenerate(prompt: string, complexity: number): Promise<string> {
-  if (complexity <= 3) return generateWithGemini(prompt, 'flash');
-  if (complexity <= 7) return generateWithGemini(prompt, 'pro');
-  return generateWithGemini(prompt, 'ultra');
+  return res.text ?? '';
 }
 ```
 
-`maxOutputTokens` must always be set explicitly. Without it, a runaway loop bug can drain your monthly Gemini budget in an afternoon. Set Google Cloud Console budget alerts on top, not instead of, this guardrail.
+Always set `maxOutputTokens` explicitly. Together with input validation, it puts a ceiling on the worst-case cost of one call.
 
-## Step 6: Rate-Limited API Endpoint
+## Step 6: A Rate-Limited Endpoint
 
-Even on an "unlimited" plan, you need a sane rate limit. "Unlimited" and "infinite parallelism" aren't the same thing.
+Even if the plan says "unlimited," you still need rate limiting. "Unlimited" describes the monthly price; it doesn't mean any number of simultaneous requests.
 
 ```typescript
 // app/api/generate/route.ts
@@ -257,23 +248,27 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { canViewPremium } from '@/lib/premium';
-import { generateWithGemini } from '@/lib/gemini';
+import { generateWithGemini, type ModelTier } from '@/lib/gemini';
 import { getCloudflareContext } from '@opennextjs/cloudflare';
-
-export const runtime = 'edge';
 
 export async function POST(req: NextRequest) {
   const session = await getServerSession(authOptions);
   if (!session?.user?.email) {
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
   }
-
-  const isPro = await canViewPremium();
-  if (!isPro) {
+  if (!(await canViewPremium())) {
     return NextResponse.json({ error: 'subscription_required' }, { status: 402 });
   }
 
-  // 10 requests/minute rate limit
+  const { prompt, tier = 'flash' } = await req.json();
+  if (typeof prompt !== 'string' || prompt.length > 8000) {
+    return NextResponse.json({ error: 'bad_request' }, { status: 400 });
+  }
+  if (tier !== 'flash' && tier !== 'pro') {
+    return NextResponse.json({ error: 'bad_tier' }, { status: 400 });
+  }
+
+  // Roughly 10 requests per minute
   const { env } = getCloudflareContext();
   const minuteKey = `rate:${session.user.email}:${Math.floor(Date.now() / 60000)}`;
   const current = parseInt((await env.MEMBERSHIP_KV.get(minuteKey)) ?? '0', 10);
@@ -282,77 +277,70 @@ export async function POST(req: NextRequest) {
   }
   await env.MEMBERSHIP_KV.put(minuteKey, String(current + 1), { expirationTtl: 120 });
 
-  const { prompt, tier = 'flash' } = await req.json();
-
-  if (tier === 'ultra' && !session.user.email?.endsWith('@gemilab.net')) {
-    return NextResponse.json({ error: 'tier_restricted' }, { status: 403 });
-  }
-
-  const text = await generateWithGemini(prompt, tier);
+  const text = await generateWithGemini(prompt, tier as ModelTier);
   return NextResponse.json({ text });
 }
 ```
 
-The rate limit (10 requests/minute) is the safety valve that makes "unlimited" honest. Without it, a leaked API key or a malicious loop can devastate your Google Cloud bill. Even on Gemini's pricing, "unlimited" without a per-minute ceiling is a footgun.
+To be candid: between the read and the write, other requests can slip in, and KV writes take time to propagate. This is not an exact counter; it's a **brake** that stops runaway loops. If you need a limit tied directly to your bill, I'd move to something that counts atomically, such as Durable Objects or Cloudflare's rate limiting feature.
 
-## Step 7: Cancellation Flows and Edge Cases
+## Step 7: Cancellation and Edge Cases
 
-**Last-minute usage on canceled accounts.** Listen for `customer.subscription.updated` (with `cancel_at_period_end: true`) to mark "scheduled cancellation" without immediately revoking access. Only on `customer.subscription.deleted` do you actually delete the KV entry. This honors the user's paid-through period.
+Three places that tend to bite after launch.
 
-**Duplicate webhooks.** Stripe occasionally redelivers events. The `event.id` idempotency check from Step 3 isn't optional.
+**Last-minute use after cancelling** — When someone cancels through the Customer Portal, access normally continues to the end of the period. The KV badge stays until `customer.subscription.deleted` arrives, and its TTL already matches the period end, so no extra handling is needed. Read `cancel_at_period_end` from `customer.subscription.updated` only if you want to show a "cancellation scheduled" notice.
 
-**Gemini quota exhaustion.** Gemini has region- and project-scoped quotas. In production you'll occasionally hit a 500 from quota saturation. A retry-with-fallback wrapper turns this into a graceful degradation instead of a user-visible error:
+**Duplicate webhooks** — The same event can arrive more than once. Step 3 handles it by recording `event.id`.
+
+**Gemini quota exhaustion** — It comes back as HTTP 429 (RESOURCE_EXHAUSTED). SDK errors carry a `status`, so checking the status is more reliable than matching message text.
 
 ```typescript
-async function generateWithFallback(prompt: string, tier: 'flash' | 'pro'): Promise<string> {
+async function generateWithRetry(prompt: string, tier: ModelTier): Promise<string> {
   try {
     return await generateWithGemini(prompt, tier);
-  } catch (e: any) {
-    if (e.message?.includes('quota')) {
-      const fallbackTier = tier === 'flash' ? 'pro' : 'flash';
-      return await generateWithGemini(prompt, fallbackTier);
+  } catch (e) {
+    const status = (e as { status?: number }).status;
+    if (status === 429 || (status !== undefined && status >= 500)) {
+      await new Promise((r) => setTimeout(r, 1500)); // wait briefly, retry once
+      return await generateWithGemini(prompt, tier);
     }
     throw e;
   }
 }
 ```
 
-## Step 8: Cloudflare Edge Cache Awareness
+Falling back from Flash to Pro is an option, but quotas are sometimes per model and sometimes a project-wide ceiling, and in the latter case it won't help. Where I've landed: wait and retry once, and if that fails, tell the user plainly that things are busy.
 
-The most-overlooked indie SaaS bug: Cloudflare Workers HTML caching ignores cookies by default, so the same membership-CTA HTML gets served to paid and unpaid users alike (project STUMBLING_POINTS #73).
+## Step 8: Cloudflare Edge Cache
+
+This is the trap indie SaaS builders miss most. Cache HTML at the edge and everyone gets the same HTML regardless of login or billing state. "I paid but the membership prompt won't go away" is nearly always this.
+
+Requests that carry a member cookie (in my setup, `premium_token`) should bypass the cache and go to the origin.
 
 ```javascript
-addEventListener('fetch', event => {
-  const req = event.request;
-  const cookie = req.headers.get('cookie') || '';
+addEventListener('fetch', (event) => {
+  const cookie = event.request.headers.get('cookie') || '';
   if (cookie.includes('premium_token')) {
-    event.respondWith(fetch(req));
+    event.respondWith(fetch(event.request)); // members skip the cache
     return;
   }
   event.respondWith(handleCachedRequest(event));
 });
 ```
 
-Skip this and you'll get a flood of "I paid but the upgrade prompt is still there" tickets within a week.
-
 ## Pre-Launch Checklist
 
-- Stripe webhook URL points to production
-- `STRIPE_WEBHOOK_SECRET` and `GEMINI_API_KEY` are live values, not test values
-- KV keys are namespaced under `site:gemilab:` to prevent multi-site contamination
-- Gemini monthly budget alerts configured in Google Cloud Console
-- Stripe test mode walk-through: subscribe → cancel → resubscribe
-- Rate-limit verification with `curl` loops
-- `cache-worker.js` premium_token cookie bypass verified live
+- The Stripe webhook endpoint points at the production URL
+- `STRIPE_WEBHOOK_SECRET` and `GEMINI_API_KEY` are the production values
+- KV key prefixes can't collide with other services sharing the namespace
+- A monthly budget alert is set on the Google Cloud side
+- Stripe test mode: purchase → cancel → repurchase, all three paths exercised
+- A webhook with a bad signature returns 400 (checked with curl)
+- The rate limit really does return 429
+- The member-cookie cache bypass works
 
-## Closing — The Three Gemini-Specific Wins
+## Looking Back
 
-The decisions that matter most in this implementation, all of which are difficult or impossible on Claude or GPT pricing:
+When I finished, very little was Gemini-specific. What remained: two model tiers chosen by the caller, a ceiling on output tokens, and a price derived from my own invoices. Everything else — async signature checks, the fetch-based HTTP client, edge caching, writing webhooks on the assumption they will be redelivered — was about the Workers environment, and that's what held the foundation up.
 
-1. **"Unlimited monthly" is structurally viable** — Gemini Flash's per-request cost lets you absorb heavy users
-2. **Dynamic tier switching** — Flash by default, Pro for select moments, Ultra on demand for the most demanding workloads
-3. **24-hour single purchase at ¥350** — a low-commitment entry point that wouldn't pay for itself on a higher-COGS API
-
-Used together, these three give a Gemini-based indie SaaS a structural edge that's costly for competitors to replicate. Wire them in correctly from day one and you have a product that bills correctly, scales economically, and stays honest about what "unlimited" means.
-
-If you get stuck, this site itself runs on the same stack.
+If you're building this, start in test mode and confirm a bad signature gets a 400. That's where I began rebuilding, one piece at a time — and I can laugh now about those red 400s at the start: it was never the key.
