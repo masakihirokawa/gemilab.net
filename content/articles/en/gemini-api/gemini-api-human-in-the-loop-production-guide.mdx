@@ -5,6 +5,7 @@ category: "gemini-api"
 level: "advanced"
 premium: true
 date: "2026-04-28T04:30"
+updated: "2026-10-16T13:29"
 author: "Gemini Lab"
 description: "Fully automating Gemini API output is risky, but reviewing every response by hand is impractical. This guide walks through a Human-in-the-Loop architecture in three layers — confidence gating, review queues, and feedback loops — at production-implementation depth."
 tags: ["gemini-api", "human-in-the-loop", "hitl", "production", "quality-assurance", "review-queue"]
@@ -90,7 +91,7 @@ class CritiqueResult(BaseModel):
 PRO_MODEL = "gemini-2.5-pro"
 FLASH_MODEL = "gemini-2.5-flash"
 
-def generate_with_logprobs(prompt: str) -> tuple[str, float]:
+def generate_with_logprobs(prompt: str) -> tuple[str, float | None]:
     """Main generation. Returns text plus an avg_logprob-derived confidence."""
     resp = client.models.generate_content(
         model=PRO_MODEL,
@@ -103,7 +104,10 @@ def generate_with_logprobs(prompt: str) -> tuple[str, float]:
     )
     text = resp.text
     # avg_logprob ranges from -inf to 0; closer to 0 is more confident
-    avg_lp = resp.candidates[0].avg_logprobs or -2.0
+    avg_lp = resp.candidates[0].avg_logprobs
+    if avg_lp is None:
+        # Not returned for every model/config. Treat it as missing, not as "zero confidence"
+        return text, None
     # Empirical normalization: -0.3+ is high confidence, -1.5 or lower is poor
     confidence = max(0.0, min(1.0, (avg_lp + 1.5) / 1.2))
     return text, confidence
@@ -149,7 +153,11 @@ def hitl_decision(prompt: str) -> dict:
     ext_score = external_verify(output)
 
     # Empirical weights: Logprobs 0.3 / Critique 0.5 / External 0.2
-    composite = lp_conf * 0.3 + critique.score * 0.5 + ext_score * 0.2
+    # If Logprobs is missing, re-weight the other two signals (0.5 : 0.2)
+    if lp_conf is None:
+        composite = (critique.score * 0.5 + ext_score * 0.2) / 0.7
+    else:
+        composite = lp_conf * 0.3 + critique.score * 0.5 + ext_score * 0.2
 
     if critique.severity == "critical" or composite < 0.55:
         decision = "regenerate"
@@ -162,7 +170,7 @@ def hitl_decision(prompt: str) -> dict:
         "output": output,
         "decision": decision,
         "scores": {
-            "logprobs": round(lp_conf, 3),
+            "logprobs": None if lp_conf is None else round(lp_conf, 3),
             "critique": critique.score,
             "external": round(ext_score, 3),
             "composite": round(composite, 3),
@@ -242,47 +250,50 @@ VALID_TRANSITIONS = {
 }
 
 async def claim_item(pool, reviewer_id: str) -> dict | None:
-    """Claim the oldest-by-SLA pending item using FOR UPDATE SKIP LOCKED."""
+    """Claim the oldest-by-SLA item using FOR UPDATE SKIP LOCKED."""
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT id, prompt, output, sla_deadline FROM review_queue
-            WHERE state = 'pending'
-            ORDER BY sla_deadline ASC
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-        """)
-        if not row:
-            return None
-        await conn.execute("""
-            UPDATE review_queue
-               SET state='claimed', claimed_by=$1, claimed_at=now()
-             WHERE id=$2
-        """, reviewer_id, row["id"])
-        return dict(row)
+        # Outside a transaction the FOR UPDATE lock is released as soon as the statement ends
+        async with conn.transaction():
+            row = await conn.fetchrow("""
+                SELECT id, prompt, output, sla_deadline FROM review_queue
+                WHERE state IN ('pending', 'escalated')
+                ORDER BY (state = 'escalated') DESC, sla_deadline ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            """)
+            if not row:
+                return None
+            await conn.execute("""
+                UPDATE review_queue
+                   SET state='claimed', claimed_by=$1, claimed_at=now()
+                 WHERE id=$2
+            """, reviewer_id, row["id"])
+            return dict(row)
 
 async def decide_item(pool, item_id: str, reviewer_id: str,
                       new_state: str, final_output: str | None = None):
     """Validate the transition before mutating state."""
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT state, claimed_by FROM review_queue WHERE id=$1 FOR UPDATE",
-            item_id,
-        )
-        if not row:
-            raise ValueError("item not found")
-        if row["claimed_by"] != reviewer_id:
-            raise PermissionError("not your item")
-        if new_state not in VALID_TRANSITIONS[row["state"]]:
-            raise ValueError(f"invalid transition: {row['state']} -> {new_state}")
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT state, claimed_by FROM review_queue WHERE id=$1 FOR UPDATE",
+                item_id,
+            )
+            if not row:
+                raise ValueError("item not found")
+            if row["claimed_by"] != reviewer_id:
+                raise PermissionError("not your item")
+            if new_state not in VALID_TRANSITIONS[row["state"]]:
+                raise ValueError(f"invalid transition: {row['state']} -> {new_state}")
 
-        await conn.execute("""
-            UPDATE review_queue
-               SET state=$1, decided_at=now(), final_output=$2
-             WHERE id=$3
-        """, new_state, final_output, item_id)
+            await conn.execute("""
+                UPDATE review_queue
+                   SET state=$1, decided_at=now(), final_output=$2
+                 WHERE id=$3
+            """, new_state, final_output, item_id)
 ```
 
-`FOR UPDATE SKIP LOCKED` is the standard pattern that prevents two reviewers from grabbing the same row when they pull from the queue at the same moment. Skip it and you'll pay for duplicate work.
+`FOR UPDATE SKIP LOCKED` is the standard pattern that prevents two reviewers from grabbing the same row when they pull from the queue at the same moment. Skip it and you'll pay for duplicate work. With asyncpg there is one more catch: the `FOR UPDATE` lock only holds inside `conn.transaction()`. I had it outside at first and only noticed when two reviewers opened the same item at once. The claim query also picks up `escalated` items first, so work that was moved aside after an SLA miss doesn't sit untouched.
 
 ### SLA Watcher — Escalating Forgotten Reviews
 
@@ -311,7 +322,7 @@ async def sla_watcher(pool):
         await asyncio.sleep(60)
 ```
 
-Use a **per-severity SLA**. I run 30 minutes for `major`, 4 hours for `minor`, and 24 hours for low-severity backlog. Single global timeouts always end up wrong.
+Use a **per-severity SLA**. I run 30 minutes for `major`, 4 hours for `minor`, and 24 hours for low-severity backlog. `critical` never reaches the queue, because the gate sends it to regeneration. Single global timeouts always end up wrong.
 
 A subtle detail: when an item gets escalated, do **not** simply reroute it to a higher-tier reviewer. The escalated state is a signal that something in the pipeline isn't working — maybe the queue is backed up, maybe the original reviewer was unavailable, maybe the SLA itself was set too tight for the actual workload. Treat escalations as data points, not just task reassignments. I track the rate of escalations per week and look at the trend; a steady increase usually means I need to add reviewer capacity, not punish the existing team.
 
@@ -407,13 +418,39 @@ When reviewers edit Gemini's output, you have two implicit responsibilities. Fir
 
 The simplest way to break a HITL setup is to scale traffic 10× without revisiting the queue's capacity. The gate happily flags 5% of 10× more traffic, your reviewers can't keep up, the SLA watcher escalates everything, and what was a polite quality check turns into a queue of fire. Build a **back-pressure rule** into the API layer: if the queue depth or the median review time crosses a ceiling, slow new requests by returning 429 or pausing the gate for a minute. Production systems need a circuit-breaker even on their human side.
 
+## Implementing the Shadow-Review Sample
+
+"Send 5% of auto-accepted output to shadow review" is easy to write and easy to get wrong. Random sampling can't be reproduced, so you can't later explain why an item was picked. And if shadow items land in the same tallies as gate-flagged items, the rejection rate stops meaning what you think it means.
+
+Pick samples by hashing the request ID, and tag the queue row with a `source` column.
+
+```sql
+ALTER TABLE review_queue
+    ADD COLUMN source TEXT NOT NULL DEFAULT 'gate';  -- 'gate' or 'shadow'
+```
+
+```python
+import hashlib
+
+SHADOW_RATE = 0.05
+
+def is_shadow_sample(request_id: str) -> bool:
+    """Same ID, same answer — the sample is reproducible after the fact."""
+    h = int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16)
+    return (h / 0xFFFFFFFF) < SHADOW_RATE
+```
+
+When `decision == "auto_accept"` and `is_shadow_sample()` is true, return the output to the customer as usual and copy it into the queue with `source='shadow'`. Delivery is never held back; the shadow verdict only answers "was auto-accept the right call?"
+
+Read the agreement rate with the sample size in mind. At 1,000 auto-accepted items a month, 5% is 50 samples. Against a 95% target the standard error is about 3 points (√(0.95×0.05÷50)), so a dozen items in one week dipping below 93% is mostly noise. I judge on a rolling four weeks, and below 40 samples I eyeball the items instead of firing an alert.
+
 ## A Minimal Stack for Solo Developers
 
 If three layers feels like a lot, here's the minimum stack I'd recommend a solo developer try:
 
 - **Infra**: Cloud Run (API) + Cloud SQL for PostgreSQL (queue) + Slack (instead of a custom UI)
 - **Reviewers**: yourself, or two or three trusted peers on hourly contract
-- **SLA**: critical = 30 minutes / major = 4 hours / minor = 24 hours
+- **SLA**: major = 30 minutes / minor = 4 hours / low-severity = 24 hours
 - **Feedback cadence**: weekly, 30 minutes on Saturday morning
 
 The trick is to **not build a custom reviewer UI on day one**. Post review-needed items into a Slack channel, and use three reaction emoji to encode approve / edit / reject. Use the Slack Events API to read the reactions and advance the state machine. Build the dedicated UI only after the Slack flow is reliably handling 100+ items per month.

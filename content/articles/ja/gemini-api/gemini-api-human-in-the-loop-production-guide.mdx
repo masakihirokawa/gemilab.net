@@ -5,6 +5,7 @@ category: "gemini-api"
 level: "advanced"
 premium: true
 date: "2026-04-28T04:30"
+updated: "2026-10-16T13:29"
 author: "Gemini Lab"
 description: "Gemini API の出力を完全自動運用するのが怖い、でも全件を人間が見るのは現実的ではありません。そんな現場のための Human-in-the-Loop（HITL）アーキテクチャを、信頼度ゲート・レビューキュー・フィードバックループの3層に分けて本番実装の粒度で解説します。"
 tags: ["gemini-api", "human-in-the-loop", "hitl", "production", "quality-assurance", "review-queue"]
@@ -82,8 +83,8 @@ class CritiqueResult(BaseModel):
 PRO_MODEL = "gemini-2.5-pro"
 FLASH_MODEL = "gemini-2.5-flash"
 
-def generate_with_logprobs(prompt: str) -> tuple[str, float]:
-    """メイン生成。avg_logprob を信頼度として返す。"""
+def generate_with_logprobs(prompt: str) -> tuple[str, float | None]:
+    """メイン生成。avg_logprob を信頼度として返す（取得できなければ None）。"""
     resp = client.models.generate_content(
         model=PRO_MODEL,
         contents=prompt,
@@ -95,7 +96,10 @@ def generate_with_logprobs(prompt: str) -> tuple[str, float]:
     )
     text = resp.text
     # avg_logprob は -inf 〜 0。0 に近いほど確信度が高い
-    avg_lp = resp.candidates[0].avg_logprobs or -2.0
+    avg_lp = resp.candidates[0].avg_logprobs
+    if avg_lp is None:
+        # モデルや設定によっては返らない。「確信度ゼロ」と誤読せず、欠測として扱う
+        return text, None
     # 確信度を 0..1 に正規化（経験則: -0.3 以上が高確信、-1.5 以下は低確信）
     confidence = max(0.0, min(1.0, (avg_lp + 1.5) / 1.2))
     return text, confidence
@@ -141,7 +145,11 @@ def hitl_decision(prompt: str) -> dict:
     ext_score = external_verify(output)
 
     # 重み付き合算（経験則: Logprobs 0.3 / Critique 0.5 / External 0.2）
-    composite = lp_conf * 0.3 + critique.score * 0.5 + ext_score * 0.2
+    # Logprobs が欠測のときは、残り 2 指標の比率（0.5 : 0.2）で重みを振り直す
+    if lp_conf is None:
+        composite = (critique.score * 0.5 + ext_score * 0.2) / 0.7
+    else:
+        composite = lp_conf * 0.3 + critique.score * 0.5 + ext_score * 0.2
 
     if critique.severity == "critical" or composite < 0.55:
         decision = "regenerate"  # 再生成または却下
@@ -154,7 +162,7 @@ def hitl_decision(prompt: str) -> dict:
         "output": output,
         "decision": decision,
         "scores": {
-            "logprobs": round(lp_conf, 3),
+            "logprobs": None if lp_conf is None else round(lp_conf, 3),
             "critique": critique.score,
             "external": round(ext_score, 3),
             "composite": round(composite, 3),
@@ -171,6 +179,8 @@ if __name__ == "__main__":
     #  'scores': {'logprobs': 0.82, 'critique': 0.91, 'external': 1.0, 'composite': 0.879},
     #  'severity': 'none', 'issues': []}
 ```
+
+最初に私がつまずいたのは、`avg_logprobs` が返ってこない呼び出しでした。初版では `or -2.0` で埋めていたため、取得できなかった出力がすべて「確信度ゼロ」と読まれ、レビューキューが一晩で膨らんでしまいました。欠測を低い値で埋めると、ゲートは「自信がない」と「測れなかった」を区別できません。**欠測は欠測のまま持ち、重みを振り直す**——これが現在の線引きです。
 
 ここで一番大事なのは、**3 つのスコアの重みは固定値で決め打ちしない** ということです。最初は経験則の値（0.3 / 0.5 / 0.2）から始めて、レビュアーの判断データが蓄積されたら、第 3 層のフィードバックループで重みを調整します。
 
@@ -236,45 +246,48 @@ VALID_TRANSITIONS = {
 async def claim_item(pool, reviewer_id: str) -> dict | None:
     """SLA が古いものから取得（FOR UPDATE SKIP LOCKED）。"""
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT id, prompt, output, sla_deadline FROM review_queue
-            WHERE state = 'pending'
-            ORDER BY sla_deadline ASC
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-        """)
-        if not row:
-            return None
-        await conn.execute("""
-            UPDATE review_queue
-               SET state='claimed', claimed_by=$1, claimed_at=now()
-             WHERE id=$2
-        """, reviewer_id, row["id"])
-        return dict(row)
+        # トランザクションの外で FOR UPDATE を使うと、文の終了と同時にロックが外れる
+        async with conn.transaction():
+            row = await conn.fetchrow("""
+                SELECT id, prompt, output, sla_deadline FROM review_queue
+                WHERE state IN ('pending', 'escalated')
+                ORDER BY (state = 'escalated') DESC, sla_deadline ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            """)
+            if not row:
+                return None
+            await conn.execute("""
+                UPDATE review_queue
+                   SET state='claimed', claimed_by=$1, claimed_at=now()
+                 WHERE id=$2
+            """, reviewer_id, row["id"])
+            return dict(row)
 
 async def decide_item(pool, item_id: str, reviewer_id: str,
                       new_state: str, final_output: str | None = None):
     """状態遷移をアプリ層でも検証。"""
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT state, claimed_by FROM review_queue WHERE id=$1 FOR UPDATE",
-            item_id,
-        )
-        if not row:
-            raise ValueError("item not found")
-        if row["claimed_by"] != reviewer_id:
-            raise PermissionError("not your item")
-        if new_state not in VALID_TRANSITIONS[row["state"]]:
-            raise ValueError(f"invalid transition: {row['state']} -> {new_state}")
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT state, claimed_by FROM review_queue WHERE id=$1 FOR UPDATE",
+                item_id,
+            )
+            if not row:
+                raise ValueError("item not found")
+            if row["claimed_by"] != reviewer_id:
+                raise PermissionError("not your item")
+            if new_state not in VALID_TRANSITIONS[row["state"]]:
+                raise ValueError(f"invalid transition: {row['state']} -> {new_state}")
 
-        await conn.execute("""
-            UPDATE review_queue
-               SET state=$1, decided_at=now(), final_output=$2
-             WHERE id=$3
-        """, new_state, final_output, item_id)
+            await conn.execute("""
+                UPDATE review_queue
+                   SET state=$1, decided_at=now(), final_output=$2
+                 WHERE id=$3
+            """, new_state, final_output, item_id)
 ```
 
-`FOR UPDATE SKIP LOCKED` は、複数のレビュアーが同時にキューを取得しようとしたときに、同じ行を 2 人が同時に取らないようにするための標準パターンです。これを忘れると重複作業が発生します。
+`FOR UPDATE SKIP LOCKED` は、複数のレビュアーが同時にキューを取得しようとしたときに、同じ行を 2 人が同時に取らないようにするための標準パターンです。これを忘れると重複作業が発生します。加えて、asyncpg では `conn.transaction()` の内側で実行しないと、`FOR UPDATE` のロックが文の終了と同時に外れてしまいます。私も最初はここを外していて、2 人のレビュアーが同じ案件を同時に開く症状として初めて気づきました。上のコードで `escalated` の案件を先に拾っているのは、SLA 超過で退避した案件が誰にも取られないまま残るのを避けるためです。
 
 ### SLA 監視 — 放置されたレビューをエスカレーションする
 
@@ -303,7 +316,7 @@ async def sla_watcher(pool):
         await asyncio.sleep(60)
 ```
 
-`severity` に応じた SLA を設定すると現場で機能します。私は `major` は 30 分、`minor` は 4 時間、`pending`（軽微）は 24 時間、と段階を分けています。
+`severity` に応じた SLA を設定すると現場で機能します。私は `major` は 30 分、`minor` は 4 時間、確認だけで済む低重大度の案件は 24 時間、と段階を分けています。`critical` は上のゲートで再生成に回るため、キューには入りません。
 
 ## レビュアー UI と承認 API の設計
 
@@ -388,20 +401,44 @@ async def synthesize_few_shots(edits: list[dict]) -> str:
 
 HITL を簡単に壊す方法は、トラフィックを 10 倍にして既存のキュー設計を見直さないことです。ゲートは 10 倍の出力の 5% を律儀にレビューに送り、レビュアーが追いつかず、SLA ウォッチャーが全件をエスカレーションし、本来「丁寧な品質チェック」だったものが「燃えている待ち行列」に変わります。API 層に **バックプレッシャールール** を組み込んでおきます。キュー深度や中央値レビュー時間が一定値を超えたら、新規リクエストを 429 で返すかゲートを 1 分間停止する、といった制御です。本番システムは人間側にもサーキットブレーカーが要ります。
 
+## シャドウレビューの抜き取りを実装する
+
+「自動採用の 5% をシャドウレビューに回す」と書くのは簡単ですが、実装では 2 つの落とし穴があります。一つは、乱数で抜くと再現できず、あとから「なぜこの案件が抜かれたのか」を説明できないこと。もう一つは、抜いた案件を通常のレビュー案件と同じ集計に混ぜてしまい、却下率の意味が変わってしまうことです。
+
+抽出はリクエスト ID のハッシュで決め、キューには `source` 列で出どころを分けます。
+
+```sql
+ALTER TABLE review_queue
+    ADD COLUMN source TEXT NOT NULL DEFAULT 'gate';  -- 'gate' or 'shadow'
+```
+
+```python
+import hashlib
+
+SHADOW_RATE = 0.05
+
+def is_shadow_sample(request_id: str) -> bool:
+    """同じ ID なら常に同じ判定になる（あとから再現できる）。"""
+    h = int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16)
+    return (h / 0xFFFFFFFF) < SHADOW_RATE
+```
+
+`decision == "auto_accept"` でも `is_shadow_sample()` が真なら、出力は顧客へ返したうえで `source='shadow'` でキューへ複製します。顧客への配送を止めないのがポイントです。シャドウ案件の判定は「あとから見て、自動採用で問題なかったか」を確かめるためのもので、承認待ちではありません。
+
+一致率の読み方にも注意が要ります。月に自動採用が 1,000 件なら、5% で 50 件です。95% を目標にした場合の標準誤差はおよそ 3 ポイント（√(0.95×0.05÷50)）ですから、1 週間分の十数件で 93% を切ったからと慌てて閾値を動かすと、ノイズに振り回されます。私は直近 4 週間の累計で判断し、件数が 40 件に届かない間は、アラートではなく目視の確認にとどめています。
+
 ## 実運用パターン — 個人開発者向けの最小構成
 
 「3 層全部はちょっと大きすぎる…」という方のために、個人開発でも回せる最小構成を共有します。
 
 - **インフラ**: Cloud Run（API）+ Cloud SQL for PostgreSQL（キュー）+ Slack（レビュー UI 代用）
 - **レビュアー**: 自分 1 人、または信頼できる同業者 2〜3 人を時間契約
-- **SLA**: critical = 30 分 / major = 4 時間 / minor = 24 時間
+- **SLA**: major = 30 分 / minor = 4 時間 / 低重大度 = 24 時間
 - **フィードバック頻度**: 週 1 回、土曜の朝に 30 分
 
 最小構成のポイントは、**最初からレビュアー UI を専用画面で作らないこと** です。Slack にレビュー要案件を投稿し、3 つのリアクション絵文字で承認・編集・却下を表現します。Slack の Events API でリアクションを拾い、状態機械を進めます。専用 UI は、Slack 運用が回り始めて月間 100 件を超えてから検討するので十分です。
 
 実装の参考になる関連記事として、[Gemini API のコンテンツモデレーション本番システム実装ガイド](/articles/gemini-api/gemini-api-content-moderation-production-system) では同じレビューキューの考え方をモデレーション用途に応用していますし、[Gemini API の Observability — 本番モニタリング設計](/articles/gemini-api/gemini-api-observability-production-monitoring) では信頼度スコアの推移を Grafana で可視化する方法を解説しています。エージェント側に自己批判ループを組み込む応用は [Gemini API で『自己批判するエージェント』を実装する](/articles/gemini-advanced/gemini-api-reflection-critic-refiner-self-improving-agent-production-guide) を併読いただくと相互補完できます。
-
-書籍で体系的に
 
 ## メトリクスとダッシュボード — HITL の健康状態を測る
 
