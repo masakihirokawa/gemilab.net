@@ -5,6 +5,7 @@ category: "gemini-api"
 level: "advanced"
 premium: true
 date: "2026-04-26T04:30"
+updated: "2026-10-16T21:00"
 author: "Gemini Lab"
 description: "A field-tested blueprint for serving Gemini API to multiple tenants on a single backend — covering tenant isolation choices, per-tenant rate limiting in Redis, request-level usage metering for billing, and runaway-cost defenses."
 tags: ["Gemini API", "Multi-Tenant", "SaaS", "Production", "Billing", "Architecture"]
@@ -14,7 +15,7 @@ highlights:
   - "Wire it into FastAPI, test it with a fake Gemini client, and handle sub-tenants and PII without production surprises"
 
 ---
-The first time I sweated over a Gemini-backed SaaS — running the whole thing solo as an indie developer — was the night a single tenant ran an infinite loop against my endpoint, and my Cloud Billing dashboard hit a four-digit USD figure before sunrise.
+The first time I sweated over a Gemini-backed SaaS — running the whole thing solo as an indie developer — was the night a single tenant ran an infinite loop against my endpoint, and my Cloud Billing dashboard climbed to several times what I'd expected before sunrise.
 
 The thing that caught it wasn't a Cloud Billing alert. It was a per-request cost log I'd been streaming to Slack on a hunch. The official alert showed up the next morning. This article is the multi-tenant blueprint I wish I'd had that night.
 
@@ -30,7 +31,7 @@ First, **the unit cost of one request varies wildly across tenants**. The same "
 
 Second, **a single API key (project) means one tenant's runaway hurts every other tenant**. Both Google AI Studio keys and Vertex AI projects enforce rate limits at the project level. If Tenant B floods you with 100 RPS, Tenant A starts getting silent 429s and `DEADLINE_EXCEEDED` errors. Without app-level fairness, you've built a noisy-neighbor disaster.
 
-Third, **cost runaway turns into financial loss instantly**. If you forward user input straight to the LLM and a user writes an infinite-loop script, Gemini 2.5 Pro will rack up four-digit USD bills within a few hours. Failsafes have to live in your code, not in your billing dashboard.
+Third, **cost runaway turns into financial loss instantly**. If you forward user input straight to the LLM and a user writes an infinite-loop script, the bill climbs fast. A call with 50K input and 4K output tokens costs about $0.10 on Pro at the sample prices below; repeat it 20 times a second for an hour and that's roughly $7,400, or about $475 on Flash. Failsafes have to live in your code, not in your billing dashboard.
 
 ## Decision 1: pick a tenant isolation model
 
@@ -138,6 +139,8 @@ class TenantRateLimiter:
         return result != -1
 ```
 
+A note on the clock: `now` is passed from Python's `time.time()`, so clock skew between API servers shows up in the refill amount. If that bothers you, you can call `redis.call('TIME')` inside the Lua script instead (try it on your Redis version first).
+
 Two things matter here. First, **the limits must differ by plan**. SaaS plans usually charge more for higher rate limits, but if you store the plan only in Stripe and never read it from the rate limiter, "I'm on Pro but my throughput is the same as Free" is a complaint you will absolutely receive.
 
 Second, **decide the deny-path UX in advance**. When `try_acquire` returns False, you can (a) immediately return 429, (b) queue briefly and serve later, or (c) return 429 with a `Retry-After` header. For chat UIs I prefer (c). For webhook-style consumers, (a) is more honest because the caller knows how to retry.
@@ -212,8 +215,13 @@ class GeminiClientWithMetering:
                 contents=prompt,
             )
             usage = resp.usage_metadata
-            record.input_tokens = usage.prompt_token_count
-            record.output_tokens = usage.candidates_token_count
+            record.input_tokens = usage.prompt_token_count or 0
+            # Thinking tokens are billed at the output rate but are NOT in
+            # candidates_token_count. Add the separate field
+            record.output_tokens = (
+                (usage.candidates_token_count or 0)
+                + (usage.thoughts_token_count or 0)
+            )
             record.cost_usd = _calc_cost(
                 model, record.input_tokens, record.output_tokens
             )
@@ -230,6 +238,28 @@ class GeminiClientWithMetering:
 ```
 
 The non-obvious detail here is **always calling `recorder.persist()` from the `finally` block**. Even when an exception fires, you may have been charged for input tokens already (especially with streaming, where the network can drop mid-output). Implementations that "only record on success" reliably under-report by a few percent, and that's the few percent that turns into dispute calls at the end of the month.
+
+### A hole I found on review: thinking tokens, and failed calls
+
+In my first version of this section the output side was counted from `candidates_token_count` alone. What stopped me was rereading one line of the official docs: with thinking on, response pricing is the sum of output tokens and thinking tokens. `candidates_token_count` holds only the visible answer; the tokens spent thinking arrive separately in `thoughts_token_count`.
+
+Take a call with 1,000 input tokens, a 200-token visible answer and 3,000 thinking tokens, priced with the Flash row of the table above:
+
+<table>
+  <thead>
+    <tr><th>How you count</th><th>Output tokens counted</th><th>Cost per call (USD)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>candidates_token_count</code> only</td><td>200</td><td>0.00018</td></tr>
+    <tr><td>Thinking tokens added</td><td>3,200</td><td>0.00138</td></tr>
+  </tbody>
+</table>
+
+That is 16x on the output side and about 7.7x on the whole call. If your records silently drop that difference, both the customer invoice and the budget guard drift below real spend, and because thinking volume swings from prompt to prompt you can't correct for it with an average. **Take the number you bill from what is charged, not from what is visible** — that's the line I drew. The code above now adds `thoughts_token_count`; the `or 0` is there because the field can be `None` depending on the SDK version and the model.
+
+The `gemini-2.5-*` IDs in the code are examples. Google's changelog in September 2026 limited the 2.5 family to recent users, so if you're starting fresh, swap in a current Flash model ID and load prices from the official pricing page rather than hard-coding them.
+
+One more gap: a failed call recorded in the `finally` block is stored with zero output tokens, even when Google may have charged for it. Code can't close that difference. Once a month, compare the sum of `usage_records` against your Cloud Billing export (BigQuery) and look at the size of the gap. While it's small, leave it alone; past some percentage you set, suspect dropped records.
 
 A reasonable Postgres schema for `usage_records` looks like this:
 
@@ -285,7 +315,7 @@ import asyncpg
 
 class TenantBudgetGuard:
     """Keeps a per-tenant 'spend so far this month' number cached briefly,
-    and warns/blocks at 80% and 100% of plan budget."""
+    and warns at 80% and blocks at 105% of plan budget."""
 
     PLAN_BUDGETS = {
         "free":       0.50,
@@ -294,17 +324,19 @@ class TenantBudgetGuard:
         "enterprise": 2000.0,  # hard cap; negotiated up-front per contract
     }
 
-    GRACE_RATIO = 1.05  # allow a tiny overshoot for accounting precision
+    GRACE_RATIO = 1.05  # tolerate 5% so a lagging rollup doesn't reject borderline calls
 
     def __init__(self, pool: asyncpg.Pool, alerter):
         self.pool = pool
         self.alerter = alerter
         self._cache: dict[str, tuple[float, datetime]] = {}
-        self._lock = asyncio.Lock()
+        self._locks: dict[str, asyncio.Lock] = {}              # one lock per tenant
+        self._alerted: set[tuple[str, str, str]] = set()       # (tenant, month, kind)
 
     async def _current_spend(self, tenant_id: str) -> float:
         # 60-second cache. We trade strict freshness for many fewer DB hits.
-        async with self._lock:
+        lock = self._locks.setdefault(tenant_id, asyncio.Lock())
+        async with lock:
             cached = self._cache.get(tenant_id)
             now = datetime.now(timezone.utc)
             if cached and (now - cached[1]).total_seconds() < 60:
@@ -321,22 +353,118 @@ class TenantBudgetGuard:
             self._cache[tenant_id] = (spend, now)
             return spend
 
+    async def _alert_once(self, kind: str, tenant_id: str, spend: float, budget: float):
+        # One notification per tenant, month and kind ("warning" or "blocked")
+        key = (tenant_id, datetime.now(timezone.utc).strftime("%Y-%m"), kind)
+        if key in self._alerted:
+            return
+        self._alerted.add(key)
+        await getattr(self.alerter, f"notify_{kind}")(tenant_id, spend, budget)
+
     async def allow(self, ctx) -> bool:
         budget = self.PLAN_BUDGETS[ctx.plan]
         spend = await self._current_spend(ctx.tenant_id)
 
         if spend >= budget * self.GRACE_RATIO:
-            await self.alerter.notify_blocked(ctx.tenant_id, spend, budget)
+            await self._alert_once("blocked", ctx.tenant_id, spend, budget)
             return False
 
-        if spend >= budget * 0.80 and spend < budget * 0.85:
-            # Fire one warning when we cross 80%. Naive, but it works.
-            await self.alerter.notify_warning(ctx.tenant_id, spend, budget)
+        if spend >= budget * 0.80:
+            await self._alert_once("warning", ctx.tenant_id, spend, budget)
 
         return True
 ```
 
-Computing `_current_spend` from Postgres on every request will cook your DB if any tenant gets hot. **The 60-second cache is the realistic compromise: nearly real-time, but not pretending to be exact.** If you really need exact, push a Redis `INCRBYFLOAT` counter alongside the persistence layer and reconcile it against the DB nightly.
+The first version of this code had three holes I only saw on review.
+
+The first was a lock shared by every tenant. One `asyncio.Lock()` was held across the DB rollup, so a slow rollup for a hot tenant made every unrelated tenant's `allow()` wait in line — the mechanism meant to separate tenants was serializing them. The code above keeps one lock per tenant. In a fake environment where the DB takes 0.05s to answer, ten tenants going through together took about 0.5s with the shared lock and about 0.05s with per-tenant locks.
+
+The second was the warning condition. Notifying only while spend sits between 80% and 85% means that if spend jumps from 79% to 90% between cache refreshes, no warning ever fires; and while it stays under 85%, a notification goes out on every request. The condition is now "at or above 80%", with one notification per (tenant, month, kind). That set lives in process memory, so with several API servers you'll get one notification per server. Once you scale out, move it to Redis `SET NX`.
+
+The third is how much overshoot the 60-second cache allows. The next part puts a number on it.
+
+### How far can the 60-second cache let you overshoot?
+
+Computing `_current_spend` from Postgres on every request will cook your DB if any tenant gets hot. The 60-second cache is the realistic compromise — nearly real-time, but not exact — and I had never put a number on that "nearly".
+
+The guard sees only spend confirmed up to 60 seconds ago. And since `usage_records` is written after a call finishes, requests still in flight are invisible too. So suppose the guard says "still room" and then, for the next 60 seconds, the tenant sends as many calls as the rate limiter from Decision 3 lets through. How far over can it go? I computed it from each plan's limits (burst capacity plus 60 seconds of refill). Each call is assumed to be Pro with 50K input and 4K output tokens at the sample prices (about $0.1025).
+
+<table>
+  <thead>
+    <tr><th>Plan</th><th>Monthly budget</th><th>Max requests passed in 60s</th><th>Possible overshoot (Pro)</th><th>Share of budget</th><th>Same on Flash</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>free</td><td>$0.50</td><td>70</td><td>about $7.17</td><td>about 1,435%</td><td>about 92%</td></tr>
+    <tr><td>starter</td><td>$20</td><td>350</td><td>about $35.88</td><td>about 179%</td><td>about 12%</td></tr>
+    <tr><td>pro</td><td>$200</td><td>1,400</td><td>about $143.50</td><td>about 72%</td><td>about 5%</td></tr>
+    <tr><td>enterprise</td><td>$2,000</td><td>7,000</td><td>about $717.50</td><td>about 36%</td><td>about 2%</td></tr>
+  </tbody>
+</table>
+
+The 1,435% for free looks absurd, but it's what happens if free can call Pro. Restrict free and starter to Flash-class models and the same arithmetic gives about $0.46 and $2.31. I realized per-plan rate limits and per-plan model access have to be decided together when I laid this table out.
+
+This is the worst alignment — the guard looking at a stale number just under the limit. It won't happen every time. Still, the precision of a monthly budget guard is set by "60 seconds x pass-through rate x cost per call", and that doesn't change.
+
+**A budget guard should watch not "how much was spent" but "how much can be spent in the next 60 seconds".**
+
+There are two ways to shrink that. Shorten the cache, which trades against DB load, or reserve the worst-case cost before the call. Here's the second. Keep a monthly estimated-spend counter in Redis, add the worst case before the call, roll it back and reject if it would exceed the budget, and settle with the actual cost afterwards.
+
+```python
+# spend_ledger.py
+from datetime import datetime, timezone
+
+class SpendLedger:
+    """Estimated spend for this month, kept in Redis. Reserve the worst case
+    before a call, settle with the actual cost after."""
+
+    def __init__(self, redis_client, db_spend, budgets: dict, grace: float = 1.05):
+        self.redis = redis_client
+        self.db_spend = db_spend      # async (tenant_id) -> confirmed spend this month (DB rollup)
+        self.budgets = budgets
+        self.grace = grace
+
+    async def reserve(self, ctx, est_usd: float) -> str | None:
+        """Returns the Redis key if reserved, or None if it would break the budget."""
+        key = f"spend:{ctx.tenant_id}:{datetime.now(timezone.utc):%Y%m}"
+        if not await self.redis.exists(key):
+            # Seed once from the DB. NX means concurrent callers seed it only once
+            await self.redis.set(key, await self.db_spend(ctx.tenant_id),
+                                 nx=True, ex=40 * 86400)
+        after = float(await self.redis.incrbyfloat(key, est_usd))
+        if after > self.budgets[ctx.plan] * self.grace:
+            await self.redis.incrbyfloat(key, -est_usd)   # give the reservation back
+            return None
+        return key
+
+    async def settle(self, key: str, est_usd: float, actual_usd: float) -> None:
+        """Apply the difference between estimate and actual. A failed call
+        passes actual_usd=0, which releases the reservation."""
+        await self.redis.incrbyfloat(key, actual_usd - est_usd)
+```
+
+On the calling side, use this flow in place of `budget_guard.allow()`:
+
+```python
+MAX_OUT = 4096   # max_output_tokens; the cap includes thinking tokens
+
+p = MODEL_PRICING[model]
+est = (len(prompt) * p["input"] + MAX_OUT * p["output"]) / 1_000_000
+key = await ledger.reserve(ctx, est)
+if key is None:
+    raise PermissionError(f"tenant {ctx.tenant_id} over monthly budget")
+try:
+    resp = await client.aio.models.generate_content(
+        model=model, contents=prompt,
+        config=types.GenerateContentConfig(max_output_tokens=MAX_OUT),
+    )
+    ...  # put the actual cost in record.cost_usd
+finally:
+    await ledger.settle(key, est, record.cost_usd)   # 0 on failure releases it
+```
+
+The worst case uses character count for the input side and `max_output_tokens` for the output side. Character count tends to be at or above the token count in most languages, but that's a rule of thumb, not a guarantee. The official docs count thinking tokens inside the output cap, and a response that hits the cap is cut off, so it's a UX trade-off.
+
+In my test, a tenant with $190 already confirmed in the DB was hit with 200 reservations of $0.1025 each; 195 were admitted and the total stopped at $209.99, just under 105% of budget. When all 195 were settled as failures, the counter went back to $190 (checked against a simple stand-in for Redis). A Redis counter drifts from the DB a little at a time, so pair it with a nightly overwrite from the `usage_records` rollup.
 
 In addition, run a **service-wide circuit breaker**. When you detect sustained Gemini 5xx bursts or your Cloud Billing alarm fires, flip a Redis health key to `down` and short-circuit every Gemini call to a graceful error response. The detailed cost-spike playbook is in [Defending Gemini API costs against runaway spend](/articles/gemini-api/gemini-api-cost-spike-defense-budget-guardrails) — it pairs nicely with the budget guard above.
 
@@ -346,7 +474,7 @@ This isn't theory. Each of these cost me a real evening.
 
 ### Pitfall 1: losing token counts in streaming responses
 
-`generate_content_stream()` only puts `usage_metadata` on the **final** chunk. If you `break` early, or you accidentally drop the last chunk, your token counter is permanently zero. I noticed only when reconciling Cloud Billing against my DB at month-end.
+`generate_content_stream()` only puts `usage_metadata` on the **final** chunk. If you `break` early, or you accidentally drop the last chunk, your token counter is permanently zero. I noticed only when reconciling Cloud Billing against my DB at month-end. What happens on the server side after the client breaks the connection, and how that shows up in billing, is something my own logs can't confirm; a monthly reconciliation shows the size of that gap.
 
 ```python
 # Wrong
@@ -522,7 +650,7 @@ A subtler PII risk is the **response**. If your tenants build chatbots that stre
 
 ## Why request_id deserves a section of its own
 
-Among all the IDs in this design, `request_id` is the one that quietly determines whether your system is debuggable. Every layer needs to log it, every retry must reuse it, and every storage row must reference it.
+Among all the IDs in this design, `request_id` is the one that decides whether your system is debuggable. Every layer needs to log it, every retry must reuse it, and every storage row must reference it.
 
 I generate `request_id` as a ULID at the API gateway (or the FastAPI middleware as shown above) before any business logic runs. From there:
 
@@ -537,13 +665,13 @@ Once `request_id` is the spine of your observability, post-incident analysis tim
 
 You don't ship all of this on day one. Here's the order I'd take if I were starting fresh.
 
-1. **Week 1 — TenantContext and the usage_records table**: emit a context from the auth middleware and persist tokens around every Gemini call. The "who used how much" question becomes a SQL query immediately.
+1. **Week 1 — TenantContext and the usage_records table**: emit a context from the auth middleware and persist tokens (thinking tokens included) around every Gemini call. The "who used how much" question becomes a SQL query immediately.
 2. **Week 2 — per-tenant token-bucket rate limiter**: stand up Redis and split free vs pro for now. Refine plans later.
-3. **Week 3 — budget guard with 80%/100% alerts**: wire alerts to Slack and email at the same time.
+3. **Week 3 — budget guard with 80%/100% alerts**: wire alerts to Slack and email at the same time, and add the reservation approach (SpendLedger) here if you have room.
 4. **Week 4 — the five dashboard panels**: tune thresholds against real numbers. Many of your initial guesses will be wrong, and that's the point.
 5. **Week 5+ — BYOK, PII masking, and a richer circuit breaker**: drive these by what real customers ask for, not by what you imagine they'll ask for.
 
-For the API-side companion patterns (project-level quota, retry budgets, Rate-Limit headers), [Gemini API rate limiting and quota management for production](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) is the right next read. If your runtime is Cloud Run, [Building a usage-based SaaS on Gemini API + Cloud Run](/articles/gemini-api/gemini-api-cloud-run-usage-based-saas-complete-guide) walks through the deployment shape that pairs well with this design.
+For the API-side companion patterns (project-level quota, retry budgets, Rate-Limit headers), [Gemini API rate limiting and quota management for production](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) is the right next read. If your runtime is Cloud Run, [Running Gemini API on Cloud Run in production](/articles/gemini-dev/gemini-cloud-run-serverless-ai-api-production) covers the deployment shape that pairs well with this design.
 
 ## Where to start
 
