@@ -59,9 +59,8 @@ export default async function LocaleLayout({
           }}
         />
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
-        {/* Google Analytics — loaded directly without consent gate (not required under Japanese law) */}
-        <script async src="https://www.googletagmanager.com/gtag/js?id=G-CJWM68JK57" />
-        <script dangerouslySetInnerHTML={{ __html: `window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments)}gtag('js',new Date());gtag('config','G-CJWM68JK57')` }} />
+        {/* Google Analytics — 計測の呼び出しはすぐ積み、gtag.js（約 150KB）の読み込みだけ load 後に回す（2026-10-17・初回描画と操作の応答を優先） */}
+        <script dangerouslySetInnerHTML={{ __html: `window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments)}gtag('js',new Date());gtag('config','G-CJWM68JK57');(function(){function l(){var s=document.createElement('script');s.async=true;s.src='https://www.googletagmanager.com/gtag/js?id=G-CJWM68JK57';document.head.appendChild(s)}if(document.readyState==='complete')setTimeout(l,0);else addEventListener('load',function(){setTimeout(l,0)},{once:true})})()` }} />
         <link rel="alternate" type="application/rss+xml" title="Gemini Lab RSS" href={locale === "ja" ? "/feed.xml" : "/en/feed.xml"} />
       </head>
       <body>
