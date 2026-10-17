@@ -5,7 +5,7 @@ import { useLocale } from "next-intl";
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
     "ARGON — gemini-4-argon が 10/13 に GA。複雑なコーディング・エージェント・数学・科学向けです",
-    "DEEP RES — deep-research-pro-preview-12-2025 は 10/23 に停止、残り7日。移行先は deep-research-preview-04-2026",
+    "DEEP RES — deep-research-pro-preview-12-2025 は 10/23 に停止、残り6日。移行先は deep-research-preview-04-2026",
     "NANO — gemini-nano-banana-2.1 が GA（10/06）。gemini-3.1-flash-image は非推奨で停止日は未発表です",
     "MCP — ツール結果が 8.5万トークンに膨らんだ事例を、ADK で 310 トークンに包んで抑えた報告が出ています",
     "FLASH — gemini-3.7-flash と 3.5-flash は新しい Flash モデルに自動で回されます（10/08）",
@@ -13,7 +13,7 @@ ja: [
   ],
   en: [
     "ARGON — gemini-4-argon is generally available as of 10/13, aimed at complex coding, agents, math and science",
-    "DEEP RES — deep-research-pro-preview-12-2025 shuts down 10/23, 7 days left. Move to deep-research-preview-04-2026",
+    "DEEP RES — deep-research-pro-preview-12-2025 shuts down 10/23, 6 days left. Move to deep-research-preview-04-2026",
     "NANO — gemini-nano-banana-2.1 is GA (10/06). gemini-3.1-flash-image is deprecated with no shutdown date yet",
     "MCP — One write-up cut an 85,000-token tool result to 310 tokens by wrapping it in an ADK FunctionTool",
     "FLASH — gemini-3.7-flash and 3.5-flash now route automatically to newer Flash models (10/08)",
