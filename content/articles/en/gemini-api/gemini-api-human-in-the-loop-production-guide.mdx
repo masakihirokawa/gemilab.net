@@ -5,7 +5,7 @@ category: "gemini-api"
 level: "advanced"
 premium: true
 date: "2026-04-28T04:30"
-updated: "2026-10-16T13:29"
+updated: "2026-10-18T20:32"
 author: "Gemini Lab"
 description: "Fully automating Gemini API output is risky, but reviewing every response by hand is impractical. This guide walks through a Human-in-the-Loop architecture in three layers — confidence gating, review queues, and feedback loops — at production-implementation depth."
 tags: ["gemini-api", "human-in-the-loop", "hitl", "production", "quality-assurance", "review-queue"]
@@ -88,8 +88,8 @@ class CritiqueResult(BaseModel):
     issues: list[str]
     severity: Literal["none", "minor", "major", "critical"]
 
-PRO_MODEL = "gemini-2.5-pro"
-FLASH_MODEL = "gemini-2.5-flash"
+PRO_MODEL = os.environ.get("HITL_PRO_MODEL", "gemini-2.5-pro")
+FLASH_MODEL = os.environ.get("HITL_FLASH_MODEL", "gemini-2.5-flash")
 
 def generate_with_logprobs(prompt: str) -> tuple[str, float | None]:
     """Main generation. Returns text plus an avg_logprob-derived confidence."""
@@ -180,7 +180,7 @@ def hitl_decision(prompt: str) -> dict:
     }
 
 if __name__ == "__main__":
-    result = hitl_decision("Summarize the eligibility rules for the small-business income deduction.")
+    result = hitl_decision("Can an opened item be returned? Answer briefly, following our return policy.")
     print(result)
     # Expected output:
     # {'output': '...', 'decision': 'auto_accept',
@@ -189,6 +189,8 @@ if __name__ == "__main__":
 ```
 
 The most important point here is that **the three weights are not meant to be hard-coded forever**. Start with the empirical defaults (0.3 / 0.5 / 0.2) and let the third layer's feedback loop adjust them once you have real reviewer data.
+
+The model names in the sample are read from environment variables. The ai.google.dev changelog notes that, as of September 18, the 2.5 family is limited to past users (it is not deprecated). If you are starting fresh, put whichever model names your own project can actually call into `HITL_PRO_MODEL` and `HITL_FLASH_MODEL` before running anything. `logprobs` is also not returned for every model, which is why the code above treats a missing value as a first-class case.
 
 ### Why Self-Critique Should Run on Flash, Not Pro
 
@@ -340,11 +342,65 @@ I split it into two stages:
 2. A separate worker pulls `approved` rows on a timer and ships the response to the customer
 3. Successful delivery sets a `delivered` flag; failures go to a dead-letter queue
 
-This separation lets the delivery side handle retries, fan-out, and failure isolation independently from the human reviewing the content.
+This separation lets the delivery side handle retries, fan-out, and failure isolation independently from the human reviewing the content. The split has a catch, though, which I only appreciated later; the next section covers it (items finished as `edited` must be delivered too).
 
 A practical detail on the UI itself: keep the prompt and the output side by side, not stacked. Reviewers compare them visually, and a stacked layout doubles the eye distance for that comparison. Color-code the issues array — red for `critical`, amber for `major`, gray for `minor` — and put the issues directly above the output, not in a side panel. The reviewer's first instinct should be "what's the model already worried about?" rather than "where do I look for the warnings?" That single change cut my reviewers' decision time by about 25% in A/B trials.
 
 Finally, give reviewers a one-key shortcut for the three actions. Approve = `a`, Edit = `e`, Reject = `r`. Reviewers process dozens or hundreds of items, and every saved click compounds. The shortcut also nudges reviewers toward intentional decisions — clicking takes longer to feel deliberate than tapping a key.
+
+## Delivery After Approval — Avoiding Double Sends and Dropped Items
+
+If you implement the three steps above literally, two gaps are easy to miss.
+
+First, a worker that only picks up `approved` rows will never deliver items a reviewer finished as `edited`. Second, if a worker crashes right after sending but before `delivered` is set, the next pass sends the same item again. It is tempting to leave the delivery side for "later" while you polish the queue — but it is the layer that touches the customer last.
+
+So give the delivery side a lease and an idempotency key.
+
+```sql
+ALTER TABLE review_queue
+    ADD COLUMN delivered_at TIMESTAMPTZ,
+    ADD COLUMN delivery_attempts INT NOT NULL DEFAULT 0,
+    ADD COLUMN delivery_lease_until TIMESTAMPTZ;
+```
+
+```python
+async def lease_for_delivery(pool, batch: int = 20, lease_seconds: int = 120) -> list[dict]:
+    """未配送の案件を短い貸出期間つきで取得する（複数ワーカーでも二重取得しない）。"""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            UPDATE review_queue
+               SET delivery_lease_until = now() + make_interval(secs => $2),
+                   delivery_attempts = delivery_attempts + 1
+             WHERE id IN (
+                   SELECT id FROM review_queue
+                    WHERE state IN ('approved', 'edited')
+                      AND delivered_at IS NULL
+                      AND delivery_attempts < 5
+                      AND (delivery_lease_until IS NULL OR delivery_lease_until < now())
+                    ORDER BY decided_at
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED)
+         RETURNING id, COALESCE(final_output, output) AS body
+        """, batch, float(lease_seconds))
+        return [dict(r) for r in rows]
+
+async def deliver_once(pool, send):
+    """send(idempotency_key, body) は呼び出し側で用意する配送関数。"""
+    for item in await lease_for_delivery(pool):
+        try:
+            await send(str(item["id"]), item["body"])  # 受け側が id を冪等キーとして扱う
+        except Exception as e:
+            print(f"[deliver] {item['id']} failed: {e}")
+            continue
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE review_queue SET delivered_at = now() WHERE id = $1", item["id"]
+            )
+```
+
+Three details matter here: include `edited` in the delivery filter, use `FOR UPDATE SKIP LOCKED` so two workers never take the same item, and pass the item ID to the receiver as an idempotency key. If a worker dies after sending, the lease expires and the item is picked up again, but the receiver rejects the repeated ID, so the customer still gets one message. Anything with `delivery_attempts` at 5 and an empty `delivered_at` is your dead-letter set; route it to its own alert.
+
+**Whether something was sent is decided by the receiver's record of the ID, not by the sender's memory.** Settling that rule up front removes a lot of guesswork on the delivery side.
 
 ## Feedback Loop — Recycling Reviewer Decisions Into Prompt Improvements
 
@@ -376,7 +432,7 @@ each containing the question and the ideal answer.
 {samples}
 """
     resp = client.models.generate_content(
-        model="gemini-2.5-pro", contents=prompt,
+        model=PRO_MODEL, contents=prompt,
         config=types.GenerateContentConfig(temperature=0.2),
     )
     return resp.text
