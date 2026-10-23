@@ -2,6 +2,7 @@ import { seoTitleFor, seoDescription } from "@/lib/seo-text";
 import { getBlogPost, getBlogPosts, getBlogContent } from "@/lib/content";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
+import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string; slug: string }>;
@@ -19,13 +20,13 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       description: post.meta.description,
       type: "article",
       publishedTime: post.meta.date,
-      images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 1200, alt: post.meta.title, type: "image/png" }],
+      images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: post.meta.title, type: "image/png" }],
     },
     twitter: {
       card: "summary_large_image",
       title: post.meta.title,
       description: post.meta.description,
-      images: [{ url: "https://gemilab.net/og/default.png", alt: post.meta.title }],
+      images: [{ url: siteOgImage(locale), alt: post.meta.title }],
     },
     alternates: {
       canonical: locale === "ja" ? `https://gemilab.net/blog/${slug}` : `https://gemilab.net/en/blog/${slug}`,

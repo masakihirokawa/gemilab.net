@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { getArticlesByCategory, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { ArticlePagination } from "@/components/ui/ArticlePagination";
+import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string; category: string }>;
@@ -28,7 +29,7 @@ async function baseCategoryMetadata({ params }: Pick<Props, "params">): Promise<
   return {
     title,
     description,
-    openGraph: { title, description, images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 1200, alt: "Gemini Lab", type: "image/png" }] },
+    openGraph: { title, description, images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: "Gemini Lab", type: "image/png" }] },
     alternates: {
       canonical: locale === "ja" ? `https://gemilab.net/articles/${category}` : `https://gemilab.net/en/articles/${category}`,
       languages: {

@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { ArticlePagination } from "@/components/ui/ArticlePagination";
+import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -24,7 +25,7 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
   const metadata: Metadata = {
     title,
     description,
-    openGraph: { title, description, images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 1200, alt: "Gemini Lab", type: "image/png" }] },
+    openGraph: { title, description, images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: "Gemini Lab", type: "image/png" }] },
     alternates: {
       canonical: canonicalUrl,
       languages: {

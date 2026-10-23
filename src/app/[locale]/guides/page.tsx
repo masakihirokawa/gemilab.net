@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { getArticles, CATEGORIES } from "@/lib/content";
+import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -14,7 +15,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   return {
     title,
     description,
-    openGraph: { title, description, images: [{ url: "https://gemilab.net/og/default.png", width: 1200, height: 1200, alt: "Gemini Lab", type: "image/png" }] },
+    openGraph: { title, description, images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: "Gemini Lab", type: "image/png" }] },
     alternates: {
       canonical: locale === "ja" ? "https://gemilab.net/guides" : `https://gemilab.net/en/guides`,
       languages: {
