@@ -8,7 +8,7 @@ ja: [
     "DEEP RES — 旧 Deep Research エージェントは 10/23 に停止済み。呼び出しが失敗する場合は deep-research-preview-04-2026 へ",
     "NANO — gemini-nano-banana-2.1 が GA（10/06）。gemini-3.1-flash-image は非推奨で停止日は未発表です",
     "MCP — ツール結果が 8.5万トークンに膨らんだ事例を、ADK で 310 トークンに包んで抑えた報告が出ています",
-    "FLASH — gemini-3.7-flash と 3.5-flash は新しい Flash モデルに自動で回されます（10/08）",
+    "STORE — 新規の有料プロジェクトでは生成リクエストの保存（store）が既定でオンになります（10/26）",
     "NEW — クラッシュ報告を毎回ゼロから読ませない — 既知バグ早見表を先に grep し…",
   ],
   en: [
@@ -16,7 +16,7 @@ ja: [
     "DEEP RES — The old Deep Research agent shut down on 10/23. If calls fail, move to deep-research-preview-04-2026",
     "NANO — gemini-nano-banana-2.1 is GA (10/06). gemini-3.1-flash-image is deprecated with no shutdown date yet",
     "MCP — One write-up cut an 85,000-token tool result to 310 tokens by wrapping it in an ADK FunctionTool",
-    "FLASH — gemini-3.7-flash and 3.5-flash now route automatically to newer Flash models (10/08)",
+    "STORE — New paid projects now save Generate Content requests by default (store on) as of 10/26",
     "NEW — Stop Re-Reading Every Crash Report: Gre…"
   ]
 };
