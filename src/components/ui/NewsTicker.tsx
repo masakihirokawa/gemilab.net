@@ -7,7 +7,7 @@ ja: [
     "ARGON — gemini-4-argon が 10/13 に GA。複雑なコーディング・エージェント・数学・科学向けです",
     "DEEP RES — 旧 Deep Research エージェントは 10/23 に停止済み。呼び出しが失敗する場合は deep-research-preview-04-2026 へ",
     "NANO — gemini-nano-banana-2.1 が GA（10/06）。gemini-3.1-flash-image は非推奨で停止日は未発表です",
-    "MCP — ツール結果が 8.5万トークンに膨らんだ事例を、ADK で 310 トークンに包んで抑えた報告が出ています",
+    "CLI — Gemini API CLI（gemini-api）がベータで登場（10/27）。エージェントやCI向けのゼロ依存クライアントです",
     "STORE — 新規の有料プロジェクトでは生成リクエストの保存（store）が既定でオンになります（10/26）",
     "NEW — クラッシュ報告を毎回ゼロから読ませない — 既知バグ早見表を先に grep し…",
   ],
@@ -15,7 +15,7 @@ ja: [
     "ARGON — gemini-4-argon is generally available as of 10/13, aimed at complex coding, agents, math and science",
     "DEEP RES — The old Deep Research agent shut down on 10/23. If calls fail, move to deep-research-preview-04-2026",
     "NANO — gemini-nano-banana-2.1 is GA (10/06). gemini-3.1-flash-image is deprecated with no shutdown date yet",
-    "MCP — One write-up cut an 85,000-token tool result to 310 tokens by wrapping it in an ADK FunctionTool",
+    "CLI — Gemini API CLI (gemini-api) is out in beta (10/27): a zero-dependency client for agents and CI",
     "STORE — New paid projects now save Generate Content requests by default (store on) as of 10/26",
     "NEW — Stop Re-Reading Every Crash Report: Gre…"
   ]
