@@ -5,7 +5,7 @@ import { useLocale } from "next-intl";
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
     "ARGON — gemini-4-argon が 10/13 に GA。複雑なコーディング・エージェント・数学・科学向けです",
-    "DEEP RES — 旧 Deep Research エージェントは 10/23 に停止済み。呼び出しが失敗する場合は deep-research-preview-04-2026 へ",
+    "COMPUTER — Computer Use が Interactions / GenerateContent API で GA になりました（10/30）",
     "NANO — gemini-nano-banana-2.1 が GA（10/06）。gemini-3.1-flash-image は非推奨で停止日は未発表です",
     "CLI — Gemini API CLI（gemini-api）がベータで登場（10/27）。エージェントやCI向けのゼロ依存クライアントです",
     "STORE — 新規の有料プロジェクトでは生成リクエストの保存（store）が既定でオンになります（10/26）",
@@ -13,7 +13,7 @@ ja: [
   ],
   en: [
     "ARGON — gemini-4-argon is generally available as of 10/13, aimed at complex coding, agents, math and science",
-    "DEEP RES — The old Deep Research agent shut down on 10/23. If calls fail, move to deep-research-preview-04-2026",
+    "COMPUTER — Computer Use is now generally available in the Interactions and GenerateContent APIs (10/30)",
     "NANO — gemini-nano-banana-2.1 is GA (10/06). gemini-3.1-flash-image is deprecated with no shutdown date yet",
     "CLI — Gemini API CLI (gemini-api) is out in beta (10/27): a zero-dependency client for agents and CI",
     "STORE — New paid projects now save Generate Content requests by default (store on) as of 10/26",
