@@ -67,6 +67,7 @@ export default async function HomePage({ params }: Props) {
     "@context": "https://schema.org",
     "@type": "WebSite",
     name: "Gemini Lab",
+    alternateName: ["GeminiLab", "gemilab.net"],
     url: `https://gemilab.net${prefix}`,
     description: META[locale]?.description || META.en.description,
     inLanguage: locale === "ja" ? "ja" : "en",
