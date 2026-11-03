@@ -6,7 +6,7 @@ const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
     "ARGON — gemini-4-argon が 10/13 に GA。複雑なコーディング・エージェント・数学・科学向けです",
     "COMPUTER — Computer Use が Interactions / GenerateContent API で GA になりました（10/30）",
-    "LIVE — Live と TTS のプレビュー版は最短 11/17 に停止します（残り14日）。移行先は gemini-3.8-live と 3.8 系 TTS です",
+    "LIVE — Live と TTS のプレビュー版は最短 11/17 に停止します（残り13日）。移行先は gemini-3.8-live と 3.8 系 TTS です",
     "CLI — Gemini API CLI（gemini-api）がベータで登場（10/27）。エージェントやCI向けのゼロ依存クライアントです",
     "STORE — 新規の有料プロジェクトでは生成リクエストの保存（store）が既定でオンになります（10/26）",
     "NEW — クラッシュ報告を毎回ゼロから読ませない — 既知バグ早見表を先に grep し…",
@@ -14,7 +14,7 @@ ja: [
   en: [
     "ARGON — gemini-4-argon is generally available as of 10/13, aimed at complex coding, agents, math and science",
     "COMPUTER — Computer Use is now generally available in the Interactions and GenerateContent APIs (10/30)",
-    "LIVE — Live and TTS preview models shut down as early as 11/17 (14 days left). Move to gemini-3.8-live and the 3.8 TTS models",
+    "LIVE — Live and TTS preview models shut down as early as 11/17 (13 days left). Move to gemini-3.8-live and the 3.8 TTS models",
     "CLI — Gemini API CLI (gemini-api) is out in beta (10/27): a zero-dependency client for agents and CI",
     "STORE — New paid projects now save Generate Content requests by default (store on) as of 10/26",
     "NEW — Stop Re-Reading Every Crash Report: Gre…"
