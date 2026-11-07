@@ -4,19 +4,19 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "ARGON — gemini-4-argon が 10/13 に GA。複雑なコーディング・エージェント・数学・科学向けです",
+    "OMNI 1.2 — Gemini Omni 1.2 Flash が GA になりました（11/5）。最長15秒の動画生成と会話での編集に対応し、1.1 Flash は 12/3 に自動で 1.2 へ振り替わります",
     "COMPUTER — Computer Use が Interactions / GenerateContent API で GA になりました（10/30）",
-    "LIVE — Live と TTS のプレビュー版は最短 11/17 に停止します（残り11日）。移行先は gemini-3.8-live と 3.8 系 TTS です",
+    "LIVE — Live と TTS のプレビュー版は最短 11/17 に停止します（残り10日）。移行先は gemini-3.8-live と 3.8 系 TTS です",
     "CLI — Gemini API CLI（gemini-api）がベータで登場（10/27）。エージェントやCI向けのゼロ依存クライアントです",
-    "STORE — 新規の有料プロジェクトでは生成リクエストの保存（store）が既定でオンになります（10/26）",
+    "2.5 PRO — gemini-2.5-pro と 2.5-flash は 12/1 から自動で振り替えられます（残り24日）。移行先は 3.8 Flash と 3.5 Flash-Lite です",
     "NEW — クラッシュ報告を毎回ゼロから読ませない — 既知バグ早見表を先に grep し…",
   ],
   en: [
-    "ARGON — gemini-4-argon is generally available as of 10/13, aimed at complex coding, agents, math and science",
+    "OMNI 1.2 — Gemini Omni 1.2 Flash is generally available (11/5) with up to 15-second video and conversational editing; 1.1 Flash is routed to 1.2 on 12/3",
     "COMPUTER — Computer Use is now generally available in the Interactions and GenerateContent APIs (10/30)",
-    "LIVE — Live and TTS preview models shut down as early as 11/17 (11 days left). Move to gemini-3.8-live and the 3.8 TTS models",
+    "LIVE — Live and TTS preview models shut down as early as 11/17 (10 days left). Move to gemini-3.8-live and the 3.8 TTS models",
     "CLI — Gemini API CLI (gemini-api) is out in beta (10/27): a zero-dependency client for agents and CI",
-    "STORE — New paid projects now save Generate Content requests by default (store on) as of 10/26",
+    "2.5 PRO — gemini-2.5-pro and 2.5-flash are routed automatically on 12/1 (24 days left), to 3.8 Flash and 3.5 Flash-Lite",
     "NEW — Stop Re-Reading Every Crash Report: Gre…"
   ]
 };
