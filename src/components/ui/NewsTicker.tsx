@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-ja: [
-    "OMNI 1.2 — Gemini Omni 1.2 Flash が GA になりました（11/5）。最長15秒の動画生成と会話での編集に対応し、1.1 Flash は 12/3 に自動で 1.2 へ振り替わります",
-    "COMPUTER — Computer Use が Interactions / GenerateContent API で GA になりました（10/30）",
-    "LIVE — Live と TTS のプレビュー版は最短 11/17 に停止します（残り7日）。移行先は gemini-3.8-live と 3.8 系 TTS です",
-    "CLI — Gemini API CLI（gemini-api）がベータで登場（10/27）。エージェントやCI向けのゼロ依存クライアントです",
-    "2.5 PRO — gemini-2.5-pro と 2.5-flash は 12/1 から自動で振り替えられます（残り21日）。移行先は 3.8 Flash と 3.5 Flash-Lite です",
-    "NEW — クラッシュ報告を毎回ゼロから読ませない — 既知バグ早見表を先に grep し…",
+  ja: [
+    "HYDROGEN — Gemini 4 Hydrogen が GA になりました（11/12）。無料枠あり、有料は $1.50／$7.50 per 1M。thinking に xhigh が加わりました",
+    "CARBON — Gemini 4 Carbon が GA になりました（11/10）。導入価格 $2.00／$10.00 は 11/30 までです",
+    "LIVE — Live と TTS のプレビュー版は最短 11/17 に停止します（残り4日）。移行先は gemini-3.8-live と 3.8 系 TTS です",
+    "CLI — Gemini CLI で、/model には出るモデルが gemini models の一覧に出ないという報告があります",
+    "AGY — Antigravity アプリでも Gemini 4 Carbon と Hydrogen が選べるようになりました",
+    "NEW — 自分のモデル名がどこに書いてあるか分からないときの辿り方",
   ],
   en: [
-    "OMNI 1.2 — Gemini Omni 1.2 Flash is generally available (11/5) with up to 15-second video and conversational editing; 1.1 Flash is routed to 1.2 on 12/3",
-    "COMPUTER — Computer Use is now generally available in the Interactions and GenerateContent APIs (10/30)",
-    "LIVE — Live and TTS preview models shut down as early as 11/17 (7 days left). Move to gemini-3.8-live and the 3.8 TTS models",
-    "CLI — Gemini API CLI (gemini-api) is out in beta (10/27): a zero-dependency client for agents and CI",
-    "2.5 PRO — gemini-2.5-pro and 2.5-flash are routed automatically on 12/1 (21 days left), to 3.8 Flash and 3.5 Flash-Lite",
-    "NEW — Stop Re-Reading Every Crash Report: Gre…"
+    "HYDROGEN — Gemini 4 Hydrogen is generally available (11/12): free tier included, $1.50/$7.50 per 1M on paid, plus a new xhigh thinking level",
+    "CARBON — Gemini 4 Carbon is generally available (11/10) at introductory pricing of $2.00/$10.00 through 11/30",
+    "LIVE — Live and TTS preview models shut down as early as 11/17 (4 days left). Move to gemini-3.8-live and the 3.8 TTS models",
+    "CLI — Users report models that appear in /model missing from the gemini models list in Gemini CLI",
+    "AGY — Gemini 4 Carbon and Hydrogen are now selectable in the Antigravity app too",
+    "NEW — Finding Your Model Name: Settings, Env Vars, No-Code",
   ]
 };
 
