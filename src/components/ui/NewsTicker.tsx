@@ -4,11 +4,11 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "HYDROGEN — Gemini 4 Hydrogen が GA になりました（11/12）。無料枠あり、有料は $1.50／$7.50 per 1M。thinking に xhigh が加わりました",
-    "CARBON — Gemini 4 Carbon が GA になりました（11/10）。導入価格 $2.00／$10.00 は 11/30 までです",
-    "LIVE — Live と TTS のプレビュー版は最短 11/17 に停止します（残り4日）。移行先は gemini-3.8-live と 3.8 系 TTS です",
-    "CLI — Gemini CLI で、/model には出るモデルが gemini models の一覧に出ないという報告があります",
-    "AGY — Antigravity アプリでも Gemini 4 Carbon と Hydrogen が選べるようになりました",
+    "HYDROGEN — Gemini 4 Hydrogen（11/12 GA）は、Managed Agents の Antigravity agent の既定モデルにもなりました",
+    "DECISION — Gemini Decision 1 と Decisions API で、二値・分類・ルーブリック判定を出力トークンなしで行えます（11/11）",
+    "LIVE — Live と TTS のプレビュー版は最短 11/17 に停止します（残り3日）。移行先は gemini-3.8-live と 3.8 系 TTS です",
+    "CLI — Gemini CLI で fetch failed の TypeError に止まるという報告が出ています。Node 26 ではタイムアウト設定が効かない件も",
+    "CARBON — Gemini 4 Carbon の導入価格 $2.00／$10.00 は 11/30 まで、残り16日です",
     "NEW — 自分のモデル名がどこに書いてあるか分からないときの辿り方",
   ],
   en: [
