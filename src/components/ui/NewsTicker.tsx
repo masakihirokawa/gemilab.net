@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "HYDROGEN — Gemini 4 Hydrogen は 11/12 に GA。入力 100 万トークンあたり $1.50・出力 $7.50 で、xhigh の思考レベルが加わりました",
-    "CLI 0.68 — Gemini CLI の安定版は v0.68.0、プレビューは v0.69.0-preview.0（いずれも 11/10）のままです",
-    "GEMINI 2.5 — gemini-2.5-pro と gemini-2.5-flash の API 停止は 12/1、残り14日です",
-    "NODE 24 — Node.js 24 で Gemini CLI を入れると、keytar の非推奨と install script の警告が出る、という問いが出ています",
-    "DECISIONS — 11/11 公開の Decisions API は、二値・カテゴリ・ルーブリックの判定に特化した呼び出し方です",
-    "NEW — OpenAI 互換レイヤーで JSON の形が揃わないとき",
+    "CLI 0.68 — Gemini CLI の安定版は v0.68.0（11/10）のまま。aistudio の changelog も 11/12 以降の新規はありません",
+    "HYDROGEN — 11/12 に GA の Gemini 4 Hydrogen は、入力 100 万トークンあたり $1.50・出力 $7.50 です",
+    "GEMINI 2.5 — gemini-2.5-pro と gemini-2.5-flash の API 停止は 12/1、残り13日です",
+    "MCP — gemini mcp add の --include-tools がカンマで分かれず、絞り込みが逆に効く、という報告が出ています",
+    "IMAGE — Gemini が「画像が見えない」と返すときは、アプリ・API・CLI のどこで起きているかを先に分けると早く片づきます",
+    "GROUNDING — Google 検索のグラウンディングは、出典が要る問いかどうかで付ける・付けないを決めると費用を抑えられます",
   ],
   en: [
-    "HYDROGEN — Gemini 4 Hydrogen went GA on 11/12 at $1.50 input / $7.50 output per 1M tokens, adding an xhigh thinking level",
-    "CLI 0.68 — Gemini CLI stable is still v0.68.0, with v0.69.0-preview.0 in preview (both 11/10)",
-    "GEMINI 2.5 — gemini-2.5-pro and gemini-2.5-flash shut down on the API on 12/1, 14 days left",
-    "NODE 24 — Installing Gemini CLI on Node.js 24 prints keytar deprecation and install-script warnings; users ask if it matters",
-    "DECISIONS — The Decisions API (11/11) is built for binary, category and rubric judgments",
-    "NEW — When JSON Shapes Drift Through the OpenAI Compatibility Layer",
+    "CLI 0.68 — Gemini CLI stable is still v0.68.0 (11/10), and the AI Studio changelog has nothing new since 11/12",
+    "HYDROGEN — Gemini 4 Hydrogen, GA since 11/12, costs $1.50 input / $7.50 output per 1M tokens",
+    "GEMINI 2.5 — gemini-2.5-pro and gemini-2.5-flash shut down on the API on 12/1, 13 days left",
+    "MCP — Users report that gemini mcp add --include-tools doesn't split on commas, so the filter works backwards",
+    "IMAGE — When Gemini says it can't see your image, first pin down whether it happens in the app, the API or the CLI",
+    "GROUNDING — Turn on Google Search grounding only for questions that need sources, and the bill stays smaller",
   ]
 };
 
