@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLI 0.68 — Gemini CLI の安定版は v0.68.0（11/10）のまま。aistudio の changelog も 11/12 以降の新規はありません",
-    "HYDROGEN — 11/12 に GA の Gemini 4 Hydrogen は、入力 100 万トークンあたり $1.50・出力 $7.50 です",
-    "GEMINI 2.5 — gemini-2.5-pro と gemini-2.5-flash の API 停止は 12/1、残り13日です",
-    "MCP — gemini mcp add の --include-tools がカンマで分かれず、絞り込みが逆に効く、という報告が出ています",
-    "IMAGE — Gemini が「画像が見えない」と返すときは、アプリ・API・CLI のどこで起きているかを先に分けると早く片づきます",
-    "GROUNDING — Google 検索のグラウンディングは、出典が要る問いかどうかで付ける・付けないを決めると費用を抑えられます",
+    "NEON — 11/18 に Gemini 4 Neon が GA。有料枠のみで、入力 100 万トークンあたり $3.00・出力 $15.00 です",
+    "OFFICE — 同じ日から Word・PowerPoint・Excel を API に直接渡せます。ページやシートを絞れば、その分だけの課金です",
+    "GEMINI 2.5 — gemini-2.5-pro と gemini-2.5-flash の API 停止は 12/1、残り12日です",
+    "OAUTH — Gemini CLI の以前のサインイン手順が、案内なしに失敗するという報告が出ています",
+    "AG IDE — Antigravity では Neon が既定モデルになり、計画を Neon・実装を Hydrogen に分ける使い方が用意されました",
+    "STRUCTURED — Structured Output の JSON が崩れるときは、スキーマ・プロンプト・検証の順に見ると早く片づきます",
   ],
   en: [
-    "CLI 0.68 — Gemini CLI stable is still v0.68.0 (11/10), and the AI Studio changelog has nothing new since 11/12",
-    "HYDROGEN — Gemini 4 Hydrogen, GA since 11/12, costs $1.50 input / $7.50 output per 1M tokens",
-    "GEMINI 2.5 — gemini-2.5-pro and gemini-2.5-flash shut down on the API on 12/1, 13 days left",
-    "MCP — Users report that gemini mcp add --include-tools doesn't split on commas, so the filter works backwards",
-    "IMAGE — When Gemini says it can't see your image, first pin down whether it happens in the app, the API or the CLI",
-    "GROUNDING — Turn on Google Search grounding only for questions that need sources, and the bill stays smaller",
+    "NEON — Gemini 4 Neon went GA on 11/18, paid tier only, at $3.00 input / $15.00 output per 1M tokens",
+    "OFFICE — Since the same day you can pass Word, PowerPoint and Excel files straight to the API and pay only for the pages or sheets you pick",
+    "GEMINI 2.5 — gemini-2.5-pro and gemini-2.5-flash shut down on the API on 12/1, 12 days left",
+    "OAUTH — Users report that Gemini CLI's older sign-in route now fails without telling you why",
+    "AG IDE — Neon is now Antigravity's default, with a setup that plans on Neon and builds on Hydrogen",
+    "STRUCTURED — When Structured Output JSON breaks, check the schema, then the prompt, then your validator",
   ]
 };
 
