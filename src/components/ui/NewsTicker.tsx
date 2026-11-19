@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "NEON — 11/18 に Gemini 4 Neon が GA。有料枠のみで、入力 100 万トークンあたり $3.00・出力 $15.00 です",
-    "OFFICE — 同じ日から Word・PowerPoint・Excel を API に直接渡せます。ページやシートを絞れば、その分だけの課金です",
-    "GEMINI 2.5 — gemini-2.5-pro と gemini-2.5-flash の API 停止は 12/1、残り12日です",
-    "OAUTH — Gemini CLI の以前のサインイン手順が、案内なしに失敗するという報告が出ています",
-    "AG IDE — Antigravity では Neon が既定モデルになり、計画を Neon・実装を Hydrogen に分ける使い方が用意されました",
-    "STRUCTURED — Structured Output の JSON が崩れるときは、スキーマ・プロンプト・検証の順に見ると早く片づきます",
+    "GENIE 4 — 11/19 に Genie 4 が GA。操作できる映像を生成し、映像出力は1秒あたり約 $0.10 です",
+    "RETRIEVAL — 同じ日に tool retrieval（Preview）が登場。道具が多くても、定義を毎回まるごと送らずに済みます",
+    "CARBON — Gemini 4 Carbon の導入価格は 11/30 まで、残り10日です",
+    "HEAP — Gemini CLI を長く動かすとメモリ不足で落ちる、という報告が出ています",
+    "CLI 0.70 — Gemini CLI の安定版 v0.70.0 が 11/19 に出ました。認証をやり直しても worktree の選択が残ります",
+    "ZDR — 「学習に使わない」とデータを残さない ZDR は別の約束です。自分の設定がどちらかを確かめておくと安心です",
   ],
   en: [
-    "NEON — Gemini 4 Neon went GA on 11/18, paid tier only, at $3.00 input / $15.00 output per 1M tokens",
-    "OFFICE — Since the same day you can pass Word, PowerPoint and Excel files straight to the API and pay only for the pages or sheets you pick",
-    "GEMINI 2.5 — gemini-2.5-pro and gemini-2.5-flash shut down on the API on 12/1, 12 days left",
-    "OAUTH — Users report that Gemini CLI's older sign-in route now fails without telling you why",
-    "AG IDE — Neon is now Antigravity's default, with a setup that plans on Neon and builds on Hydrogen",
-    "STRUCTURED — When Structured Output JSON breaks, check the schema, then the prompt, then your validator",
+    "GENIE 4 — Genie 4 went GA on 11/19, generating steerable worlds, with video output at about $0.10 per second",
+    "RETRIEVAL — Tool retrieval (Preview) arrived the same day, so large tool sets no longer go out in full on every request",
+    "CARBON — Gemini 4 Carbon's launch pricing ends on 11/30, 10 days left",
+    "HEAP — Users report Gemini CLI crashing with out-of-memory errors after long runs",
+    "CLI 0.70 — Gemini CLI v0.70.0 stable shipped on 11/19 and keeps your worktree choice across sign-in restarts",
+    "ZDR — \"Not used for training\" and Zero Data Retention are different promises. Check which one your setup has",
   ]
 };
 
