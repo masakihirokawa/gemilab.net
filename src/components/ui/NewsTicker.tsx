@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GENIE 4 — 11/19 に Genie 4 が GA。操作できる映像を生成し、映像出力は1秒あたり約 $0.10 です",
-    "RETRIEVAL — 同じ日に tool retrieval（Preview）が登場。道具が多くても、定義を毎回まるごと送らずに済みます",
-    "CARBON — Gemini 4 Carbon の導入価格は 11/30 まで、残り10日です",
-    "HEAP — Gemini CLI を長く動かすとメモリ不足で落ちる、という報告が出ています",
-    "CLI 0.70 — Gemini CLI の安定版 v0.70.0 が 11/19 に出ました。認証をやり直しても worktree の選択が残ります",
-    "ZDR — 「学習に使わない」とデータを残さない ZDR は別の約束です。自分の設定がどちらかを確かめておくと安心です",
+    "GENIE 4 — 11/19 に GA した Genie 4 は、映像出力が1秒あたり約 $0.10 です",
+    "RETRIEVAL — Tool retrieval（Preview）なら、道具の定義を必要なときだけ読ませられます",
+    "CARBON — Gemini 4 Carbon の導入価格は 11/30 まで、残り9日です",
+    "SSH — Gemini CLI の git push が「unable to fork」で止まる、という報告が出ています",
+    "LEARN — 授業で使う前に、「答えを先に出さない」使い方を先生自身が一度試しておくと安心です",
+    "SCHEDULE — 毎朝の要約のような決まった作業は、スケジュール設定で Gemini に任せられます",
   ],
   en: [
-    "GENIE 4 — Genie 4 went GA on 11/19, generating steerable worlds, with video output at about $0.10 per second",
-    "RETRIEVAL — Tool retrieval (Preview) arrived the same day, so large tool sets no longer go out in full on every request",
-    "CARBON — Gemini 4 Carbon's launch pricing ends on 11/30, 10 days left",
-    "HEAP — Users report Gemini CLI crashing with out-of-memory errors after long runs",
-    "CLI 0.70 — Gemini CLI v0.70.0 stable shipped on 11/19 and keeps your worktree choice across sign-in restarts",
-    "ZDR — \"Not used for training\" and Zero Data Retention are different promises. Check which one your setup has",
+    "GENIE 4 — Genie 4, GA since 11/19, costs about $0.10 per second of video output",
+    "RETRIEVAL — Tool retrieval (Preview) loads tool definitions only when they are needed",
+    "CARBON — Gemini 4 Carbon's launch pricing ends on 11/30, 9 days left",
+    "SSH — Users report git push failing with \"unable to fork\" in Gemini CLI",
+    "LEARN — Before class, try the guided, answer-last way of learning with Gemini yourself",
+    "SCHEDULE — Routine jobs like a morning digest can run on a schedule in Gemini",
   ]
 };
 
