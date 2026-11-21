@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GENIE 4 — 11/19 に GA した Genie 4 は、映像出力が1秒あたり約 $0.10 です",
-    "RETRIEVAL — Tool retrieval（Preview）なら、道具の定義を必要なときだけ読ませられます",
-    "CARBON — Gemini 4 Carbon の導入価格は 11/30 まで、残り9日です",
-    "SSH — Gemini CLI の git push が「unable to fork」で止まる、という報告が出ています",
-    "LEARN — 授業で使う前に、「答えを先に出さない」使い方を先生自身が一度試しておくと安心です",
-    "SCHEDULE — 毎朝の要約のような決まった作業は、スケジュール設定で Gemini に任せられます",
+    "CLI 0.71 — Gemini CLI v0.71.0 のプレビュー版が公開されました。安定版は v0.70.0 のままです",
+    "TOOL RETR — Tool retrieval（Preview）で、道具の定義を必要なときだけモデルに読ませられるようになりました",
+    "2.5 ROUTE — 12/1 から gemini-2.5-pro は 3.8 Flash へ、2.5-flash は 3.5 Flash-Lite へ自動で回り、料金も移行先になります（残り9日）",
+    "OAUTH — 保存済みの MCP の OAuth トークンが、URL を差し替えた先にも確認なしで送られる、という報告が出ています",
+    "PICK — Gemini 4 のどのモデルを日常に使うかは、推論・長文・価格の3つで比べると迷いにくくなります",
+    "AG NEON — Antigravity の App v2.34.0 で、Gemini API キーからも Gemini 4 Neon を選べるようになりました",
   ],
   en: [
-    "GENIE 4 — Genie 4, GA since 11/19, costs about $0.10 per second of video output",
-    "RETRIEVAL — Tool retrieval (Preview) loads tool definitions only when they are needed",
-    "CARBON — Gemini 4 Carbon's launch pricing ends on 11/30, 9 days left",
-    "SSH — Users report git push failing with \"unable to fork\" in Gemini CLI",
-    "LEARN — Before class, try the guided, answer-last way of learning with Gemini yourself",
-    "SCHEDULE — Routine jobs like a morning digest can run on a schedule in Gemini",
+    "CLI 0.71 — Gemini CLI v0.71.0 is out as a preview. The stable release is still v0.70.0",
+    "TOOL RETR — Tool retrieval (Preview) lets the model load tool definitions only when it needs them",
+    "2.5 ROUTE — From 12/1, gemini-2.5-pro routes to 3.8 Flash and 2.5-flash to 3.5 Flash-Lite, billed at the new rates (9 days left)",
+    "OAUTH — Users report a stored MCP OAuth token being sent to a repointed server URL without asking",
+    "PICK — Choosing a daily Gemini 4 model gets easier when you weigh reasoning, long context and price",
+    "AG NEON — Antigravity App v2.34.0 adds Gemini 4 Neon for Gemini API keys",
   ]
 };
 
