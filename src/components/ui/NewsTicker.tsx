@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLI 0.71 — Gemini CLI v0.71.0 のプレビュー版が公開されました。安定版は v0.70.0 のままです",
-    "TOOL RETR — Tool retrieval（Preview）で、道具の定義を必要なときだけモデルに読ませられるようになりました",
-    "2.5 ROUTE — 12/1 から gemini-2.5-pro は 3.8 Flash へ、2.5-flash は 3.5 Flash-Lite へ自動で回り、料金も移行先になります（残り9日）",
-    "OAUTH — 保存済みの MCP の OAuth トークンが、URL を差し替えた先にも確認なしで送られる、という報告が出ています",
-    "PICK — Gemini 4 のどのモデルを日常に使うかは、推論・長文・価格の3つで比べると迷いにくくなります",
-    "AG NEON — Antigravity の App v2.34.0 で、Gemini API キーからも Gemini 4 Neon を選べるようになりました",
+    "CHANGELOG — Gemini API の changelog は 11/19 が最新で、週末の新規はありません。CLI の安定版は v0.70.0 です",
+    "2.5 ROUTE — 12/1 から gemini-2.5-pro は 3.8 Flash、2.5-flash は 3.5 Flash-Lite へ自動で回ります。残り8日です",
+    "SPEND CAP — API に「ここで止める」支出の上限が無い、という声が出ています。予算アラートとキーの止め方を先に決めておくと安心です",
+    "CARBON — Gemini 4 Carbon の導入価格は 11/30 まで、残り7日です",
+    "OMNI 1.2 — 12/3 に gemini-omni-1.1-flash は 1.2 へ自動で切り替わります",
+    "/SHELLS — 文書にある /shells は削除済みのコマンドです。動かないときは削除の有無から確かめます",
   ],
   en: [
-    "CLI 0.71 — Gemini CLI v0.71.0 is out as a preview. The stable release is still v0.70.0",
-    "TOOL RETR — Tool retrieval (Preview) lets the model load tool definitions only when it needs them",
-    "2.5 ROUTE — From 12/1, gemini-2.5-pro routes to 3.8 Flash and 2.5-flash to 3.5 Flash-Lite, billed at the new rates (9 days left)",
-    "OAUTH — Users report a stored MCP OAuth token being sent to a repointed server URL without asking",
-    "PICK — Choosing a daily Gemini 4 model gets easier when you weigh reasoning, long context and price",
-    "AG NEON — Antigravity App v2.34.0 adds Gemini 4 Neon for Gemini API keys",
+    "CHANGELOG — No new Gemini API changelog entries since 11/19; the stable CLI is still v0.70.0",
+    "2.5 ROUTE — From 12/1, gemini-2.5-pro reroutes to 3.8 Flash and 2.5-flash to 3.5 Flash-Lite. 8 days left",
+    "SPEND CAP — Developers are asking for a hard spend limit on the API. Set budget alerts and decide how you would pause a key",
+    "CARBON — Gemini 4 Carbon launch pricing ends 11/30, 7 days left",
+    "OMNI 1.2 — On 12/3, gemini-omni-1.1-flash switches to 1.2 automatically",
+    "/SHELLS — /shells still appears in the docs but was removed. If a command fails, check whether it still exists",
   ]
 };
 
