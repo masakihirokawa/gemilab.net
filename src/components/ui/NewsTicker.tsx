@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLI 0.71 — CLI の安定版が v0.71.0 になり、同じ 11/24 にパッチの v0.71.1 も出ました",
-    "CARBON — Gemini 4 Carbon の導入価格は 11/30 まで、残り5日です",
-    "CANCEL — MCP のツール実行中に Ctrl-C すると、取り消していないのに「取り消し」と伝わるという報告が出ています",
-    "2.5 ROUTE — 12/1 から gemini-2.5-pro は 3.8 Flash、2.5-flash は 3.5 Flash-Lite へ自動で回ります。残り6日です",
-    "OMNI 1.2 — 12/3 に gemini-omni-1.1-flash は 1.2 へ自動で切り替わります。残り8日です",
-    "IMAGE — 画像が読めないと返るときは、形式・サイズ・送り方の順に確かめると切り分けやすくなります",
+    "A2A — 安定版 v0.71.1 は、A2A サーバーに bearer トークン認証と入力の検証を必須にする修正1件です",
+    "CARBON — Gemini 4 Carbon の導入価格は 11/30 まで、残り4日です",
+    "WINDOWS — Windows で ProgramData に置いた system 設定が、常に読み飛ばされるという報告が出ています",
+    "2.5 ROUTE — 12/1 から gemini-2.5-pro は 3.8 Flash、2.5-flash は 3.5 Flash-Lite へ自動で回ります。残り5日です",
+    "OMNI 1.2 — 12/3 に gemini-omni-1.1-flash は 1.2 へ自動で切り替わります。残り7日です",
+    "DEVCON — Dev Containers の中で Gemini CLI を動かし、手元を汚さずに試す手順が Zenn に出ています",
   ],
   en: [
-    "CLI 0.71 — The stable CLI is now v0.71.0, with a v0.71.1 patch out the same day (11/24)",
-    "CARBON — Gemini 4 Carbon launch pricing ends 11/30, 5 days left",
-    "CANCEL — Report: pressing Ctrl-C during an MCP tool call tells the model the operation was cancelled when it wasn't",
-    "2.5 ROUTE — From 12/1, gemini-2.5-pro reroutes to 3.8 Flash and 2.5-flash to 3.5 Flash-Lite. 6 days left",
-    "OMNI 1.2 — On 12/3, gemini-omni-1.1-flash switches to 1.2 automatically. 8 days left",
-    "IMAGE — Gemini says it can't see your image? Check the format, then the size, then how you sent it",
+    "A2A — Stable v0.71.1 is a single fix: the A2A server now requires bearer-token auth and validates input",
+    "CARBON — Gemini 4 Carbon launch pricing ends 11/30, 4 days left",
+    "WINDOWS — Report: on Windows, system settings in ProgramData are always skipped",
+    "2.5 ROUTE — From 12/1, gemini-2.5-pro reroutes to 3.8 Flash and 2.5-flash to 3.5 Flash-Lite. 5 days left",
+    "OMNI 1.2 — On 12/3, gemini-omni-1.1-flash switches to 1.2 automatically. 7 days left",
+    "DEVCON — A Zenn walkthrough runs Gemini CLI inside Dev Containers to keep your machine clean",
   ]
 };
 
