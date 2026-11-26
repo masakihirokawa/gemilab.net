@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "A2A — 安定版 v0.71.1 は、A2A サーバーに bearer トークン認証と入力の検証を必須にする修正1件です",
-    "CARBON — Gemini 4 Carbon の導入価格は 11/30 まで、残り4日です",
-    "WINDOWS — Windows で ProgramData に置いた system 設定が、常に読み飛ばされるという報告が出ています",
-    "2.5 ROUTE — 12/1 から gemini-2.5-pro は 3.8 Flash、2.5-flash は 3.5 Flash-Lite へ自動で回ります。残り5日です",
-    "OMNI 1.2 — 12/3 に gemini-omni-1.1-flash は 1.2 へ自動で切り替わります。残り7日です",
-    "DEVCON — Dev Containers の中で Gemini CLI を動かし、手元を汚さずに試す手順が Zenn に出ています",
+    "CLI 0.71.1 — Gemini CLI の安定版は v0.71.1（11/24）のままです。nightly は 11/25・11/26 と2日続けてリリースに失敗しています",
+    "CARBON — API の Gemini 4 Carbon は 11/30 で導入価格が終わります。残り3日です",
+    "CRLF — Windows の CRLF ファイルで、write_file の差分が全行変更に見えるという報告が出ています",
+    "2.5 ROUTE — 12/1 から gemini-2.5-pro は 3.8-flash、2.5-flash は 3.5-flash-lite へ自動で回ります。残り4日です",
+    "OMNI 1.2 — gemini-omni-1.1-flash は 12/3 に 1.2 へ切り替わります。残り6日です",
+    "GENIE 4 — Genie 4 が GA に。文字や画像から、操作できる映像の世界を Interactions API で作れます",
   ],
   en: [
-    "A2A — Stable v0.71.1 is a single fix: the A2A server now requires bearer-token auth and validates input",
-    "CARBON — Gemini 4 Carbon launch pricing ends 11/30, 4 days left",
-    "WINDOWS — Report: on Windows, system settings in ProgramData are always skipped",
-    "2.5 ROUTE — From 12/1, gemini-2.5-pro reroutes to 3.8 Flash and 2.5-flash to 3.5 Flash-Lite. 5 days left",
-    "OMNI 1.2 — On 12/3, gemini-omni-1.1-flash switches to 1.2 automatically. 7 days left",
-    "DEVCON — A Zenn walkthrough runs Gemini CLI inside Dev Containers to keep your machine clean",
+    "CLI 0.71.1 — Gemini CLI stable stays at v0.71.1 (11/24). Nightly releases failed on both 11/25 and 11/26",
+    "CARBON — Introductory pricing for Gemini 4 Carbon on the API ends 11/30. 3 days left",
+    "CRLF — Users report write_file diffs showing every line changed for files with CRLF line endings on Windows",
+    "2.5 ROUTE — From 12/1, gemini-2.5-pro reroutes to 3.8-flash and 2.5-flash to 3.5-flash-lite. 4 days left",
+    "OMNI 1.2 — gemini-omni-1.1-flash switches to 1.2 on 12/3. 6 days left",
+    "GENIE 4 — Genie 4 is GA: build steerable video worlds from text or an image through the Interactions API",
   ]
 };
 
