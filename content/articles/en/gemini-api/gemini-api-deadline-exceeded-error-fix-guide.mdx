@@ -5,97 +5,146 @@ category: "gemini-api"
 level: "intermediate"
 premium: false
 date: "2026-05-07T09:30"
-updated: "2026-10-22T13:28"
+updated: "2026-11-28T18:44"
 author: "Gemini Lab"
-description: "When DEADLINE_EXCEEDED suddenly starts spiking on your Gemini API backend, here are the five checks I run first — based on real production debugging."
-tags: ["Gemini API", "DEADLINE_EXCEEDED", "gRPC", "troubleshooting", "timeout"]
+description: "How to work out which layer is cutting off your Gemini API requests with 504 DEADLINE_EXCEEDED: measuring the latency distribution, millisecond timeouts, thinking_level and model choice, SDK retry options, and what changes after December 1."
+tags: ["Gemini API", "DEADLINE_EXCEEDED", "504", "troubleshooting", "timeout"]
 ---
+A backend that had been calm for weeks started returning `504 DEADLINE_EXCEEDED` one morning. The logs showed the same line every few minutes. Unlike a rate-limit error, which at least tells you what you ran out of, this one only says the deadline passed — and that makes the first move easy to get wrong.
 
-A Gemini API backend that has been humming along for weeks suddenly starts returning `DEADLINE_EXCEEDED` one morning. I have been there myself, and the first half of that day disappeared into log diving before I figured out what was actually going on. Unlike rate-limit errors that hand you a clear message, this one just whispers "deadline" — and choosing the wrong first step can pull you into a long debugging spiral.
+I got it wrong. I raised the timeout, then added more retries, and only half a day later did I actually measure how long requests were taking. Once I did, the picture was obvious: almost everything came back in a few seconds, and a small slice of inputs was hitting the wall every time.
 
-This article walks through the five checks I now run, in the order I actually run them, ranked from least to most invasive. If you go through them top-down, you can usually nail down the real cause before touching any business logic.
+What follows is the order I now check things in, from least to most invasive. I re-checked model names, defaults and units against the official docs and the SDK source as of November 2026.
 
-## What the error really means — at which layer is the deadline being hit?
+## A 504 doesn't tell you where it was cut off
 
-`DEADLINE_EXCEEDED` is a gRPC status name that means "no response arrived within the allotted time." The Gemini API maps it to HTTP 504, and how you see it differs slightly depending on the SDK and runtime:
+`DEADLINE_EXCEEDED` is a gRPC status name that maps to HTTP 504. The official API errors page (as of November 2026) describes it as "the request didn't finish within the deadline," and the recommended action is to remove or increase your client deadline so the server default applies.
 
-- Python `google-genai`: `google.genai.errors.ServerError: 504 DEADLINE_EXCEEDED` (`e.code` is 504, `e.status` is `DEADLINE_EXCEEDED`)
-- Node.js SDK or fetch over HTTPS: surfaces as `Request timed out` or `AbortError`
-- Google AI Studio: shows up as a generic "The request timed out" UI message
+So the first thing Google asks you to suspect is your own deadline. In practice, though, it's easy to skip the question of whether *your side* is too short or *their side* is too slow, and just pick one. The symptom looks a little different depending on where you are:
 
-One trap is easy to miss: if your retry handler catches `google.api_core.exceptions.DeadlineExceeded`, it will never fire, because the newer `google-genai` raises its own exception from `google.genai.errors`. The logs fill with 504s and not a single retry runs. **Print `type(e)` once and catch what actually arrives, not what you assume.**
+- Python `google-genai`: a `google.genai.errors.ServerError` with `e.code == 504` and `e.status == "DEADLINE_EXCEEDED"`
+- Python, when your own client deadline fires first: not an API error at all, but a timeout exception from the HTTP library (httpx)
+- Node.js calling REST with `fetch`: an `AbortError`, or an `HTTP 504` you throw yourself
+- AI Studio: a "The request timed out" message in the UI
 
-The crucial split is whether the deadline is being hit on the client side (your code or runtime cut the wait short) or on the server side (Gemini itself didn't finish in time). The fixes differ completely. Bumping a client timeout will not help when the server is genuinely slow on a huge prompt, and vice versa. Almost everything else in this guide builds on getting that distinction right.
+One trap is worth calling out. If your retry handler catches the old `google.api_core.exceptions.DeadlineExceeded`, it will never run, because `google-genai` raises its own exceptions from `google.genai.errors`. The logs fill up with 504s and not a single retry happens.
 
-## Check 1: Measure the server-side time before suspecting your code
+**Catch the exception that actually arrives, not the one you expect.** Printing `type(e)` and `getattr(e, "code", None)` once is the quickest way to hold that line.
 
-The very first thing I do is run the same prompt and the same model in Google AI Studio. AI Studio uses a generous internal timeout, so it shows you the real wall-clock time the server takes to finish.
+## Triage at a glance
 
-If your code times out at 60 seconds and AI Studio quietly returns the answer at 90 seconds, the bottleneck is your client. If AI Studio is also slow, or fails outright, the issue is server-side and almost certainly tied to input size or model choice.
+This is the table I keep open when it happens. The rows are ordered by how cheap they are to check.
 
-To spot this quickly in your own code, drop in a tiny instrumentation wrapper around every Gemini call:
+<table>
+<thead>
+<tr><th>Symptom</th><th>Likely cause</th><th>How to confirm</th><th>Fix</th></tr>
+</thead>
+<tbody>
+<tr><td>Failures land at almost exactly the same elapsed time (say, 60 s)</td><td>A client or proxy deadline is too short</td><td>Log elapsed time on failure and see whether the values line up</td><td>Set the deadline explicitly (Check 3)</td></tr>
+<tr><td>The exception is an httpx timeout or AbortError, not a 504</td><td>Your side gave up before the API answered</td><td>Print the exception type</td><td>Re-check the timeout value and its unit</td></tr>
+<tr><td>Most calls return in seconds, a few are extremely slow</td><td>Specific inputs (long context, PDFs, video) are heavy</td><td>Log input size next to latency (Check 1)</td><td>Split inputs, use the Files API (Check 2)</td></tr>
+<tr><td>Hard questions are slow, easy ones are fast</td><td>The model is spending a lot of time thinking</td><td>Time the same input at different thinking_level values</td><td>Revisit model and thinking_level (Check 4)</td></tr>
+<tr><td>Failures went up after you added retries</td><td>Stacked retries, or retries with no backoff</td><td>Count how many sends one logical request produced</td><td>Give retries a single owner (Check 5)</td></tr>
+<tr><td>Cloudflare Workers returns Error 1102</td><td>The Worker hit its CPU time limit</td><td>Look for Exceeded CPU Time Limits under Invocation Statuses</td><td>Cut CPU-heavy work or raise the limit (last section)</td></tr>
+</tbody>
+</table>
+
+The first and third rows look alike but have opposite fixes. The first goes away when you lengthen your deadline. The third just makes you wait longer before failing.
+
+## Check 1: Measure the latency distribution before touching timeouts
+
+Start by running the same prompt on the same model in AI Studio. If it completes there but fails in your code, your deadline is probably too short. If it also stalls in AI Studio, look at the input or the model.
+
+Then record latency in your own code. An average will mislead you, so keep the spread (p50 and p95) and the details of the slow calls together.
 
 ```python
-# Diagnostic wrapper: log how long every Gemini call actually takes.
+# Diagnostic: record latency, outcome and an input hint per call, then summarize
+import statistics
 import time
 from google import genai
+from google.genai import errors
 
 client = genai.Client(api_key="YOUR_API_KEY")
+records = []  # (seconds, outcome, model, label)
 
-def measured_generate(model: str, contents):
+def measured_generate(model: str, contents, label: str = ""):
     start = time.perf_counter()
+    status = "OK"
     try:
-        response = client.models.generate_content(model=model, contents=contents)
-        elapsed = time.perf_counter() - start
-        print(f"[OK] {model} took {elapsed:.2f}s")
-        return response
-    except Exception as e:
-        elapsed = time.perf_counter() - start
-        print(f"[ERR] {model} failed at {elapsed:.2f}s: {type(e).__name__}: {e}")
+        return client.models.generate_content(model=model, contents=contents)
+    except errors.APIError as e:
+        status = f"{e.code} {e.status}"       # e.g. 504 DEADLINE_EXCEEDED
         raise
+    except Exception as e:                    # httpx timeouts and other client-side cutoffs
+        status = type(e).__name__
+        raise
+    finally:
+        elapsed = time.perf_counter() - start
+        records.append((elapsed, status, model, label))
+        print(f"[{status}] {model} {label} {elapsed:.2f}s")
 
-# Expected output (healthy):
-# [OK] gemini-2.5-flash took 3.42s
+def summarize():
+    times = sorted(r[0] for r in records)
+    if len(times) < 2:
+        return
+    q = statistics.quantiles(times, n=20)     # cut points every 5%
+    p50, p95 = q[9], q[18]
+    print(f"n={len(times)} p50={p50:.1f}s p95={p95:.1f}s max={times[-1]:.1f}s")
+    for r in records:
+        if r[0] >= p95:
+            print("slow:", r)
 ```
 
-Twenty requests of this kind of log are usually enough to reveal the shape of the problem — for example, "average is around 5 seconds, but a long tail is pinning at 60 seconds and getting cut off."
+Put something meaningful in `label` — which feature made the call, how many characters or pages went in. If you leave it empty, you'll find the slow rows and still not know what made them slow.
 
-## Check 2: Suspect the input size — long prompts, PDFs, and video
+The output looks like this (the numbers are only an example):
 
-Even when timeouts feel random, careful logs almost always show that they cluster around specific request types. In my experience the usual suspects are:
+```text
+[OK] gemini-3.8-flash faq:1200chars 3.42s
+[504 DEADLINE_EXCEEDED] gemini-3.8-flash pdf:180pages 61.03s
+n=120 p50=4.1s p95=58.7s max=61.0s
+slow: (61.03, '504 DEADLINE_EXCEEDED', 'gemini-3.8-flash', 'pdf:180pages')
+```
 
-- Very long prompts: latency tends to balloon once you cross roughly 300K tokens of context
-- PDFs and Office documents: parse time grows with page count
-- Video: anything more than a few minutes long has highly variable processing time
+Ten or twenty calls won't tell you much, so I let a full day accumulate before calling `summarize()`. If p50 is a few seconds and only p95 is pinned at the deadline, the problem is probably a subset of inputs, not the whole system.
 
-Inlining huge attachments into every request is a recipe for spiky latency. The cleaner pattern is to upload the file once via the File API and pass a reference at inference time. That separates upload time from inference time and makes the whole system easier to reason about.
+## Check 2: Suspect input size — long context, PDFs, video
+
+Errors that look random often turn out, once you line up the Check 1 log, to come from the same few inputs. In my case the usual suspects were:
+
+- Conversations or summaries that resend a long context every time
+- PDFs and Office documents with many pages
+- Videos longer than a few minutes
+
+Until things settle, I'd avoid pushing large inputs through a single request. Upload the file once to the Files API and pass only the reference at inference time. The official Files API page (November 2026) says uploaded files are deleted automatically after 48 hours, and that PDFs sent inline in a request are capped at 50 MB.
 
 ```python
-# Before: send the PDF inline on every request (slow, repetitive)
+# Before: embed the PDF in every request (upload and parsing happen every time)
+from google.genai import types
+
 with open("report.pdf", "rb") as f:
     pdf_bytes = f.read()
 response = client.models.generate_content(
-    model="gemini-2.5-pro",
-    contents=[
-        {"inline_data": {"mime_type": "application/pdf", "data": pdf_bytes}},
-        "Summarize the five key findings of this document.",
-    ],
+    model="gemini-3.8-flash",
+    contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+              "Give me the five key points of this document."],
 )
 
-# After: upload once via File API, then reference the file in subsequent calls
+# After: upload once, then pass the reference (remember it expires after 48 hours)
 uploaded = client.files.upload(file="report.pdf")
 response = client.models.generate_content(
-    model="gemini-2.5-pro",
-    contents=[uploaded, "Summarize the five key findings of this document."],
+    model="gemini-3.8-flash",
+    contents=[uploaded, "Give me the five key points of this document."],
 )
-# Expected: subsequent calls referencing the same file are dramatically faster.
 ```
 
-A nice side effect: when the same document is queried multiple times, you also avoid re-uploading the same bytes, which trims bandwidth.
+The reason to do it this way is that upload time and inference time become separately measurable. Once you know which half is slow, there's only one thing left to change. Because references expire, anything you reuse for longer needs a re-upload step alongside it.
 
-## Check 3: Override the SDK's default timeout with a realistic value
+Documents that are still slow after that, I summarize chapter by chapter and then combine. Each call takes a similar amount of time, which makes choosing a deadline much easier.
 
-Default SDK timeouts are easy to overlook. The `google-genai` Python SDK lets you raise the timeout via `HttpOptions`. For complex Pro-tier reasoning, a value of 120 to 180 seconds is a sensible floor.
+## Check 3: Set the client timeout explicitly — and check the unit
+
+This is the fix the docs point to first. In both `google-genai` (Python) and `@google/genai` (JavaScript), `HttpOptions.timeout` is in **milliseconds** (confirmed in the SDK source, November 2026).
 
 ```python
 from google import genai
@@ -103,26 +152,42 @@ from google.genai import types
 
 client = genai.Client(
     api_key="YOUR_API_KEY",
-    http_options=types.HttpOptions(timeout=180_000),  # milliseconds (180s)
+    http_options=types.HttpOptions(timeout=180_000),  # milliseconds = 180 s
 )
 
 response = client.models.generate_content(
-    model="gemini-2.5-pro",
-    contents="Write a long, structured analysis report.",
+    model="gemini-4-argon",
+    contents="Write a fairly long analytical report.",
 )
-# Expected: long-running reasoning calls no longer get cut off client-side.
 ```
 
-If you are calling the REST API directly from Node.js or an edge runtime, manage the timeout yourself with `AbortController`. Frameworks sometimes apply aggressive defaults — Cloudflare Workers and Vercel Edge in particular — so being explicit is the safer path:
+The JavaScript SDK works the same way:
 
 ```ts
-// Works in Node.js and Edge runtimes alike
+import { GoogleGenAI } from "@google/genai";
+
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  httpOptions: { timeout: 180_000 }, // milliseconds = 180 s
+});
+
+const res = await ai.models.generateContent({
+  model: "gemini-3.8-flash",
+  contents: "Write a fairly long analytical report.",
+});
+console.log(res.text);
+```
+
+If you call REST directly with `fetch`, own the deadline with an `AbortController`:
+
+```ts
+// Node.js / edge runtimes: manage the deadline with AbortController
 const ctrl = new AbortController();
-const timeout = setTimeout(() => ctrl.abort(), 180_000); // 180s
+const timer = setTimeout(() => ctrl.abort(), 180_000); // 180 s
 
 try {
   const res = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
     {
       method: "POST",
       headers: {
@@ -133,69 +198,155 @@ try {
       signal: ctrl.signal,
     }
   );
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
   const data = await res.json();
-  // Expected: response text lives at data.candidates[0].content.parts[0].text
+  console.log(data.candidates?.[0]?.content?.parts?.[0]?.text);
 } finally {
-  clearTimeout(timeout);
+  clearTimeout(timer);
 }
 ```
 
-That said, raising the timeout often only delays the symptom rather than fixing it. Pair it with a concurrency cap on your worker pool — the [Gemini API rate limiting and quota management guide](/en/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) walks through how I structure that — to keep load from snowballing on the server side.
+I include `await res.text()` in the error because the body tells you who sent the 504. If it carries a `DEADLINE_EXCEEDED` status, the API sent it; if it's an HTML page or empty, something in between did.
 
-## Check 4: Reconsider the model — Pro vs. Flash
+The near-miss I still remember is typing `timeout=180` while thinking in seconds. That's 0.18 s, and every single request fails. The symptom is "everything fails instantly," so if Check 1 shows elapsed times all under a second, look at the unit first.
 
-`gemini-2.5-pro` and the Thinking-tier models genuinely run longer reasoning loops, so their tail latency is higher by design. Routing every workload through Pro is a fast way to make timeouts more frequent. Match the model to the task instead.
+Lengthening the deadline only helps when your side was too short, though. If only p95 is long, a bigger number just means waiting longer to fail — move on to Checks 2 and 4.
 
-In the services I run, the rough split is:
+## Check 4: Pick the model and thinking_level from how long you can wait
 
-- Short summaries, classification, extraction: `gemini-2.5-flash-lite`
-- General text generation, FAQ-style replies: `gemini-2.5-flash`
-- Long-form structuring, complex reasoning, code generation: `gemini-2.5-pro`
+Gemini 3 and later models think by default. The official Thinking page (November 2026) describes `thinking_level` as the main control over quality, latency and token use. When harder questions are the slow ones, this is usually where the answer is.
 
-Pushing everything through Pro inflates both latency and cost. In production I have measured cases where a Flash-suitable workload routed to Pro ran 2–3× slower and cost 5–10× more. If you are firefighting `DEADLINE_EXCEEDED`, the highest-leverage question is often the simplest one: "does this request actually need Pro?"
+<table>
+<thead>
+<tr><th>Use</th><th>Model ID</th><th>Default thinking_level</th><th>When I choose it</th></tr>
+</thead>
+<tbody>
+<tr><td>Short classification, extraction, tagging</td><td>gemini-3.5-flash-lite</td><td>minimal</td><td>High volume, and you want each call short and consistent</td></tr>
+<tr><td>Everyday generation, FAQ answers</td><td>gemini-3.8-flash</td><td>medium</td><td>The default for anything a user waits on in the UI</td></tr>
+<tr><td>Long-document structuring, involved reasoning</td><td>gemini-4-argon</td><td>medium</td><td>Flash isn't good enough, but you still want to keep latency down</td></tr>
+<tr><td>Work that needs the deepest reasoning</td><td>gemini-4-carbon</td><td>medium</td><td>Only for asynchronous jobs where results can arrive later</td></tr>
+</tbody>
+</table>
 
-## Check 5: Implement retries with exponential backoff and jitter
+The rule fits in a sentence: **if a person is waiting at the screen, use Flash; send only the work that can wait to the larger models.** When I'm unsure, I lower thinking_level and measure first, and only move up a model if quality still falls short.
 
-Naively retrying on every `DEADLINE_EXCEEDED` is one of the fastest ways to make the problem worse — your retries pile onto an already-busy upstream and trigger more deadlines. Always combine exponential backoff (gradually increasing waits) with jitter (a small random offset) so concurrent clients do not retry in lockstep.
+```python
+# Time the same input at different thinking_level values
+import time
+from google.genai import types
+
+prompt = "Classify this support message as refund, bug, or feature request: ..."
+for level in ["low", "medium", "high"]:
+    start = time.perf_counter()
+    r = client.models.generate_content(
+        model="gemini-3.8-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level=level)
+        ),
+    )
+    print(level, f"{time.perf_counter() - start:.2f}s", (r.text or "")[:40])
+```
+
+The docs recommend lowering thinking_level rather than shrinking `max_output_tokens` when you want lower latency or cost. `max_output_tokens` includes thinking tokens, so if the model is cut off mid-thought you get empty or truncated output — and you still pay for the thinking.
+
+Check the model name itself, too. Per the official deprecations page (November 2026), from December 1, 2026, API requests to `gemini-2.5-pro` route automatically to `gemini-3.8-flash`, and requests to `gemini-2.5-flash` route to `gemini-3.5-flash-lite`, billed at the destination's rates. `gemini-2.5-flash-lite` is not deprecated. If a 2.5 name is still in your code, the whole latency distribution will shift in December, so take the Check 1 measurements again on both sides of the switch.
+
+## Check 5: Give retries a single owner
+
+Retrying immediately, with no wait, piles more load on a busy service and can produce more 504s. Exponential backoff (waits that grow) and jitter (a little randomness) are non-negotiable.
+
+What cost me the most time, though, was figuring out *who* was retrying. When your own loop and the SDK's retries overlap, one failure turns into many sends.
+
+<table>
+<thead>
+<tr><th>Approach</th><th>Good fit</th><th>Watch out for</th></tr>
+</thead>
+<tbody>
+<tr><td>Let the SDK's HttpRetryOptions handle it</td><td>Simple retry conditions, and counts are enough for your logs</td><td>Don't wrap your own loop around it. Work out the worst-case wait</td></tr>
+<tr><td>Write your own loop</td><td>You want each retry to lighten the input or drop to a smaller model</td><td>Leave SDK retries off. Always write a stop condition</td></tr>
+</tbody>
+</table>
+
+To let the SDK own retries, pass `retry_options` in `HttpOptions`:
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(
+    api_key="YOUR_API_KEY",
+    http_options=types.HttpOptions(
+        timeout=120_000,  # 120 s per attempt (milliseconds)
+        retry_options=types.HttpRetryOptions(
+            attempts=3,               # includes the first try
+            initial_delay=2.0,        # seconds
+            max_delay=30.0,           # seconds
+            http_status_codes=[503, 504],
+        ),
+    ),
+)
+```
+
+With this in place, the worst-case wait is roughly attempts × timeout plus the backoff delays. Here that's 3 × 120 s plus a few seconds — a little over six minutes. If a load balancer or a serverless execution limit sits in front, reduce attempts or the timeout until that total fits under it.
+
+If you want each retry to do something different, write it yourself:
 
 ```python
 import random
 import time
-from google import genai
 from google.genai import errors
 
-client = genai.Client(api_key="YOUR_API_KEY")
-
-def generate_with_retry(model: str, contents, max_retries: int = 3):
+def generate_with_fallback(contents, models=("gemini-4-argon", "gemini-3.8-flash"),
+                           max_retries=3):
+    last = None
     for attempt in range(max_retries):
+        model = models[min(attempt, len(models) - 1)]  # fall back to the lighter model
         try:
             return client.models.generate_content(model=model, contents=contents)
-        except errors.ServerError as e:  # any 5xx, including 504 DEADLINE_EXCEEDED and 503 UNAVAILABLE
-            if e.code not in (503, 504) or attempt == max_retries - 1:
+        except errors.ServerError as e:
+            if e.code not in (503, 504):
                 raise
-            # Exponential backoff + jitter: ~4s, ~8s, ~16s with 0–1s wobble
-            wait = (2 ** (attempt + 2)) + random.random()
-            print(f"[retry {attempt + 1}/{max_retries}] {e.code} {e.status} -> waiting {wait:.2f}s")
+            last = e
+            wait = (2 ** (attempt + 1)) + random.random()  # 2s, 4s, 8s + jitter
+            print(f"[retry {attempt + 1}/{max_retries}] {model} {e.code} {e.status} -> {wait:.1f}s")
             time.sleep(wait)
-
-# Expected: transient deadlines self-heal and the retry trail shows up in logs.
+    raise last
 ```
 
-For the broader question of which errors to retry, how to layer in a circuit breaker, and where to give up, the [Gemini API error handling and retry patterns](/en/articles/gemini-api/gemini-api-error-handling-retry-patterns) article digs deeper. I would recommend reading it before pushing any retry policy to production.
+I shaped it this way because most of my 504s meant "this input is too heavy for this model." Sending the same thing three times recovered more slowly, for me, than dropping to the lighter model on the second attempt. If you use this function, create the `client` without `retry_options`.
 
-## Still failing? Look one layer deeper
+## Three common misunderstandings
 
-If none of the above moves the needle, the deadline is probably being enforced somewhere other than where you think. Real cases I have hit personally include:
+**1. "The SDK retries 5xx errors for me out of the box."**
+The official troubleshooting page says the SDKs retry transient errors by default. But reading the `google-genai` Python source as of November 2026, when you don't pass `retry_options`, no retries happen based on HTTP status — only certain connection errors are retried. Behavior may differ between versions, so I'd rather set `retry_options` explicitly and make the owner obvious.
 
-- An NGINX `proxy_read_timeout` of 60 seconds in front of the API gateway, cutting requests short
-- Cloudflare Workers running into the CPU-time limit (10 ms on the free plan, 30 seconds by default on paid) rather than a network timeout. Time spent waiting on Gemini does not count as CPU time, so on the free plan it is usually your own JSON shaping or heavy post-processing that trips it. Limits change, so check actual CPU time in the dashboard's observability view
-- An API key that turned out to belong to a different project, taking a slower routing path
+**2. "Timeouts are in seconds."**
+`HttpOptions.timeout` is in milliseconds, while `initial_delay` and `max_delay` in `HttpRetryOptions` are in seconds. Values with different units sit side by side in the same config, so a unit comment on each line is cheap insurance.
 
-Edge runtimes are especially prone to this — the deadline you see in logs is rarely from Gemini itself. Cross-check with the [Cloudflare Workers subrequest limit troubleshooting guide](/en/articles/gemini-api/gemini-api-edge-runtime-subrequest-limit-troubleshooting) and the [Gemini API slow response and timeout fix guide](/en/articles/gemini-api/gemini-api-slow-response-timeout-fix) to rule out infrastructure-level cutoffs before you go any deeper into application code.
+**3. "Streaming will make the 504s go away."**
+Streaming shortens the time to the first token and makes it less likely that a proxy in the middle closes the connection as idle. It doesn't change the total generation time, though. Heavy inputs still need Checks 2 and 4.
+
+## When nothing helps, it's being cut off somewhere else
+
+If none of the five checks moves the needle, the cutoff may be in front of the Gemini API. These are the ones I've actually run into:
+
+- A load balancer or NGINX `proxy_read_timeout` still at 60 seconds
+- An API key from a different project, with different quotas and settings than I assumed
+- The CPU time limit on Cloudflare Workers
+
+The official Cloudflare Workers Limits page (November 2026) lists CPU time per request at 10 ms on the Free plan and 30 seconds by default on Paid, configurable up to 5 minutes (300,000 ms). Time spent waiting on `fetch()` does not count as CPU time. So simply waiting for Gemini rarely trips the limit; what trips it is parsing or reshaping a large response afterward. And when it trips, you get Error 1102 ("Worker exceeded resource limits"), not a 504 — the error number itself tells you which layer you're in.
+
+If slow cold starts on edge or serverless platforms are part of the picture, the measurement approach in [mitigating Gemini API cold starts on serverless](/articles/gemini-api/gemini-api-cold-start-mitigation-serverless-production) helps. For how to handle each error status in general, see [telling Gemini API errors apart by status](/articles/gemini-api/gemini-api-error-troubleshooting-guide).
+
+## What tends to bite next: latency after the December 1 switch
+
+Once the 504s settle down, the next thing people tend to hit is "no errors, but the replies feel different or slower." If you're still calling a 2.5 model name, a different model will be answering from December 1. I wrote up how to log the model you requested next to the model that actually served the response in [the first log to check when Flash suddenly sounds different](/articles/gemini-updates/gemini-flash-auto-routing-requested-vs-served-model-log).
+
+If concurrency grows and 429s start mixing in with your 504s, [my notes on Gemini API rate limits and 429 handling](/articles/gemini-api/gemini-api-rate-limiting-quota-management-production-guide) cover how to cap concurrency, and if retries start to snowball, [resilience design with circuit breakers and bulkheads](/articles/gemini-api/gemini-api-resilience-circuit-breaker-bulkhead-production-guide) is the natural next read.
 
 ## What to do next
 
-If you want to reduce `DEADLINE_EXCEEDED` for real, start with Check 1 — measuring. Increasing timeouts or piling on retries without a latency distribution in hand only hides the symptom. Wrap your Gemini calls with the timing helper above, capture twenty-four hours of traffic, and look at the shape of that distribution. From there you can usually tell whether the issue lives on the client, the server, or in a specific subset of inputs.
+Today, wrap one production call site with `measured_generate` from Check 1 and let a full day of latencies collect. Once you can see p50, p95 and the `label` on the slow rows, it becomes clear whether the thing to change is the deadline, the input, or the model.
 
-In my own debugging session, the moment I had real measurements I noticed that the top 5% of long PDFs accounted for nearly all the failures — and clearing that one slice of traffic resolved most of the problem within thirty minutes. Measure first, then act on the part of the curve that is actually misbehaving.
+For me, the morning after a day of logging showed that only the long PDFs were slow. Splitting just those by chapter made the 504s all but disappear. Look at the distribution before you change anything — I try to keep to that order most of all on the days I'm in a hurry.
